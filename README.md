@@ -21,8 +21,7 @@ Fast, lightweight, and entirely local — no cloud, no telemetry, no Electron.
 
 ## Screenshot
 
-<!-- Replace with an actual screenshot -->
-<!-- ![OpenChat screenshot](docs/screenshot.png) -->
+![OpenChat dark theme](docs/screenshots/screenshot-dark-theme.jpg)
 
 ## Download
 
