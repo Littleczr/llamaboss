@@ -15,7 +15,7 @@ Fast, lightweight, and entirely local — no cloud, no telemetry, no Electron.
 - **Conversation history** — auto-save/load with a sidebar browser, right-click to delete
 - **Model management** — live model list from Ollama's API, auto-unload on model switch
 - **Keyboard shortcuts** — Ctrl+N (new chat), Ctrl+S (save), Ctrl+O (open)
-- **Dark theme** — Telegram-inspired color scheme
+- **Dark & Light themes** — Telegram-inspired dark theme (default) and clean light theme, switchable live in Settings
 - **Window persistence** — remembers position, size, and maximized state across sessions
 - **Settings dialog** — change model and API URL at runtime with live model fetching
 
@@ -23,6 +23,10 @@ Fast, lightweight, and entirely local — no cloud, no telemetry, no Electron.
 
 <!-- Replace with an actual screenshot -->
 <!-- ![OpenChat screenshot](docs/screenshot.png) -->
+
+## Download
+
+Pre-built Windows binaries are available on the [Releases](https://github.com/Littleczr/openchat/releases) page. Extract the zip and run `openchat.exe` — no installation required.
 
 ## Requirements
 
@@ -86,6 +90,7 @@ Settings are stored in the Windows registry under `HKCU\Software\OllamaChatApp` 
 |---|---|---|
 | `Model` | `llama3` | Ollama model name |
 | `ApiBaseUrl` | `http://127.0.0.1:11434` | Ollama API endpoint |
+| `Theme` | `dark` | UI theme (`dark` or `light`) |
 | `WindowX/Y/W/H` | — | Window geometry |
 | `WindowMaximized` | `false` | Maximized state |
 
@@ -102,6 +107,7 @@ openchat/
 ├── markdown_renderer.h/.cpp # Streaming markdown → wxRichTextCtrl
 ├── app_state.h/.cpp        # Config, logging, window state persistence
 ├── settings.h/.cpp         # Settings dialog with async model fetching
+├── theme.h/.cpp            # Theme definitions (dark/light) and ThemeManager
 ├── CMakeLists.txt          # CMake build (alternative to .sln)
 ├── vcpkg.json              # Dependency manifest
 ├── openchat.sln            # Visual Studio solution

@@ -36,22 +36,11 @@
 #include "app_state.h"
 
 // ─── Application version ─────────────────────────────────────
-static const char* OPENCHAT_VERSION = "1.0.0";
+static const char* OPENCHAT_VERSION = "1.1.0";
 
-// ─── Color constants for the dark theme (Telegram-inspired) ─────
-namespace Theme {
-    const wxColour BG_DARK(23, 33, 43);              // Main background (#17212B)
-    const wxColour BG_TOOLBAR(28, 40, 54);            // Top bar (#1C2836)
-    const wxColour BG_SIDEBAR(14, 22, 33);            // Sidebar background (#0E1621)
-    const wxColour BG_INPUT_FIELD(36, 47, 61);        // Text field background (#242F3D)
-    const wxColour TEXT_PRIMARY(245, 245, 245);       // Primary text (#F5F5F5)
-    const wxColour TEXT_MUTED(109, 127, 142);         // Secondary/muted text (#6D7F8E)
-    const wxColour ACCENT_GREEN(94, 181, 247);        // Send button / status dot (#5EB5F7)
-    const wxColour STOP_RED(180, 60, 60);             // Stop button
-    const wxColour BORDER_SUBTLE(43, 56, 69);         // Subtle borders (#2B3845)
-    const wxColour MODEL_PILL_BG(43, 82, 120);        // Model pill background (#2B5278)
-    const wxColour ATTACH_INDICATOR(94, 181, 247);    // Attachment text (#5EB5F7)
-}
+// ─── Color constants removed ──────────────────────────────────────
+// All colors now come from ThemeData via m_appState->GetTheme().
+// See theme.h / theme.cpp for dark and light theme definitions.
 
 // ─── Custom status dot panel (green/gray circle) ─────────────────
 class StatusDot : public wxPanel {
@@ -59,6 +48,8 @@ public:
     StatusDot(wxWindow* parent, int size = 8)
         : wxPanel(parent, wxID_ANY, wxDefaultPosition, wxSize(size, size))
         , m_connected(true), m_size(size)
+        , m_connectedColor(94, 181, 247)
+        , m_disconnectedColor(109, 127, 142)
     {
         SetBackgroundStyle(wxBG_STYLE_PAINT);
         Bind(wxEVT_PAINT, &StatusDot::OnPaint, this);
@@ -67,15 +58,22 @@ public:
         m_connected = connected;
         Refresh();
     }
+    void SetColors(const wxColour& connected, const wxColour& disconnected) {
+        m_connectedColor = connected;
+        m_disconnectedColor = disconnected;
+        Refresh();
+    }
 private:
     bool m_connected;
     int m_size;
+    wxColour m_connectedColor;
+    wxColour m_disconnectedColor;
     void OnPaint(wxPaintEvent&) {
         wxAutoBufferedPaintDC dc(this);
         dc.SetBackground(wxBrush(GetParent()->GetBackgroundColour()));
         dc.Clear();
         dc.SetPen(*wxTRANSPARENT_PEN);
-        dc.SetBrush(wxBrush(m_connected ? Theme::ACCENT_GREEN : Theme::TEXT_MUTED));
+        dc.SetBrush(wxBrush(m_connected ? m_connectedColor : m_disconnectedColor));
         dc.DrawCircle(m_size / 2, m_size / 2, m_size / 2 - 1);
     }
 };
@@ -156,7 +154,7 @@ public:
                 wxOK | wxICON_ERROR);
         }
 
-        SetBackgroundColour(Theme::BG_DARK);
+        SetBackgroundColour(m_appState->GetTheme().bgMain);
 
         auto* mainSizer = new wxBoxSizer(wxVERTICAL);
 
@@ -168,21 +166,21 @@ public:
 
         // ── Sidebar panel (collapsible) ──
         _sidebarPanel = new wxPanel(this, wxID_ANY);
-        _sidebarPanel->SetBackgroundColour(Theme::BG_SIDEBAR);
+        _sidebarPanel->SetBackgroundColour(m_appState->GetTheme().bgSidebar);
         _sidebarPanel->SetMinSize(wxSize(260, -1));
 
         auto* sidebarOuterSizer = new wxBoxSizer(wxHORIZONTAL);
 
         // ── Sidebar content area ──
-        auto* sidebarContent = new wxPanel(_sidebarPanel, wxID_ANY);
-        sidebarContent->SetBackgroundColour(Theme::BG_SIDEBAR);
+        _sidebarContent = new wxPanel(_sidebarPanel, wxID_ANY);
+        _sidebarContent->SetBackgroundColour(m_appState->GetTheme().bgSidebar);
         auto* sidebarContentSizer = new wxBoxSizer(wxVERTICAL);
 
         // "New Chat" button at top
-        _sidebarNewChat = new wxButton(sidebarContent, wxID_ANY, "+ New Chat",
+        _sidebarNewChat = new wxButton(_sidebarContent, wxID_ANY, "+ New Chat",
             wxDefaultPosition, wxSize(-1, 42), wxBORDER_NONE);
-        _sidebarNewChat->SetBackgroundColour(Theme::MODEL_PILL_BG);
-        _sidebarNewChat->SetForegroundColour(Theme::TEXT_PRIMARY);
+        _sidebarNewChat->SetBackgroundColour(m_appState->GetTheme().modelPillBg);
+        _sidebarNewChat->SetForegroundColour(m_appState->GetTheme().textPrimary);
         wxFont ncFont = _sidebarNewChat->GetFont();
         ncFont.SetPointSize(11);
         ncFont.SetWeight(wxFONTWEIGHT_MEDIUM);
@@ -190,52 +188,52 @@ public:
         sidebarContentSizer->Add(_sidebarNewChat, 0, wxEXPAND | wxALL, 8);
 
         // Scrollable conversation list
-        _conversationList = new wxScrolledWindow(sidebarContent, wxID_ANY,
+        _conversationList = new wxScrolledWindow(_sidebarContent, wxID_ANY,
             wxDefaultPosition, wxDefaultSize, wxVSCROLL);
-        _conversationList->SetBackgroundColour(Theme::BG_SIDEBAR);
+        _conversationList->SetBackgroundColour(m_appState->GetTheme().bgSidebar);
         _conversationList->SetScrollRate(0, 8);
         _conversationListSizer = new wxBoxSizer(wxVERTICAL);
         _conversationList->SetSizer(_conversationListSizer);
 
         sidebarContentSizer->Add(_conversationList, 1, wxEXPAND);
-        sidebarContent->SetSizer(sidebarContentSizer);
-        sidebarOuterSizer->Add(sidebarContent, 1, wxEXPAND);
+        _sidebarContent->SetSizer(sidebarContentSizer);
+        sidebarOuterSizer->Add(_sidebarContent, 1, wxEXPAND);
 
         // Vertical border on the right edge
-        auto* sidebarBorder = new wxPanel(_sidebarPanel, wxID_ANY, wxDefaultPosition, wxSize(1, -1));
-        sidebarBorder->SetBackgroundColour(Theme::BORDER_SUBTLE);
-        sidebarOuterSizer->Add(sidebarBorder, 0, wxEXPAND);
+        _sidebarBorder = new wxPanel(_sidebarPanel, wxID_ANY, wxDefaultPosition, wxSize(1, -1));
+        _sidebarBorder->SetBackgroundColour(m_appState->GetTheme().borderSubtle);
+        sidebarOuterSizer->Add(_sidebarBorder, 0, wxEXPAND);
 
         _sidebarPanel->SetSizer(sidebarOuterSizer);
         _sidebarPanel->Hide(); // Start collapsed
         _contentSizer->Add(_sidebarPanel, 0, wxEXPAND);
 
         // ── Right panel (chat display + input) ──
-        auto* rightPanel = new wxPanel(this, wxID_ANY);
-        rightPanel->SetBackgroundColour(Theme::BG_DARK);
+        _rightPanel = new wxPanel(this, wxID_ANY);
+        _rightPanel->SetBackgroundColour(m_appState->GetTheme().bgMain);
         auto* rightSizer = new wxBoxSizer(wxVERTICAL);
 
         _chatDisplayCtrl = new wxRichTextCtrl(
-            rightPanel, wxID_ANY, wxEmptyString,
+            _rightPanel, wxID_ANY, wxEmptyString,
             wxDefaultPosition, wxDefaultSize,
             wxRE_MULTILINE | wxRE_READONLY | wxBORDER_NONE
         );
-        _chatDisplayCtrl->SetBackgroundColour(Theme::BG_DARK);
-        _chatDisplayCtrl->SetForegroundColour(Theme::TEXT_PRIMARY);
+        _chatDisplayCtrl->SetBackgroundColour(m_appState->GetTheme().bgMain);
+        _chatDisplayCtrl->SetForegroundColour(m_appState->GetTheme().textPrimary);
         rightSizer->Add(_chatDisplayCtrl, 1, wxEXPAND | wxLEFT | wxRIGHT, 8);
 
         // ─── ATTACHMENT INDICATOR (hidden by default) ────────────────
-        _attachLabel = new wxStaticText(rightPanel, wxID_ANY, "");
-        _attachLabel->SetForegroundColour(Theme::ATTACH_INDICATOR);
-        _attachLabel->SetBackgroundColour(Theme::BG_DARK);
+        _attachLabel = new wxStaticText(_rightPanel, wxID_ANY, "");
+        _attachLabel->SetForegroundColour(m_appState->GetTheme().attachIndicator);
+        _attachLabel->SetBackgroundColour(m_appState->GetTheme().bgMain);
         _attachLabel->Hide();
         rightSizer->Add(_attachLabel, 0, wxLEFT | wxRIGHT | wxTOP, 12);
 
         // ─── INPUT AREA ──────────────────────────────────────────────
-        BuildInputArea(rightSizer, rightPanel);
+        BuildInputArea(rightSizer, _rightPanel);
 
-        rightPanel->SetSizer(rightSizer);
-        _contentSizer->Add(rightPanel, 1, wxEXPAND);
+        _rightPanel->SetSizer(rightSizer);
+        _contentSizer->Add(_rightPanel, 1, wxEXPAND);
 
         mainSizer->Add(_contentSizer, 1, wxEXPAND);
 
@@ -248,6 +246,11 @@ public:
 
         m_chatDisplay = new ChatDisplay(_chatDisplayCtrl);
         m_chatDisplay->SetFont(codeFont);
+        m_chatDisplay->ApplyTheme(m_appState->GetTheme());
+
+        // ─── Apply theme colors to StatusDot ─────────────────────────
+        _statusDot->SetColors(m_appState->GetTheme().accentButton,
+                              m_appState->GetTheme().textMuted);
 
         // ─── Bind events ─────────────────────────────────────────────
         _sendButton->Bind(wxEVT_BUTTON, &MyFrame::OnSendMessage, this);
@@ -374,9 +377,21 @@ private:
     wxButton* _settingsButton;
     wxButton* _newChatButton;
     wxButton* _sidebarToggle;
+    wxButton* _aboutButton;
     wxStaticText* _attachLabel;
     wxBoxSizer* _inputSizer;
     wxBoxSizer* _contentSizer;
+
+    // Themed panels (need pointers for live theme switching)
+    wxPanel* _toolbarPanel;
+    wxStaticText* _titleLabel;
+    wxPanel* _modelPill;
+    wxPanel* _topSeparator;
+    wxPanel* _rightPanel;
+    wxPanel* _sidebarContent;
+    wxPanel* _sidebarBorder;
+    wxPanel* _inputContainer;
+    wxPanel* _inputSeparator;
 
     // Sidebar
     wxPanel* _sidebarPanel;
@@ -405,58 +420,58 @@ private:
 
     void BuildTopBar(wxBoxSizer* mainSizer)
     {
-        auto* toolbar = new wxPanel(this, wxID_ANY);
-        toolbar->SetBackgroundColour(Theme::BG_TOOLBAR);
+        _toolbarPanel = new wxPanel(this, wxID_ANY);
+        _toolbarPanel->SetBackgroundColour(m_appState->GetTheme().bgToolbar);
         auto* sizer = new wxBoxSizer(wxHORIZONTAL);
 
         // ── Left: Sidebar toggle + App title ──
         wxString hamburger = wxString::FromUTF8("\xE2\x98\xB0"); // ☰
-        _sidebarToggle = new wxButton(toolbar, wxID_ANY, hamburger,
+        _sidebarToggle = new wxButton(_toolbarPanel, wxID_ANY, hamburger,
             wxDefaultPosition, wxSize(44, 38), wxBORDER_NONE);
-        _sidebarToggle->SetBackgroundColour(Theme::BG_TOOLBAR);
-        _sidebarToggle->SetForegroundColour(Theme::TEXT_MUTED);
+        _sidebarToggle->SetBackgroundColour(m_appState->GetTheme().bgToolbar);
+        _sidebarToggle->SetForegroundColour(m_appState->GetTheme().textMuted);
         _sidebarToggle->SetToolTip("Toggle sidebar");
         wxFont hamburgerFont = _sidebarToggle->GetFont();
         hamburgerFont.SetPointSize(14);
         _sidebarToggle->SetFont(hamburgerFont);
         sizer->Add(_sidebarToggle, 0, wxALIGN_CENTER_VERTICAL | wxLEFT, 4);
 
-        auto* title = new wxStaticText(toolbar, wxID_ANY, "Ollama Chat");
-        title->SetForegroundColour(Theme::TEXT_PRIMARY);
-        wxFont titleFont = title->GetFont();
+        _titleLabel = new wxStaticText(_toolbarPanel, wxID_ANY, "Ollama Chat");
+        _titleLabel->SetForegroundColour(m_appState->GetTheme().textPrimary);
+        wxFont titleFont = _titleLabel->GetFont();
         titleFont.SetPointSize(13);
         titleFont.SetWeight(wxFONTWEIGHT_MEDIUM);
-        title->SetFont(titleFont);
-        sizer->Add(title, 0, wxALIGN_CENTER_VERTICAL | wxLEFT, 4);
+        _titleLabel->SetFont(titleFont);
+        sizer->Add(_titleLabel, 0, wxALIGN_CENTER_VERTICAL | wxLEFT, 4);
 
         sizer->AddStretchSpacer(1);
 
         // ── Center: Model pill [dot + model name] ──
-        auto* pill = new wxPanel(toolbar, wxID_ANY);
-        pill->SetBackgroundColour(Theme::MODEL_PILL_BG);
+        _modelPill = new wxPanel(_toolbarPanel, wxID_ANY);
+        _modelPill->SetBackgroundColour(m_appState->GetTheme().modelPillBg);
         auto* pillSizer = new wxBoxSizer(wxHORIZONTAL);
 
-        _statusDot = new StatusDot(pill, 10);
+        _statusDot = new StatusDot(_modelPill, 10);
         pillSizer->Add(_statusDot, 0, wxALIGN_CENTER_VERTICAL | wxLEFT, 10);
 
-        _modelLabel = new wxStaticText(pill, wxID_ANY, "loading...");
-        _modelLabel->SetForegroundColour(Theme::TEXT_MUTED);
+        _modelLabel = new wxStaticText(_modelPill, wxID_ANY, "loading...");
+        _modelLabel->SetForegroundColour(m_appState->GetTheme().textMuted);
         wxFont modelFont = _modelLabel->GetFont();
         modelFont.SetPointSize(11);
         _modelLabel->SetFont(modelFont);
         pillSizer->Add(_modelLabel, 0, wxALIGN_CENTER_VERTICAL | wxLEFT, 6);
         pillSizer->AddSpacer(10);
 
-        pill->SetSizer(pillSizer);
-        sizer->Add(pill, 0, wxALIGN_CENTER_VERTICAL);
+        _modelPill->SetSizer(pillSizer);
+        sizer->Add(_modelPill, 0, wxALIGN_CENTER_VERTICAL);
 
         sizer->AddStretchSpacer(1);
 
         // ── Right: New Chat button ──
-        _newChatButton = new wxButton(toolbar, wxID_ANY, "+",
+        _newChatButton = new wxButton(_toolbarPanel, wxID_ANY, "+",
             wxDefaultPosition, wxSize(40, 38), wxBORDER_NONE);
-        _newChatButton->SetBackgroundColour(Theme::BG_TOOLBAR);
-        _newChatButton->SetForegroundColour(Theme::TEXT_MUTED);
+        _newChatButton->SetBackgroundColour(m_appState->GetTheme().bgToolbar);
+        _newChatButton->SetForegroundColour(m_appState->GetTheme().textMuted);
         _newChatButton->SetToolTip("New Chat (Ctrl+N)");
         wxFont newChatFont = _newChatButton->GetFont();
         newChatFont.SetPointSize(18);
@@ -465,10 +480,10 @@ private:
 
         // ── Right: Settings gear ──
         wxString gear = wxString::FromUTF8("\xE2\x9A\x99\xEF\xB8\x8F");
-        _settingsButton = new wxButton(toolbar, wxID_ANY, gear,
+        _settingsButton = new wxButton(_toolbarPanel, wxID_ANY, gear,
             wxDefaultPosition, wxSize(44, 38), wxBORDER_NONE);
-        _settingsButton->SetBackgroundColour(Theme::BG_TOOLBAR);
-        _settingsButton->SetForegroundColour(Theme::TEXT_MUTED);
+        _settingsButton->SetBackgroundColour(m_appState->GetTheme().bgToolbar);
+        _settingsButton->SetForegroundColour(m_appState->GetTheme().textMuted);
         _settingsButton->SetToolTip("Settings");
         wxFont gearFont = _settingsButton->GetFont();
         gearFont.SetPointSize(14);
@@ -477,46 +492,46 @@ private:
 
         // ── Right: About info ──
         wxString infoChar = wxString::FromUTF8("\xE2\x93\x98"); // ⓘ
-        auto* aboutButton = new wxButton(toolbar, wxID_ANY, infoChar,
+        _aboutButton = new wxButton(_toolbarPanel, wxID_ANY, infoChar,
             wxDefaultPosition, wxSize(40, 38), wxBORDER_NONE);
-        aboutButton->SetBackgroundColour(Theme::BG_TOOLBAR);
-        aboutButton->SetForegroundColour(Theme::TEXT_MUTED);
-        aboutButton->SetToolTip("About OpenChat");
-        wxFont aboutFont = aboutButton->GetFont();
+        _aboutButton->SetBackgroundColour(m_appState->GetTheme().bgToolbar);
+        _aboutButton->SetForegroundColour(m_appState->GetTheme().textMuted);
+        _aboutButton->SetToolTip("About OpenChat");
+        wxFont aboutFont = _aboutButton->GetFont();
         aboutFont.SetPointSize(14);
-        aboutButton->SetFont(aboutFont);
-        aboutButton->Bind(wxEVT_BUTTON, &MyFrame::OnAbout, this);
-        sizer->Add(aboutButton, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 8);
+        _aboutButton->SetFont(aboutFont);
+        _aboutButton->Bind(wxEVT_BUTTON, &MyFrame::OnAbout, this);
+        sizer->Add(_aboutButton, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 8);
 
-        toolbar->SetSizer(sizer);
-        mainSizer->Add(toolbar, 0, wxEXPAND);
+        _toolbarPanel->SetSizer(sizer);
+        mainSizer->Add(_toolbarPanel, 0, wxEXPAND);
 
         // Separator line
-        auto* sep = new wxPanel(this, wxID_ANY, wxDefaultPosition, wxSize(-1, 1));
-        sep->SetBackgroundColour(Theme::BORDER_SUBTLE);
-        mainSizer->Add(sep, 0, wxEXPAND);
+        _topSeparator = new wxPanel(this, wxID_ANY, wxDefaultPosition, wxSize(-1, 1));
+        _topSeparator->SetBackgroundColour(m_appState->GetTheme().borderSubtle);
+        mainSizer->Add(_topSeparator, 0, wxEXPAND);
     }
 
     void BuildInputArea(wxBoxSizer* mainSizer, wxWindow* parent)
     {
-        auto* container = new wxPanel(parent, wxID_ANY);
-        container->SetBackgroundColour(Theme::BG_DARK);
+        _inputContainer = new wxPanel(parent, wxID_ANY);
+        _inputContainer->SetBackgroundColour(m_appState->GetTheme().bgInputArea);
         auto* outerSizer = new wxBoxSizer(wxVERTICAL);
 
         // Separator line above input
-        auto* sep = new wxPanel(container, wxID_ANY, wxDefaultPosition, wxSize(-1, 1));
-        sep->SetBackgroundColour(Theme::BORDER_SUBTLE);
-        outerSizer->Add(sep, 0, wxEXPAND);
+        _inputSeparator = new wxPanel(_inputContainer, wxID_ANY, wxDefaultPosition, wxSize(-1, 1));
+        _inputSeparator->SetBackgroundColour(m_appState->GetTheme().borderSubtle);
+        outerSizer->Add(_inputSeparator, 0, wxEXPAND);
 
         // Input row: [📎] [TextInput] [Send/Stop]
         _inputSizer = new wxBoxSizer(wxHORIZONTAL);
 
         // Attach button
         wxString clip = wxString::FromUTF8("\xF0\x9F\x93\x8E");
-        _attachButton = new wxButton(container, wxID_ANY, clip,
+        _attachButton = new wxButton(_inputContainer, wxID_ANY, clip,
             wxDefaultPosition, wxSize(44, 38), wxBORDER_NONE);
-        _attachButton->SetBackgroundColour(Theme::BG_DARK);
-        _attachButton->SetForegroundColour(Theme::TEXT_MUTED);
+        _attachButton->SetBackgroundColour(m_appState->GetTheme().bgInputArea);
+        _attachButton->SetForegroundColour(m_appState->GetTheme().textMuted);
         _attachButton->SetToolTip("Attach an image");
         wxFont clipFont = _attachButton->GetFont();
         clipFont.SetPointSize(14);
@@ -524,19 +539,19 @@ private:
         _inputSizer->Add(_attachButton, 0, wxALIGN_CENTER_VERTICAL | wxLEFT, 6);
 
         // Text input field (ChatInputCtrl intercepts WM_PASTE for image clipboard support)
-        _userInputCtrl = new ChatInputCtrl(container, wxID_ANY, wxEmptyString,
+        _userInputCtrl = new ChatInputCtrl(_inputContainer, wxID_ANY, wxEmptyString,
             wxDefaultPosition, wxDefaultSize,
             wxTE_PROCESS_ENTER | wxTE_MULTILINE | wxBORDER_NONE);
-        _userInputCtrl->SetBackgroundColour(Theme::BG_INPUT_FIELD);
-        _userInputCtrl->SetForegroundColour(Theme::TEXT_PRIMARY);
+        _userInputCtrl->SetBackgroundColour(m_appState->GetTheme().bgInputField);
+        _userInputCtrl->SetForegroundColour(m_appState->GetTheme().textPrimary);
         _userInputCtrl->SetHint("Message...");
         _inputSizer->Add(_userInputCtrl, 1, wxEXPAND | wxTOP | wxBOTTOM, 6);
 
         // Send button — the primary action
-        _sendButton = new wxButton(container, wxID_ANY, "Send",
+        _sendButton = new wxButton(_inputContainer, wxID_ANY, "Send",
             wxDefaultPosition, wxSize(76, 36), wxBORDER_NONE);
-        _sendButton->SetBackgroundColour(Theme::ACCENT_GREEN);
-        _sendButton->SetForegroundColour(wxColour(255, 255, 255));  // White text on blue
+        _sendButton->SetBackgroundColour(m_appState->GetTheme().accentButton);
+        _sendButton->SetForegroundColour(m_appState->GetTheme().accentButtonText);
         wxFont btnFont = _sendButton->GetFont();
         btnFont.SetPointSize(11);
         btnFont.SetWeight(wxFONTWEIGHT_MEDIUM);
@@ -544,22 +559,87 @@ private:
         _inputSizer->Add(_sendButton, 0, wxALIGN_CENTER_VERTICAL | wxLEFT | wxRIGHT, 6);
 
         // Stop button — red, hidden by default, replaces Send
-        _stopButton = new wxButton(container, wxID_ANY, "Stop",
+        _stopButton = new wxButton(_inputContainer, wxID_ANY, "Stop",
             wxDefaultPosition, wxSize(76, 36), wxBORDER_NONE);
-        _stopButton->SetBackgroundColour(Theme::STOP_RED);
-        _stopButton->SetForegroundColour(*wxWHITE);
+        _stopButton->SetBackgroundColour(m_appState->GetTheme().stopButton);
+        _stopButton->SetForegroundColour(m_appState->GetTheme().stopButtonText);
         _stopButton->SetFont(btnFont);
         _stopButton->Hide();
         _inputSizer->Add(_stopButton, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 6);
 
         outerSizer->Add(_inputSizer, 0, wxEXPAND | wxALL, 4);
-        container->SetSizer(outerSizer);
-        mainSizer->Add(container, 0, wxEXPAND);
+        _inputContainer->SetSizer(outerSizer);
+        mainSizer->Add(_inputContainer, 0, wxEXPAND);
     }
 
     // ═════════════════════════════════════════════════════════════
     //  HELPERS
     // ═════════════════════════════════════════════════════════════
+
+    void ApplyThemeToUI()
+    {
+        const ThemeData& t = m_appState->GetTheme();
+
+        // ── Frame ────────────────────────────────────────────────
+        SetBackgroundColour(t.bgMain);
+
+        // ── Toolbar ──────────────────────────────────────────────
+        _toolbarPanel->SetBackgroundColour(t.bgToolbar);
+        _sidebarToggle->SetBackgroundColour(t.bgToolbar);
+        _sidebarToggle->SetForegroundColour(t.textMuted);
+        _titleLabel->SetForegroundColour(t.textPrimary);
+        _modelPill->SetBackgroundColour(t.modelPillBg);
+        _modelLabel->SetForegroundColour(t.textMuted);
+        _newChatButton->SetBackgroundColour(t.bgToolbar);
+        _newChatButton->SetForegroundColour(t.textMuted);
+        _settingsButton->SetBackgroundColour(t.bgToolbar);
+        _settingsButton->SetForegroundColour(t.textMuted);
+        _aboutButton->SetBackgroundColour(t.bgToolbar);
+        _aboutButton->SetForegroundColour(t.textMuted);
+        _topSeparator->SetBackgroundColour(t.borderSubtle);
+        _statusDot->SetColors(t.accentButton, t.textMuted);
+
+        // ── Sidebar ──────────────────────────────────────────────
+        _sidebarPanel->SetBackgroundColour(t.bgSidebar);
+        _sidebarContent->SetBackgroundColour(t.bgSidebar);
+        _sidebarNewChat->SetBackgroundColour(t.modelPillBg);
+        _sidebarNewChat->SetForegroundColour(t.textPrimary);
+        _conversationList->SetBackgroundColour(t.bgSidebar);
+        _sidebarBorder->SetBackgroundColour(t.borderSubtle);
+
+        // ── Chat area ────────────────────────────────────────────
+        _rightPanel->SetBackgroundColour(t.bgMain);
+        _chatDisplayCtrl->SetBackgroundColour(t.bgMain);
+        _chatDisplayCtrl->SetForegroundColour(t.textPrimary);
+        _attachLabel->SetForegroundColour(t.attachIndicator);
+        _attachLabel->SetBackgroundColour(t.bgMain);
+
+        // ── Input area ───────────────────────────────────────────
+        _inputContainer->SetBackgroundColour(t.bgInputArea);
+        _inputSeparator->SetBackgroundColour(t.borderSubtle);
+        _attachButton->SetBackgroundColour(t.bgInputArea);
+        _attachButton->SetForegroundColour(t.textMuted);
+        _userInputCtrl->SetBackgroundColour(t.bgInputField);
+        _userInputCtrl->SetForegroundColour(t.textPrimary);
+        _sendButton->SetBackgroundColour(t.accentButton);
+        _sendButton->SetForegroundColour(t.accentButtonText);
+        _stopButton->SetBackgroundColour(t.stopButton);
+        _stopButton->SetForegroundColour(t.stopButtonText);
+
+        // ── ChatDisplay + MarkdownRenderer ───────────────────────
+        if (m_chatDisplay) {
+            m_chatDisplay->ApplyTheme(t);
+        }
+
+        // ── Refresh sidebar if visible ───────────────────────────
+        if (m_sidebarVisible) {
+            RefreshConversationList();
+        }
+
+        // ── Force repaint ────────────────────────────────────────
+        Refresh();
+        Update();
+    }
 
     void UpdateModelLabel()
     {
@@ -754,7 +834,8 @@ private:
             return;
         }
 
-        SettingsDialog dlg(this, m_appState->GetModel(), m_appState->GetApiUrl());
+        SettingsDialog dlg(this, m_appState->GetModel(), m_appState->GetApiUrl(),
+                           m_appState->GetThemeName());
 
         if (dlg.ShowModal() == wxID_OK)
         {
@@ -766,6 +847,13 @@ private:
                 apiUrlChanged
             );
 
+            // Handle theme change separately (doesn't require chat clear)
+            bool themeChanged = dlg.WasThemeChanged();
+            if (themeChanged) {
+                m_appState->SetTheme(dlg.GetSelectedTheme());
+                ApplyThemeToUI();
+            }
+
             if (anyChange)
             {
                 m_chatHistory->Clear();
@@ -775,6 +863,11 @@ private:
 
                 m_chatDisplay->DisplaySystemMessage("Settings updated. Chat cleared.");
                 _userInputCtrl->SetFocus();
+            }
+            else if (themeChanged)
+            {
+                m_chatDisplay->DisplaySystemMessage("Theme changed to " +
+                    m_appState->GetThemeName() + ".");
             }
         }
     }
@@ -1042,7 +1135,7 @@ private:
             // Highlight the active conversation
             bool isActive = (entry.filePath == m_chatHistory->GetFilePath());
             panel->SetBackgroundColour(isActive ?
-                Theme::MODEL_PILL_BG : Theme::BG_SIDEBAR);
+                m_appState->GetTheme().modelPillBg : m_appState->GetTheme().bgSidebar);
 
             auto* panelSizer = new wxBoxSizer(wxVERTICAL);
 
@@ -1053,7 +1146,7 @@ private:
             }
             auto* titleLabel = new wxStaticText(panel, wxID_ANY,
                 wxString::FromUTF8(displayTitle));
-            titleLabel->SetForegroundColour(Theme::TEXT_PRIMARY);
+            titleLabel->SetForegroundColour(m_appState->GetTheme().textPrimary);
             wxFont titleFont = titleLabel->GetFont();
             titleFont.SetPointSize(10);
             titleLabel->SetFont(titleFont);
@@ -1063,7 +1156,7 @@ private:
             std::string timeStr = RelativeTimeString(entry.modTime);
             auto* timeLabel = new wxStaticText(panel, wxID_ANY,
                 wxString::FromUTF8(timeStr));
-            timeLabel->SetForegroundColour(Theme::TEXT_MUTED);
+            timeLabel->SetForegroundColour(m_appState->GetTheme().textMuted);
             wxFont timeFont = timeLabel->GetFont();
             timeFont.SetPointSize(9);
             timeLabel->SetFont(timeFont);
@@ -1114,15 +1207,15 @@ private:
             timeLabel->Bind(wxEVT_RIGHT_UP, rightClickHandler);
 
             // Hover effect
-            auto enterHandler = [panel](wxMouseEvent&) {
-                if (panel->GetBackgroundColour() != Theme::MODEL_PILL_BG) {
-                    panel->SetBackgroundColour(wxColour(24, 36, 48));
+            auto enterHandler = [panel, this](wxMouseEvent&) {
+                if (panel->GetBackgroundColour() != m_appState->GetTheme().modelPillBg) {
+                    panel->SetBackgroundColour(m_appState->GetTheme().sidebarHover);
                     panel->Refresh();
                 }
                 };
-            auto leaveHandler = [panel](wxMouseEvent&) {
-                if (panel->GetBackgroundColour() != Theme::MODEL_PILL_BG) {
-                    panel->SetBackgroundColour(Theme::BG_SIDEBAR);
+            auto leaveHandler = [panel, this](wxMouseEvent&) {
+                if (panel->GetBackgroundColour() != m_appState->GetTheme().modelPillBg) {
+                    panel->SetBackgroundColour(m_appState->GetTheme().bgSidebar);
                     panel->Refresh();
                 }
                 };
