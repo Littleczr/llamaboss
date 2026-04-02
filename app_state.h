@@ -10,6 +10,9 @@
 // Poco headers
 #include <Poco/Logger.h>
 
+// Theme system
+#include "theme.h"
+
 // Application state and configuration management
 class AppState
 {
@@ -49,6 +52,12 @@ public:
     void SaveWindowState(wxFrame* frame);
     void RestoreWindowState(wxFrame* frame);
 
+    // Theme management
+    const ThemeData& GetTheme() const { return m_themeManager.GetActiveTheme(); }
+    ThemeManager& GetThemeManager() { return m_themeManager; }
+    std::string GetThemeName() const { return m_themeManager.GetActiveThemeName(); }
+    void SetTheme(const std::string& themeName);
+
 private:
     // Configuration data
     std::string m_currentModel;
@@ -58,6 +67,7 @@ private:
 
     // Application components
     Poco::Logger* m_logger;
+    ThemeManager m_themeManager;
 
     // Configuration file handling
     void LoadSettings();
@@ -68,6 +78,7 @@ private:
     static const char* CONFIG_APP_NAME;
     static const char* CONFIG_MODEL_KEY;
     static const char* CONFIG_API_URL_KEY;
+    static const char* CONFIG_THEME_KEY;
 };
 
 #endif // APP_STATE_H

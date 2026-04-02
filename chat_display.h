@@ -6,8 +6,9 @@
 #include <wx/richtext/richtextctrl.h>
 #include <string>
 
-// Forward declaration
+// Forward declarations
 class MarkdownRenderer;
+struct ThemeData;
 
 // Manages the display of chat messages in a wxRichTextCtrl,
 // handling different roles (user, assistant, system) and formats,
@@ -36,6 +37,9 @@ public:
     void SetSystemColor(const wxColour& color);
     void SetThoughtColor(const wxColour& color);
     void SetFont(const wxFont& font);
+
+    // Apply all colors from a ThemeData
+    void ApplyTheme(const ThemeData& theme);
 
 private:
     wxRichTextCtrl* m_displayCtrl;

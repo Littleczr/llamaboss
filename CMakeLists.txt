@@ -13,6 +13,7 @@ set(SOURCES
     app_state.cpp
     settings.cpp
     markdown_renderer.cpp
+    theme.cpp
 )
 
 set(HEADERS
@@ -22,6 +23,7 @@ set(HEADERS
     app_state.h
     settings.h
     markdown_renderer.h
+    theme.h
 )
 
 # ─── Find dependencies ───────────────────────────────────────────

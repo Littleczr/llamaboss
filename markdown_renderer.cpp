@@ -20,8 +20,10 @@ MarkdownRenderer::MarkdownRenderer(wxRichTextCtrl* ctrl)
     : m_ctrl(ctrl)
     , m_inCodeBlock(false)
     , m_partialLineStart(-1)
-    , m_codeColor(232, 184, 77)       // Warm amber (#E8B84D)
-    , m_headingColor(232, 232, 232)   // Near-white (#E8E8E8)
+    , m_codeColor(232, 184, 77)             // Warm amber (#E8B84D)
+    , m_headingColor(232, 232, 232)         // Near-white (#E8E8E8)
+    , m_codeLabelColor(120, 120, 120)       // Gray
+    , m_horizontalRuleColor(80, 80, 80)     // Dark gray
 {
 }
 
@@ -147,7 +149,7 @@ void MarkdownRenderer::RenderCompleteLine(const std::string& line, const wxColou
             // Render a subtle language label if present
             if (!m_codeBlockLang.empty()) {
                 WriteStyled("[" + m_codeBlockLang + "]\n",
-                    wxColour(120, 120, 120), false, true, true);
+                    m_codeLabelColor, false, true, true);
             }
         }
         return;
@@ -239,7 +241,7 @@ void MarkdownRenderer::RenderHorizontalRule(const wxColour& baseColor)
         "\xE2\x94\x80\xE2\x94\x80\xE2\x94\x80\xE2\x94\x80"
         "\xE2\x94\x80\xE2\x94\x80\xE2\x94\x80\xE2\x94\x80"
         "\xE2\x94\x80\xE2\x94\x80\xE2\x94\x80\xE2\x94\x80\n",
-        wxColour(80, 80, 80));
+        m_horizontalRuleColor);
 }
 
 // ═══════════════════════════════════════════════════════════════════

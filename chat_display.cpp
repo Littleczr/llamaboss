@@ -1,6 +1,7 @@
 // chat_display.cpp
 #include "chat_display.h"
 #include "markdown_renderer.h"
+#include "theme.h"
 
 ChatDisplay::ChatDisplay(wxRichTextCtrl* displayCtrl)
     : m_displayCtrl(displayCtrl)
@@ -176,6 +177,21 @@ void ChatDisplay::SetFont(const wxFont& font)
 {
     if (m_displayCtrl) {
         m_displayCtrl->SetFont(font);
+    }
+}
+
+void ChatDisplay::ApplyTheme(const ThemeData& theme)
+{
+    m_userColor      = theme.chatUser;
+    m_assistantColor = theme.chatAssistant;
+    m_systemColor    = theme.chatSystem;
+    m_thoughtColor   = theme.chatThought;
+
+    if (m_markdownRenderer) {
+        m_markdownRenderer->SetCodeColor(theme.mdCode);
+        m_markdownRenderer->SetHeadingColor(theme.mdHeading);
+        m_markdownRenderer->SetCodeLabelColor(theme.mdCodeLabel);
+        m_markdownRenderer->SetHorizontalRuleColor(theme.mdHorizontalRule);
     }
 }
 

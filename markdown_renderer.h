@@ -27,8 +27,10 @@ public:
     void Reset();
 
     // ── Color configuration ──────────────────────────────────────
-    void SetCodeColor(const wxColour& color)    { m_codeColor = color; }
-    void SetHeadingColor(const wxColour& color)  { m_headingColor = color; }
+    void SetCodeColor(const wxColour& color)           { m_codeColor = color; }
+    void SetHeadingColor(const wxColour& color)         { m_headingColor = color; }
+    void SetCodeLabelColor(const wxColour& color)       { m_codeLabelColor = color; }
+    void SetHorizontalRuleColor(const wxColour& color)  { m_horizontalRuleColor = color; }
 
 private:
     wxRichTextCtrl* m_ctrl;
@@ -42,6 +44,8 @@ private:
     // ── Colors ───────────────────────────────────────────────────
     wxColour m_codeColor;
     wxColour m_headingColor;
+    wxColour m_codeLabelColor;
+    wxColour m_horizontalRuleColor;
 
     // ── Block-level rendering ────────────────────────────────────
     void RenderCompleteLine(const std::string& line, const wxColour& baseColor);

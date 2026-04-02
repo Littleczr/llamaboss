@@ -34,13 +34,16 @@ private:
 class SettingsDialog : public wxDialog
 {
 public:
-    SettingsDialog(wxWindow* parent, const std::string& currentModel, const std::string& currentApiUrl);
+    SettingsDialog(wxWindow* parent, const std::string& currentModel,
+                   const std::string& currentApiUrl, const std::string& currentTheme);
     ~SettingsDialog();
 
     std::string GetSelectedModel() const { return m_selectedModel; }
     std::string GetSelectedApiUrl() const { return m_selectedApiUrl; }
+    std::string GetSelectedTheme() const { return m_selectedTheme; }
     bool WasModelChanged() const { return m_modelChanged; }
     bool WasApiUrlChanged() const { return m_apiUrlChanged; }
+    bool WasThemeChanged() const { return m_themeChanged; }
 
     // Thread-safe methods for model fetching
     void PostModelsReceived(const std::vector<std::string>& models);
@@ -63,14 +66,18 @@ private:
     wxButton* m_refreshButton;
     wxGauge* m_progressGauge;
     wxStaticText* m_statusText;
+    wxComboBox* m_themeComboBox;
 
     std::string m_selectedModel;
     std::string m_selectedApiUrl;
+    std::string m_selectedTheme;
     std::string m_originalModel;
     std::string m_originalApiUrl;
+    std::string m_originalTheme;
 
     bool m_modelChanged;
     bool m_apiUrlChanged;
+    bool m_themeChanged;
     bool m_isFetching;
 
     ModelFetchThread* m_fetchThread;

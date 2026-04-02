@@ -18,6 +18,7 @@
 const char* AppState::CONFIG_APP_NAME = "OllamaChatApp";
 const char* AppState::CONFIG_MODEL_KEY = "Model";
 const char* AppState::CONFIG_API_URL_KEY = "ApiBaseUrl";
+const char* AppState::CONFIG_THEME_KEY = "Theme";
 
 AppState::AppState()
     : m_currentModel("")
@@ -85,16 +86,31 @@ void AppState::SetApiUrl(const std::string& apiUrl)
     }
 }
 
+void AppState::SetTheme(const std::string& themeName)
+{
+    std::string previous = m_themeManager.GetActiveThemeName();
+    if (previous != themeName) {
+        m_themeManager.SetActiveTheme(themeName);
+        SaveSettings();
+
+        if (m_logger) {
+            m_logger->information("Theme changed from '" + previous + "' to '" + themeName + "'");
+        }
+    }
+}
+
 void AppState::SaveSettings()
 {
     try {
         wxFileConfig cfg(CONFIG_APP_NAME);
         cfg.Write(CONFIG_MODEL_KEY, wxString::FromUTF8(m_currentModel));
         cfg.Write(CONFIG_API_URL_KEY, wxString::FromUTF8(m_currentApiUrl));
+        cfg.Write(CONFIG_THEME_KEY, wxString::FromUTF8(m_themeManager.GetActiveThemeName()));
         cfg.Flush();
 
         if (m_logger) {
-            m_logger->information("Settings saved - Model: " + m_currentModel + ", API: " + m_currentApiUrl);
+            m_logger->information("Settings saved - Model: " + m_currentModel +
+                ", API: " + m_currentApiUrl + ", Theme: " + m_themeManager.GetActiveThemeName());
         }
     }
     catch (const std::exception& ex) {
@@ -170,7 +186,8 @@ bool AppState::UpdateSettings(const std::string& newModel, const std::string& ne
 void AppState::LogStartupMessage() const
 {
     if (m_logger) {
-        m_logger->information("Application started - Model: " + m_currentModel + ", API: " + m_currentApiUrl);
+        m_logger->information("Application started - Model: " + m_currentModel +
+            ", API: " + m_currentApiUrl + ", Theme: " + m_themeManager.GetActiveThemeName());
     }
 }
 
@@ -287,6 +304,12 @@ void AppState::LoadSettings()
     // Load API URL setting
     if (cfg.Read(CONFIG_API_URL_KEY, &savedApiUrl)) {
         m_currentApiUrl = savedApiUrl.ToStdString();
+    }
+
+    // Load theme setting
+    wxString savedTheme;
+    if (cfg.Read(CONFIG_THEME_KEY, &savedTheme)) {
+        m_themeManager.SetActiveTheme(savedTheme.ToStdString());
     }
 
     // Ensure we have valid defaults

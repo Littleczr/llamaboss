@@ -137,6 +137,7 @@
     <ClCompile Include="markdown_renderer.cpp" />
     <ClCompile Include="openchat.cpp" />
     <ClCompile Include="settings.cpp" />
+    <ClCompile Include="theme.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="app_state.h" />
@@ -147,6 +148,7 @@
     <ClInclude Include="resource.h" />
     <ClInclude Include="resource1.h" />
     <ClInclude Include="settings.h" />
+    <ClInclude Include="theme.h" />
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="openchat.rc" />

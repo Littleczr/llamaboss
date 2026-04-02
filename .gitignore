@@ -1,36 +1,53 @@
-# ── Build outputs ─────────────────────────────────────────────
+# ─── Visual Studio ────────────────────────────────────────────
+.vs/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# ─── Build output ─────────────────────────────────────────────
 x64/
+x86/
 Debug/
 Release/
 out/
 build/
-*.obj
-*.pdb
-*.ilk
-*.exe
-*.dll
-*.lib
-*.exp
-*.log
+[Bb]in/
+[Oo]bj/
 
-# ── Visual Studio ─────────────────────────────────────────────
-.vs/
-*.vcxproj.user
-*.suo
-*.user
-*.sln.docstates
+# ─── Auto-generated resource files ────────────────────────────
 *.aps
 
-# ── vcpkg ─────────────────────────────────────────────────────
+# ─── vcpkg installed packages ─────────────────────────────────
 vcpkg_installed/
 
-# ── OS junk ───────────────────────────────────────────────────
-Thumbs.db
-Desktop.ini
-.DS_Store
+# ─── Compiler / linker intermediates ──────────────────────────
+*.obj
+*.o
+*.pch
+*.pdb
+*.ilk
+*.idb
+*.exp
+*.lib
+*.dll
+*.exe
+*.log
+*.tlog
+*.ipch
+*.sdf
+*.opensdf
+*.opendb
+*.db
+*.ipdb
+*.iobj
 
-# ── Editor / IDE ──────────────────────────────────────────────
-*.swp
-*~
-.vscode/
-.idea/
+# ─── IntelliSense / browse DB ─────────────────────────────────
+*.VC.db
+*.VC.VC.opendb
+ipch/
+
+# ─── OS junk ──────────────────────────────────────────────────
+Thumbs.db
+.DS_Store
+desktop.ini

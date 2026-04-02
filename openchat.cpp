@@ -28,6 +28,12 @@
 #include <Poco/JSON/Parser.h>
 #include <Poco/JSON/Array.h>
 #include <Poco/JSON/Stringifier.h>
+#include <Poco/URI.h>
+#include <Poco/Net/HTTPClientSession.h>
+#include <Poco/Net/HTTPRequest.h>
+#include <Poco/Net/HTTPResponse.h>
+#include <Poco/StreamCopier.h>
+#include <Poco/Timespan.h>
 
 #include "settings.h"
 #include "chat_client.h"
@@ -36,7 +42,10 @@
 #include "app_state.h"
 
 // ─── Application version ─────────────────────────────────────
-static const char* OPENCHAT_VERSION = "1.1.0";
+static const char* OPENCHAT_VERSION = "1.1.1";
+
+// Custom event for model picker popup
+wxDEFINE_EVENT(wxEVT_MODEL_LIST_READY, wxCommandEvent);
 
 // ─── Color constants removed ──────────────────────────────────────
 // All colors now come from ThemeData via m_appState->GetTheme().
@@ -135,6 +144,68 @@ private:
     MyFrame* m_frame;
 };
 
+// ─── Thread for quick model list fetch (model pill picker) ───
+class ModelPickerThread : public wxThread {
+public:
+    ModelPickerThread(wxEvtHandler* handler, const std::string& apiUrl)
+        : wxThread(wxTHREAD_DETACHED), m_handler(handler), m_apiUrl(apiUrl) {}
+protected:
+    ExitCode Entry() override {
+        try {
+            Poco::URI uri(m_apiUrl + "/api/tags");
+            Poco::Net::HTTPClientSession sess(uri.getHost(), uri.getPort());
+            sess.setTimeout(Poco::Timespan(5, 0));
+
+            Poco::Net::HTTPRequest req(Poco::Net::HTTPRequest::HTTP_GET,
+                uri.getPathAndQuery(), Poco::Net::HTTPMessage::HTTP_1_1);
+            sess.sendRequest(req);
+
+            Poco::Net::HTTPResponse resp;
+            std::istream& in = sess.receiveResponse(resp);
+
+            if (resp.getStatus() != Poco::Net::HTTPResponse::HTTP_OK) {
+                wxCommandEvent* evt = new wxCommandEvent(wxEVT_MODEL_LIST_READY);
+                evt->SetString("");
+                wxQueueEvent(m_handler, evt);
+                return (ExitCode)0;
+            }
+
+            std::string body;
+            Poco::StreamCopier::copyToString(in, body);
+
+            Poco::JSON::Parser parser;
+            auto result = parser.parse(body);
+            auto obj = result.extract<Poco::JSON::Object::Ptr>();
+
+            wxString modelList;
+            if (obj->has("models")) {
+                auto arr = obj->getArray("models");
+                for (size_t i = 0; i < arr->size(); ++i) {
+                    auto m = arr->getObject(i);
+                    if (m->has("name")) {
+                        if (!modelList.empty()) modelList += "\n";
+                        modelList += wxString::FromUTF8(
+                            m->getValue<std::string>("name"));
+                    }
+                }
+            }
+
+            wxCommandEvent* evt = new wxCommandEvent(wxEVT_MODEL_LIST_READY);
+            evt->SetString(modelList);
+            wxQueueEvent(m_handler, evt);
+        }
+        catch (...) {
+            wxCommandEvent* evt = new wxCommandEvent(wxEVT_MODEL_LIST_READY);
+            evt->SetString("");
+            wxQueueEvent(m_handler, evt);
+        }
+        return (ExitCode)0;
+    }
+private:
+    wxEvtHandler* m_handler;
+    std::string m_apiUrl;
+};
+
 // ═══════════════════════════════════════════════════════════════════
 class MyFrame : public wxFrame {
 public:
@@ -147,6 +218,7 @@ public:
         , m_chatDisplay(nullptr)
         , m_chatHistory(new ChatHistory())
         , m_sidebarVisible(false)
+        , m_isClosing(false)
     {
         // Initialize application state first
         if (!m_appState->Initialize()) {
@@ -268,6 +340,12 @@ public:
         Bind(wxEVT_ASSISTANT_COMPLETE, &MyFrame::OnAssistantComplete, this);
         Bind(wxEVT_ASSISTANT_ERROR, &MyFrame::OnAssistantError, this);
 
+        // ─── Model pill click (quick model switch) ────────────────────
+        _modelPill->Bind(wxEVT_LEFT_UP, &MyFrame::OnModelPillClick, this);
+        _modelLabel->Bind(wxEVT_LEFT_UP, &MyFrame::OnModelPillClick, this);
+        _statusDot->Bind(wxEVT_LEFT_UP, &MyFrame::OnModelPillClick, this);
+        Bind(wxEVT_MODEL_LIST_READY, &MyFrame::OnModelListReady, this);
+
         // ─── Drag-and-drop support ────────────────────────────────────
         SetDropTarget(new ImageDropTarget(this));
 
@@ -315,25 +393,16 @@ public:
 
     void OnClose(wxCloseEvent& evt)
     {
-        // Stop any active streaming FIRST — sets the cancel flag so the
-        // detached thread won't post any more events to this frame.
+        m_isClosing = true;
+
         if (m_chatClient->IsStreaming()) {
             m_chatClient->StopGeneration();
         }
 
-        // Disconnect assistant events so any already-queued events from the
-        // thread (posted between the cancel check and our flag set) won't
-        // invoke member functions on a half-destroyed frame.
-        Unbind(wxEVT_ASSISTANT_DELTA, &MyFrame::OnAssistantDelta, this);
-        Unbind(wxEVT_ASSISTANT_COMPLETE, &MyFrame::OnAssistantComplete, this);
-        Unbind(wxEVT_ASSISTANT_ERROR, &MyFrame::OnAssistantError, this);
-
-        // Save current conversation
         if (!m_chatHistory->IsEmpty()) {
             AutoSaveConversation();
         }
 
-        // Save window position/size before closing
         m_appState->SaveWindowState(this);
 
         evt.Skip(); // Allow the default close behavior
@@ -399,6 +468,7 @@ private:
     wxScrolledWindow* _conversationList;
     wxBoxSizer* _conversationListSizer;
     bool m_sidebarVisible;
+    bool m_isClosing;
 
     // Top bar controls
     wxStaticText* _modelLabel;
@@ -414,6 +484,9 @@ private:
     std::string m_pendingImageBase64;
     std::string m_pendingImageName;
 
+    // ─── Model picker state ──────────────────────────────────────
+    std::vector<std::string> m_pickerModels;
+
     // ═════════════════════════════════════════════════════════════
     //  UI CONSTRUCTION
     // ═════════════════════════════════════════════════════════════
@@ -427,37 +500,41 @@ private:
         // ── Left: Sidebar toggle + App title ──
         wxString hamburger = wxString::FromUTF8("\xE2\x98\xB0"); // ☰
         _sidebarToggle = new wxButton(_toolbarPanel, wxID_ANY, hamburger,
-            wxDefaultPosition, wxSize(44, 38), wxBORDER_NONE);
+            wxDefaultPosition, wxSize(52, 44), wxBORDER_NONE);
         _sidebarToggle->SetBackgroundColour(m_appState->GetTheme().bgToolbar);
         _sidebarToggle->SetForegroundColour(m_appState->GetTheme().textMuted);
         _sidebarToggle->SetToolTip("Toggle sidebar");
         wxFont hamburgerFont = _sidebarToggle->GetFont();
-        hamburgerFont.SetPointSize(14);
+        hamburgerFont.SetPointSize(18);
         _sidebarToggle->SetFont(hamburgerFont);
         sizer->Add(_sidebarToggle, 0, wxALIGN_CENTER_VERTICAL | wxLEFT, 4);
 
         _titleLabel = new wxStaticText(_toolbarPanel, wxID_ANY, "Ollama Chat");
         _titleLabel->SetForegroundColour(m_appState->GetTheme().textPrimary);
         wxFont titleFont = _titleLabel->GetFont();
-        titleFont.SetPointSize(13);
-        titleFont.SetWeight(wxFONTWEIGHT_MEDIUM);
+        titleFont.SetPointSize(15);
+        titleFont.SetWeight(wxFONTWEIGHT_BOLD);
         _titleLabel->SetFont(titleFont);
         sizer->Add(_titleLabel, 0, wxALIGN_CENTER_VERTICAL | wxLEFT, 4);
 
         sizer->AddStretchSpacer(1);
 
-        // ── Center: Model pill [dot + model name] ──
+        // ── Center: Model pill [dot + model name] (clickable) ──
         _modelPill = new wxPanel(_toolbarPanel, wxID_ANY);
-        _modelPill->SetBackgroundColour(m_appState->GetTheme().modelPillBg);
+        _modelPill->SetBackgroundColour(m_appState->GetTheme().bgToolbar);
+        _modelPill->SetCursor(wxCURSOR_HAND);
         auto* pillSizer = new wxBoxSizer(wxHORIZONTAL);
 
         _statusDot = new StatusDot(_modelPill, 10);
+        _statusDot->SetCursor(wxCURSOR_HAND);
         pillSizer->Add(_statusDot, 0, wxALIGN_CENTER_VERTICAL | wxLEFT, 10);
 
         _modelLabel = new wxStaticText(_modelPill, wxID_ANY, "loading...");
-        _modelLabel->SetForegroundColour(m_appState->GetTheme().textMuted);
+        _modelLabel->SetForegroundColour(m_appState->GetTheme().textPrimary);
+        _modelLabel->SetCursor(wxCURSOR_HAND);
         wxFont modelFont = _modelLabel->GetFont();
-        modelFont.SetPointSize(11);
+        modelFont.SetPointSize(13);
+        modelFont.SetWeight(wxFONTWEIGHT_BOLD);
         _modelLabel->SetFont(modelFont);
         pillSizer->Add(_modelLabel, 0, wxALIGN_CENTER_VERTICAL | wxLEFT, 6);
         pillSizer->AddSpacer(10);
@@ -469,36 +546,36 @@ private:
 
         // ── Right: New Chat button ──
         _newChatButton = new wxButton(_toolbarPanel, wxID_ANY, "+",
-            wxDefaultPosition, wxSize(40, 38), wxBORDER_NONE);
+            wxDefaultPosition, wxSize(48, 44), wxBORDER_NONE);
         _newChatButton->SetBackgroundColour(m_appState->GetTheme().bgToolbar);
         _newChatButton->SetForegroundColour(m_appState->GetTheme().textMuted);
         _newChatButton->SetToolTip("New Chat (Ctrl+N)");
         wxFont newChatFont = _newChatButton->GetFont();
-        newChatFont.SetPointSize(18);
+        newChatFont.SetPointSize(22);
         _newChatButton->SetFont(newChatFont);
         sizer->Add(_newChatButton, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
 
         // ── Right: Settings gear ──
         wxString gear = wxString::FromUTF8("\xE2\x9A\x99\xEF\xB8\x8F");
         _settingsButton = new wxButton(_toolbarPanel, wxID_ANY, gear,
-            wxDefaultPosition, wxSize(44, 38), wxBORDER_NONE);
+            wxDefaultPosition, wxSize(52, 44), wxBORDER_NONE);
         _settingsButton->SetBackgroundColour(m_appState->GetTheme().bgToolbar);
         _settingsButton->SetForegroundColour(m_appState->GetTheme().textMuted);
         _settingsButton->SetToolTip("Settings");
         wxFont gearFont = _settingsButton->GetFont();
-        gearFont.SetPointSize(14);
+        gearFont.SetPointSize(18);
         _settingsButton->SetFont(gearFont);
         sizer->Add(_settingsButton, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 2);
 
         // ── Right: About info ──
         wxString infoChar = wxString::FromUTF8("\xE2\x93\x98"); // ⓘ
         _aboutButton = new wxButton(_toolbarPanel, wxID_ANY, infoChar,
-            wxDefaultPosition, wxSize(40, 38), wxBORDER_NONE);
+            wxDefaultPosition, wxSize(48, 44), wxBORDER_NONE);
         _aboutButton->SetBackgroundColour(m_appState->GetTheme().bgToolbar);
         _aboutButton->SetForegroundColour(m_appState->GetTheme().textMuted);
         _aboutButton->SetToolTip("About OpenChat");
         wxFont aboutFont = _aboutButton->GetFont();
-        aboutFont.SetPointSize(14);
+        aboutFont.SetPointSize(18);
         _aboutButton->SetFont(aboutFont);
         _aboutButton->Bind(wxEVT_BUTTON, &MyFrame::OnAbout, this);
         sizer->Add(_aboutButton, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 8);
@@ -529,12 +606,12 @@ private:
         // Attach button
         wxString clip = wxString::FromUTF8("\xF0\x9F\x93\x8E");
         _attachButton = new wxButton(_inputContainer, wxID_ANY, clip,
-            wxDefaultPosition, wxSize(44, 38), wxBORDER_NONE);
+            wxDefaultPosition, wxSize(52, 42), wxBORDER_NONE);
         _attachButton->SetBackgroundColour(m_appState->GetTheme().bgInputArea);
         _attachButton->SetForegroundColour(m_appState->GetTheme().textMuted);
         _attachButton->SetToolTip("Attach an image");
         wxFont clipFont = _attachButton->GetFont();
-        clipFont.SetPointSize(14);
+        clipFont.SetPointSize(18);
         _attachButton->SetFont(clipFont);
         _inputSizer->Add(_attachButton, 0, wxALIGN_CENTER_VERTICAL | wxLEFT, 6);
 
@@ -588,8 +665,8 @@ private:
         _sidebarToggle->SetBackgroundColour(t.bgToolbar);
         _sidebarToggle->SetForegroundColour(t.textMuted);
         _titleLabel->SetForegroundColour(t.textPrimary);
-        _modelPill->SetBackgroundColour(t.modelPillBg);
-        _modelLabel->SetForegroundColour(t.textMuted);
+        _modelPill->SetBackgroundColour(t.bgToolbar);
+        _modelLabel->SetForegroundColour(t.textPrimary);
         _newChatButton->SetBackgroundColour(t.bgToolbar);
         _newChatButton->SetForegroundColour(t.textMuted);
         _settingsButton->SetBackgroundColour(t.bgToolbar);
@@ -652,7 +729,8 @@ private:
             display = model.substr(slash + 1);
         }
 
-        _modelLabel->SetLabel(wxString::FromUTF8(display));
+        _modelLabel->SetLabel(wxString::FromUTF8(display) +
+            wxString::FromUTF8(" \xE2\x96\xBE"));  // ▾ dropdown indicator
         _modelLabel->GetParent()->Layout();
     }
 
@@ -748,12 +826,17 @@ private:
 
     void OnAssistantDelta(wxCommandEvent& event)
     {
+        if (m_isClosing) return;
+
         m_chatDisplay->DisplayAssistantDelta(event.GetString().ToStdString());
     }
 
     void OnAssistantComplete(wxCommandEvent& event)
     {
+        if (m_isClosing) return;
+
         std::string fullResponse = event.GetString().ToStdString();
+
         m_chatDisplay->DisplayAssistantComplete();
         m_chatHistory->UpdateLastAssistantMessage(fullResponse);
         m_chatClient->ResetStreamingState();
@@ -768,27 +851,32 @@ private:
 
     void OnAssistantError(wxCommandEvent& event)
     {
+        if (m_isClosing) return;
+
         std::string error = event.GetString().ToStdString();
 
-        // Detect connection failures and show a friendly message
         std::string friendly;
+
         if (error.find("Connection refused") != std::string::npos ||
             error.find("Network Error") != std::string::npos ||
             error.find("No connection") != std::string::npos ||
             error.find("Connection reset") != std::string::npos ||
             error.find("Net Exception") != std::string::npos) {
+
             friendly = "Could not connect to Ollama at " + m_appState->GetApiUrl() +
                 ".\nMake sure Ollama is running (\"ollama serve\") and the URL in Settings is correct.";
             _statusDot->SetConnected(false);
         }
         else if (error.find("Timeout") != std::string::npos ||
-                 error.find("timeout") != std::string::npos) {
-            friendly = "Request timed out. Ollama may be busy loading a model \xe2\x80\x94 try again in a moment.";
+            error.find("timeout") != std::string::npos) {
+
+            friendly = "Request timed out. Ollama may be busy loading a model — try again in a moment.";
         }
         else if (error.find("model") != std::string::npos &&
-                 error.find("not found") != std::string::npos) {
+            error.find("not found") != std::string::npos) {
+
             friendly = "Model \"" + m_appState->GetModel() + "\" was not found. "
-                "Open Settings to pick an available model, or run:\n  ollama pull " + m_appState->GetModel();
+                "Open Settings to pick an available model, or run:\n ollama pull " + m_appState->GetModel();
         }
         else {
             friendly = "Error: " + error;
@@ -866,6 +954,12 @@ private:
             }
             else if (themeChanged)
             {
+                // Re-render existing conversation with new theme colors
+                // (wxRichTextCtrl bakes colors into rendered text, so we must replay)
+                if (!m_chatHistory->IsEmpty()) {
+                    m_chatDisplay->Clear();
+                    ReplayConversation();
+                }
                 m_chatDisplay->DisplaySystemMessage("Theme changed to " +
                     m_appState->GetThemeName() + ".");
             }
@@ -882,6 +976,95 @@ private:
             << wxString::FromUTF8("Model: ") << wxString::FromUTF8(m_appState->GetModel()) << "\n"
             << wxString::FromUTF8("API: ") << wxString::FromUTF8(m_appState->GetApiUrl());
         wxMessageBox(msg, "About OpenChat", wxOK | wxICON_INFORMATION);
+    }
+
+    // ─── Model pill click → fetch model list and show picker ─────
+    void OnModelPillClick(wxMouseEvent&)
+    {
+        if (m_chatClient->IsStreaming()) return;
+
+        // Start async model list fetch
+        auto* thread = new ModelPickerThread(this, m_appState->GetApiUrl());
+        if (thread->Run() != wxTHREAD_NO_ERROR) {
+            delete thread;
+            m_chatDisplay->DisplaySystemMessage(
+                "Failed to fetch model list. Is Ollama running?");
+        }
+    }
+
+    void OnModelListReady(wxCommandEvent& event)
+    {
+        if (m_isClosing) return;
+
+        wxString modelStr = event.GetString();
+        if (modelStr.empty()) {
+            m_chatDisplay->DisplaySystemMessage(
+                "Could not fetch models from " + m_appState->GetApiUrl() +
+                ". Make sure Ollama is running.");
+            return;
+        }
+
+        // Parse newline-separated model list
+        m_pickerModels.clear();
+        std::istringstream stream(modelStr.ToStdString());
+        std::string line;
+        while (std::getline(stream, line)) {
+            if (!line.empty()) m_pickerModels.push_back(line);
+        }
+
+        if (m_pickerModels.empty()) return;
+
+        // Build popup menu with checkmarks on the active model
+        wxMenu menu;
+        std::string currentModel = m_appState->GetModel();
+
+        for (size_t i = 0; i < m_pickerModels.size(); ++i) {
+            wxMenuItem* item = menu.AppendCheckItem(
+                10000 + (int)i, wxString::FromUTF8(m_pickerModels[i]));
+            if (m_pickerModels[i] == currentModel) {
+                item->Check(true);
+            }
+        }
+
+        menu.Bind(wxEVT_MENU, [this](wxCommandEvent& e) {
+            int idx = e.GetId() - 10000;
+            if (idx >= 0 && idx < (int)m_pickerModels.size()) {
+                SwitchToModel(m_pickerModels[idx]);
+            }
+        });
+
+        // Show popup below the model pill
+        wxPoint pos = _modelPill->GetScreenPosition();
+        pos = ScreenToClient(pos);
+        pos.y += _modelPill->GetSize().y;
+        PopupMenu(&menu, pos);
+    }
+
+    void SwitchToModel(const std::string& newModel)
+    {
+        if (newModel == m_appState->GetModel()) return;
+        if (m_chatClient->IsStreaming()) return;
+
+        // Save current conversation before switching
+        if (!m_chatHistory->IsEmpty()) {
+            AutoSaveConversation();
+        }
+
+        bool mc, ac;
+        m_appState->UpdateSettings(newModel, m_appState->GetApiUrl(), mc, ac);
+
+        m_chatHistory->Clear();
+        m_chatDisplay->Clear();
+        ClearPendingImage();
+        UpdateModelLabel();
+        UpdateWindowTitle();
+
+        m_chatDisplay->DisplaySystemMessage("Switched to " + newModel);
+        _statusDot->SetConnected(true);
+        _userInputCtrl->SetFocus();
+
+        if (auto* logger = m_appState->GetLogger())
+            logger->information("Quick-switched to model: " + newModel);
     }
 
     void OnNewChat(wxCommandEvent&)

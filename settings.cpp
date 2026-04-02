@@ -29,14 +29,18 @@ EVT_COMMAND(wxID_ANY, wxEVT_MODELS_RECEIVED, SettingsDialog::OnModelsReceived)
 EVT_COMMAND(wxID_ANY, wxEVT_MODELS_FETCH_ERROR, SettingsDialog::OnModelsFetchError)
 wxEND_EVENT_TABLE()
 
-SettingsDialog::SettingsDialog(wxWindow* parent, const std::string& currentModel, const std::string& currentApiUrl)
-    : wxDialog(parent, wxID_ANY, "Settings", wxDefaultPosition, wxSize(500, 300))
+SettingsDialog::SettingsDialog(wxWindow* parent, const std::string& currentModel,
+                               const std::string& currentApiUrl, const std::string& currentTheme)
+    : wxDialog(parent, wxID_ANY, "Settings", wxDefaultPosition, wxSize(500, 340))
     , m_selectedModel(currentModel)
     , m_selectedApiUrl(currentApiUrl)
+    , m_selectedTheme(currentTheme)
     , m_originalModel(currentModel)
     , m_originalApiUrl(currentApiUrl)
+    , m_originalTheme(currentTheme)
     , m_modelChanged(false)
     , m_apiUrlChanged(false)
+    , m_themeChanged(false)
     , m_isFetching(false)
     , m_fetchThread(nullptr)
 {
@@ -96,7 +100,30 @@ void SettingsDialog::CreateControls()
     mainSizer->Add(m_progressGauge, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 5);
 
     // Future settings can be added here
-    // Font size, timeout settings, theme selection, etc.
+    // Font size, timeout settings, etc.
+
+    // ── Theme selection ──────────────────────────────────────────
+    mainSizer->AddSpacer(5);
+    auto* themeLabel = new wxStaticText(this, wxID_ANY, "Theme:");
+    mainSizer->Add(themeLabel, 0, wxLEFT | wxRIGHT | wxTOP, 5);
+
+    wxArrayString themeChoices;
+    themeChoices.Add("Dark");
+    themeChoices.Add("Light");
+    themeChoices.Add("System");
+    m_themeComboBox = new wxComboBox(this, wxID_ANY, "",
+        wxDefaultPosition, wxDefaultSize, themeChoices,
+        wxCB_DROPDOWN | wxCB_READONLY);
+
+    // Select current theme
+    if (m_selectedTheme == "light")
+        m_themeComboBox->SetSelection(1);
+    else if (m_selectedTheme == "system")
+        m_themeComboBox->SetSelection(2);
+    else
+        m_themeComboBox->SetSelection(0);
+
+    mainSizer->Add(m_themeComboBox, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 5);
 
     // Buttons
     auto* buttonSizer = CreateButtonSizer(wxOK | wxCANCEL);
@@ -226,9 +253,12 @@ void SettingsDialog::OnOK(wxCommandEvent& event)
 
     m_selectedModel = m_modelComboBox->GetValue().ToStdString();
     m_selectedApiUrl = m_apiUrlTextCtrl->GetValue().ToStdString();
+    int themeSel = m_themeComboBox->GetSelection();
+    m_selectedTheme = (themeSel == 2) ? "system" : (themeSel == 1) ? "light" : "dark";
 
     m_modelChanged = (m_selectedModel != m_originalModel);
     m_apiUrlChanged = (m_selectedApiUrl != m_originalApiUrl);
+    m_themeChanged = (m_selectedTheme != m_originalTheme);
 
     // Save to config
     wxFileConfig cfg("OllamaChatApp");
