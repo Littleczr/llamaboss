@@ -15,14 +15,18 @@ Fast, lightweight, and entirely local — no cloud, no telemetry, no Electron.
 - **Conversation history** — auto-save/load with a sidebar browser, right-click to delete
 - **Model management** — live model list from Ollama's API, auto-unload on model switch
 - **Keyboard shortcuts** — Ctrl+N (new chat), Ctrl+S (save), Ctrl+O (open)
-- **Dark theme** — Telegram-inspired color scheme
+- **Dark & Light themes** — Telegram-inspired dark scheme + refined light palette, live switching or auto from Windows system setting
+- **Clickable model picker** — click the model pill in the toolbar to switch models instantly without opening Settings
 - **Window persistence** — remembers position, size, and maximized state across sessions
 - **Settings dialog** — change model and API URL at runtime with live model fetching
 
-## Screenshot
+## Screenshots
 
-<!-- Replace with an actual screenshot -->
-<!-- ![OpenChat screenshot](docs/screenshot.png) -->
+**Dark Theme**
+![OpenChat dark theme](docs/screenshots/screenshot-dark-theme.jpg)
+
+**Light Theme**
+![OpenChat light theme](docs/screenshots/screenshot-light-theme.jpg)
 
 ## Requirements
 
@@ -102,6 +106,7 @@ openchat/
 ├── markdown_renderer.h/.cpp # Streaming markdown → wxRichTextCtrl
 ├── app_state.h/.cpp        # Config, logging, window state persistence
 ├── settings.h/.cpp         # Settings dialog with async model fetching
+├── theme.h/.cpp            # Theme definitions and color palette
 ├── CMakeLists.txt          # CMake build (alternative to .sln)
 ├── vcpkg.json              # Dependency manifest
 ├── openchat.sln            # Visual Studio solution
@@ -118,3 +123,9 @@ openchat/
 ## License
 
 [MIT](LICENSE)
+
+## Download
+
+See [Releases](https://github.com/Littleczr/openchat/releases) for pre-built Windows x64 binaries.
+
+**Latest:** [openchat-v1.1.1-win-x64.zip](https://github.com/Littleczr/openchat/releases/download/v1.1.1/openchat-v1.1.1-win-x64.zip)
