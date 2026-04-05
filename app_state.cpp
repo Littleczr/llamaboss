@@ -7,6 +7,8 @@
 #include <wx/log.h>
 #include <wx/icon.h>
 #include <wx/display.h>
+#include <wx/stdpaths.h>
+#include <wx/filename.h>
 
 // Poco headers
 #include <Poco/ConsoleChannel.h>
@@ -19,6 +21,8 @@ const char* AppState::CONFIG_APP_NAME = "OllamaChatApp";
 const char* AppState::CONFIG_MODEL_KEY = "Model";
 const char* AppState::CONFIG_API_URL_KEY = "ApiBaseUrl";
 const char* AppState::CONFIG_THEME_KEY = "Theme";
+const char* AppState::CONFIG_WORKSPACE_ENABLED_KEY = "WorkspaceEnabled";
+const char* AppState::CONFIG_WORKSPACE_PATH_KEY = "WorkspacePath";
 
 AppState::AppState()
     : m_currentModel("")
@@ -26,6 +30,7 @@ AppState::AppState()
     , m_defaultModel("llama3")
     , m_defaultApiUrl("http://127.0.0.1:11434")
     , m_logger(nullptr)
+    , m_workspaceEnabled(false)
 {
     SetDefaults();
 }
@@ -99,6 +104,33 @@ void AppState::SetTheme(const std::string& themeName)
     }
 }
 
+void AppState::SetWorkspaceEnabled(bool enabled)
+{
+    if (m_workspaceEnabled != enabled) {
+        m_workspaceEnabled = enabled;
+        SaveSettings();
+
+        if (m_logger) {
+            m_logger->information(std::string("Workspace ") +
+                (enabled ? "enabled" : "disabled"));
+        }
+    }
+}
+
+void AppState::SetWorkspacePath(const std::string& path)
+{
+    if (m_workspacePath != path) {
+        std::string previous = m_workspacePath;
+        m_workspacePath = path;
+        SaveSettings();
+
+        if (m_logger) {
+            m_logger->information("Workspace path changed from '" +
+                previous + "' to '" + path + "'");
+        }
+    }
+}
+
 void AppState::SaveSettings()
 {
     try {
@@ -106,11 +138,14 @@ void AppState::SaveSettings()
         cfg.Write(CONFIG_MODEL_KEY, wxString::FromUTF8(m_currentModel));
         cfg.Write(CONFIG_API_URL_KEY, wxString::FromUTF8(m_currentApiUrl));
         cfg.Write(CONFIG_THEME_KEY, wxString::FromUTF8(m_themeManager.GetActiveThemeName()));
+        cfg.Write(CONFIG_WORKSPACE_ENABLED_KEY, m_workspaceEnabled);
+        cfg.Write(CONFIG_WORKSPACE_PATH_KEY, wxString::FromUTF8(m_workspacePath));
         cfg.Flush();
 
         if (m_logger) {
             m_logger->information("Settings saved - Model: " + m_currentModel +
-                ", API: " + m_currentApiUrl + ", Theme: " + m_themeManager.GetActiveThemeName());
+                ", API: " + m_currentApiUrl + ", Theme: " + m_themeManager.GetActiveThemeName() +
+                ", Workspace: " + std::string(m_workspaceEnabled ? "on" : "off"));
         }
     }
     catch (const std::exception& ex) {
@@ -187,7 +222,9 @@ void AppState::LogStartupMessage() const
 {
     if (m_logger) {
         m_logger->information("Application started - Model: " + m_currentModel +
-            ", API: " + m_currentApiUrl + ", Theme: " + m_themeManager.GetActiveThemeName());
+            ", API: " + m_currentApiUrl + ", Theme: " + m_themeManager.GetActiveThemeName() +
+            ", Workspace: " + std::string(m_workspaceEnabled ? "on" : "off") +
+            " (" + m_workspacePath + ")");
     }
 }
 
@@ -310,6 +347,24 @@ void AppState::LoadSettings()
     wxString savedTheme;
     if (cfg.Read(CONFIG_THEME_KEY, &savedTheme)) {
         m_themeManager.SetActiveTheme(savedTheme.ToStdString());
+    }
+
+    // Load workspace settings
+    bool savedWorkspaceEnabled = false;
+    if (cfg.Read(CONFIG_WORKSPACE_ENABLED_KEY, &savedWorkspaceEnabled)) {
+        m_workspaceEnabled = savedWorkspaceEnabled;
+    }
+
+    wxString savedWorkspacePath;
+    if (cfg.Read(CONFIG_WORKSPACE_PATH_KEY, &savedWorkspacePath)) {
+        m_workspacePath = savedWorkspacePath.ToStdString();
+    }
+
+    // Compute default workspace path if none was saved
+    if (m_workspacePath.empty()) {
+        wxString docsDir = wxStandardPaths::Get().GetDocumentsDir();
+        m_workspacePath = (docsDir + wxFileName::GetPathSeparator()
+                          + "LlamaBossWorkspace").ToStdString();
     }
 
     // Ensure we have valid defaults

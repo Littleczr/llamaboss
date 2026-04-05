@@ -44,15 +44,19 @@ class SettingsDialog : public wxDialog
 {
 public:
     SettingsDialog(wxWindow* parent, const std::string& currentModel,
-                   const std::string& currentApiUrl, const std::string& currentTheme);
+                   const std::string& currentApiUrl, const std::string& currentTheme,
+                   bool currentWorkspaceEnabled, const std::string& currentWorkspacePath);
     ~SettingsDialog();
 
     std::string GetSelectedModel() const { return m_selectedModel; }
     std::string GetSelectedApiUrl() const { return m_selectedApiUrl; }
     std::string GetSelectedTheme() const { return m_selectedTheme; }
+    bool GetWorkspaceEnabled() const { return m_workspaceEnabled; }
+    std::string GetWorkspacePath() const { return m_workspacePath; }
     bool WasModelChanged() const { return m_modelChanged; }
     bool WasApiUrlChanged() const { return m_apiUrlChanged; }
     bool WasThemeChanged() const { return m_themeChanged; }
+    bool WasWorkspaceChanged() const { return m_workspaceChanged; }
 
     // [STEP 3] PostModelsReceived / PostModelsFetchError removed —
     // the thread now sends data entirely through events, so the
@@ -65,6 +69,7 @@ private:
     void OnApiUrlChanged(wxCommandEvent& event);
     void OnModelsReceived(wxCommandEvent& event);
     void OnModelsFetchError(wxCommandEvent& event);
+    void OnBrowseWorkspace(wxCommandEvent& event);
 
     void CreateControls();
     void StartModelFetch();
@@ -76,6 +81,9 @@ private:
     wxGauge* m_progressGauge;
     wxStaticText* m_statusText;
     wxComboBox* m_themeComboBox;
+    wxCheckBox* m_workspaceCheckBox;
+    wxTextCtrl* m_workspacePathCtrl;
+    wxButton* m_workspaceBrowseButton;
 
     std::string m_selectedModel;
     std::string m_selectedApiUrl;
@@ -84,9 +92,15 @@ private:
     std::string m_originalApiUrl;
     std::string m_originalTheme;
 
+    bool m_workspaceEnabled;
+    std::string m_workspacePath;
+    bool m_originalWorkspaceEnabled;
+    std::string m_originalWorkspacePath;
+
     bool m_modelChanged;
     bool m_apiUrlChanged;
     bool m_themeChanged;
+    bool m_workspaceChanged;
     bool m_isFetching;
 
     // [STEP 3/4] Replaced ModelFetchThread* m_fetchThread with a

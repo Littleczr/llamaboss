@@ -1,47 +1,77 @@
 # Changelog
 
+## v1.4.0 — 2026-04-05
+
+### Workspace Folder (New Feature)
+
+LlamaBoss now supports a dedicated workspace folder for file operations, controlled via Settings with a checkbox and directory picker. Disabled by default.
+
+**Default path:** `C:\Users\<user>\Documents\LlamaBossWorkspace`
+
+#### Slash Commands
+- `/search <query>` — Search workspace files by name. Recursive scan with case-insensitive multi-term matching. Results show relative paths, file sizes, and total files scanned.
+- `/savechat [name]` — Save the current conversation as a markdown file. Auto-generates timestamped filename if no name given. Sanitizes custom names, appends numeric suffix on duplicates.
+
+#### Natural Language Understanding
+- LlamaBoss can now understand plain English workspace requests without slash commands.
+  - "Save this chat as meeting notes" → saves to workspace
+  - "Find the budget file" → scans workspace folder
+  - "What is C++?" → correctly routed as regular chat
+- Uses a short synchronous classification call to the active Ollama model (~450ms warm). Falls back to regular chat on any failure.
+- Slash commands always bypass the LLM classifier for instant execution.
+
+#### Architecture
+- **Three-stage message pipeline:** (1a) deterministic slash-command router → (1b) LLM-assisted NL classifier → (2) model routing
+- **New modules:** `action_classifier.h/.cpp`, `llm_classifier.h/.cpp`, `workspace_executor.h/.cpp`
+- **C++17 required** for `std::filesystem`
+
+---
+
 ## v1.3.0 — 2026-04-04
 
-Focused UX and architecture update for the desktop Ollama client, including multi-LLM directed routing, sidebar extraction, rendering fixes, and conversation-history reliability improvements.
+Directed multi-LLM routing, sidebar extraction, batch delete, and conversation reliability fixes.
 
 ### Added
-- Multi-LLM directed routing in group chat mode
-  - Default behavior remains group discussion in loaded order
-  - Explicit targeting now supported with prefixes such as `qwen,`, `qwen:`, `@qwen`, `gemma,`, `gemma:`, and `@gemma`
-  - Directed prompts now trigger only the addressed model while the other model stays silent
-- Extracted conversation sidebar into its own component
-  - Sidebar UI and interaction logic moved out of `openchat.cpp`
-  - Cleaner separation between app flow and conversation-list behavior
-- Batch deletion for conversation history
-  - Multi-select conversation rows
-  - Delete multiple saved chats in one action from the sidebar
-- Participant-aware request builder for multi-LLM conversations
-  - Prevents one model from treating another model's prior assistant replies as its own
-
-### Changed
-- Group chat remains the default when no explicit target is detected
-- Group replies continue to follow loaded model order (Model A first, then Model B)
-- Saved assistant replies are replayed more directly instead of relying only on the streaming path
-- Sidebar behavior is now more stable and easier to extend
+- **Directed messaging in group chat** — prefix with `@model`, `model,`, or `model:` to address one model; the other stays silent. `@all`/`@everyone`/`@both` forces a full group turn.
+- **Visual routing indicator** — directed messages display as "You → modelname:" in the UI, persisted in conversation JSON.
+- **Sidebar extraction** — conversation sidebar moved to its own `conversation_sidebar.h/.cpp` component (~247 lines removed from `openchat.cpp`).
+- **Multi-select batch delete** — Ctrl+Click, Shift+Click range selection; delete multiple conversations at once from a single confirmation dialog.
 
 ### Fixed
-- Assistant prefix / first-paragraph spacing issue on long replies
+- Assistant prefix/first-paragraph spacing on long replies
 - UTF-8 conversation save/load corruption on Windows
-  - Prevented conversation titles from falling back to filenames like `chat_xxxxxxxx.json`
-  - Fixed long-answer history/title issues caused by unsafe `ToStdString()` usage
-- Conversation history reshuffle caused by unnecessary timestamp updates when loading past chats
-- Visual replay issues exposed by older long-form city prompts
-
-### Internal
-- Added turn-routing state to support group vs directed requests
-- Added participant-aware chat history request building
-- Improved conversation-sidebar modularity for future features such as richer keyboard support and more advanced selection behavior
+- Conversation history reordering on load (stale timestamp updates)
+- Visual replay issues on older long-form conversations
 
 ---
 
 ## v1.2.0 — 2026-03-30
 
-Initial public multi-feature desktop release.
+Multi-model group chat and repo rename to LlamaBoss.
+
+### Added
+- **Multi-model group chat** — load two Ollama models simultaneously; both respond in round-robin order
+- **Participant-aware request builder** — prevents models from treating each other's replies as their own
+
+---
+
+## v1.1.1 — 2026-04-04
+
+Light theme rendering fixes and conversation replay on theme switch.
+
+---
+
+## v1.1.0 — 2026-03-31
+
+### Added
+- **Dark & Light theme system** — switchable at runtime from Settings
+- Theme preference persisted across sessions
+
+---
+
+## v1.0.0 — 2026-03-30
+
+Initial public release.
 
 ### Features
 - Streaming chat with Ollama's `/api/chat` endpoint

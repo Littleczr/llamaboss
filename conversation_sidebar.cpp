@@ -323,9 +323,10 @@ void ConversationSidebar::BuildListEntry(const ConversationEntry& entry)
     }
     auto* titleLabel = new wxStaticText(panel, wxID_ANY,
         wxString::FromUTF8(displayTitle));
-    titleLabel->SetForegroundColour(m_theme->textPrimary);
+    titleLabel->SetForegroundColour(m_theme->textMuted);
     wxFont titleFont = titleLabel->GetFont();
-    titleFont.SetPointSize(10);
+    titleFont.SetPointSize(11);
+    titleFont.SetWeight(wxFONTWEIGHT_BOLD);
     titleLabel->SetFont(titleFont);
     panelSizer->Add(titleLabel, 0, wxLEFT | wxRIGHT | wxTOP, 8);
 

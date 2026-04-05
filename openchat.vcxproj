@@ -79,6 +79,7 @@
       <SDLCheck>true</SDLCheck>
       <PreprocessorDefinitions>WIN32;_DEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
+      <LanguageStandard>stdcpp17</LanguageStandard>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
@@ -93,6 +94,7 @@
       <SDLCheck>true</SDLCheck>
       <PreprocessorDefinitions>WIN32;NDEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
+      <LanguageStandard>stdcpp17</LanguageStandard>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
@@ -107,6 +109,7 @@
       <SDLCheck>true</SDLCheck>
       <PreprocessorDefinitions>_DEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
+      <LanguageStandard>stdcpp17</LanguageStandard>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
@@ -121,6 +124,7 @@
       <SDLCheck>true</SDLCheck>
       <PreprocessorDefinitions>NDEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
+      <LanguageStandard>stdcpp17</LanguageStandard>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
@@ -130,29 +134,35 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClCompile Include="action_classifier.cpp" />
     <ClCompile Include="app_state.cpp" />
     <ClCompile Include="chat_client.cpp" />
     <ClCompile Include="chat_display.cpp" />
     <ClCompile Include="chat_history.cpp" />
     <ClCompile Include="conversation_sidebar.cpp" />
+    <ClCompile Include="llm_classifier.cpp" />
     <ClCompile Include="markdown_renderer.cpp" />
     <ClCompile Include="message_router.cpp" />
     <ClCompile Include="openchat.cpp" />
     <ClCompile Include="settings.cpp" />
     <ClCompile Include="theme.cpp" />
+    <ClCompile Include="workspace_executor.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="action_classifier.h" />
     <ClInclude Include="app_state.h" />
     <ClInclude Include="chat_client.h" />
     <ClInclude Include="chat_display.h" />
     <ClInclude Include="chat_history.h" />
     <ClInclude Include="conversation_sidebar.h" />
+    <ClInclude Include="llm_classifier.h" />
     <ClInclude Include="markdown_renderer.h" />
     <ClInclude Include="message_router.h" />
     <ClInclude Include="resource.h" />
     <ClInclude Include="resource1.h" />
     <ClInclude Include="settings.h" />
     <ClInclude Include="theme.h" />
+    <ClInclude Include="workspace_executor.h" />
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="openchat.rc" />

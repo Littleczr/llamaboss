@@ -2,6 +2,7 @@
 #include "settings.h"
 #include <wx/fileconf.h>
 #include <wx/msgdlg.h>
+#include <wx/dirdlg.h>
 
 // Poco headers for HTTP requests
 #include <Poco/URI.h>
@@ -32,17 +33,23 @@ EVT_COMMAND(wxID_ANY, wxEVT_MODELS_FETCH_ERROR, SettingsDialog::OnModelsFetchErr
 wxEND_EVENT_TABLE()
 
 SettingsDialog::SettingsDialog(wxWindow* parent, const std::string& currentModel,
-                               const std::string& currentApiUrl, const std::string& currentTheme)
-    : wxDialog(parent, wxID_ANY, "Settings", wxDefaultPosition, wxSize(500, 340))
+                               const std::string& currentApiUrl, const std::string& currentTheme,
+                               bool currentWorkspaceEnabled, const std::string& currentWorkspacePath)
+    : wxDialog(parent, wxID_ANY, "Settings", wxDefaultPosition, wxSize(500, 420))
     , m_selectedModel(currentModel)
     , m_selectedApiUrl(currentApiUrl)
     , m_selectedTheme(currentTheme)
     , m_originalModel(currentModel)
     , m_originalApiUrl(currentApiUrl)
     , m_originalTheme(currentTheme)
+    , m_workspaceEnabled(currentWorkspaceEnabled)
+    , m_workspacePath(currentWorkspacePath)
+    , m_originalWorkspaceEnabled(currentWorkspaceEnabled)
+    , m_originalWorkspacePath(currentWorkspacePath)
     , m_modelChanged(false)
     , m_apiUrlChanged(false)
     , m_themeChanged(false)
+    , m_workspaceChanged(false)
     , m_isFetching(false)
     // [STEP 4] m_fetchThread removed — no stored thread pointer
 {
@@ -121,6 +128,26 @@ void SettingsDialog::CreateControls()
 
     mainSizer->Add(m_themeComboBox, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 5);
 
+    // ── Workspace section ────────────────────────────────────────
+    mainSizer->AddSpacer(5);
+    auto* workspaceLabel = new wxStaticText(this, wxID_ANY, "Workspace:");
+    mainSizer->Add(workspaceLabel, 0, wxLEFT | wxRIGHT | wxTOP, 5);
+
+    m_workspaceCheckBox = new wxCheckBox(this, wxID_ANY, "Enable workspace commands (/search)");
+    m_workspaceCheckBox->SetValue(m_workspaceEnabled);
+    mainSizer->Add(m_workspaceCheckBox, 0, wxLEFT | wxRIGHT | wxBOTTOM, 5);
+
+    auto* pathSizer = new wxBoxSizer(wxHORIZONTAL);
+    m_workspacePathCtrl = new wxTextCtrl(this, wxID_ANY,
+        wxString::FromUTF8(m_workspacePath));
+    pathSizer->Add(m_workspacePathCtrl, 1, wxEXPAND | wxRIGHT, 5);
+
+    m_workspaceBrowseButton = new wxButton(this, wxID_ANY, "Browse...");
+    m_workspaceBrowseButton->Bind(wxEVT_BUTTON, &SettingsDialog::OnBrowseWorkspace, this);
+    pathSizer->Add(m_workspaceBrowseButton, 0, wxALIGN_CENTER_VERTICAL);
+
+    mainSizer->Add(pathSizer, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 5);
+
     // Buttons
     auto* buttonSizer = CreateButtonSizer(wxOK | wxCANCEL);
     mainSizer->Add(buttonSizer, 0, wxEXPAND | wxALL, 5);
@@ -190,6 +217,17 @@ void SettingsDialog::OnApiUrlChanged(wxCommandEvent& event)
     event.Skip();  // Let other controls (combo box) process their text events
 }
 
+void SettingsDialog::OnBrowseWorkspace(wxCommandEvent& /*event*/)
+{
+    wxDirDialog dlg(this, "Select Workspace Folder",
+                    m_workspacePathCtrl->GetValue(),
+                    wxDD_DEFAULT_STYLE | wxDD_DIR_MUST_EXIST);
+
+    if (dlg.ShowModal() == wxID_OK) {
+        m_workspacePathCtrl->SetValue(dlg.GetPath());
+    }
+}
+
 void SettingsDialog::OnModelsReceived(wxCommandEvent& event)
 {
     SetFetchingState(false);
@@ -254,9 +292,14 @@ void SettingsDialog::OnOK(wxCommandEvent& event)
     int themeSel = m_themeComboBox->GetSelection();
     m_selectedTheme = (themeSel == 2) ? "system" : (themeSel == 1) ? "light" : "dark";
 
+    m_workspaceEnabled = m_workspaceCheckBox->GetValue();
+    m_workspacePath = m_workspacePathCtrl->GetValue().ToStdString();
+
     m_modelChanged = (m_selectedModel != m_originalModel);
     m_apiUrlChanged = (m_selectedApiUrl != m_originalApiUrl);
     m_themeChanged = (m_selectedTheme != m_originalTheme);
+    m_workspaceChanged = (m_workspaceEnabled != m_originalWorkspaceEnabled ||
+                          m_workspacePath != m_originalWorkspacePath);
 
     // Save to config
     wxFileConfig cfg("OllamaChatApp");

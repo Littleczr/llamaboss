@@ -33,6 +33,12 @@
     <ClCompile Include="conversation_sidebar.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="action_classifier.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="llm_classifier.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="app_state.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -43,6 +49,9 @@
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="theme.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="workspace_executor.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
   </ItemGroup>
@@ -68,6 +77,12 @@
     <ClInclude Include="conversation_sidebar.h">
       <Filter>Source Files</Filter>
     </ClInclude>
+    <ClInclude Include="action_classifier.h">
+      <Filter>Source Files</Filter>
+    </ClInclude>
+    <ClInclude Include="llm_classifier.h">
+      <Filter>Source Files</Filter>
+    </ClInclude>
     <ClInclude Include="app_state.h">
       <Filter>Source Files</Filter>
     </ClInclude>
@@ -78,6 +93,9 @@
       <Filter>Source Files</Filter>
     </ClInclude>
     <ClInclude Include="theme.h">
+      <Filter>Source Files</Filter>
+    </ClInclude>
+    <ClInclude Include="workspace_executor.h">
       <Filter>Source Files</Filter>
     </ClInclude>
   </ItemGroup>

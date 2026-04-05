@@ -45,9 +45,12 @@
 #include "app_state.h"
 #include "conversation_sidebar.h"
 #include "message_router.h"
+#include "action_classifier.h"
+#include "workspace_executor.h"
+#include "llm_classifier.h"
 
 // ─── Application version ─────────────────────────────────────
-static const char* OPENCHAT_VERSION = "1.3.0";
+static const char* OPENCHAT_VERSION = "1.1.1";
 
 // Custom event for model picker popup
 wxDEFINE_EVENT(wxEVT_MODEL_LIST_READY, wxCommandEvent);
@@ -100,6 +103,20 @@ static bool IsImageFile(const wxString& path)
         ext == "gif" || ext == "bmp" || ext == "webp";
 }
 
+static bool IsTextFile(const wxString& path)
+{
+    wxString ext = wxFileName(path).GetExt().Lower();
+    return ext == "txt" || ext == "md" || ext == "json" ||
+        ext == "cpp" || ext == "h" || ext == "hpp" ||
+        ext == "py" || ext == "js" || ext == "ts" ||
+        ext == "css" || ext == "html" || ext == "xml" ||
+        ext == "yaml" || ext == "yml" || ext == "toml" ||
+        ext == "csv" || ext == "log" || ext == "ini" ||
+        ext == "cfg" || ext == "sh" || ext == "bat";
+}
+
+static constexpr size_t kMaxTextFileBytes = 100 * 1024; // 100 KB cap
+
 // ─── Custom input control with clipboard image paste support ─────
 // On Windows, a wxTE_MULTILINE text control handles Ctrl+V natively
 // at the WM_PASTE message level, before wxEVT_CHAR_HOOK can fire.
@@ -134,6 +151,100 @@ protected:
 private:
     std::function<bool()> m_imagePasteHandler;
 };
+
+// ─── Custom display control with fast drag-scroll ─────────────────
+// wxRichTextCtrl's built-in auto-scroll during drag-select is extremely
+// slow.  This subclass uses a timer to scroll faster when the mouse is
+// dragged above or below the visible area, scaling speed with distance.
+class ChatDisplayCtrl : public wxRichTextCtrl {
+public:
+    ChatDisplayCtrl(wxWindow* parent, wxWindowID id,
+        const wxString& value = wxEmptyString,
+        const wxPoint& pos = wxDefaultPosition,
+        const wxSize& size = wxDefaultSize,
+        long style = 0)
+        : wxRichTextCtrl(parent, id, value, pos, size, style)
+        , m_autoScrollTimer(this)
+        , m_scrollDirection(0)
+        , m_scrollIntensity(0)
+        , m_inAutoScroll(false)
+    {
+        Bind(wxEVT_MOTION, &ChatDisplayCtrl::OnDragMotion, this);
+        Bind(wxEVT_LEFT_UP, &ChatDisplayCtrl::OnDragEnd, this);
+        Bind(wxEVT_MOUSE_CAPTURE_LOST, &ChatDisplayCtrl::OnCaptureLost, this);
+        Bind(wxEVT_TIMER, &ChatDisplayCtrl::OnAutoScrollTimer, this,
+            m_autoScrollTimer.GetId());
+    }
+
+private:
+    wxTimer m_autoScrollTimer;
+    int m_scrollDirection;    // -1 = up, +1 = down, 0 = idle
+    int m_scrollIntensity;    // lines per tick, scales with distance from edge
+    bool m_inAutoScroll;      // guard against re-entry from synthetic events
+
+    void OnDragMotion(wxMouseEvent& evt) {
+        evt.Skip();  // always let base class handle selection
+        if (m_inAutoScroll) return;
+
+        if (!evt.Dragging() || !evt.LeftIsDown()) {
+            StopAutoScroll();
+            return;
+        }
+
+        int y = evt.GetPosition().y;
+        int h = GetClientSize().y;
+
+        if (y < 0) {
+            m_scrollDirection = -1;
+            m_scrollIntensity = std::min(std::max((-y) / 15 + 1, 1), 12);
+            if (!m_autoScrollTimer.IsRunning())
+                m_autoScrollTimer.Start(30);
+        }
+        else if (y > h) {
+            m_scrollDirection = 1;
+            m_scrollIntensity = std::min(std::max((y - h) / 15 + 1, 1), 12);
+            if (!m_autoScrollTimer.IsRunning())
+                m_autoScrollTimer.Start(30);
+        }
+        else {
+            StopAutoScroll();
+        }
+    }
+
+    void OnDragEnd(wxMouseEvent& evt) {
+        StopAutoScroll();
+        evt.Skip();
+    }
+
+    void OnCaptureLost(wxMouseCaptureLostEvent&) {
+        StopAutoScroll();
+    }
+
+    void OnAutoScrollTimer(wxTimerEvent&) {
+        if (m_scrollDirection == 0) return;
+
+        ScrollLines(m_scrollDirection * m_scrollIntensity);
+
+        // Synthesize a mouse-move at the visible edge so the base class
+        // extends the selection to match the new scroll position.
+        m_inAutoScroll = true;
+        wxMouseEvent fake(wxEVT_MOTION);
+        fake.SetLeftDown(true);
+        fake.SetX(GetClientSize().x / 2);
+        fake.SetY(m_scrollDirection < 0 ? 0 : GetClientSize().y - 1);
+        fake.SetEventObject(this);
+        HandleWindowEvent(fake);
+        m_inAutoScroll = false;
+    }
+
+    void StopAutoScroll() {
+        if (m_autoScrollTimer.IsRunning())
+            m_autoScrollTimer.Stop();
+        m_scrollDirection = 0;
+        m_scrollIntensity = 0;
+    }
+};
+
 
 // ─── Forward declaration ─────────────────────────────────────────
 class MyFrame;
@@ -296,17 +407,19 @@ public:
         _rightPanel->SetBackgroundColour(m_appState->GetTheme().bgMain);
         auto* rightSizer = new wxBoxSizer(wxVERTICAL);
 
-        _chatDisplayCtrl = new wxRichTextCtrl(
+        _chatDisplayCtrl = new ChatDisplayCtrl(
             _rightPanel, wxID_ANY, wxEmptyString,
             wxDefaultPosition, wxDefaultSize,
             wxRE_MULTILINE | wxRE_READONLY | wxBORDER_NONE
         );
+
         _chatDisplayCtrl->SetBackgroundColour(m_appState->GetTheme().bgMain);
         _chatDisplayCtrl->SetForegroundColour(m_appState->GetTheme().textPrimary);
         rightSizer->Add(_chatDisplayCtrl, 1, wxEXPAND | wxLEFT | wxRIGHT, 8);
 
         // ─── ATTACHMENT INDICATOR (hidden by default) ────────────────
         _attachLabel = new wxStaticText(_rightPanel, wxID_ANY, "");
+        { wxFont f = _attachLabel->GetFont(); f.SetPointSize(11); _attachLabel->SetFont(f); }
         _attachLabel->SetForegroundColour(m_appState->GetTheme().attachIndicator);
         _attachLabel->SetBackgroundColour(m_appState->GetTheme().bgMain);
         _attachLabel->Hide();
@@ -389,8 +502,6 @@ public:
             wxCommandEvent anEvent(wxEVT_TEXT, _userInputCtrl->GetId());
             OnUserInputChanged(anEvent);
 
-            // Auto-load the most recent conversation
-            AutoLoadLastConversation();
             });
     }
 
@@ -436,6 +547,10 @@ public:
         std::string base64 = FileToBase64(filePath);
         if (base64.empty()) return false;
 
+        // Clear any pending text file (one attachment at a time)
+        m_pendingFileText.clear();
+        m_pendingFileName.clear();
+
         m_pendingImageBase64 = base64;
         m_pendingImageName = fname.GetFullName().ToStdString();
 
@@ -453,9 +568,55 @@ public:
         return true;
     }
 
+    // ── Public interface for text-file attachment (used by drop target) ──
+    bool AttachTextFile(const std::string& filePath)
+    {
+        if (IsBusy()) return false;
+
+        wxFileName fname(wxString::FromUTF8(filePath));
+        if (!fname.FileExists()) return false;
+
+        // Size guard
+        wxULongLong fileSize = fname.GetSize();
+        if (fileSize == wxInvalidSize || fileSize.GetValue() > kMaxTextFileBytes) {
+            wxMessageBox("Text file too large (max 100 KB).",
+                "Attachment Error", wxOK | wxICON_WARNING);
+            return false;
+        }
+
+        std::ifstream ifs(filePath, std::ios::in);
+        if (!ifs.is_open()) return false;
+
+        std::ostringstream oss;
+        oss << ifs.rdbuf();
+        std::string content = oss.str();
+        if (content.empty()) return false;
+
+        // Clear any pending image (one attachment at a time)
+        m_pendingImageBase64.clear();
+        m_pendingImageName.clear();
+
+        m_pendingFileText = std::move(content);
+        m_pendingFileName = fname.GetFullName().ToStdString();
+
+        // 📄 U+1F4C4
+        _attachLabel->SetLabel(wxString::FromUTF8(
+            "  \xF0\x9F\x93\x84  " + m_pendingFileName));
+        _attachLabel->Show();
+        GetSizer()->Layout();
+        _userInputCtrl->SetFocus();
+
+        if (auto* logger = m_appState->GetLogger()) {
+            logger->information("Text file attached: " + m_pendingFileName +
+                " (" + std::to_string(m_pendingFileText.size()) + " bytes)");
+        }
+
+        return true;
+    }
+
 private:
     // ─── UI Controls ──────────────────────────────────────────────
-    wxRichTextCtrl* _chatDisplayCtrl;
+    ChatDisplayCtrl* _chatDisplayCtrl;
     ChatInputCtrl* _userInputCtrl;
     wxButton* _sendButton;
     wxButton* _stopButton;
@@ -507,6 +668,10 @@ private:
     // ─── Pending image attachment ─────────────────────────────────
     std::string m_pendingImageBase64;
     std::string m_pendingImageName;
+
+    // ─── Pending text-file attachment ─────────────────────────────
+    std::string m_pendingFileText;
+    std::string m_pendingFileName;
 
     // ─── Model picker state ──────────────────────────────────────
     std::vector<std::string> m_pickerModels;
@@ -838,10 +1003,47 @@ private:
         }
     }
 
-    void ClearPendingImage()
+    std::string InjectTextFileIntoRequest(const std::string& requestJson,
+        const std::string& fileName, const std::string& fileText)
+    {
+        try {
+            Poco::JSON::Parser parser;
+            auto root = parser.parse(requestJson).extract<Poco::JSON::Object::Ptr>();
+            auto messages = root->getArray("messages");
+
+            if (messages && messages->size() > 0) {
+                for (int i = (int)messages->size() - 1; i >= 0; --i) {
+                    auto msg = messages->getObject(i);
+                    if (msg->getValue<std::string>("role") == "user") {
+                        std::string original = msg->getValue<std::string>("content");
+                        std::string combined =
+                            "[File: " + fileName + "]\n"
+                            "```\n" + fileText + "\n```\n\n"
+                            + original;
+                        msg->set("content", combined);
+                        break;
+                    }
+                }
+            }
+
+            std::ostringstream oss;
+            Poco::JSON::Stringifier::stringify(root, oss);
+            return oss.str();
+        }
+        catch (const Poco::Exception& ex) {
+            if (auto* logger = m_appState->GetLogger()) {
+                logger->error("Failed to inject text file: " + ex.displayText());
+            }
+            return requestJson;
+        }
+    }
+
+    void ClearPendingAttachment()
     {
         m_pendingImageBase64.clear();
         m_pendingImageName.clear();
+        m_pendingFileText.clear();
+        m_pendingFileName.clear();
         _attachLabel->SetLabel("");
         _attachLabel->Hide();
         GetSizer()->Layout();
@@ -988,16 +1190,30 @@ private:
 
     void OnAttachImage(wxCommandEvent&)
     {
-        wxFileDialog dlg(this, "Select an image", "", "",
+        wxFileDialog dlg(this, "Attach a file", "", "",
             "Image files (*.png;*.jpg;*.jpeg;*.gif;*.bmp;*.webp)"
             "|*.png;*.jpg;*.jpeg;*.gif;*.bmp;*.webp"
+            "|Text files (*.txt;*.md;*.json;*.cpp;*.h;*.py;*.js;*.ts;*.css;*.html;*.xml;*.yaml;*.yml;*.csv;*.log)"
+            "|*.txt;*.md;*.json;*.cpp;*.h;*.py;*.js;*.ts;*.css;*.html;*.xml;*.yaml;*.yml;*.csv;*.log"
             "|All files (*.*)|*.*",
             wxFD_OPEN | wxFD_FILE_MUST_EXIST);
 
         if (dlg.ShowModal() == wxID_CANCEL) return;
 
-        if (!AttachImageFromFile(dlg.GetPath().ToStdString())) {
-            wxMessageBox("Failed to read image file", "Error", wxOK | wxICON_ERROR);
+        wxString path = dlg.GetPath();
+        if (IsImageFile(path)) {
+            if (!AttachImageFromFile(path.ToStdString()))
+                wxMessageBox("Failed to read image file.", "Error", wxOK | wxICON_ERROR);
+        }
+        else if (IsTextFile(path)) {
+            if (!AttachTextFile(path.ToStdString()))
+                wxMessageBox("Failed to read text file.", "Error", wxOK | wxICON_ERROR);
+        }
+        else {
+            wxMessageBox("Unsupported file type.\n\n"
+                "Supported: images (png, jpg, gif, bmp, webp)\n"
+                "and text files (txt, md, json, cpp, h, py, js, etc.)",
+                "Unsupported File", wxOK | wxICON_INFORMATION);
         }
     }
 
@@ -1193,7 +1409,9 @@ private:
         }
 
         SettingsDialog dlg(this, m_appState->GetModel(), m_appState->GetApiUrl(),
-                           m_appState->GetThemeName());
+                           m_appState->GetThemeName(),
+                           m_appState->IsWorkspaceEnabled(),
+                           m_appState->GetWorkspacePath());
 
         if (dlg.ShowModal() == wxID_OK)
         {
@@ -1212,11 +1430,18 @@ private:
                 ApplyThemeToUI();
             }
 
+            // Handle workspace change (doesn't require chat clear)
+            bool workspaceChanged = dlg.WasWorkspaceChanged();
+            if (workspaceChanged) {
+                m_appState->SetWorkspaceEnabled(dlg.GetWorkspaceEnabled());
+                m_appState->SetWorkspacePath(dlg.GetWorkspacePath());
+            }
+
             if (anyChange)
             {
                 m_chatHistory->Clear();
                 m_chatDisplay->Clear();
-                ClearPendingImage();
+                ClearPendingAttachment();
                 m_groupModelB.clear();
                 UpdateModelLabel();
                 UpdateGroupToggleButton();
@@ -1413,7 +1638,7 @@ private:
 
         m_chatHistory->Clear();
         m_chatDisplay->Clear();
-        ClearPendingImage();
+        ClearPendingAttachment();
         m_groupModelB.clear();  // Clear group mode on model switch
         UpdateModelLabel();
         UpdateGroupToggleButton();
@@ -1438,7 +1663,7 @@ private:
 
         m_chatHistory->Clear();
         m_chatDisplay->Clear();
-        ClearPendingImage();
+        ClearPendingAttachment();
         m_groupModelB.clear();  // Clear group mode on new chat
         UpdateModelLabel();
         UpdateGroupToggleButton();
@@ -1539,7 +1764,7 @@ private:
 
         // Replay the conversation to the display
         m_chatDisplay->Clear();
-        ClearPendingImage();
+        ClearPendingAttachment();
         ReplayConversation();
         UpdateWindowTitle();
         _userInputCtrl->SetFocus();
@@ -1681,7 +1906,7 @@ private:
 
         // Replay to display
         m_chatDisplay->Clear();
-        ClearPendingImage();
+        ClearPendingAttachment();
         ReplayConversation();
         UpdateWindowTitle();
         if (m_sidebar->IsVisible())
@@ -1728,7 +1953,7 @@ private:
                 if (!clearedActive && filePath == m_chatHistory->GetFilePath()) {
                     m_chatHistory->Clear();
                     m_chatDisplay->Clear();
-                    ClearPendingImage();
+                    ClearPendingAttachment();
                     UpdateWindowTitle();
                     clearedActive = true;
                 }
@@ -1844,6 +2069,10 @@ private:
 
         if (base64.empty()) return false;
 
+        // Clear any pending text file (one attachment at a time)
+        m_pendingFileText.clear();
+        m_pendingFileName.clear();
+
         m_pendingImageBase64 = base64;
         m_pendingImageName = "clipboard_image.png";
 
@@ -1873,16 +2102,133 @@ private:
         if (IsBusy()) return;
 
         std::string userInput = WxToUtf8(_userInputCtrl->GetValue());
-        if (userInput.empty() && m_pendingImageBase64.empty()) return;
+        bool hasImage = !m_pendingImageBase64.empty();
+        bool hasFile  = !m_pendingFileText.empty();
+        if (userInput.empty() && !hasImage && !hasFile) return;
 
-        if (userInput.empty() && !m_pendingImageBase64.empty())
+        if (userInput.empty() && hasImage)
             userInput = "What is in this image?";
+        if (userInput.empty() && hasFile)
+            userInput = "Please review this file.";
 
+        // ── Stage 1: Action classification ───────────────────────
+        // Runs before model routing.  If the message is a workspace
+        // command, handle it here and skip the LLM entirely.
+        ActionIntent intent = ClassifyAction(userInput,
+            m_appState->IsWorkspaceEnabled());
+
+        if (intent.action == ActionType::WorkspaceSearch)
+        {
+            m_chatDisplay->DisplayUserMessage(userInput);
+            _userInputCtrl->Clear();
+            { wxCommandEvent e(wxEVT_TEXT, _userInputCtrl->GetId()); OnUserInputChanged(e); }
+
+            // Execute the search against the workspace folder
+            WorkspaceSearchResult searchResult = ExecuteWorkspaceSearch(
+                intent.rawQuery, m_appState->GetWorkspacePath());
+
+            std::string sysMsg = FormatSearchResult(
+                searchResult, intent.rawQuery, m_appState->GetWorkspacePath());
+
+            m_chatDisplay->DisplaySystemMessage(sysMsg);
+            _userInputCtrl->SetFocus();
+            return;
+        }
+
+        if (intent.action == ActionType::WorkspaceSaveChat)
+        {
+            m_chatDisplay->DisplayUserMessage(userInput);
+            _userInputCtrl->Clear();
+            { wxCommandEvent e(wxEVT_TEXT, _userInputCtrl->GetId()); OnUserInputChanged(e); }
+
+            // Convert ChatHistory messages to executor-friendly format
+            std::vector<ChatMessage> exportMessages;
+            for (const auto& msg : m_chatHistory->GetMessages()) {
+                ChatMessage cm;
+                cm.role = msg->getValue<std::string>("role");
+                cm.content = msg->getValue<std::string>("content");
+                cm.model = ChatHistory::GetMessageModel(msg);
+                exportMessages.push_back(std::move(cm));
+            }
+
+            WorkspaceSaveChatResult saveResult = ExecuteWorkspaceSaveChat(
+                exportMessages,
+                m_appState->GetWorkspacePath(),
+                intent.rawQuery,                // custom name (may be empty)
+                m_appState->GetModel());         // primary model
+
+            m_chatDisplay->DisplaySystemMessage(FormatSaveChatResult(saveResult));
+            _userInputCtrl->SetFocus();
+            return;
+        }
+
+        // ── Stage 1b: LLM-assisted classification ────────────────
+        // If workspace is enabled and no slash command matched, ask
+        // the model whether this is a natural language workspace request.
+        // This is a short synchronous call — typically 200-500ms.
+        if (m_appState->IsWorkspaceEnabled() && m_pendingImageBase64.empty()
+            && m_pendingFileText.empty())
+        {
+            LLMClassifyResult llmResult = ClassifyWithLLM(
+                userInput,
+                m_appState->GetApiUrl(),
+                m_appState->GetModel());
+
+            if (llmResult.success && llmResult.action == "save_chat")
+            {
+                m_chatDisplay->DisplayUserMessage(userInput);
+                _userInputCtrl->Clear();
+                { wxCommandEvent e(wxEVT_TEXT, _userInputCtrl->GetId()); OnUserInputChanged(e); }
+
+                // Convert ChatHistory messages to executor-friendly format
+                std::vector<ChatMessage> exportMessages;
+                for (const auto& msg : m_chatHistory->GetMessages()) {
+                    ChatMessage cm;
+                    cm.role = msg->getValue<std::string>("role");
+                    cm.content = msg->getValue<std::string>("content");
+                    cm.model = ChatHistory::GetMessageModel(msg);
+                    exportMessages.push_back(std::move(cm));
+                }
+
+                WorkspaceSaveChatResult saveResult = ExecuteWorkspaceSaveChat(
+                    exportMessages,
+                    m_appState->GetWorkspacePath(),
+                    llmResult.filenameHint,
+                    m_appState->GetModel());
+
+                m_chatDisplay->DisplaySystemMessage(FormatSaveChatResult(saveResult));
+                _userInputCtrl->SetFocus();
+                return;
+            }
+
+            if (llmResult.success && llmResult.action == "workspace_search")
+            {
+                m_chatDisplay->DisplayUserMessage(userInput);
+                _userInputCtrl->Clear();
+                { wxCommandEvent e(wxEVT_TEXT, _userInputCtrl->GetId()); OnUserInputChanged(e); }
+
+                WorkspaceSearchResult searchResult = ExecuteWorkspaceSearch(
+                    llmResult.topic, m_appState->GetWorkspacePath());
+
+                std::string sysMsg = FormatSearchResult(
+                    searchResult, llmResult.topic, m_appState->GetWorkspacePath());
+
+                m_chatDisplay->DisplaySystemMessage(sysMsg);
+                _userInputCtrl->SetFocus();
+                return;
+            }
+
+            // LLM returned "chat" or failed — fall through to normal chat
+        }
+
+        // ── Stage 2: Model routing ───────────────────────────────
         // Decide routing before dispatch.
         m_currentTurnRoute = ParseTurnRoute(userInput);
 
         if (!m_pendingImageBase64.empty())
             m_chatDisplay->DisplayUserMessage("[" + m_pendingImageName + "] " + userInput);
+        else if (!m_pendingFileText.empty())
+            m_chatDisplay->DisplayUserMessage("[" + m_pendingFileName + "] " + userInput);
         else
             m_chatDisplay->DisplayUserMessage(userInput);
 
@@ -1919,7 +2265,11 @@ private:
 
         if (!m_pendingImageBase64.empty()) {
             body = InjectImageIntoRequest(body, m_pendingImageBase64);
-            ClearPendingImage();
+            ClearPendingAttachment();
+        }
+        else if (!m_pendingFileText.empty()) {
+            body = InjectTextFileIntoRequest(body, m_pendingFileName, m_pendingFileText);
+            ClearPendingAttachment();
         }
 
         if (auto* logger = m_appState->GetLogger())
@@ -1936,8 +2286,12 @@ private:
         else if (m_currentTurnRoute == TurnRoute::DirectModelB) {
             m_chatState = ChatState::GroupModelB;
         }
+        else if (m_currentTurnRoute == TurnRoute::DirectModelA) {
+            m_chatState = ChatState::GroupDirected;
+            m_directedTarget = targetModel;
+        }
         else {
-            // GroupAll and DirectModelA both start with Model A.
+            // GroupAll: Model A streams first, then chains to Model B.
             m_chatState = ChatState::GroupModelA;
         }
 
@@ -1960,13 +2314,14 @@ private:
 bool ImageDropTarget::OnDropFiles(wxCoord /*x*/, wxCoord /*y*/,
     const wxArrayString& filenames)
 {
-    // Accept the first valid image file from the drop
+    // Accept the first valid image or text file from the drop
     for (const auto& file : filenames) {
-        if (IsImageFile(file)) {
+        if (IsImageFile(file))
             return m_frame->AttachImageFromFile(file.ToStdString());
-        }
+        if (IsTextFile(file))
+            return m_frame->AttachTextFile(file.ToStdString());
     }
-    return false; // No valid image found in drop
+    return false; // No supported file found in drop
 }
 
 // ═══════════════════════════════════════════════════════════════════
