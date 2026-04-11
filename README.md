@@ -2,7 +2,7 @@
 
 A lightweight native desktop chat client for [Ollama](https://ollama.com), built with C++ using wxWidgets and Poco.
 
-![LlamaBoss Screenshot](https://github.com/Littleczr/llamaboss/assets/screenshot.jpg)
+![LlamaBoss Screenshot](https://github.com/Littleczr/llamaboss/releases/download/v1.0.0/screenshot-1.jpg)
 
 ## Features
 
@@ -19,6 +19,12 @@ A lightweight native desktop chat client for [Ollama](https://ollama.com), built
 - **Think-block support** — collapsible `<think>` block rendering
 - **Fast drag-scroll** in chat display
 - **Window and sidebar state persistence** across sessions
+
+## Screenshots
+
+| Main UI | Group Chat | Theme Switch |
+|---|---|---|
+| ![Main UI](https://github.com/Littleczr/llamaboss/releases/download/v1.0.0/screenshot-1.jpg) | ![Group Chat](https://github.com/Littleczr/llamaboss/releases/download/v1.0.0/screenshot-2.jpg) | ![Theme Switch](https://github.com/Littleczr/llamaboss/releases/download/v1.0.0/screenshot-3.jpg) |
 
 ## Requirements
 
