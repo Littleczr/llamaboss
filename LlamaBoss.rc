@@ -1,4 +1,4 @@
-// LlamaBoss.rc — Application resource file
+﻿// LlamaBoss.rc — Application resource file
 
 // Application icon (embedded as a named resource for wxIcon)
 APP_ICON ICON "app_icon.ico"

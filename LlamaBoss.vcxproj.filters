@@ -27,6 +27,9 @@
     <ClCompile Include="chat_display.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="attachment_manager.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="chat_history.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -45,7 +48,16 @@
     <ClCompile Include="model_manager.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="modelfile_creator.cpp">
+    <ClCompile Include="server_manager.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="ui_builder.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="model_switcher.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="conversation_controller.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
   </ItemGroup>
@@ -57,6 +69,12 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="chat_display.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="ascii_animation.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="attachment_manager.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="chat_history.h">
@@ -80,7 +98,25 @@
     <ClInclude Include="model_manager.h">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="modelfile_creator.h">
+    <ClInclude Include="server_manager.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="widgets.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="chat_input_ctrl.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="chat_display_ctrl.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="ui_builder.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="model_switcher.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="conversation_controller.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>

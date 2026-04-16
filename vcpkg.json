@@ -3,7 +3,7 @@
   "dependencies": [
     {
       "name": "poco",
-      "features": [ "json", "net" ]
+      "features": [ "json", "net", "netssl" ]
     },
     "wxwidgets"
   ]

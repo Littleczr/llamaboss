@@ -1,4 +1,4 @@
-// theme.cpp
+﻿// theme.cpp
 // Preset theme definitions for LlamaBoss.
 
 #include "theme.h"
@@ -82,6 +82,7 @@ ThemeData ThemeManager::GetDarkTheme()
 
     // Attachment
     t.attachIndicator   = wxColour(94, 181, 247);     // #5EB5F7
+    t.attachChipBg      = wxColour(36, 52, 68);       // #243444 subtle raised surface
 
     // Chat message colors
     t.chatUser          = wxColour(108, 180, 238);     // Soft blue (#6CB4EE)
@@ -135,6 +136,7 @@ ThemeData ThemeManager::GetLightTheme()
 
     // Attachment
     t.attachIndicator   = wxColour(59, 130, 246);      // Blue
+    t.attachChipBg      = wxColour(225, 232, 242);     // Soft blue-gray pill
 
     // Chat message colors
     t.chatUser          = wxColour(20, 75, 150);        // Deep blue (strong on white)

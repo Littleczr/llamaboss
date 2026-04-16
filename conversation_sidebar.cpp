@@ -9,8 +9,6 @@
 #include <wx/dir.h>
 #include <wx/filename.h>
 
-#include <Poco/JSON/Parser.h>
-
 #include <fstream>
 #include <algorithm>
 
@@ -46,6 +44,18 @@ ConversationSidebar::ConversationSidebar(wxWindow* parent,
     ncFont.SetWeight(wxFONTWEIGHT_MEDIUM);
     m_newChatButton->SetFont(ncFont);
     contentSizer->Add(m_newChatButton, 0, wxEXPAND | wxALL, 8);
+
+    // Search box
+    m_searchBox = new wxTextCtrl(m_content, wxID_ANY, wxEmptyString,
+        wxDefaultPosition, wxSize(-1, 32),
+        wxTE_PROCESS_ENTER | wxBORDER_SIMPLE);
+    m_searchBox->SetHint("Search conversations...");
+    m_searchBox->SetBackgroundColour(theme.bgInputField);
+    m_searchBox->SetForegroundColour(theme.textPrimary);
+    wxFont searchFont = m_searchBox->GetFont();
+    searchFont.SetPointSize(10);
+    m_searchBox->SetFont(searchFont);
+    contentSizer->Add(m_searchBox, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 8);
 
     // Scrollable conversation list
     m_listWindow = new wxScrolledWindow(m_content, wxID_ANY,
@@ -99,6 +109,19 @@ ConversationSidebar::ConversationSidebar(wxWindow* parent,
         if (m_callbacks.onNewChatClicked)
             m_callbacks.onNewChatClicked();
     });
+
+    // ── Search box events ────────────────────────────────────────
+    m_searchBox->Bind(wxEVT_TEXT, [this](wxCommandEvent&) {
+        FilterRows();
+    });
+    m_searchBox->Bind(wxEVT_KEY_DOWN, [this](wxKeyEvent& e) {
+        if (e.GetKeyCode() == WXK_ESCAPE) {
+            ClearSearch();
+        }
+        else {
+            e.Skip();
+        }
+    });
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -140,26 +163,23 @@ void ConversationSidebar::SetWidth(int w)
 }
 
 // ═══════════════════════════════════════════════════════════════════
-//  Content — rebuild the conversation list from disk
+//  Content — incremental refresh instead of full rebuild
 // ═══════════════════════════════════════════════════════════════════
 
 void ConversationSidebar::Refresh(const std::string& activeFilePath)
 {
-    if (!m_listSizer) return;
+    if (!m_listSizer || !m_listWindow) return;
 
     m_activeFilePath = activeFilePath;
-
-    // Clear existing UI entries
-    m_listSizer->Clear(true);
 
     // Scan and sort
     auto entries = ScanConversations();
 
-    // Rebuild the ordered path list for Shift+Click range logic
+    // Rebuild ordered path list for Shift+Click range logic
     m_orderedPaths.clear();
     m_orderedPaths.reserve(entries.size());
 
-    // Prune selection: remove any paths that no longer exist on disk
+    // Prune selection for files that no longer exist
     std::set<std::string> validPaths;
     for (const auto& e : entries)
         validPaths.insert(e.filePath);
@@ -171,14 +191,57 @@ void ConversationSidebar::Refresh(const std::string& activeFilePath)
             ++it;
     }
 
-    // Build UI for each entry
-    for (const auto& entry : entries) {
+    m_listWindow->Freeze();
+
+    // Remove rows that disappeared
+    for (auto it = m_rows.begin(); it != m_rows.end(); ) {
+        if (validPaths.find(it->first) == validPaths.end()) {
+            RemoveRow(it->first);
+            it = m_rows.erase(it);
+        }
+        else {
+            ++it;
+        }
+    }
+
+    // Create/update/reorder rows without rebuilding them all
+    for (size_t i = 0; i < entries.size(); ++i) {
+        const auto& entry = entries[i];
         m_orderedPaths.push_back(entry.filePath);
-        BuildListEntry(entry);
+
+        auto found = m_rows.find(entry.filePath);
+        if (found == m_rows.end()) {
+            RowWidgets row = CreateRow(entry);
+            auto [insertedIt, _] = m_rows.emplace(entry.filePath, std::move(row));
+            found = insertedIt;
+        }
+        else {
+            UpdateRow(found->second, entry);
+        }
+
+        wxPanel* panel = found->second.panel;
+        if (!panel) continue;
+
+        wxSizerItem* currentItem =
+            (i < m_listSizer->GetItemCount()) ? m_listSizer->GetItem(i) : nullptr;
+        wxWindow* currentWindow = currentItem ? currentItem->GetWindow() : nullptr;
+
+        if (currentWindow != panel) {
+            m_listSizer->Detach(panel);
+            m_listSizer->Insert(i, panel, 0, wxEXPAND);
+        }
+
+        panel->SetBackgroundColour(GetRowBackground(entry.filePath));
+        panel->Refresh();
     }
 
     m_listWindow->FitInside();
     m_listWindow->Layout();
+    m_listWindow->Thaw();
+
+    // Reapply search filter if active
+    if (!m_searchFilter.empty())
+        FilterRows();
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -200,7 +263,6 @@ bool ConversationSidebar::IsSelected(const std::string& path) const
 void ConversationSidebar::SelectRange(const std::string& from,
                                       const std::string& to)
 {
-    // Find indices in the ordered list
     int idxFrom = -1, idxTo = -1;
     for (int i = 0; i < (int)m_orderedPaths.size(); ++i) {
         if (m_orderedPaths[i] == from) idxFrom = i;
@@ -229,8 +291,25 @@ void ConversationSidebar::ApplyTheme(const ThemeData& theme)
     m_content->SetBackgroundColour(theme.bgSidebar);
     m_newChatButton->SetBackgroundColour(theme.modelPillBg);
     m_newChatButton->SetForegroundColour(theme.textPrimary);
+    m_searchBox->SetBackgroundColour(theme.bgInputField);
+    m_searchBox->SetForegroundColour(theme.textPrimary);
     m_listWindow->SetBackgroundColour(theme.bgSidebar);
     m_border->SetBackgroundColour(theme.borderSubtle);
+
+    // Cached rows do not get rebuilt on theme changes, so recolor them here.
+    for (auto& [path, row] : m_rows) {
+        if (row.titleLabel)
+            row.titleLabel->SetForegroundColour(theme.chatAssistant);
+        if (row.timeLabel)
+            row.timeLabel->SetForegroundColour(theme.textMuted);
+        if (row.deleteBtn)
+            row.deleteBtn->SetForegroundColour(theme.textMuted);
+        if (row.panel)
+            row.panel->SetBackgroundColour(GetRowBackground(path));
+    }
+
+    RefreshAllRowBackgrounds();
+    m_listWindow->Refresh();
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -239,7 +318,6 @@ void ConversationSidebar::ApplyTheme(const ThemeData& theme)
 
 wxColour ConversationSidebar::GetRowBackground(const std::string& filePath) const
 {
-    // Priority: active > selected > normal
     if (filePath == m_activeFilePath)
         return m_theme->modelPillBg;
     if (IsSelected(filePath))
@@ -249,19 +327,50 @@ wxColour ConversationSidebar::GetRowBackground(const std::string& filePath) cons
 
 void ConversationSidebar::RefreshAllRowBackgrounds()
 {
-    // Walk through every row panel in the sizer and update its color
-    for (size_t i = 0; i < m_listSizer->GetItemCount(); ++i) {
-        wxSizerItem* item = m_listSizer->GetItem(i);
-        if (!item) continue;
-        wxWindow* win = item->GetWindow();
-        if (!win) continue;
+    for (auto& [path, row] : m_rows) {
+        if (!row.panel) continue;
+        row.panel->SetBackgroundColour(GetRowBackground(path));
+        row.panel->Refresh();
+    }
+}
 
-        std::string path = win->GetName().ToStdString();
-        if (!path.empty()) {
-            win->SetBackgroundColour(GetRowBackground(path));
-            win->Refresh();
+// ═══════════════════════════════════════════════════════════════════
+//  Search / Filter
+// ═══════════════════════════════════════════════════════════════════
+
+void ConversationSidebar::FilterRows()
+{
+    wxString raw = m_searchBox->GetValue();
+    m_searchFilter = raw.Lower().ToUTF8().data();
+
+    m_listWindow->Freeze();
+
+    for (auto& [path, row] : m_rows) {
+        if (!row.panel) continue;
+
+        if (m_searchFilter.empty()) {
+            row.panel->Show();
+        }
+        else {
+            // Case-insensitive substring match on the displayed title
+            std::string titleLower = row.displayedTitle;
+            std::transform(titleLower.begin(), titleLower.end(),
+                           titleLower.begin(), ::tolower);
+
+            bool match = (titleLower.find(m_searchFilter) != std::string::npos);
+            row.panel->Show(match);
         }
     }
+
+    m_listWindow->FitInside();
+    m_listWindow->Layout();
+    m_listWindow->Thaw();
+}
+
+void ConversationSidebar::ClearSearch()
+{
+    m_searchBox->Clear();
+    // wxEVT_TEXT fires automatically from Clear(), which calls FilterRows()
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -273,7 +382,7 @@ std::string ConversationSidebar::PathFromWidget(wxWindow* win, wxWindow* stop)
     while (win && win != stop) {
         wxString name = win->GetName();
         if (name.EndsWith(".json"))
-            return name.ToStdString();
+            return name.ToUTF8().data();
         win = win->GetParent();
     }
     return {};
@@ -299,34 +408,41 @@ ConversationSidebar::ScanConversations() const
             wxFileName::GetPathSeparator() + filename;
 
         ConversationEntry entry;
-        entry.filePath = fullPath.ToStdString();
+        entry.filePath = fullPath.ToUTF8().data();
 
-        // Read the title from the JSON file
         try {
-            std::ifstream file(entry.filePath);
+            std::ifstream file(entry.filePath, std::ios::in);
             if (file.is_open()) {
-                std::string content((std::istreambuf_iterator<char>(file)),
-                    std::istreambuf_iterator<char>());
-                file.close();
+                std::string line;
+                while (std::getline(file, line)) {
+                    size_t keyPos = line.find("\"title\"");
+                    if (keyPos == std::string::npos) continue;
 
-                Poco::JSON::Parser parser;
-                auto result = parser.parse(content);
-                auto obj = result.extract<Poco::JSON::Object::Ptr>();
+                    size_t colonPos = line.find(':', keyPos + 7);
+                    if (colonPos == std::string::npos) break;
+                    size_t openQuote = line.find('"', colonPos + 1);
+                    if (openQuote == std::string::npos) break;
 
-                if (obj->has("title")) {
-                    entry.title = obj->getValue<std::string>("title");
+                    size_t end = openQuote + 1;
+                    while (end < line.size()) {
+                        if (line[end] == '"' && line[end - 1] != '\\') break;
+                        ++end;
+                    }
+                    if (end < line.size()) {
+                        entry.title = line.substr(openQuote + 1, end - openQuote - 1);
+                    }
+                    break;
                 }
             }
         }
         catch (...) {
-            // Skip files we can't parse
+            // Skip files we can't read
         }
 
         if (entry.title.empty()) {
-            entry.title = filename.ToStdString();
+            entry.title = filename.ToUTF8().data();
         }
 
-        // Get file modification time
         wxFileName fn(fullPath);
         fn.GetTimes(nullptr, &entry.modTime, nullptr);
 
@@ -334,7 +450,6 @@ ConversationSidebar::ScanConversations() const
         found = dir.GetNext(&filename);
     }
 
-    // Sort by modification time, newest first
     std::sort(entries.begin(), entries.end(),
         [](const ConversationEntry& a, const ConversationEntry& b) {
             return a.modTime.IsLaterThan(b.modTime);
@@ -344,53 +459,69 @@ ConversationSidebar::ScanConversations() const
 }
 
 // ═══════════════════════════════════════════════════════════════════
-//  Internal — build a single conversation row in the list
+//  Internal — create a cached conversation row
 // ═══════════════════════════════════════════════════════════════════
 
-void ConversationSidebar::BuildListEntry(const ConversationEntry& entry)
+ConversationSidebar::RowWidgets
+ConversationSidebar::CreateRow(const ConversationEntry& entry)
 {
-    auto* panel = new wxPanel(m_listWindow, wxID_ANY);
-    panel->SetBackgroundColour(GetRowBackground(entry.filePath));
+    RowWidgets row;
+    row.filePath = entry.filePath;
+    row.modTime = entry.modTime;
+
+    row.displayedTitle = entry.title;
+    if (row.displayedTitle.size() > 35)
+        row.displayedTitle = row.displayedTitle.substr(0, 32) + "...";
+
+    row.displayedTime = RelativeTimeString(entry.modTime);
+
+    row.panel = new wxPanel(m_listWindow, wxID_ANY);
+    row.panel->SetBackgroundColour(GetRowBackground(entry.filePath));
+    row.panel->SetName(wxString::FromUTF8(entry.filePath));
 
     auto* panelSizer = new wxBoxSizer(wxVERTICAL);
 
-    // Title (truncated)
-    std::string displayTitle = entry.title;
-    if (displayTitle.size() > 35) {
-        displayTitle = displayTitle.substr(0, 32) + "...";
-    }
-    auto* titleLabel = new wxStaticText(panel, wxID_ANY,
-        wxString::FromUTF8(displayTitle));
-    titleLabel->SetForegroundColour(wxColour(125, 212, 160));
-    wxFont titleFont = titleLabel->GetFont();
+    // ── Top row: title + trash icon ──────────────────────────────
+    auto* topSizer = new wxBoxSizer(wxHORIZONTAL);
+
+    row.titleLabel = new wxStaticText(row.panel, wxID_ANY,
+        wxString::FromUTF8(row.displayedTitle));
+    row.titleLabel->SetForegroundColour(m_theme->chatAssistant);
+    wxFont titleFont = row.titleLabel->GetFont();
     titleFont.SetPointSize(11);
     titleFont.SetWeight(wxFONTWEIGHT_BOLD);
-    titleLabel->SetFont(titleFont);
-    panelSizer->Add(titleLabel, 0, wxLEFT | wxRIGHT | wxTOP, 8);
+    row.titleLabel->SetFont(titleFont);
+    topSizer->Add(row.titleLabel, 1, wxLEFT | wxTOP, 8);
 
-    // Relative time
-    std::string timeStr = RelativeTimeString(entry.modTime);
-    auto* timeLabel = new wxStaticText(panel, wxID_ANY,
-        wxString::FromUTF8(timeStr));
-    timeLabel->SetForegroundColour(m_theme->textMuted);
-    wxFont timeFont = timeLabel->GetFont();
+    // Trash icon — hidden by default, shown on hover
+    row.deleteBtn = new wxStaticText(row.panel, wxID_ANY,
+        wxString::FromUTF8("\xF0\x9F\x97\x91"));  // 🗑
+    row.deleteBtn->SetForegroundColour(m_theme->textMuted);
+    row.deleteBtn->SetCursor(wxCursor(wxCURSOR_HAND));
+    wxFont delFont = row.deleteBtn->GetFont();
+    delFont.SetPointSize(11);
+    row.deleteBtn->SetFont(delFont);
+    row.deleteBtn->Hide();
+    topSizer->Add(row.deleteBtn, 0, wxTOP | wxRIGHT | wxALIGN_CENTER_VERTICAL, 8);
+
+    panelSizer->Add(topSizer, 0, wxEXPAND);
+
+    row.timeLabel = new wxStaticText(row.panel, wxID_ANY,
+        wxString::FromUTF8(row.displayedTime));
+    row.timeLabel->SetForegroundColour(m_theme->textMuted);
+    wxFont timeFont = row.timeLabel->GetFont();
     timeFont.SetPointSize(9);
-    timeLabel->SetFont(timeFont);
-    panelSizer->Add(timeLabel, 0, wxLEFT | wxRIGHT | wxBOTTOM, 8);
+    row.timeLabel->SetFont(timeFont);
+    panelSizer->Add(row.timeLabel, 0, wxLEFT | wxRIGHT | wxBOTTOM, 8);
 
-    panel->SetSizer(panelSizer);
+    row.panel->SetSizer(panelSizer);
 
-    // Store file path in the panel name for click handling
-    panel->SetName(wxString::FromUTF8(entry.filePath));
-
-    // ── Left-click handler (selection + optional load) ───────────
     auto clickHandler = [this](wxMouseEvent& evt) {
         std::string path = PathFromWidget(
             dynamic_cast<wxWindow*>(evt.GetEventObject()), m_listWindow);
         if (path.empty()) return;
 
         if (evt.ControlDown()) {
-            // Ctrl+Click: toggle this item in/out of selection, no load
             if (IsSelected(path))
                 m_selected.erase(path);
             else
@@ -399,12 +530,10 @@ void ConversationSidebar::BuildListEntry(const ConversationEntry& entry)
             RefreshAllRowBackgrounds();
         }
         else if (evt.ShiftDown() && !m_anchorPath.empty()) {
-            // Shift+Click: range-select from anchor to here, no load
             SelectRange(m_anchorPath, path);
             RefreshAllRowBackgrounds();
         }
         else {
-            // Plain click: clear selection, select + load this one
             m_selected.clear();
             m_selected.insert(path);
             m_anchorPath = path;
@@ -417,52 +546,132 @@ void ConversationSidebar::BuildListEntry(const ConversationEntry& entry)
         }
     };
 
-    panel->Bind(wxEVT_LEFT_UP, clickHandler);
-    titleLabel->Bind(wxEVT_LEFT_UP, clickHandler);
-    timeLabel->Bind(wxEVT_LEFT_UP, clickHandler);
+    row.panel->Bind(wxEVT_LEFT_UP, clickHandler);
+    row.titleLabel->Bind(wxEVT_LEFT_UP, clickHandler);
+    row.timeLabel->Bind(wxEVT_LEFT_UP, clickHandler);
 
-    // ── Right-click handler (context menu) ───────────────────────
     auto rightClickHandler = [this](wxMouseEvent& evt) {
         std::string path = PathFromWidget(
             dynamic_cast<wxWindow*>(evt.GetEventObject()), m_listWindow);
         if (path.empty()) return;
 
         if (!IsSelected(path)) {
-            // Right-clicked an unselected item: replace selection
             m_selected.clear();
             m_selected.insert(path);
             m_anchorPath = path;
             RefreshAllRowBackgrounds();
         }
-        // If already selected, keep the current multi-selection
 
         m_listWindow->CallAfter([this, path]() {
             ShowContextMenu(path);
         });
     };
 
-    panel->Bind(wxEVT_RIGHT_UP, rightClickHandler);
-    titleLabel->Bind(wxEVT_RIGHT_UP, rightClickHandler);
-    timeLabel->Bind(wxEVT_RIGHT_UP, rightClickHandler);
+    row.panel->Bind(wxEVT_RIGHT_UP, rightClickHandler);
+    row.titleLabel->Bind(wxEVT_RIGHT_UP, rightClickHandler);
+    row.timeLabel->Bind(wxEVT_RIGHT_UP, rightClickHandler);
 
-    // ── Hover effect ─────────────────────────────────────────────
-    // Only apply hover to rows that are not active or selected.
-    auto enterHandler = [panel, this](wxMouseEvent&) {
-        std::string p = panel->GetName().ToStdString();
+    // ── Trash icon click → delete this conversation ────────────
+    row.deleteBtn->Bind(wxEVT_LEFT_UP, [this, panel = row.panel](wxMouseEvent&) {
+        if (m_callbacks.isBusy && m_callbacks.isBusy()) {
+            wxBell();
+            return;
+        }
+
+        std::string path = panel->GetName().ToUTF8().data();
+        if (path.empty()) return;
+        panel->CallAfter([this, path]() {
+            if (m_callbacks.onDeleteRequested)
+                m_callbacks.onDeleteRequested({ path });
+        });
+    });
+
+    // ── Hover: show trash icon + highlight background ────────────
+    // Uses CallAfter on leave to prevent flicker when the mouse
+    // moves between the panel and its child widgets (title, time, trash).
+    auto enterHandler = [panel = row.panel, delBtn = row.deleteBtn, this](wxMouseEvent&) {
+        std::string p = panel->GetName().ToUTF8().data();
         if (p != m_activeFilePath && !IsSelected(p)) {
             panel->SetBackgroundColour(m_theme->sidebarHover);
             panel->Refresh();
         }
+        if (delBtn && !delBtn->IsShown()) {
+            delBtn->Show();
+            panel->Layout();
+        }
     };
-    auto leaveHandler = [panel, this](wxMouseEvent&) {
-        std::string p = panel->GetName().ToStdString();
-        panel->SetBackgroundColour(GetRowBackground(p));
-        panel->Refresh();
-    };
-    panel->Bind(wxEVT_ENTER_WINDOW, enterHandler);
-    panel->Bind(wxEVT_LEAVE_WINDOW, leaveHandler);
 
-    m_listSizer->Add(panel, 0, wxEXPAND);
+    auto leaveHandler = [panel = row.panel, delBtn = row.deleteBtn, this](wxMouseEvent&) {
+        // Defer the hide check so that child-enter events fire first.
+        // If the mouse just moved to a child widget, it's still inside
+        // the panel and we should keep the hover state.
+        panel->CallAfter([panel, delBtn, this]() {
+            if (!panel) return;
+            wxPoint mouseScreen = wxGetMousePosition();
+            wxRect panelScreen = panel->GetScreenRect();
+            if (!panelScreen.Contains(mouseScreen)) {
+                std::string p = panel->GetName().ToUTF8().data();
+                panel->SetBackgroundColour(GetRowBackground(p));
+                panel->Refresh();
+                if (delBtn && delBtn->IsShown()) {
+                    delBtn->Hide();
+                    panel->Layout();
+                }
+            }
+        });
+    };
+
+    row.panel->Bind(wxEVT_ENTER_WINDOW, enterHandler);
+    row.panel->Bind(wxEVT_LEAVE_WINDOW, leaveHandler);
+    row.titleLabel->Bind(wxEVT_ENTER_WINDOW, enterHandler);
+    row.titleLabel->Bind(wxEVT_LEAVE_WINDOW, leaveHandler);
+    row.timeLabel->Bind(wxEVT_ENTER_WINDOW, enterHandler);
+    row.timeLabel->Bind(wxEVT_LEAVE_WINDOW, leaveHandler);
+    row.deleteBtn->Bind(wxEVT_ENTER_WINDOW, enterHandler);
+    row.deleteBtn->Bind(wxEVT_LEAVE_WINDOW, leaveHandler);
+
+    return row;
+}
+
+void ConversationSidebar::UpdateRow(RowWidgets& row,
+                                    const ConversationEntry& entry)
+{
+    row.filePath = entry.filePath;
+    row.modTime = entry.modTime;
+
+    std::string newTitle = entry.title;
+    if (newTitle.size() > 35)
+        newTitle = newTitle.substr(0, 32) + "...";
+
+    std::string newTime = RelativeTimeString(entry.modTime);
+
+    if (newTitle != row.displayedTitle) {
+        row.displayedTitle = newTitle;
+        if (row.titleLabel)
+            row.titleLabel->SetLabel(wxString::FromUTF8(newTitle));
+    }
+
+    if (newTime != row.displayedTime) {
+        row.displayedTime = newTime;
+        if (row.timeLabel)
+            row.timeLabel->SetLabel(wxString::FromUTF8(newTime));
+    }
+
+    if (row.panel)
+        row.panel->SetBackgroundColour(GetRowBackground(entry.filePath));
+}
+
+void ConversationSidebar::RemoveRow(const std::string& filePath)
+{
+    auto found = m_rows.find(filePath);
+    if (found == m_rows.end())
+        return;
+
+    if (found->second.panel) {
+        m_listSizer->Detach(found->second.panel);
+        found->second.panel->Destroy();
+        found->second.panel = nullptr;
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -473,19 +682,24 @@ void ConversationSidebar::ShowContextMenu(const std::string& /*filePath*/)
 {
     wxMenu menu;
 
+    const bool isBusy = m_callbacks.isBusy && m_callbacks.isBusy();
+
+    wxMenuItem* deleteItem = nullptr;
     size_t count = m_selected.size();
     if (count <= 1) {
-        menu.Append(wxID_DELETE, "Delete conversation");
+        deleteItem = menu.Append(wxID_DELETE, "Delete conversation");
     }
     else {
         wxString label = wxString::Format("Delete %zu conversations", count);
-        menu.Append(wxID_DELETE, label);
+        deleteItem = menu.Append(wxID_DELETE, label);
+    }
+
+    if (deleteItem && isBusy) {
+        deleteItem->Enable(false);
     }
 
     menu.Bind(wxEVT_MENU, [this](wxCommandEvent&) {
         if (m_callbacks.onDeleteRequested && !m_selected.empty()) {
-            // Snapshot the selection — the callback may trigger Refresh()
-            // which would clear UI, so capture paths first.
             std::vector<std::string> paths(m_selected.begin(), m_selected.end());
             m_callbacks.onDeleteRequested(paths);
         }
@@ -517,5 +731,5 @@ std::string ConversationSidebar::RelativeTimeString(const wxDateTime& dt)
     if (days < 7) return std::to_string(days) + " days ago";
     if (days < 30) return std::to_string(days / 7) + "w ago";
 
-    return dt.Format("%b %d").ToStdString();
+    return dt.Format("%b %d").ToUTF8().data();
 }

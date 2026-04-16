@@ -7,6 +7,8 @@
 // Poco headers
 #include <Poco/JSON/Object.h>
 
+#include "attachment_manager.h"  // for AttachmentInfo
+
 // Chat history management class with file persistence
 class ChatHistory
 {
@@ -18,7 +20,9 @@ public:
     // model param on assistant messages: tags which model produced the response.
     // Empty string is valid (single-model legacy behavior).
     // target param on user messages: which model was addressed (empty = group turn).
-    void AddUserMessage(const std::string& content, const std::string& target = "");
+    // attachments: optional metadata about files attached to this message.
+    void AddUserMessage(const std::string& content, const std::string& target = "",
+                        const std::vector<AttachmentInfo>& attachments = {});
     void AddAssistantMessage(const std::string& content, const std::string& model = "");
     void AddSystemMessage(const std::string& content);
 
@@ -28,23 +32,10 @@ public:
     bool IsEmpty() const;
 
     // ── API integration ───────────────────────────────────────────
-    // Build a standard single-model request body for Ollama /api/chat.
+    // Build a JSON request body for the OpenAI-compatible /v1/chat/completions endpoint.
     // If systemPrompt is non-empty, it is prepended as a system message.
     std::string BuildChatRequestJson(const std::string& model, bool stream = true,
                                      const std::string& systemPrompt = "") const;
-
-    std::string BuildParticipantChatRequestJson(const std::string& targetModel,
-        bool stream = true) const;
-
-    // Build a group-chat request body for Model B.
-    // Model A's assistant messages are rewritten as user messages with
-    // "[modelAName]: ..." prefix so Ollama sees them as context.
-    // Model B's own prior assistant messages keep their role.
-    // If systemPrompt is non-empty, it replaces the default group prompt.
-    std::string BuildGroupChatRequestJson(const std::string& targetModel,
-                                          const std::string& peerModelName,
-                                          bool stream = true,
-                                          const std::string& systemPrompt = "") const;
 
     // ── Streaming support methods ─────────────────────────────────
     void AddAssistantPlaceholder(const std::string& model = "");
@@ -84,6 +75,9 @@ public:
     void SetFilePath(const std::string& path) { m_filePath = path; }
     bool HasFilePath() const { return !m_filePath.empty(); }
 
+    // Dirty tracking — true when content has changed since last save/load
+    bool IsDirty() const { return m_dirty; }
+
     // Conversation metadata
     std::string GetTitle() const { return m_title; }
     void SetTitle(const std::string& title) { m_title = title; }
@@ -97,6 +91,17 @@ public:
     // Generate a unique filename for a new conversation
     static std::string GenerateFilePath();
 
+    // ── Attachment sidecar helpers (Phase 3) ──────────────────────
+    // Absolute path to sidecar directory for a conversation's attachments.
+    // Does NOT create the directory — caller creates when saving.
+    // e.g. ".../conversations/attachments/chat_abc12345/"
+    static std::string GetAttachmentDir(const std::string& conversationPath);
+
+    // Relative path prefix (from conversations dir) for storagePath values.
+    // Uses forward slashes for cross-platform JSON portability.
+    // e.g. "attachments/chat_abc12345"
+    static std::string GetAttachmentRelDir(const std::string& conversationPath);
+
 private:
     std::vector<Poco::JSON::Object::Ptr> m_messages;
 
@@ -105,6 +110,12 @@ private:
     std::string m_title;        // Conversation title
     std::string m_createdAt;    // ISO timestamp of creation
     std::string m_updatedAt;    // ISO timestamp of last save
+    bool        m_dirty = false; // True when content changed since last save/load
+
+    // Streaming accumulation buffer — avoids O(n²) string concatenation
+    // in AppendToLastAssistantMessage by accumulating here instead of
+    // repeatedly reading/writing the Poco JSON object per delta.
+    std::string m_streamBuffer;
 
     // Helper methods
     Poco::JSON::Object::Ptr CreateMessage(const std::string& role,

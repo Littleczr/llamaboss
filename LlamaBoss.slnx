@@ -1,7 +1,7 @@
-<Solution>
+﻿<Solution>
   <Configurations>
     <Platform Name="x64" />
     <Platform Name="x86" />
   </Configurations>
-  <Project Path="LlamaBoss.vcxproj" Id="5ad66a34-6b39-4df7-af1a-5c7f86f2e413" />
+  <Project Path="LlamaBoss.vcxproj" Id="9a431208-7b77-4ebb-96a3-8a8a93f8e0e7" />
 </Solution>

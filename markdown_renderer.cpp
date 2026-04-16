@@ -20,7 +20,6 @@ MarkdownRenderer::MarkdownRenderer(wxRichTextCtrl* ctrl)
     : m_ctrl(ctrl)
     , m_inCodeBlock(false)
     , m_partialLineStart(-1)
-    , m_hasRenderedStableLine(false)
     , m_codeColor(232, 184, 77)
     , m_headingColor(232, 232, 232)         // Near-white (#E8E8E8)
     , m_codeLabelColor(120, 120, 120)       // Gray
@@ -34,7 +33,6 @@ void MarkdownRenderer::Reset()
     m_inCodeBlock = false;
     m_codeBlockLang.clear();
     m_partialLineStart = -1;
-    m_hasRenderedStableLine = false;
     // Note: m_codeBlocks is intentionally NOT cleared here —
     // old code blocks from previous messages must remain accessible.
     // Call ClearCodeBlocks() explicitly when the entire chat is cleared.
@@ -72,10 +70,14 @@ void MarkdownRenderer::ProcessDelta(const std::string& delta, const wxColour& ba
 
     m_ctrl->Freeze();
 
-    // Accumulate new text only
+    // Erase the previous partial-line preview (if any) before modifying the buffer,
+    // so it doesn't get baked in as permanent text.
+    RemovePartialLine();
+
+    // Accumulate new text
     m_lineBuffer += delta;
 
-    // Render only complete lines
+    // Render all complete lines (terminated by \n)
     size_t pos = 0;
     size_t newlinePos;
     while ((newlinePos = m_lineBuffer.find('\n', pos)) != std::string::npos) {
@@ -84,9 +86,15 @@ void MarkdownRenderer::ProcessDelta(const std::string& delta, const wxColour& ba
         pos = newlinePos + 1;
     }
 
-    // Keep any incomplete trailing text buffered
+    // Remove the consumed complete lines from the buffer
     if (pos > 0) {
-        m_lineBuffer = m_lineBuffer.substr(pos);
+        m_lineBuffer.erase(0, pos);
+    }
+
+    // Show the remaining incomplete text as a temporary partial-line preview.
+    // This gives the user immediate visual feedback for every token.
+    if (!m_lineBuffer.empty()) {
+        RenderPartialLine(m_lineBuffer, baseColor);
     }
 
     m_ctrl->Thaw();
@@ -98,6 +106,10 @@ void MarkdownRenderer::Flush(const wxColour& baseColor)
     if (m_lineBuffer.empty()) return;
 
     m_ctrl->Freeze();
+
+    // Remove the partial-line preview — we're about to render this text
+    // permanently with full markdown formatting.
+    RemovePartialLine();
 
     // Render the final buffered remainder as a complete line
     RenderCompleteLine(m_lineBuffer, baseColor);
@@ -212,16 +224,23 @@ void MarkdownRenderer::RenderCompleteLine(const std::string& line, const wxColou
 
     // ── Bullet list item? ────────────────────────────────────────
     if (IsBulletItem(line)) {
-        std::string text = line.substr(2);
-        RenderBulletItem(text, baseColor);
+        // Find the bullet marker after any leading whitespace
+        size_t indent = 0;
+        while (indent < line.size() && (line[indent] == ' ' || line[indent] == '\t')) ++indent;
+        std::string text = line.substr(indent + 2);  // skip "- " or "* "
+        int depth = static_cast<int>(indent / 2);     // 2 spaces per indent level
+        RenderBulletItem(text, baseColor, depth);
         return;
     }
 
     // ── Numbered list item? ──────────────────────────────────────
     std::string numPrefix;
     if (IsNumberedItem(line, numPrefix)) {
-        std::string text = line.substr(numPrefix.size());
-        RenderNumberedItem(numPrefix, text, baseColor);
+        size_t indent = 0;
+        while (indent < line.size() && (line[indent] == ' ' || line[indent] == '\t')) ++indent;
+        std::string text = line.substr(indent + numPrefix.size());
+        int depth = static_cast<int>(indent / 2);
+        RenderNumberedItem(numPrefix, text, baseColor, depth);
         return;
     }
 
@@ -252,18 +271,20 @@ void MarkdownRenderer::RenderHeading(const std::string& text, int level,
 }
 
 void MarkdownRenderer::RenderBulletItem(const std::string& text,
-    const wxColour& baseColor)
+    const wxColour& baseColor, int depth)
 {
-    WriteStyled("  \xE2\x80\xA2 ", baseColor);  // UTF-8 bullet •
+    std::string indent(2 + depth * 3, ' ');  // base indent + 3 spaces per nesting level
+    WriteStyled(indent + "\xE2\x80\xA2 ", baseColor);  // UTF-8 bullet •
     RenderInlineMarkdown(text, baseColor);
     WriteStyled("\n", baseColor);
 }
 
 void MarkdownRenderer::RenderNumberedItem(const std::string& prefix,
     const std::string& text,
-    const wxColour& baseColor)
+    const wxColour& baseColor, int depth)
 {
-    WriteStyled("  " + prefix, baseColor);
+    std::string indent(2 + depth * 3, ' ');
+    WriteStyled(indent + prefix, baseColor);
     RenderInlineMarkdown(text, baseColor);
     WriteStyled("\n", baseColor);
 }
@@ -472,22 +493,30 @@ int MarkdownRenderer::GetHeadingLevel(const std::string& line) const
 
 bool MarkdownRenderer::IsBulletItem(const std::string& line) const
 {
-    if (line.size() < 2) return false;
-    if (line[0] == '-' && line[1] == ' ') return true;
-    if (line[0] == '*' && line[1] == ' ') return true;
+    // Skip leading whitespace to support indented sub-lists
+    size_t i = 0;
+    while (i < line.size() && (line[i] == ' ' || line[i] == '\t')) ++i;
+
+    if (i + 1 < line.size() &&
+        (line[i] == '-' || line[i] == '*') && line[i + 1] == ' ')
+        return true;
     return false;
 }
 
 bool MarkdownRenderer::IsNumberedItem(const std::string& line,
     std::string& prefix) const
 {
+    // Skip leading whitespace to support indented sub-lists
     size_t i = 0;
+    while (i < line.size() && (line[i] == ' ' || line[i] == '\t')) ++i;
+
+    size_t numStart = i;
     while (i < line.size() && line[i] >= '0' && line[i] <= '9') {
         i++;
     }
 
-    if (i > 0 && i + 1 < line.size() && line[i] == '.' && line[i + 1] == ' ') {
-        prefix = line.substr(0, i + 2);
+    if (i > numStart && i + 1 < line.size() && line[i] == '.' && line[i + 1] == ' ') {
+        prefix = line.substr(numStart, i - numStart + 2);  // "1. "
         return true;
     }
 

@@ -37,7 +37,7 @@ public:
     wxFont CreateMonospaceFont(int size = 14) const;
     bool LoadApplicationIcon(wxFrame* frame, const std::string& iconPath = "app_icon.ico");
 
-    // Settings update handling
+    // Settings update handling (simplified — no more Ollama model unloading)
     bool UpdateSettings(const std::string& newModel, const std::string& newApiUrl,
         bool& modelChanged, bool& apiUrlChanged);
 

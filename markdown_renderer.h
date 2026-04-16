@@ -51,7 +51,6 @@ private:
     bool        m_inCodeBlock;         // Currently inside a ``` fenced block
     std::string m_codeBlockLang;       // Language tag from opening fence (if any)
     long        m_partialLineStart;    // Character position where partial line begins (-1 = none)
-    bool        m_hasRenderedStableLine; // True after the first complete line has been rendered
 
     // ── Colors ───────────────────────────────────────────────────
     wxColour m_codeColor;
@@ -68,9 +67,10 @@ private:
     void RenderCompleteLine(const std::string& line, const wxColour& baseColor);
     void RenderCodeBlockLine(const std::string& line);
     void RenderHeading(const std::string& text, int level, const wxColour& baseColor);
-    void RenderBulletItem(const std::string& text, const wxColour& baseColor);
+    void RenderBulletItem(const std::string& text, const wxColour& baseColor,
+                          int depth = 0);
     void RenderNumberedItem(const std::string& prefix, const std::string& text,
-                            const wxColour& baseColor);
+                            const wxColour& baseColor, int depth = 0);
     void RenderHorizontalRule(const wxColour& baseColor);
 
     // ── Inline markdown parsing ──────────────────────────────────

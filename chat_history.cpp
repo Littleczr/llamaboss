@@ -19,8 +19,8 @@
 #include <sstream>
 #include <fstream>
 
-// File format version: 2 adds per-message "model" and top-level "models" array
-static const int CONVERSATION_FORMAT_VERSION = 2;
+// File format version: 3 adds per-message "attachments" array
+static const int CONVERSATION_FORMAT_VERSION = 3;
 
 ChatHistory::ChatHistory()
 {
@@ -39,32 +39,57 @@ Poco::JSON::Object::Ptr ChatHistory::CreateMessage(const std::string& role,
     return msg;
 }
 
-void ChatHistory::AddUserMessage(const std::string& content, const std::string& target)
+void ChatHistory::AddUserMessage(const std::string& content, const std::string& target,
+                                  const std::vector<AttachmentInfo>& attachments)
 {
     auto msg = CreateMessage("user", content);
     if (!target.empty()) {
         msg->set("target", target);
     }
+
+    // Store structured attachment metadata on the message (v3 format).
+    // This is separate from the content string — it records what was
+    // attached so future code can render file chips, image previews, etc.
+    if (!attachments.empty()) {
+        Poco::JSON::Array::Ptr arr = new Poco::JSON::Array;
+        for (const auto& a : attachments) {
+            Poco::JSON::Object::Ptr obj = new Poco::JSON::Object;
+            obj->set("kind", a.kind == AttachmentInfo::Kind::Image ? "image" : "text_file");
+            obj->set("filename", a.filename);
+            obj->set("mime_type", a.mimeType);
+            obj->set("byte_size", static_cast<Poco::Int64>(a.byteSize));
+            if (!a.storagePath.empty())
+                obj->set("storage_path", a.storagePath);
+            arr->add(obj);
+        }
+        msg->set("attachments", arr);
+    }
+
     m_messages.push_back(msg);
+    m_dirty = true;
 }
 
 void ChatHistory::AddAssistantMessage(const std::string& content, const std::string& model)
 {
     m_messages.push_back(CreateMessage("assistant", content, model));
+    m_dirty = true;
 }
 
 void ChatHistory::AddSystemMessage(const std::string& content)
 {
     m_messages.push_back(CreateMessage("system", content));
+    m_dirty = true;
 }
 
 void ChatHistory::Clear()
 {
     m_messages.clear();
+    m_streamBuffer.clear();
     m_filePath.clear();
     m_title.clear();
     m_createdAt.clear();
     m_updatedAt.clear();
+    m_dirty = false;
 }
 
 size_t ChatHistory::GetMessageCount() const
@@ -102,145 +127,13 @@ std::string ChatHistory::BuildChatRequestJson(const std::string& model, bool str
         // Skip empty messages (e.g. the assistant placeholder added before streaming)
         std::string content = msg->getValue<std::string>("content");
         if (content.empty()) continue;
-        // Strip "model" field from the wire format — Ollama doesn't expect it
+        // Strip per-message metadata ("model", "target", "attachments") from
+        // the wire format — only "role" + "content" go to the server.
         Poco::JSON::Object::Ptr wireMsg = new Poco::JSON::Object;
         wireMsg->set("role", msg->getValue<std::string>("role"));
         wireMsg->set("content", content);
         messagesArray->add(wireMsg);
     }
-    root->set("messages", messagesArray);
-
-    std::ostringstream oss;
-    Poco::JSON::Stringifier::stringify(root, oss);
-    return oss.str();
-}
-
-std::string ChatHistory::BuildParticipantChatRequestJson(const std::string& targetModel,
-    bool stream) const
-{
-    Poco::JSON::Object::Ptr root = new Poco::JSON::Object;
-    root->set("model", targetModel);
-    root->set("stream", stream);
-
-    Poco::JSON::Array::Ptr messagesArray = new Poco::JSON::Array;
-
-    // Group-aware system prompt for directed or first-speaker turns.
-    Poco::JSON::Object::Ptr sysMsg = new Poco::JSON::Object;
-    sysMsg->set("role", "system");
-    sysMsg->set("content",
-        "You are participating in a group chat with the user and one or more AI assistants. "
-        "The user's messages are from the human. Messages prefixed with [name] are from other AI assistants. "
-        "Reply only as yourself, and do not speak for the other assistants.");
-    messagesArray->add(sysMsg);
-
-    for (const auto& msg : m_messages) {
-        std::string content = msg->getValue<std::string>("content");
-        if (content.empty()) continue;
-
-        std::string role = msg->getValue<std::string>("role");
-
-        if (role == "assistant") {
-            std::string msgModel = GetMessageModel(msg);
-
-            Poco::JSON::Object::Ptr wireMsg = new Poco::JSON::Object;
-
-            if (msgModel.empty() || msgModel == targetModel) {
-                // Keep this model's own prior assistant messages as assistant.
-                wireMsg->set("role", "assistant");
-                wireMsg->set("content", content);
-            }
-            else {
-                // Rewrite other models' assistant messages as user messages
-                // so the target model does not think it authored them.
-                wireMsg->set("role", "user");
-                wireMsg->set("content", "[" + msgModel + "]: " + content);
-            }
-
-            messagesArray->add(wireMsg);
-        }
-        else {
-            // user / system pass through unchanged
-            Poco::JSON::Object::Ptr wireMsg = new Poco::JSON::Object;
-            wireMsg->set("role", role);
-            wireMsg->set("content", content);
-            messagesArray->add(wireMsg);
-        }
-    }
-
-    root->set("messages", messagesArray);
-
-    std::ostringstream oss;
-    Poco::JSON::Stringifier::stringify(root, oss);
-    return oss.str();
-}
-
-std::string ChatHistory::BuildGroupChatRequestJson(const std::string& targetModel,
-                                                    const std::string& peerModelName,
-                                                    bool stream,
-                                                    const std::string& systemPrompt) const
-{
-    // Build a request body for the "target" model (Model B) in a group chat.
-    //
-    // Rules for context construction:
-    //   - user messages     -> pass through as-is
-    //   - system messages   -> pass through as-is
-    //   - assistant messages from targetModel -> keep as "assistant" role
-    //   - assistant messages from peerModel   -> rewrite as "user" role
-    //     with prefix "[peerModelName]: <content>"
-    //   - A system prompt is prepended explaining the group chat context.
-
-    Poco::JSON::Object::Ptr root = new Poco::JSON::Object;
-    root->set("model", targetModel);
-    root->set("stream", stream);
-
-    Poco::JSON::Array::Ptr messagesArray = new Poco::JSON::Array;
-
-    // System prompt: use caller-provided if available, otherwise default
-    std::string prompt = systemPrompt;
-    if (prompt.empty()) {
-        prompt = "You are in a group chat with the user and another AI assistant named '"
-            + peerModelName + "'. The user's messages are from the human. Messages "
-            "prefixed with [" + peerModelName + "] are from the other AI. "
-            "Respond naturally to the user \xe2\x80\x94 you may agree with, disagree with, "
-            "or build upon what " + peerModelName + " said.";
-    }
-
-    Poco::JSON::Object::Ptr sysMsg = new Poco::JSON::Object;
-    sysMsg->set("role", "system");
-    sysMsg->set("content", prompt);
-    messagesArray->add(sysMsg);
-
-    for (const auto& msg : m_messages) {
-        std::string content = msg->getValue<std::string>("content");
-        if (content.empty()) continue;
-
-        std::string role = msg->getValue<std::string>("role");
-        std::string msgModel = GetMessageModel(msg);
-
-        if (role == "assistant") {
-            Poco::JSON::Object::Ptr wireMsg = new Poco::JSON::Object;
-
-            if (msgModel == targetModel) {
-                // This model's own prior responses — keep as assistant
-                wireMsg->set("role", "assistant");
-                wireMsg->set("content", content);
-            }
-            else {
-                // Peer model's response — inject as a user message with prefix
-                wireMsg->set("role", "user");
-                wireMsg->set("content", "[" + peerModelName + "]: " + content);
-            }
-            messagesArray->add(wireMsg);
-        }
-        else {
-            // user / system messages pass through unchanged
-            Poco::JSON::Object::Ptr wireMsg = new Poco::JSON::Object;
-            wireMsg->set("role", role);
-            wireMsg->set("content", content);
-            messagesArray->add(wireMsg);
-        }
-    }
-
     root->set("messages", messagesArray);
 
     std::ostringstream oss;
@@ -254,6 +147,7 @@ std::string ChatHistory::BuildGroupChatRequestJson(const std::string& targetMode
 
 void ChatHistory::AddAssistantPlaceholder(const std::string& model)
 {
+    m_streamBuffer.clear();
     AddAssistantMessage("", model);
 }
 
@@ -262,8 +156,11 @@ void ChatHistory::AppendToLastAssistantMessage(const std::string& delta)
     if (delta.empty()) return;
 
     if (!m_messages.empty() && IsLastMessageRole("assistant")) {
-        std::string current = m_messages.back()->getValue<std::string>("content");
-        m_messages.back()->set("content", current + delta);
+        // Accumulate in the buffer (amortized O(1) per delta)
+        // and sync to the JSON object so auto-save captures partial content.
+        m_streamBuffer += delta;
+        m_messages.back()->set("content", m_streamBuffer);
+        m_dirty = true;
     }
 }
 
@@ -271,13 +168,16 @@ void ChatHistory::UpdateLastAssistantMessage(const std::string& content)
 {
     if (!m_messages.empty() && IsLastMessageRole("assistant")) {
         m_messages.back()->set("content", content);
+        m_dirty = true;
     }
+    m_streamBuffer.clear();
 }
 
 void ChatHistory::RemoveLastAssistantMessage()
 {
     if (!m_messages.empty() && IsLastMessageRole("assistant")) {
         m_messages.pop_back();
+        m_dirty = true;
     }
 }
 
@@ -365,7 +265,9 @@ bool ChatHistory::SaveToFile(const std::string& filePath, const std::vector<std:
         }
 
         // Build the JSON document
-        Poco::JSON::Object::Ptr root = new Poco::JSON::Object;
+        // preserveInsertOrder=true keeps title/metadata before messages,
+        // which enables fast title extraction in the sidebar.
+        Poco::JSON::Object::Ptr root = new Poco::JSON::Object(true);
         root->set("version", CONVERSATION_FORMAT_VERSION);
         root->set("title", m_title);
         root->set("created_at", m_createdAt);
@@ -400,6 +302,10 @@ bool ChatHistory::SaveToFile(const std::string& filePath, const std::vector<std:
                 if (!msgTarget.empty()) {
                     saveMsg->set("target", msgTarget);
                 }
+                // Preserve attachment metadata (v3 format)
+                if (msg->has("attachments")) {
+                    saveMsg->set("attachments", msg->getArray("attachments"));
+                }
                 messagesArray->add(saveMsg);
             }
         }
@@ -416,6 +322,7 @@ bool ChatHistory::SaveToFile(const std::string& filePath, const std::vector<std:
         file.close();
 
         m_filePath = savePath;
+        m_dirty = false;
         return true;
     }
     catch (...) {
@@ -483,11 +390,16 @@ bool ChatHistory::LoadFromFile(const std::string& filePath, std::vector<std::str
                 if (msgObj->has("target")) {
                     loadedMsg->set("target", msgObj->getValue<std::string>("target"));
                 }
+                // Restore attachment metadata (v3 format; absent in v1/v2 files)
+                if (msgObj->has("attachments")) {
+                    loadedMsg->set("attachments", msgObj->getArray("attachments"));
+                }
                 m_messages.push_back(loadedMsg);
             }
         }
 
         m_filePath = filePath;
+        m_dirty = false;
         return true;
     }
     catch (...) {
@@ -528,7 +440,9 @@ std::string ChatHistory::GenerateTitle() const
 
 std::string ChatHistory::GetConversationsDir()
 {
-    wxString userDataDir = wxStandardPaths::Get().GetUserDataDir();
+    // Use GetUserLocalDataDir (%LOCALAPPDATA%) to match ServerManager::GetDataDir().
+    // Keeps conversations alongside models, logs, and config in one location.
+    wxString userDataDir = wxStandardPaths::Get().GetUserLocalDataDir();
     wxFileName dir(userDataDir + wxFileName::GetPathSeparator() + "conversations"
         + wxFileName::GetPathSeparator());
 
@@ -536,7 +450,7 @@ std::string ChatHistory::GetConversationsDir()
         dir.Mkdir(wxS_DIR_DEFAULT, wxPATH_MKDIR_FULL);
     }
 
-    return dir.GetPath().ToStdString();
+    return dir.GetPath().ToUTF8().data();
 }
 
 std::string ChatHistory::GenerateFilePath()
@@ -550,6 +464,29 @@ std::string ChatHistory::GenerateFilePath()
     std::string shortId = uuid.substr(0, 8);
 
     return dir + std::string(1, (char)wxFileName::GetPathSeparator()) + "chat_" + shortId + ".json";
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Attachment Sidecar Helpers (Phase 3)
+// ═══════════════════════════════════════════════════════════════════
+
+std::string ChatHistory::GetAttachmentDir(const std::string& conversationPath)
+{
+    // Extract the filename stem (e.g. "chat_abc12345" from ".../chat_abc12345.json")
+    wxFileName fn(wxString::FromUTF8(conversationPath));
+    std::string stem(fn.GetName().ToUTF8().data());
+    std::string convDir = GetConversationsDir();
+
+    return convDir + "/attachments/" + stem;
+}
+
+std::string ChatHistory::GetAttachmentRelDir(const std::string& conversationPath)
+{
+    wxFileName fn(wxString::FromUTF8(conversationPath));
+    std::string stem(fn.GetName().ToUTF8().data());
+
+    // Forward slashes for cross-platform JSON portability
+    return "attachments/" + stem;
 }
 
 std::string ChatHistory::CurrentTimestamp()

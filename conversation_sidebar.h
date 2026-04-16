@@ -18,6 +18,7 @@
 #include <string>
 #include <vector>
 #include <set>
+#include <unordered_map>
 
 // Forward declarations
 struct ThemeData;
@@ -30,6 +31,7 @@ public:
         std::function<void(const std::string& path)>              onConversationClicked;
         std::function<void()>                                      onNewChatClicked;
         std::function<void(const std::vector<std::string>& paths)> onDeleteRequested;
+        std::function<bool()>                                      isBusy;
         std::function<void(int width)>                             onResized;  // sidebar width changed
     };
 
@@ -70,6 +72,18 @@ private:
         wxDateTime  modTime;
     };
 
+    struct RowWidgets {
+        wxPanel*      panel = nullptr;
+        wxStaticText* titleLabel = nullptr;
+        wxStaticText* timeLabel = nullptr;
+        wxStaticText* deleteBtn = nullptr;   // Trash icon — visible on hover
+
+        std::string filePath;
+        std::string displayedTitle;
+        std::string displayedTime;
+        wxDateTime  modTime;
+    };
+
     // ── UI widgets ───────────────────────────────────────────────
     wxPanel*          m_panel;            // Outer panel (contains content + border)
     wxPanel*          m_content;          // Content area (button + list)
@@ -83,6 +97,7 @@ private:
     static constexpr int MIN_WIDTH = 180;
     static constexpr int MAX_WIDTH = 600;
     wxButton*         m_newChatButton;    // "+ New Chat" button
+    wxTextCtrl*       m_searchBox;        // Search/filter conversations
     wxScrolledWindow* m_listWindow;       // Scrollable conversation list
     wxBoxSizer*       m_listSizer;        // Sizer inside m_listWindow
 
@@ -90,6 +105,7 @@ private:
     Callbacks    m_callbacks;
     const ThemeData* m_theme;             // Current theme (not owned)
     std::string  m_activeFilePath;        // Currently loaded conversation
+    std::string  m_searchFilter;          // Current search text (lowercase)
 
     // ── Multi-select state ───────────────────────────────────────
     std::set<std::string>  m_selected;    // Set of selected file paths
@@ -98,9 +114,16 @@ private:
     // rebuilt on every Refresh(). Needed for Shift+Click range logic.
     std::vector<std::string> m_orderedPaths;
 
+    // Cached row widgets keyed by full conversation file path.
+    // Lets Refresh() update only rows that changed instead of rebuilding
+    // the entire widget tree on every refresh.
+    std::unordered_map<std::string, RowWidgets> m_rows;
+
     // ── Helpers ──────────────────────────────────────────────────
     std::vector<ConversationEntry> ScanConversations() const;
-    void BuildListEntry(const ConversationEntry& entry);
+    RowWidgets CreateRow(const ConversationEntry& entry);
+    void UpdateRow(RowWidgets& row, const ConversationEntry& entry);
+    void RemoveRow(const std::string& filePath);
     void ShowContextMenu(const std::string& filePath);
 
     // Selection helpers
@@ -108,6 +131,10 @@ private:
     bool IsSelected(const std::string& path) const;
     wxColour GetRowBackground(const std::string& filePath) const;
     void RefreshAllRowBackgrounds();
+
+    // Search helpers
+    void FilterRows();
+    void ClearSearch();
 
     // Walk up from a child widget to find the panel holding the .json path
     static std::string PathFromWidget(wxWindow* win, wxWindow* stop);

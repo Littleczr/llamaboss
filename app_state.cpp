@@ -1,6 +1,5 @@
-// app_state.cpp
+﻿// app_state.cpp
 #include "app_state.h"
-#include "chat_client.h"  // For UnloadModel
 
 // wxWidgets headers
 #include <wx/fileconf.h>
@@ -23,8 +22,8 @@ const char* AppState::CONFIG_THEME_KEY = "Theme";
 AppState::AppState()
     : m_currentModel("")
     , m_currentApiUrl("")
-    , m_defaultModel("llama3")
-    , m_defaultApiUrl("http://127.0.0.1:11434")
+    , m_defaultModel("")                           // No default — set from GGUF scan
+    , m_defaultApiUrl("http://127.0.0.1:8384")     // llama-server default port
     , m_logger(nullptr)
 {
     SetDefaults();
@@ -33,25 +32,15 @@ AppState::AppState()
 AppState::~AppState()
 {
     LogShutdownMessage();
-
-    // Unload current model if we have valid configuration
-    if (HasValidConfiguration()) {
-        ChatClient::UnloadModel(m_currentModel, m_currentApiUrl, m_logger);
-    }
+    // No more Ollama model unloading — ServerManager handles process cleanup
 }
 
 bool AppState::Initialize()
 {
     try {
-        // Initialize logging first
         InitializeLogger();
-
-        // Load configuration from file
         LoadSettings();
-
-        // Log successful initialization
         LogStartupMessage();
-
         return true;
     }
     catch (const std::exception& ex) {
@@ -134,8 +123,6 @@ bool AppState::LoadApplicationIcon(wxFrame* frame, const std::string& /*iconPath
     }
 
 #ifdef __WXMSW__
-    // Load from the Win32 resource embedded by LlamaBoss.rc.
-    // This works regardless of the exe's working directory.
     wxIcon icon("APP_ICON", wxBITMAP_TYPE_ICO_RESOURCE);
     if (icon.IsOk()) {
         frame->SetIcon(icon);
@@ -146,7 +133,6 @@ bool AppState::LoadApplicationIcon(wxFrame* frame, const std::string& /*iconPath
     }
 #endif
 
-    // Fallback: try loading from file next to the exe
     wxIcon fileIcon;
     if (fileIcon.LoadFile("app_icon.ico", wxBITMAP_TYPE_ICO)) {
         frame->SetIcon(fileIcon);
@@ -171,19 +157,9 @@ bool AppState::UpdateSettings(const std::string& newModel, const std::string& ne
     bool anyChange = modelChanged || apiUrlChanged;
 
     if (anyChange) {
-        std::string previousModel = m_currentModel;
-
-        // Update the settings
         SetModel(newModel);
         SetApiUrl(newApiUrl);
-
-        // Save to configuration file
         SaveSettings();
-
-        // Unload previous model if model changed
-        if (modelChanged && !previousModel.empty() && previousModel != newModel) {
-            ChatClient::UnloadModel(previousModel, m_currentApiUrl, m_logger);
-        }
 
         if (m_logger) {
             m_logger->information("Settings updated - Model changed: " +
@@ -225,8 +201,6 @@ void AppState::SaveWindowState(wxFrame* frame)
         bool maximized = frame->IsMaximized();
         cfg.Write("WindowMaximized", maximized);
 
-        // Save normal (non-maximized) position and size
-        // If maximized, restore first to get the normal geometry
         if (!maximized) {
             wxPoint pos = frame->GetPosition();
             wxSize size = frame->GetSize();
@@ -265,7 +239,6 @@ void AppState::RestoreWindowState(wxFrame* frame)
         }
 
         if (hasPos) {
-            // Sanity check: make sure the window is on a visible display
             wxRect windowRect(x, y, hasSize ? w : 1100, hasSize ? h : 700);
             bool onScreen = false;
             for (unsigned int i = 0; i < wxDisplay::GetCount(); ++i) {
@@ -303,7 +276,7 @@ void AppState::RestoreWindowState(wxFrame* frame)
 int AppState::GetSidebarWidth() const
 {
     wxFileConfig cfg(CONFIG_APP_NAME);
-    int w = 260;  // default
+    int w = 260;
     cfg.Read("SidebarWidth", &w);
     return w;
 }
@@ -323,23 +296,20 @@ void AppState::LoadSettings()
 
     wxString savedModel, savedApiUrl;
 
-    // Load model setting
     if (cfg.Read(CONFIG_MODEL_KEY, &savedModel)) {
-        m_currentModel = savedModel.ToStdString();
+        m_currentModel = savedModel.ToUTF8().data();
     }
 
-    // Load API URL setting
     if (cfg.Read(CONFIG_API_URL_KEY, &savedApiUrl)) {
-        m_currentApiUrl = savedApiUrl.ToStdString();
+        m_currentApiUrl = savedApiUrl.ToUTF8().data();
     }
 
-    // Load theme setting
     wxString savedTheme;
     if (cfg.Read(CONFIG_THEME_KEY, &savedTheme)) {
-        m_themeManager.SetActiveTheme(savedTheme.ToStdString());
+        m_themeManager.SetActiveTheme(savedTheme.ToUTF8().data());
     }
 
-    // Ensure we have valid defaults
+    // Keep defaults if nothing was saved
     if (m_currentModel.empty()) {
         m_currentModel = m_defaultModel;
     }
@@ -350,7 +320,6 @@ void AppState::LoadSettings()
 
 void AppState::InitializeLogger()
 {
-    // Set up Poco logger with console output
     Poco::AutoPtr<Poco::ConsoleChannel> pCons(new Poco::ConsoleChannel);
     Poco::AutoPtr<Poco::PatternFormatter> pPF(new Poco::PatternFormatter);
     pPF->setProperty("pattern", "%Y-%m-%d %H:%M:%S.%F %s: %t");
@@ -358,11 +327,9 @@ void AppState::InitializeLogger()
         new Poco::FormattingChannel(pPF, pCons)
     );
 
-    // Configure root logger
     Poco::Logger::root().setChannel(pFC);
     Poco::Logger::root().setLevel(Poco::Message::PRIO_INFORMATION);
 
-    // Get our application logger
     m_logger = &Poco::Logger::get("LlamaBoss");
 }
 

@@ -1,113 +1,60 @@
-﻿#pragma once
+#pragma once
 // settings.h
 
 #include <wx/wx.h>
 #include <wx/dialog.h>
-#include <wx/textctrl.h>
+#include <wx/combobox.h>
 #include <wx/button.h>
 #include <wx/sizer.h>
 #include <wx/stattext.h>
-#include <wx/combobox.h>
-#include <wx/gauge.h>
-#include <wx/thread.h>
 #include <string>
 #include <vector>
-#include <memory>
-#include <atomic>
-
-// Control IDs for SettingsDialog
-enum {
-    ID_SETTINGS_API_URL = wxID_HIGHEST + 100
-};
-
-// ── Thread for fetching models from Ollama ───────────────────────
-// No longer holds a raw SettingsDialog pointer.  Instead it
-// posts results via wxQueueEvent through a generic wxEvtHandler* and
-// uses a shared cancel flag (same pattern as ChatWorkerThread).
-class ModelFetchThread : public wxThread
-{
-public:
-    ModelFetchThread(wxEvtHandler* handler,
-                     const std::string& apiUrl,
-                     std::shared_ptr<std::atomic<bool>> cancelFlag);
-
-protected:
-    virtual ExitCode Entry() override;
-
-private:
-    wxEvtHandler* m_handler;
-    std::string m_apiUrl;
-    std::shared_ptr<std::atomic<bool>> m_cancelFlag;
-
-    // Post event only if not cancelled; deletes event on cancel.
-    bool SafePost(wxCommandEvent* event);
-};
 
 // Forward declarations
 struct ThemeData;
 
 // ── Settings dialog ──────────────────────────────────────────────
+// Model selection now scans the filesystem for .gguf files
+// instead of fetching from an Ollama API.
 class SettingsDialog : public wxDialog
 {
 public:
-    SettingsDialog(wxWindow* parent, const std::string& currentModel,
-                   const std::string& currentApiUrl, const std::string& currentTheme,
+    SettingsDialog(wxWindow* parent,
+                   const std::string& currentModelPath,  // full GGUF path
+                   const std::string& currentTheme,
                    const ThemeData& theme);
-    ~SettingsDialog();
+    ~SettingsDialog() = default;
 
+    // Returns the full GGUF path of the selected model
     std::string GetSelectedModel() const { return m_selectedModel; }
-    std::string GetSelectedApiUrl() const { return m_selectedApiUrl; }
     std::string GetSelectedTheme() const { return m_selectedTheme; }
     bool WasModelChanged() const { return m_modelChanged; }
-    bool WasApiUrlChanged() const { return m_apiUrlChanged; }
     bool WasThemeChanged() const { return m_themeChanged; }
-
-    // PostModelsReceived / PostModelsFetchError removed —
-    // the thread now sends data entirely through events, so the
-    // dialog no longer needs public methods callable from threads.
 
 private:
     void OnOK(wxCommandEvent& event);
     void OnCancel(wxCommandEvent& event);
-    void OnRefreshModels(wxCommandEvent& event);
-    void OnApiUrlChanged(wxCommandEvent& event);
-    void OnModelsReceived(wxCommandEvent& event);
-    void OnModelsFetchError(wxCommandEvent& event);
     void OnManageModels(wxCommandEvent& event);
+    void OnOpenModelsFolder(wxCommandEvent& event);
+    void OnDownloadModels(wxCommandEvent& event);
 
     void CreateControls();
-    void StartModelFetch();
-    void SetFetchingState(bool fetching);
+    void PopulateModelList();
 
-    wxComboBox* m_modelComboBox;
-    wxTextCtrl* m_apiUrlTextCtrl;
-    wxButton* m_refreshButton;
-    wxGauge* m_progressGauge;
+    wxComboBox*   m_modelComboBox;
     wxStaticText* m_statusText;
-    wxComboBox* m_themeComboBox;
+    wxComboBox*   m_themeComboBox;
 
+    // Model list: display name -> full path mapping
+    std::vector<std::string> m_modelPaths;   // parallel to combobox items
     std::string m_selectedModel;
-    std::string m_selectedApiUrl;
     std::string m_selectedTheme;
     std::string m_originalModel;
-    std::string m_originalApiUrl;
     std::string m_originalTheme;
 
     bool m_modelChanged;
-    bool m_apiUrlChanged;
     bool m_themeChanged;
-    bool m_isFetching;
     const ThemeData* m_theme;
-
-    // Replaced ModelFetchThread* m_fetchThread with a
-    // shared cancel flag.  We never store the thread pointer — the
-    // detached thread owns itself.  Cancellation is communicated
-    // exclusively through this atomic flag.
-    std::shared_ptr<std::atomic<bool>> m_cancelFlag;
 
     wxDECLARE_EVENT_TABLE();
 };
-
-// Custom events
-wxDECLARE_EVENT(wxEVT_MODELS_RECEIVED, wxCommandEvent);
-wxDECLARE_EVENT(wxEVT_MODELS_FETCH_ERROR, wxCommandEvent);

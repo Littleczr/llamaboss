@@ -1,4 +1,4 @@
-// theme.h
+﻿// theme.h
 // Centralized theme definitions for LlamaBoss.
 // ThemeData holds every color used across the UI.
 // ThemeManager provides preset themes and tracks the active selection.
@@ -43,6 +43,7 @@ struct ThemeData
 
     // ── Attachment indicator ─────────────────────────────────────
     wxColour attachIndicator;   // Attachment label text color
+    wxColour attachChipBg;      // Attachment chip pill background
 
     // ── Chat message colors ──────────────────────────────────────
     wxColour chatUser;          // User message text

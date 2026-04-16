@@ -1,4 +1,4 @@
-// resource.h — Resource identifiers for LlamaBoss
+﻿// resource.h — Resource identifiers for LlamaBoss
 #ifndef RESOURCE_H
 #define RESOURCE_H
 
