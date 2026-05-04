@@ -19,6 +19,7 @@ struct TopBarWidgets {
     wxPanel*       modelPill;
     wxStaticText*  modelLabel;
     StatusDot*     statusDot;
+    wxStaticText*  protocolChip;  // Phase 3b: "native" / "xml" / hidden
     wxButton*      sidebarToggle;
     wxButton*      newChatButton;
     wxButton*      settingsButton;

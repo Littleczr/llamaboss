@@ -9,6 +9,9 @@
 #include <wx/wx.h>
 #include <wx/richtext/richtextctrl.h>
 #include <string>
+#include <functional>
+
+#include "presented_file.h"
 
 class MarkdownRenderer
 {
@@ -43,13 +46,22 @@ public:
     // Returns block index if pos is inside a [Copy] link, or -1
     int HitTestCopyLink(long pos) const;
 
+    // ── File chip callback ────────────────────────────────────────
+    // When a fenced code block closes, the renderer packages it into a
+    // PresentedFile and invokes this callback.  ChatDisplay wires it to
+    // its own PresentFile() method so the same chip-rendering path is
+    // shared with future producers (PowerShell tool, etc.).
+    using FileCallback = std::function<void(const PresentedFile&)>;
+    void SetFileCallback(FileCallback cb) { m_fileCallback = std::move(cb); }
+
 private:
     wxRichTextCtrl* m_ctrl;
 
     // ── Streaming state ──────────────────────────────────────────
     std::string m_lineBuffer;          // Accumulated text not yet rendered
     bool        m_inCodeBlock;         // Currently inside a ``` fenced block
-    std::string m_codeBlockLang;       // Language tag from opening fence (if any)
+    std::string m_codeBlockLang;       // Language tag from opening fence (just "cpp", etc.)
+    std::string m_codeBlockFilename;   // Filename parsed from opening fence (may be empty)
     long        m_partialLineStart;    // Character position where partial line begins (-1 = none)
 
     // ── Colors ───────────────────────────────────────────────────
@@ -62,6 +74,9 @@ private:
     std::vector<std::string>  m_codeBlocks;         // Completed code block contents
     std::vector<CopyLink>     m_copyLinks;          // Clickable [Copy] link positions
     std::string               m_currentCodeContent;  // Accumulating during current block
+
+    // ── File chip callback ────────────────────────────────────────
+    FileCallback              m_fileCallback;        // Invoked when a fenced block closes
 
     // ── Block-level rendering ────────────────────────────────────
     void RenderCompleteLine(const std::string& line, const wxColour& baseColor);
@@ -92,5 +107,16 @@ private:
     bool IsBulletItem(const std::string& line) const;
     bool IsNumberedItem(const std::string& line, std::string& prefix) const;
     std::string TrimLeading(const std::string& s, char c) const;
+
+    // ── Filename detection helpers (used by the file-chip callback) ─
+    struct FenceInfo {
+        std::string language;   // Just "cpp", "python", ... stripped of any extras
+        std::string filename;   // Parsed from fence if present, else empty
+    };
+    FenceInfo    ParseFenceInfo(const std::string& rawAfterTicks) const;
+    std::string  LanguageToExtension(const std::string& lang) const;
+    std::string  LanguageDisplayName(const std::string& lang) const;
+    std::string  ExtractFilenameFromContent(const std::string& content) const;
+    bool         IsLikelyFilename(const std::string& s) const;
 };
 

@@ -3,6 +3,7 @@
 
 #include <wx/wx.h>
 #include <wx/thread.h>
+#include <wx/clntdata.h>
 #include <vector>
 #include <string>
 #include <memory>
@@ -15,6 +16,33 @@
 wxDECLARE_EVENT(wxEVT_ASSISTANT_DELTA, wxCommandEvent);
 wxDECLARE_EVENT(wxEVT_ASSISTANT_COMPLETE, wxCommandEvent);
 wxDECLARE_EVENT(wxEVT_ASSISTANT_ERROR, wxCommandEvent);
+
+// ── Phase 3c-ii: extra payload on assistant-complete events ────
+// wxCommandEvent::SetString already carries the model's prose
+// content for the completed turn.  When the model is on the
+// native tool-calling protocol it may also have emitted a
+// structured tool_calls array; we surface that here.
+//
+// AssistantCompletePayload is attached via SetClientObject (wx
+// owns it and frees it after the event is consumed).  Recipients
+// that don't know about tool_calls can ignore the payload entirely
+// — the existing SetString-based contract is unchanged.
+//
+// toolCallsJson is a JSON array string in OpenAI shape:
+//   [{"id":"call_0","type":"function",
+//     "function":{"name":"pwd","arguments":"{}"}}]
+// Empty when the stream had no tool_calls.
+class AssistantCompletePayload : public wxClientData
+{
+public:
+    explicit AssistantCompletePayload(std::string toolCallsJson)
+        : m_toolCallsJson(std::move(toolCallsJson)) {}
+
+    const std::string& ToolCallsJson() const { return m_toolCallsJson; }
+
+private:
+    std::string m_toolCallsJson;
+};
 
 // Forward declarations
 class ChatClient;

@@ -7,6 +7,7 @@
 #include "attachment_manager.h"
 #include "widgets.h"
 #include "model_manager.h"
+#include "model_downloader.h"   // first-run onboarding
 #include "theme.h"
 
 ModelSwitcher::ModelSwitcher(AppState& appState,
@@ -15,7 +16,8 @@ ModelSwitcher::ModelSwitcher(AppState& appState,
                              std::unique_ptr<ChatHistory>& chatHistory,
                              AttachmentManager& attachments,
                              StatusDot* statusDot,
-                             wxStaticText* modelLabel)
+                             wxStaticText* modelLabel,
+                             wxWindow* parentFrame)
     : m_appState(appState)
     , m_serverManager(serverManager)
     , m_chatDisplay(chatDisplay)
@@ -23,6 +25,7 @@ ModelSwitcher::ModelSwitcher(AppState& appState,
     , m_attachments(attachments)
     , m_statusDot(statusDot)
     , m_modelLabel(modelLabel)
+    , m_parentFrame(parentFrame)
 {
 }
 
@@ -32,21 +35,55 @@ ModelSwitcher::ModelSwitcher(AppState& appState,
 
 void ModelSwitcher::StartInitialServer()
 {
-    auto models = ServerManager::ScanModels();
+    auto models = ServerManager::ScanModelPaths();
 
     if (models.empty()) {
-        m_statusDot->SetConnected(false);
-        m_chatDisplay->DisplaySystemMessage(
-            "No .gguf models found.\n\n"
-            "To get started:\n"
-            "1. Download a GGUF model (e.g. from huggingface.co)\n"
-            "2. Place it in: " + ServerManager::GetModelsDir() + "\n"
-            "   (Documents \\ LlamaBoss \\ models)\n"
-            "3. Open Settings to select it\n\n"
-            "The models folder has been created for you.");
+        // ── First-run onboarding path ─────────────────────────────
+        // A fresh install with no models AND the first-run flag still
+        // set means this is someone's very first encounter with the
+        // app. Open the downloader in first-run mode — it pre-highlights
+        // the starter model and auto-closes on successful download so
+        // the caller (here) can pick up and load it immediately.
+        //
+        // Existing users landing here (e.g., they deleted all their
+        // models) have been migrated past first-run in AppState::
+        // Initialize(), so they take the else branch below and see
+        // the normal empty-state message instead.
+        if (m_appState.IsFirstRun() && m_parentFrame) {
+            std::string downloaded = LaunchFirstRunDownloader();
+            if (!downloaded.empty()) {
+                // Success — persist the choice and fall through to the
+                // load-model block below. Rescanning picks up the new
+                // bundle folder we just populated.
+                bool mc, ac;
+                m_appState.UpdateSettings(downloaded, m_appState.GetApiUrl(),
+                                          mc, ac);
+                m_completingFirstRun = true;
+                models = ServerManager::ScanModelPaths();
+                // Fall through — models is now non-empty.
+            } else {
+                // Dismissed without downloading. Leave the first-run
+                // flag set so they get the onboarding again next launch.
+                ShowFirstRunDismissedMessage();
+                ServerManager::EnsureDataDirs();
+                return;
+            }
+        } else {
+            // Existing user with an empty folder, or first-run user on
+            // a build without a parent frame wired up. Show the original
+            // empty-state message unchanged.
+            m_statusDot->SetConnected(false);
+            m_chatDisplay->DisplaySystemMessage(
+                "No models found.\n\n"
+                "To get started:\n"
+                "1. Download a model through Settings \xe2\x86\x92 Download Models\n"
+                "2. Or drop a .gguf file into: " + ServerManager::GetModelsDir() + "\n"
+                "3. Open Settings to select it\n\n"
+                "The models folder has been created for you.");
 
-        ServerManager::EnsureDataDirs();
-        return;
+            ServerManager::EnsureDataDirs();
+            return;
+        }
     }
 
     // Use saved model if it still exists, otherwise first available
@@ -67,7 +104,7 @@ void ModelSwitcher::StartInitialServer()
         "Loading " + ServerManager::ModelDisplayName(modelToLoad) + "...");
     m_statusDot->SetConnected(false);
 
-    m_serverManager.StartServer(modelToLoad);
+    m_serverManager.StartServer(modelToLoad, m_appState.MakeServerConfig());
 }
 
 // ═════════════════════════════════════════════════════════════════
@@ -89,6 +126,16 @@ void ModelSwitcher::OnServerReady()
 
     if (auto* logger = m_appState.GetLogger())
         logger->information("Server ready: " + displayName);
+
+    // ── First-run onboarding completion ──────────────────────────
+    // The flag is only true after LaunchFirstRunDownloader returned
+    // a path on the first-run path. Every other "server ready" event
+    // (model switch, initial load for a returning user, restart after
+    // error) leaves the flag false and this block is a no-op.
+    if (m_completingFirstRun) {
+        m_completingFirstRun = false;
+        m_appState.MarkFirstRunComplete();
+    }
 }
 
 void ModelSwitcher::OnServerError(const std::string& error)
@@ -110,11 +157,11 @@ void ModelSwitcher::OnModelPillClick(wxWindow* popupParent)
 {
     if (m_cb.isBusy && m_cb.isBusy()) return;
 
-    auto models = ServerManager::ScanModels();
+    auto models = ServerManager::ScanModelPaths();
     if (models.empty()) {
         m_chatDisplay->DisplaySystemMessage(
-            "No .gguf models found in " + ServerManager::GetModelsDir() +
-            "\nPlace .gguf files there and try again.");
+            "No models found in " + ServerManager::GetModelsDir() +
+            "\nDownload one through Settings, or drop a .gguf file there.");
         return;
     }
 
@@ -194,7 +241,7 @@ void ModelSwitcher::SwitchToModel(const std::string& newModel)
     m_statusDot->SetConnected(false);
     m_chatDisplay->DisplaySystemMessage(
         "Loading " + ServerManager::ModelDisplayName(newModel) + "...");
-    m_serverManager.StartServer(newModel);
+    m_serverManager.StartServer(newModel, m_appState.MakeServerConfig());
 
     if (auto* logger = m_appState.GetLogger())
         logger->information("Quick-switched to model: " + newModel);
@@ -217,11 +264,77 @@ void ModelSwitcher::UpdateModelLabel()
         if (slash != std::string::npos && slash + 1 < m.size())
             return m.substr(slash + 1);
         return m;
-    };
+        };
 
     std::string display = shortenModel(model);
 
-    m_modelLabel->SetLabel(wxString::FromUTF8(display) +
-        wxString::FromUTF8(" \xE2\x96\xBE"));
-    m_modelLabel->GetParent()->Layout();
+    wxString label = wxString::FromUTF8(display) +
+        wxString::FromUTF8(" \xE2\x96\xBE"); // ▾
+
+    m_modelLabel->SetLabel(label);
+
+    // Full name stays available on hover even if the toolbar ellipsizes it.
+    m_modelLabel->SetToolTip(wxString::FromUTF8(display));
+    if (auto* parent = m_modelLabel->GetParent()) {
+        parent->SetToolTip(wxString::FromUTF8(display));
+        parent->Layout();
+
+        if (auto* grandparent = parent->GetParent()) {
+            grandparent->Layout();
+        }
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════
+//  FIRST-RUN ONBOARDING
+// ═════════════════════════════════════════════════════════════════
+//
+// Two helpers used only from StartInitialServer's first-run branch.
+// Kept here (rather than inline) so the branch reads as a sequence of
+// high-level steps: "launch downloader → act on result."
+
+std::string ModelSwitcher::LaunchFirstRunDownloader()
+{
+    if (!m_parentFrame) return "";
+
+    // The dialog reorders Llama 3.2 3B to the top, renders a "Start here"
+    // badge next to it, and auto-closes ~1s after a successful download.
+    // ShowModal blocks until that happens (or the user dismisses).
+    ModelDownloaderDialog dlg(m_parentFrame, &m_appState.GetTheme(),
+                              /*firstRunMode=*/true);
+    int result = dlg.ShowModal();
+
+    // EndModal(wxID_OK) from the auto-close timer signals success.
+    // Any other path (user clicked Close, pressed Escape, X-button)
+    // returns wxID_CANCEL and we treat it as a dismissal. The explicit
+    // path-nonempty check is belt-and-braces: if something upstream
+    // ever returns wxID_OK without a completed download, we'd still
+    // refuse to pretend onboarding succeeded.
+    if (result == wxID_OK && !dlg.GetDownloadedModelPath().empty()) {
+        if (auto* logger = m_appState.GetLogger())
+            logger->information("First-run download succeeded: " +
+                                dlg.GetDownloadedModelPath());
+        return dlg.GetDownloadedModelPath();
+    }
+
+    if (auto* logger = m_appState.GetLogger())
+        logger->information("First-run downloader dismissed without download");
+    return "";
+}
+
+void ModelSwitcher::ShowFirstRunDismissedMessage()
+{
+    // Option B copy — the existing "No models found" body with one
+    // added sentence pointing at the model pill. That pill is where
+    // a dismissed user would otherwise have no idea to click, so
+    // naming it explicitly gives them a direct way back to the
+    // downloader without opening Settings.
+    m_statusDot->SetConnected(false);
+    m_chatDisplay->DisplaySystemMessage(
+        "No model installed yet.\n\n"
+        "LlamaBoss needs a local AI model before you can start chatting.\n"
+        "You can return to the model downloader any time by clicking\n"
+        "the model name at the top of the window, or by opening\n"
+        "Settings \xe2\x86\x92 Download Models.\n\n"
+        "Models are saved to:\n" + ServerManager::GetModelsDir());
 }
