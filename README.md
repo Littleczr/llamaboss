@@ -1,10 +1,14 @@
 # LlamaBoss
 
-**LlamaBoss** is a private local desktop AI assistant for Windows. It is built for local LLMs, real files, projects, reusable skills, and approval-gated tools.
+**LlamaBoss** is a private local desktop AI assistant for Windows. It is built
+for local LLMs, real files, projects, reusable skills, and approval-gated
+tools.
 
 > Current milestone: **LlamaBoss Beta v0.1.0**
 
-LlamaBoss is designed for people who want an AI assistant that can help with documents, spreadsheets, PDFs, scripts, project files, and repeatable workflows while keeping control on the local machine.
+LlamaBoss is designed for people who want an AI assistant that can help with
+documents, spreadsheets, PDFs, scripts, project files, and repeatable workflows
+while keeping control on the local machine.
 
 ## What LlamaBoss does
 
@@ -13,16 +17,24 @@ LlamaBoss is designed for people who want an AI assistant that can help with doc
 - Chats with local GGUF models
 - Imports and works with local files
 - Creates per-chat workflow folders for generated artifacts
-- Supports long-lived Projects with their own files, notes, sources, templates, outputs, and workflows
+- Supports long-lived Projects with their own files, notes, sources,
+  templates, outputs, and workflows
 - Supports reusable global Skills for cross-project procedures
-- Uses approval cards before risky actions such as script creation, script execution, deletion, package installation, and other controlled write operations
-- Provides helper tools for common office-style work: CSV, XLSX, PDF, DOCX, Python scripts, notes, and file operations
+- Uses approval cards before risky actions such as script creation, script
+  execution, deletion, package installation, and other controlled write
+  operations
+- Provides helper tools for common office-style work: CSV, XLSX, PDF, DOCX,
+  Python scripts, notes, and file operations
 
 ## Beta status
 
-LlamaBoss is currently beta software. The core direction is stable, but feature names, workflows, file handling, installer behavior, and UI details may change before a stable release.
+LlamaBoss is currently beta software. The core direction is stable, but feature
+names, workflows, file handling, installer behavior, and UI details may change
+before a stable release.
 
-Use caution with important files. LlamaBoss is intentionally built around approvals and local-first control, but beta builds should still be tested on copies of important documents.
+Use caution with important files. LlamaBoss is intentionally built around
+approvals and local-first control, but beta builds should still be tested on
+copies of important documents.
 
 ## Current feature areas
 
@@ -38,7 +50,8 @@ Use caution with important files. LlamaBoss is intentionally built around approv
 
 ### Projects
 
-Projects are long-lived folders under the user's LlamaBoss directory. A project can include:
+Projects are long-lived folders under the user's LlamaBoss directory. A project
+can include:
 
 ```text
 Projects/<Project Name>/
@@ -62,9 +75,12 @@ Project support includes:
 
 ### Skills
 
-Skills are reusable global workflows stored under the LlamaBoss Skills folder. A Skill is usually a Markdown `.workflow.md` contract and may optionally include a same-stem Python helper script.
+Skills are reusable global workflows stored under the LlamaBoss Skills folder.
+A Skill is usually a Markdown `.workflow.md` contract and may optionally
+include a same-stem Python helper script.
 
-Skills are intended for repeatable procedures that should be available across projects, such as:
+Skills are intended for repeatable procedures that should be available across
+projects, such as:
 
 - File conversion workflows
 - Report generation workflows
@@ -78,7 +94,9 @@ LlamaBoss has both global notes and project notes.
 
 - Global notes live in the user's LlamaBoss root as `NOTES.md`
 - Project notes live inside the active project as `Notes/NOTES.md`
-- When a project is active and the user asks to save something to notes, LlamaBoss saves the full note in the project notes and adds a compact pointer in global notes
+- When a project is active and the user asks to save something to notes,
+  LlamaBoss saves the full note in the project notes and adds a compact
+  pointer in global notes
 
 ### Tools and approvals
 
@@ -96,11 +114,13 @@ Tool areas include:
 - DOCX text extraction and inspection
 - Global and project notes
 
-Riskier actions are gated by approval cards so the user can review what is about to happen before allowing it.
+Riskier actions are gated by approval cards so the user can review what is
+about to happen before allowing it.
 
 ### Python helpers
 
-Python is used for document and office automation tasks that are better handled by scripts than by C++ directly.
+Python is used for document and office automation tasks that are better handled
+by scripts than by C++ directly.
 
 Current Python-oriented capabilities include:
 
@@ -130,7 +150,8 @@ LlamaBoss uses a local user folder similar to:
   NOTES.md
 ```
 
-Per-chat artifacts are stored in conversation-specific workflow folders such as:
+Per-chat artifacts are stored in conversation-specific workflow folders such
+as:
 
 ```text
 %USERPROFILE%\LlamaBoss\Workflows\chat_<id>\Workspace\
@@ -140,9 +161,11 @@ Per-chat artifacts are stored in conversation-specific workflow folders such as:
 
 - Windows 10/11 x64
 - A compatible local GGUF model
-- llama.cpp runtime support, either bundled by a release build or configured locally
+- llama.cpp runtime support, either bundled by a release build or configured
+  locally
 - Python 3 for Python helper features
-- Optional Python packages for specific helpers, such as `openpyxl`, `pymupdf`, and `python-docx`
+- Optional Python packages for specific helpers, such as `openpyxl`, `pymupdf`,
+  and `python-docx`
 
 ## Building from source
 
@@ -166,7 +189,8 @@ git clone https://github.com/Littleczr/llamaboss.git
 cd llamaboss
 ```
 
-Open `LlamaBoss.slnx` or `LlamaBoss.vcxproj` in Visual Studio, restore dependencies through vcpkg, then build the Release x64 configuration.
+Open `LlamaBoss.slnx` or `LlamaBoss.vcxproj` in Visual Studio, restore
+dependencies through vcpkg, then build the Release x64 configuration.
 
 ## Suggested first tests
 
@@ -207,7 +231,9 @@ Longer-term ideas:
 
 ## Privacy and safety direction
 
-LlamaBoss is designed around local-first operation, user-visible files, and approval-based actions. The goal is to make useful local automation approachable without hiding what the assistant is doing.
+LlamaBoss is designed around local-first operation, user-visible files, and
+approval-based actions. The goal is to make useful local automation approachable
+without hiding what the assistant is doing.
 
 ## License
 
