@@ -35,7 +35,8 @@ public:
                   std::unique_ptr<ChatHistory>& chatHistory,
                   AttachmentManager& attachments,
                   StatusDot* statusDot,
-                  wxStaticText* modelLabel);
+                  wxStaticText* modelLabel,
+                  wxWindow* parentFrame);
 
     void SetCallbacks(Callbacks cb) { m_cb = std::move(cb); }
 
@@ -63,6 +64,18 @@ private:
     void ShowModelPickerMenu(wxWindow* anchor,
                              const std::vector<std::string>& ggufPaths);
 
+    // ── First-run onboarding ─────────────────────────────────────
+    // Opens the model downloader in first-run mode, blocks until the
+    // user either downloads a model (dialog auto-closes) or dismisses.
+    // Returns the full path of the downloaded .gguf on success, or
+    // empty string on dismiss.
+    std::string LaunchFirstRunDownloader();
+
+    // System message shown when the user dismisses the first-run
+    // downloader without completing a download. Points them at the
+    // model pill so they can reopen the downloader without hunting.
+    void ShowFirstRunDismissedMessage();
+
     AppState&                       m_appState;
     ServerManager&                  m_serverManager;
     ChatDisplay*                    m_chatDisplay;
@@ -70,8 +83,14 @@ private:
     AttachmentManager&              m_attachments;
     StatusDot*                      m_statusDot;
     wxStaticText*                   m_modelLabel;
+    wxWindow*                       m_parentFrame;  // Owner for modal dialogs
 
     Callbacks                       m_cb;
     std::vector<std::string>        m_pickerModels;
     std::unordered_map<int,size_t>  m_menuIdMap;  // maps wxNewId() → m_pickerModels index
+
+    // True between "first-run download succeeded, server is loading"
+    // and "server became ready." Gates the one-shot MarkFirstRunComplete
+    // call in OnServerReady so routine ready events don't touch the flag.
+    bool m_completingFirstRun = false;
 };

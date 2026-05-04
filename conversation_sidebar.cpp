@@ -5,9 +5,12 @@
 #include "conversation_sidebar.h"
 #include "chat_history.h"
 #include "theme.h"
+#include "path_safety.h"
 
 #include <wx/dir.h>
 #include <wx/filename.h>
+#include <wx/dnd.h>
+#include <wx/dataobj.h>
 
 #include <fstream>
 #include <algorithm>
@@ -18,10 +21,15 @@
 
 ConversationSidebar::ConversationSidebar(wxWindow* parent,
                                          const ThemeData& theme,
-                                         const Callbacks& callbacks)
+                                         const Callbacks& callbacks,
+                                         const std::vector<std::string>& initialCollapsed)
     : m_callbacks(callbacks)
     , m_theme(&theme)
 {
+    for (const auto& id : initialCollapsed) {
+        if (!id.empty()) m_collapsedGroups.insert(id);
+    }
+
     // ── Outer panel (sidebar + right border) ─────────────────────
     m_panel = new wxPanel(parent, wxID_ANY);
     m_panel->SetBackgroundColour(theme.bgSidebar);
@@ -122,6 +130,49 @@ ConversationSidebar::ConversationSidebar(wxWindow* parent,
             e.Skip();
         }
     });
+
+    // ── Sidebar-wide Delete-key shortcut ─────────────────────────
+    // CHAR_HOOK fires on every level of the widget hierarchy from the
+    // top-level window down to the focused window, so this handler
+    // catches Del whenever focus is anywhere inside the sidebar — the
+    // scrolled list, a row panel, the search box, or the New Chat
+    // button.  KEY_DOWN bound on m_listWindow alone wouldn't reliably
+    // catch the event because wxPanel::SetFocus() redirects focus to
+    // the first focusable child, so the scrolled window rarely actually
+    // owns focus after a click.
+    //
+    // The Del key is intentionally not consumed when focus is on a
+    // wxTextCtrl (the search box, primarily) so editing keystrokes
+    // continue to work normally there.
+    m_panel->Bind(wxEVT_CHAR_HOOK, [this](wxKeyEvent& e) {
+        if (e.GetKeyCode() != WXK_DELETE) {
+            e.Skip();
+            return;
+        }
+
+        // Don't intercept when typing in any text input within the sidebar.
+        wxWindow* focused = wxWindow::FindFocus();
+        if (dynamic_cast<wxTextCtrl*>(focused)) {
+            e.Skip();
+            return;
+        }
+
+        if (m_callbacks.isBusy && m_callbacks.isBusy()) {
+            wxBell();
+            return;
+        }
+        if (m_selected.empty()) {
+            wxBell();
+            return;
+        }
+
+        std::vector<std::string> paths(m_selected.begin(), m_selected.end());
+        m_panel->CallAfter([this, paths]() {
+            if (m_callbacks.onDeleteRequested)
+                m_callbacks.onDeleteRequested(paths);
+        });
+        // Intentionally not Skip()'d — we've consumed the event.
+    });
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -175,7 +226,75 @@ void ConversationSidebar::Refresh(const std::string& activeFilePath)
     // Scan and sort
     auto entries = ScanConversations();
 
-    // Rebuild ordered path list for Shift+Click range logic
+    // ── Group by project ─────────────────────────────────────────
+    // Walk the (mod-time-sorted) entries once and bucket them by group
+    // id.  An empty projectId in the entry maps to kUnassignedId so the
+    // sentinel flows through the rest of the layout code unchanged.
+    //
+    // Group display order:
+    //   1. Real projects, alphabetical by display name (case-insensitive).
+    //   2. Unassigned, always last.
+    //
+    // Within each group, entries keep ScanConversations()'s descending
+    // mod-time order — the most recently touched chat is at the top of
+    // its own group, which matches the expected "what was I just
+    // working on" navigation pattern.
+    struct Group {
+        std::string id;
+        std::string displayName;
+        std::vector<const ConversationEntry*> entries;
+    };
+    std::unordered_map<std::string, Group> groupsById;
+
+    for (const auto& e : entries) {
+        const std::string id = e.projectId.empty() ? kUnassignedId : e.projectId;
+        auto& g = groupsById[id];
+        if (g.id.empty()) {
+            g.id = id;
+            g.displayName = (id == kUnassignedId)
+                ? std::string("Unassigned")
+                : (e.projectName.empty() ? std::string("(unnamed project)")
+                                         : e.projectName);
+        }
+        g.entries.push_back(&e);
+    }
+
+    std::vector<Group*> orderedGroups;
+    orderedGroups.reserve(groupsById.size());
+    for (auto& [id, g] : groupsById) {
+        if (id != kUnassignedId) orderedGroups.push_back(&g);
+    }
+    std::sort(orderedGroups.begin(), orderedGroups.end(),
+        [](const Group* a, const Group* b) {
+            std::string an = a->displayName;
+            std::string bn = b->displayName;
+            std::transform(an.begin(), an.end(), an.begin(), ::tolower);
+            std::transform(bn.begin(), bn.end(), bn.begin(), ::tolower);
+            return an < bn;
+        });
+    if (auto it = groupsById.find(kUnassignedId); it != groupsById.end()) {
+        orderedGroups.push_back(&it->second);
+    }
+
+    // ── Recompute override-expanded set for this render ──────────
+    // A collapsed section is force-expanded for display only when it
+    // contains the active chat or (later) a search match.  This does not
+    // touch m_collapsedGroups, so the user's persisted intent survives.
+    m_overrideExpandedGroups.clear();
+    if (!m_activeFilePath.empty()) {
+        for (const auto* g : orderedGroups) {
+            for (const auto* e : g->entries) {
+                if (e->filePath == m_activeFilePath) {
+                    if (m_collapsedGroups.count(g->id))
+                        m_overrideExpandedGroups.insert(g->id);
+                    break;
+                }
+            }
+        }
+    }
+
+    // Rebuild ordered path list for Shift+Click range logic.  Headers
+    // are NOT included — selection still operates on chat rows only.
     m_orderedPaths.clear();
     m_orderedPaths.reserve(entries.size());
 
@@ -204,35 +323,94 @@ void ConversationSidebar::Refresh(const std::string& activeFilePath)
         }
     }
 
-    // Create/update/reorder rows without rebuilding them all
-    for (size_t i = 0; i < entries.size(); ++i) {
-        const auto& entry = entries[i];
-        m_orderedPaths.push_back(entry.filePath);
-
-        auto found = m_rows.find(entry.filePath);
-        if (found == m_rows.end()) {
-            RowWidgets row = CreateRow(entry);
-            auto [insertedIt, _] = m_rows.emplace(entry.filePath, std::move(row));
-            found = insertedIt;
+    // Remove headers for groups that disappeared
+    std::set<std::string> validGroupIds;
+    for (const auto* g : orderedGroups) validGroupIds.insert(g->id);
+    for (auto it = m_projectHeaders.begin(); it != m_projectHeaders.end(); ) {
+        if (validGroupIds.find(it->first) == validGroupIds.end()) {
+            RemoveProjectHeader(it->first);
+            it = m_projectHeaders.erase(it);
         }
         else {
-            UpdateRow(found->second, entry);
+            ++it;
         }
+    }
 
-        wxPanel* panel = found->second.panel;
-        if (!panel) continue;
-
+    // ── Lay out: header → its chats → next header → ... ──────────
+    size_t sizerIdx = 0;
+    auto placeAtSizerIndex = [&](wxPanel* panel) {
         wxSizerItem* currentItem =
-            (i < m_listSizer->GetItemCount()) ? m_listSizer->GetItem(i) : nullptr;
+            (sizerIdx < m_listSizer->GetItemCount())
+                ? m_listSizer->GetItem(sizerIdx)
+                : nullptr;
         wxWindow* currentWindow = currentItem ? currentItem->GetWindow() : nullptr;
-
         if (currentWindow != panel) {
             m_listSizer->Detach(panel);
-            m_listSizer->Insert(i, panel, 0, wxEXPAND);
+            m_listSizer->Insert(sizerIdx, panel, 0, wxEXPAND);
+        }
+        ++sizerIdx;
+    };
+
+    for (const auto* g : orderedGroups) {
+        const bool collapsed = IsGroupCollapsed(g->id);
+        const int  chatCount = static_cast<int>(g->entries.size());
+
+        // Create-or-update the header for this group
+        auto headerIt = m_projectHeaders.find(g->id);
+        if (headerIt == m_projectHeaders.end()) {
+            HeaderWidgets header = CreateProjectHeader(
+                g->id, g->displayName, chatCount, collapsed);
+            auto [insertedIt, _] =
+                m_projectHeaders.emplace(g->id, std::move(header));
+            headerIt = insertedIt;
+        }
+        else {
+            UpdateProjectHeader(headerIt->second, g->displayName,
+                                chatCount, collapsed);
+        }
+        if (headerIt->second.panel) {
+            headerIt->second.panel->Show();
+            placeAtSizerIndex(headerIt->second.panel);
         }
 
-        panel->SetBackgroundColour(GetRowBackground(entry.filePath));
-        panel->Refresh();
+        // Chat rows for this group.  Hidden rows are not added to
+        // m_orderedPaths so Shift+Click range selection can't span
+        // across a collapsed section invisibly.
+        for (const auto* e : g->entries) {
+            const auto& entry = *e;
+
+            auto rowIt = m_rows.find(entry.filePath);
+            if (rowIt == m_rows.end()) {
+                RowWidgets row = CreateRow(entry);
+                auto [insertedIt, _] =
+                    m_rows.emplace(entry.filePath, std::move(row));
+                rowIt = insertedIt;
+            }
+            else {
+                UpdateRow(rowIt->second, entry);
+            }
+            rowIt->second.groupId = g->id;
+
+            wxPanel* panel = rowIt->second.panel;
+            if (!panel) continue;
+
+            if (collapsed) {
+                panel->Hide();
+                // Detach so collapsed rows don't take any vertical
+                // space in the sizer at all.
+                if (m_listSizer->GetItem(panel)) {
+                    m_listSizer->Detach(panel);
+                }
+                continue;
+            }
+
+            panel->Show();
+            placeAtSizerIndex(panel);
+            m_orderedPaths.push_back(entry.filePath);
+
+            panel->SetBackgroundColour(GetRowBackground(entry.filePath));
+            panel->Refresh();
+        }
     }
 
     m_listWindow->FitInside();
@@ -308,6 +486,18 @@ void ConversationSidebar::ApplyTheme(const ThemeData& theme)
             row.panel->SetBackgroundColour(GetRowBackground(path));
     }
 
+    // Recolor cached project headers — same lifetime story as rows.
+    for (auto& [id, header] : m_projectHeaders) {
+        if (header.panel)
+            header.panel->SetBackgroundColour(theme.bgSidebar);
+        if (header.triangle)
+            header.triangle->SetForegroundColour(theme.textMuted);
+        if (header.nameLabel)
+            header.nameLabel->SetForegroundColour(theme.textPrimary);
+        if (header.countLabel)
+            header.countLabel->SetForegroundColour(theme.textMuted);
+    }
+
     RefreshAllRowBackgrounds();
     m_listWindow->Refresh();
 }
@@ -341,24 +531,56 @@ void ConversationSidebar::RefreshAllRowBackgrounds()
 void ConversationSidebar::FilterRows()
 {
     wxString raw = m_searchBox->GetValue();
-    m_searchFilter = raw.Lower().ToUTF8().data();
+    std::string newFilter = raw.Lower().ToUTF8().data();
+    const bool wasFiltered  = !m_searchFilter.empty();
+    const bool nowFiltered  = !newFilter.empty();
+    const bool transition   = (wasFiltered != nowFiltered);
+
+    m_searchFilter = newFilter;
+
+    // Crossing the empty/non-empty boundary changes how IsGroupCollapsed
+    // behaves and therefore changes the sizer layout.  A full Refresh
+    // is the cleanest way to re-emit headers and chat rows in the right
+    // expanded/collapsed state.  Once back inside the filtered or
+    // unfiltered regime, per-row visibility tweaks are enough.
+    if (transition) {
+        Refresh(m_activeFilePath);
+        if (!nowFiltered) return;  // Cleared filter — Refresh did the work
+    }
 
     m_listWindow->Freeze();
+
+    // Track which groups have at least one visible chat under the
+    // current filter, so we can hide headers for groups that match
+    // nothing.
+    std::set<std::string> groupsWithMatches;
 
     for (auto& [path, row] : m_rows) {
         if (!row.panel) continue;
 
-        if (m_searchFilter.empty()) {
-            row.panel->Show();
-        }
-        else {
-            // Case-insensitive substring match on the displayed title
+        bool show = true;
+        if (nowFiltered) {
             std::string titleLower = row.displayedTitle;
             std::transform(titleLower.begin(), titleLower.end(),
                            titleLower.begin(), ::tolower);
+            show = (titleLower.find(m_searchFilter) != std::string::npos);
+        }
 
-            bool match = (titleLower.find(m_searchFilter) != std::string::npos);
-            row.panel->Show(match);
+        row.panel->Show(show);
+        if (show && !row.groupId.empty())
+            groupsWithMatches.insert(row.groupId);
+    }
+
+    // Hide headers whose groups have no surviving chat rows.  When the
+    // filter is empty, every header that exists in m_projectHeaders
+    // should be visible (Refresh already removed dead ones).
+    for (auto& [id, header] : m_projectHeaders) {
+        if (!header.panel) continue;
+        if (!nowFiltered) {
+            header.panel->Show();
+        }
+        else {
+            header.panel->Show(groupsWithMatches.count(id) != 0);
         }
     }
 
@@ -393,7 +615,7 @@ std::string ConversationSidebar::PathFromWidget(wxWindow* win, wxWindow* stop)
 // ═══════════════════════════════════════════════════════════════════
 
 std::vector<ConversationSidebar::ConversationEntry>
-ConversationSidebar::ScanConversations() const
+ConversationSidebar::ScanConversations()
 {
     std::vector<ConversationEntry> entries;
 
@@ -410,44 +632,105 @@ ConversationSidebar::ScanConversations() const
         ConversationEntry entry;
         entry.filePath = fullPath.ToUTF8().data();
 
-        try {
-            std::ifstream file(entry.filePath, std::ios::in);
-            if (file.is_open()) {
-                std::string line;
-                while (std::getline(file, line)) {
-                    size_t keyPos = line.find("\"title\"");
-                    if (keyPos == std::string::npos) continue;
-
-                    size_t colonPos = line.find(':', keyPos + 7);
-                    if (colonPos == std::string::npos) break;
-                    size_t openQuote = line.find('"', colonPos + 1);
-                    if (openQuote == std::string::npos) break;
-
-                    size_t end = openQuote + 1;
-                    while (end < line.size()) {
-                        if (line[end] == '"' && line[end - 1] != '\\') break;
-                        ++end;
-                    }
-                    if (end < line.size()) {
-                        entry.title = line.substr(openQuote + 1, end - openQuote - 1);
-                    }
-                    break;
-                }
-            }
-        }
-        catch (...) {
-            // Skip files we can't read
-        }
-
-        if (entry.title.empty()) {
-            entry.title = filename.ToUTF8().data();
-        }
-
         wxFileName fn(fullPath);
         fn.GetTimes(nullptr, &entry.modTime, nullptr);
+        time_t thisMtime = entry.modTime.IsValid() ? entry.modTime.GetTicks() : 0;
+
+        // ── Cache lookup ─────────────────────────────────────────
+        // If we've seen this path before and its mtime hasn't moved,
+        // reuse the cached metadata.  The JSON file hasn't been
+        // rewritten so title and project association are unchanged.
+        auto cachedIt = m_metaCache.find(entry.filePath);
+        bool cacheHit = (cachedIt != m_metaCache.end() &&
+                         cachedIt->second.mtime == thisMtime &&
+                         thisMtime != 0);
+
+        if (cacheHit) {
+            entry.title       = cachedIt->second.title;
+            entry.projectId   = cachedIt->second.projectId;
+            entry.projectName = cachedIt->second.projectName;
+        }
+        else {
+            // Cache miss (new file, or rewritten since we last looked).
+            // Pull title + project_id + project_name out of the JSON by
+            // scanning lines for each key.  preserveInsertOrder=true in
+            // SaveToFile keeps these near the top, so this typically
+            // only reads the first handful of lines before exiting.
+            //
+            // We exit early once all three fields have been seen, OR
+            // the moment we hit a "messages" line — past that point the
+            // metadata fields can't appear anymore and we'd just be
+            // reading the body for nothing.
+            try {
+                std::ifstream file(path_safety::Utf8ToWide(entry.filePath), std::ios::in);
+                if (file.is_open()) {
+                    bool sawTitle = false, sawProjectId = false, sawProjectName = false;
+                    auto extractStringField = [](const std::string& line,
+                                                 const std::string& key,
+                                                 std::string& out) -> bool {
+                        std::string needle = "\"" + key + "\"";
+                        size_t keyPos = line.find(needle);
+                        if (keyPos == std::string::npos) return false;
+                        size_t colonPos = line.find(':', keyPos + needle.size());
+                        if (colonPos == std::string::npos) return false;
+                        size_t openQuote = line.find('"', colonPos + 1);
+                        if (openQuote == std::string::npos) return false;
+                        size_t end = openQuote + 1;
+                        while (end < line.size()) {
+                            if (line[end] == '"' && line[end - 1] != '\\') break;
+                            ++end;
+                        }
+                        if (end >= line.size()) return false;
+                        out = line.substr(openQuote + 1, end - openQuote - 1);
+                        return true;
+                    };
+
+                    std::string line;
+                    while (std::getline(file, line)) {
+                        if (line.find("\"messages\"") != std::string::npos) break;
+
+                        if (!sawTitle && extractStringField(line, "title", entry.title))
+                            sawTitle = true;
+                        if (!sawProjectId && extractStringField(line, "project_id", entry.projectId))
+                            sawProjectId = true;
+                        if (!sawProjectName && extractStringField(line, "project_name", entry.projectName))
+                            sawProjectName = true;
+
+                        if (sawTitle && sawProjectId && sawProjectName) break;
+                    }
+                }
+            }
+            catch (...) {
+                // Skip files we can't read
+            }
+
+            if (entry.title.empty()) {
+                entry.title = filename.ToUTF8().data();
+            }
+
+            // Populate cache for next refresh
+            m_metaCache[entry.filePath] = {
+                entry.title, entry.projectId, entry.projectName, thisMtime
+            };
+        }
 
         entries.push_back(entry);
         found = dir.GetNext(&filename);
+    }
+
+    // Prune cache entries for files that no longer exist. Not strictly
+    // required (stale entries cost ~200 bytes each) but keeps the cache
+    // bounded to what's actually on disk.
+    if (m_metaCache.size() > entries.size()) {
+        std::set<std::string> currentPaths;
+        for (const auto& e : entries)
+            currentPaths.insert(e.filePath);
+        for (auto it = m_metaCache.begin(); it != m_metaCache.end(); ) {
+            if (currentPaths.find(it->first) == currentPaths.end())
+                it = m_metaCache.erase(it);
+            else
+                ++it;
+        }
     }
 
     std::sort(entries.begin(), entries.end(),
@@ -456,6 +739,382 @@ ConversationSidebar::ScanConversations() const
         });
 
     return entries;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Project header — CRUD + collapse handling
+// ═══════════════════════════════════════════════════════════════════
+
+namespace {
+// Unicode geometric shapes used as collapse indicators.  Matches the
+// project status strip's monospace aesthetic; both glyphs are present
+// in Consolas, Cascadia Mono, DejaVu, and Segoe UI Symbol so we don't
+// need to ship a fallback font.
+constexpr const char* kTriangleExpanded  = "\xE2\x96\xBC";  // ▼
+constexpr const char* kTriangleCollapsed = "\xE2\x96\xB6";  // ▶
+
+// Squared distance threshold to consider a press-and-move a drag.
+// 5 px ⇒ 25 px².  Matches Win32 SM_CXDRAG/SM_CYDRAG defaults closely
+// enough that drags feel native without the extra GetSystemMetrics
+// plumbing.
+constexpr int kDragThresholdSq = 25;
+
+// ── Custom DnD payload format ────────────────────────────────────
+// Private clipboard format so external apps can't accidentally
+// accept these drops, and so we can't accidentally accept anything
+// they generate.  Payload is the chat file paths joined by '\n'
+// (conversation paths are generated by us under
+// ChatHistory::GetConversationsDir() and never contain newlines).
+const wxDataFormat& SidebarChatsFormat()
+{
+    static wxDataFormat fmt(wxString("application/x-llamaboss-chats"));
+    return fmt;
+}
+
+class ChatPathsDataObject : public wxCustomDataObject
+{
+public:
+    ChatPathsDataObject() : wxCustomDataObject(SidebarChatsFormat()) {}
+
+    void SetPaths(const std::vector<std::string>& paths)
+    {
+        std::string joined;
+        for (size_t i = 0; i < paths.size(); ++i) {
+            if (i > 0) joined += '\n';
+            joined += paths[i];
+        }
+        SetData(joined.size(), joined.data());
+    }
+
+    std::vector<std::string> GetPaths() const
+    {
+        std::vector<std::string> out;
+        const size_t n = GetSize();
+        if (n == 0) return out;
+        const char* data = static_cast<const char*>(GetData());
+        if (!data) return out;
+
+        std::string raw(data, n);
+        size_t start = 0;
+        while (start <= raw.size()) {
+            size_t nl = raw.find('\n', start);
+            std::string token = (nl == std::string::npos)
+                ? raw.substr(start)
+                : raw.substr(start, nl - start);
+            if (!token.empty()) out.push_back(token);
+            if (nl == std::string::npos) break;
+            start = nl + 1;
+        }
+        return out;
+    }
+};
+
+} // namespace
+
+// Drop target installed on each project header panel.  Lives at file
+// scope (rather than the anonymous namespace above) so the friend
+// declaration in conversation_sidebar.h can reference it by name.
+// The sidebar owns the actual logic; this class is just a wxWidgets-
+// shaped adapter that calls back into the sidebar with the dropped
+// paths.
+class HeaderDropTarget : public wxDropTarget
+{
+public:
+    HeaderDropTarget(ConversationSidebar* sb, std::string groupId)
+        : m_sidebar(sb)
+        , m_groupId(std::move(groupId))
+    {
+        // Drop target takes ownership of the data object and deletes
+        // it in its destructor.  We own one instance per target.
+        SetDataObject(new ChatPathsDataObject());
+    }
+
+    wxDragResult OnEnter(wxCoord, wxCoord, wxDragResult def) override
+    {
+        m_sidebar->OnDragHoverHeader(m_groupId, true);
+        return def;
+    }
+
+    wxDragResult OnDragOver(wxCoord, wxCoord, wxDragResult def) override
+    {
+        // Always allow a move — the sidebar knows how to skip no-ops
+        // (drops onto the chat's existing project become quiet
+        // skipped-counts in MoveChatsToProject's summary).
+        return def == wxDragNone ? wxDragNone : wxDragMove;
+    }
+
+    void OnLeave() override
+    {
+        m_sidebar->OnDragHoverHeader(m_groupId, false);
+    }
+
+    wxDragResult OnData(wxCoord, wxCoord, wxDragResult def) override
+    {
+        m_sidebar->OnDragHoverHeader(m_groupId, false);
+        if (!GetData()) return wxDragNone;
+
+        auto* obj = dynamic_cast<ChatPathsDataObject*>(GetDataObject());
+        if (!obj) return wxDragNone;
+
+        m_sidebar->OnChatsDroppedOnHeader(obj->GetPaths(), m_groupId);
+        return def;
+    }
+
+private:
+    ConversationSidebar* m_sidebar;  // Not owned
+    std::string          m_groupId;  // Real project id, or kUnassignedId
+};
+
+bool ConversationSidebar::IsGroupCollapsed(const std::string& groupId) const
+{
+    // While a search filter is active, every group renders expanded so
+    // FilterRows() can decide visibility per-row.  The user's persisted
+    // collapsed set is untouched and resumes effect when the filter clears.
+    if (!m_searchFilter.empty()) return false;
+    if (m_overrideExpandedGroups.count(groupId)) return false;
+    return m_collapsedGroups.count(groupId) != 0;
+}
+
+std::vector<std::string> ConversationSidebar::CollapsedGroupsAsVector() const
+{
+    return std::vector<std::string>(m_collapsedGroups.begin(),
+                                    m_collapsedGroups.end());
+}
+
+ConversationSidebar::HeaderWidgets
+ConversationSidebar::CreateProjectHeader(const std::string& groupId,
+                                         const std::string& displayName,
+                                         int chatCount,
+                                         bool collapsed)
+{
+    HeaderWidgets header;
+    header.groupId     = groupId;
+    header.displayName = displayName;
+    header.chatCount   = chatCount;
+    header.collapsed   = collapsed;
+
+    header.panel = new wxPanel(m_listWindow, wxID_ANY);
+    header.panel->SetBackgroundColour(m_theme->bgSidebar);
+    header.panel->SetCursor(wxCursor(wxCURSOR_HAND));
+
+    auto* sizer = new wxBoxSizer(wxHORIZONTAL);
+
+    // Monospace font matches the project status strip + the box-drawing
+    // sidebar idiom.  Bold weight keeps the section break visually
+    // distinct from chat titles.
+    wxFont monoFont(11, wxFONTFAMILY_TELETYPE, wxFONTSTYLE_NORMAL,
+                    wxFONTWEIGHT_BOLD, false, "Consolas");
+
+    header.triangle = new wxStaticText(header.panel, wxID_ANY,
+        wxString::FromUTF8(collapsed ? kTriangleCollapsed : kTriangleExpanded));
+    header.triangle->SetForegroundColour(m_theme->textMuted);
+    header.triangle->SetFont(monoFont);
+    header.triangle->SetCursor(wxCursor(wxCURSOR_HAND));
+    sizer->Add(header.triangle, 0,
+               wxALIGN_CENTER_VERTICAL | wxLEFT | wxTOP | wxBOTTOM, 8);
+
+    header.nameLabel = new wxStaticText(header.panel, wxID_ANY,
+        wxString::FromUTF8(displayName));
+    header.nameLabel->SetForegroundColour(m_theme->textPrimary);
+    header.nameLabel->SetFont(monoFont);
+    header.nameLabel->SetCursor(wxCursor(wxCURSOR_HAND));
+    sizer->Add(header.nameLabel, 0,
+               wxALIGN_CENTER_VERTICAL | wxLEFT | wxTOP | wxBOTTOM, 6);
+
+    // Count label is only populated when collapsed, but we always
+    // create the widget so toggling doesn't allocate/destroy.
+    header.countLabel = new wxStaticText(header.panel, wxID_ANY, "");
+    header.countLabel->SetForegroundColour(m_theme->textMuted);
+    header.countLabel->SetFont(monoFont);
+    header.countLabel->SetCursor(wxCursor(wxCURSOR_HAND));
+    sizer->Add(header.countLabel, 0,
+               wxALIGN_CENTER_VERTICAL | wxLEFT | wxTOP | wxBOTTOM, 4);
+
+    sizer->AddStretchSpacer(1);
+
+    header.panel->SetSizer(sizer);
+
+    // Update count label content based on initial state
+    UpdateProjectHeader(header, displayName, chatCount, collapsed);
+
+    // ── Click → toggle collapse ─────────────────────────────────
+    // Whole row is the hit target, including the triangle and the
+    // name label.  The lambda captures groupId by value so each
+    // header gets its own dedicated handler — no widget-tree walk
+    // and no fragile name-stash needed.
+    auto clickToggle = [this, groupId](wxMouseEvent&) {
+        OnProjectHeaderClicked(groupId);
+    };
+
+    header.panel->Bind(wxEVT_LEFT_UP, clickToggle);
+    header.triangle->Bind(wxEVT_LEFT_UP, clickToggle);
+    header.nameLabel->Bind(wxEVT_LEFT_UP, clickToggle);
+    header.countLabel->Bind(wxEVT_LEFT_UP, clickToggle);
+
+    // ── Right-click → header context menu ──────────────────────
+    // Frame builds the popup (Attach this chat / open folders /
+    // delete project).  Unassigned sections pass an empty groupId
+    // up so the frame can either show a slim menu or nothing.
+    const std::string contextId =
+        (groupId == kUnassignedId) ? std::string() : groupId;
+    auto rightClickMenu =
+        [this, contextId, panel = header.panel](wxMouseEvent&) {
+            if (m_callbacks.onProjectHeaderContextMenuRequested) {
+                m_callbacks.onProjectHeaderContextMenuRequested(contextId, panel);
+            }
+        };
+
+    header.panel->Bind(wxEVT_RIGHT_UP, rightClickMenu);
+    header.triangle->Bind(wxEVT_RIGHT_UP, rightClickMenu);
+    header.nameLabel->Bind(wxEVT_RIGHT_UP, rightClickMenu);
+    header.countLabel->Bind(wxEVT_RIGHT_UP, rightClickMenu);
+
+    // ── Drop target ─────────────────────────────────────────────
+    // Owned by the panel (wxWindow::SetDropTarget takes ownership).
+    // Unassigned sections receive drops too — that's how chats leave
+    // a project via DnD.  The OS routes drops over child static-text
+    // widgets up to the parent panel since the children have no drop
+    // target of their own.
+    header.panel->SetDropTarget(new HeaderDropTarget(this, groupId));
+
+    return header;
+}
+
+void ConversationSidebar::UpdateProjectHeader(HeaderWidgets& header,
+                                              const std::string& displayName,
+                                              int chatCount,
+                                              bool collapsed)
+{
+    header.chatCount = chatCount;
+
+    if (header.collapsed != collapsed) {
+        header.collapsed = collapsed;
+        if (header.triangle) {
+            header.triangle->SetLabel(wxString::FromUTF8(
+                collapsed ? kTriangleCollapsed : kTriangleExpanded));
+        }
+    }
+
+    if (header.displayName != displayName) {
+        header.displayName = displayName;
+        if (header.nameLabel) {
+            header.nameLabel->SetLabel(wxString::FromUTF8(displayName));
+        }
+    }
+
+    // Show "(N)" only while collapsed — when expanded, the rows
+    // themselves convey the count and the trailing number is noise.
+    if (header.countLabel) {
+        if (collapsed && chatCount > 0) {
+            std::string label = "  (" + std::to_string(chatCount) + ")";
+            header.countLabel->SetLabel(wxString::FromUTF8(label));
+        }
+        else {
+            header.countLabel->SetLabel("");
+        }
+    }
+
+    if (header.panel) {
+        header.panel->Layout();
+    }
+}
+
+void ConversationSidebar::RemoveProjectHeader(const std::string& groupId)
+{
+    auto it = m_projectHeaders.find(groupId);
+    if (it == m_projectHeaders.end()) return;
+
+    if (it->second.panel) {
+        m_listSizer->Detach(it->second.panel);
+        it->second.panel->Destroy();
+        it->second.panel = nullptr;
+    }
+}
+
+void ConversationSidebar::OnProjectHeaderClicked(const std::string& groupId)
+{
+    if (groupId.empty()) return;
+
+    if (m_collapsedGroups.count(groupId)) {
+        m_collapsedGroups.erase(groupId);
+    }
+    else {
+        m_collapsedGroups.insert(groupId);
+    }
+
+    if (m_callbacks.onCollapsedProjectsChanged) {
+        m_callbacks.onCollapsedProjectsChanged(CollapsedGroupsAsVector());
+    }
+
+    Refresh(m_activeFilePath);
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Drag-and-drop — internal handlers
+// ═══════════════════════════════════════════════════════════════════
+
+std::vector<std::string>
+ConversationSidebar::PathsForDragFrom(const std::string& path) const
+{
+    // If the row that started the drag is part of the multi-selection,
+    // drag everything that's selected.  If it isn't, drag only that
+    // one row — without disturbing the selection.  This matches the
+    // file-explorer convention users are already familiar with.
+    if (path.empty()) return {};
+
+    if (m_selected.count(path)) {
+        return std::vector<std::string>(m_selected.begin(), m_selected.end());
+    }
+    return { path };
+}
+
+void ConversationSidebar::MaybeStartDragFrom(const std::string& path,
+                                             wxWindow* origin)
+{
+    auto paths = PathsForDragFrom(path);
+    if (paths.empty()) return;
+
+    // wxDropSource needs the data object to outlive DoDragDrop; stack
+    // allocation is the simplest way to guarantee that.  The drop
+    // target on the receiving end has its own data-object instance
+    // that GetData() copies into — so the source's local object can
+    // safely vanish when this function returns.
+    ChatPathsDataObject obj;
+    obj.SetPaths(paths);
+
+    wxDropSource source(obj, origin ? origin : m_listWindow);
+    source.DoDragDrop(wxDrag_DefaultMove);
+    // We don't act on the result — the drop target invokes
+    // OnChatsDroppedOnHeader directly when a drop succeeds.
+}
+
+void ConversationSidebar::OnDragHoverHeader(const std::string& groupId,
+                                            bool hovering)
+{
+    auto it = m_projectHeaders.find(groupId);
+    if (it == m_projectHeaders.end() || !it->second.panel) return;
+
+    // Reuse sidebarHover for highlight — same color the chat rows
+    // use on mouse-over, so the visual language is consistent.
+    wxColour bg = hovering ? m_theme->sidebarHover : m_theme->bgSidebar;
+    it->second.panel->SetBackgroundColour(bg);
+    it->second.panel->Refresh();
+}
+
+void ConversationSidebar::OnChatsDroppedOnHeader(
+    const std::vector<std::string>& paths,
+    const std::string& groupId)
+{
+    if (!m_callbacks.onChatsDroppedOnProject) return;
+    if (paths.empty()) return;
+
+    // Translate the Unassigned sentinel back to the empty-string
+    // convention MoveChatsToProject already uses.  The frame doesn't
+    // know about kUnassignedId — keep that abstraction local.
+    const std::string targetId =
+        (groupId == kUnassignedId) ? std::string() : groupId;
+
+    m_callbacks.onChatsDroppedOnProject(paths, targetId);
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -491,7 +1150,11 @@ ConversationSidebar::CreateRow(const ConversationEntry& entry)
     titleFont.SetPointSize(11);
     titleFont.SetWeight(wxFONTWEIGHT_BOLD);
     row.titleLabel->SetFont(titleFont);
-    topSizer->Add(row.titleLabel, 1, wxLEFT | wxTOP, 8);
+    // Indented past the header triangle so chats sit visually under
+    // the project name.  The leading indent is intentionally larger
+    // than the header's triangle padding (8px) — chat titles align
+    // roughly under the project name's first character.
+    topSizer->Add(row.titleLabel, 1, wxLEFT | wxTOP, 24);
 
     // Trash icon — hidden by default, shown on hover
     row.deleteBtn = new wxStaticText(row.panel, wxID_ANY,
@@ -512,7 +1175,7 @@ ConversationSidebar::CreateRow(const ConversationEntry& entry)
     wxFont timeFont = row.timeLabel->GetFont();
     timeFont.SetPointSize(9);
     row.timeLabel->SetFont(timeFont);
-    panelSizer->Add(row.timeLabel, 0, wxLEFT | wxRIGHT | wxBOTTOM, 8);
+    panelSizer->Add(row.timeLabel, 0, wxLEFT | wxRIGHT | wxBOTTOM, 24);
 
     row.panel->SetSizer(panelSizer);
 
@@ -544,6 +1207,15 @@ ConversationSidebar::CreateRow(const ConversationEntry& entry)
                 });
             }
         }
+
+        // Park focus on the scrolled list itself.  Plain SetFocus() would
+        // redirect to the first focusable child (per wxPanel docs);
+        // SetFocusIgnoringChildren forces focus to actually land on
+        // m_listWindow.  This isn't strictly required for the Del-key
+        // shortcut (CHAR_HOOK on m_panel catches keys from any sidebar
+        // descendant) but it ensures focus stays inside the sidebar
+        // hierarchy after a click rather than wherever it was before.
+        m_listWindow->SetFocusIgnoringChildren();
     };
 
     row.panel->Bind(wxEVT_LEFT_UP, clickHandler);
@@ -562,6 +1234,10 @@ ConversationSidebar::CreateRow(const ConversationEntry& entry)
             RefreshAllRowBackgrounds();
         }
 
+        // See clickHandler above — park focus on the list so the Del-key
+        // CHAR_HOOK on m_panel will fire after the context menu closes.
+        m_listWindow->SetFocusIgnoringChildren();
+
         m_listWindow->CallAfter([this, path]() {
             ShowContextMenu(path);
         });
@@ -570,6 +1246,67 @@ ConversationSidebar::CreateRow(const ConversationEntry& entry)
     row.panel->Bind(wxEVT_RIGHT_UP, rightClickHandler);
     row.titleLabel->Bind(wxEVT_RIGHT_UP, rightClickHandler);
     row.timeLabel->Bind(wxEVT_RIGHT_UP, rightClickHandler);
+
+    // ── Drag initiation ─────────────────────────────────────────
+    // LEFT_DOWN records the press (and lets evt.Skip() carry through
+    // so LEFT_UP still fires for plain clicks).  MOTION compares
+    // distance against the threshold and kicks off DoDragDrop.
+    //
+    // We only stash the path here — actual drag payload (which paths
+    // travel) is decided at drag-start time so multi-selection
+    // changes between press and threshold-crossing are honored.
+    auto pressDown = [this, path = entry.filePath](wxMouseEvent& evt) {
+        m_dragState.pressActive = true;
+        m_dragState.pressPath   = path;
+        m_dragState.pressPoint  = evt.GetPosition();
+        evt.Skip();  // Don't suppress LEFT_UP click handling
+    };
+
+    auto pressMotion = [this](wxMouseEvent& evt) {
+        if (!m_dragState.pressActive) {
+            evt.Skip();
+            return;
+        }
+        if (!evt.LeftIsDown()) {
+            // Button released without us ever crossing the threshold
+            // (or a focus loss interrupted the press).  Bail out.
+            m_dragState.pressActive = false;
+            evt.Skip();
+            return;
+        }
+
+        const wxPoint cur = evt.GetPosition();
+        const int dx = cur.x - m_dragState.pressPoint.x;
+        const int dy = cur.y - m_dragState.pressPoint.y;
+        if (dx * dx + dy * dy < kDragThresholdSq) {
+            evt.Skip();
+            return;
+        }
+
+        // Past threshold — start drag.  Clear pressActive first so
+        // we don't re-enter from any motion events that fire while
+        // DoDragDrop is running.
+        const std::string fromPath = m_dragState.pressPath;
+        m_dragState.pressActive = false;
+
+        wxWindow* origin = dynamic_cast<wxWindow*>(evt.GetEventObject());
+        MaybeStartDragFrom(fromPath, origin);
+    };
+
+    auto pressEnd = [this](wxMouseEvent& evt) {
+        m_dragState.pressActive = false;
+        evt.Skip();
+    };
+
+    row.panel->Bind(wxEVT_LEFT_DOWN,  pressDown);
+    row.panel->Bind(wxEVT_MOTION,     pressMotion);
+    row.panel->Bind(wxEVT_LEFT_UP,    pressEnd);
+    row.titleLabel->Bind(wxEVT_LEFT_DOWN, pressDown);
+    row.titleLabel->Bind(wxEVT_MOTION,    pressMotion);
+    row.titleLabel->Bind(wxEVT_LEFT_UP,   pressEnd);
+    row.timeLabel->Bind(wxEVT_LEFT_DOWN,  pressDown);
+    row.timeLabel->Bind(wxEVT_MOTION,     pressMotion);
+    row.timeLabel->Bind(wxEVT_LEFT_UP,    pressEnd);
 
     // ── Trash icon click → delete this conversation ────────────
     row.deleteBtn->Bind(wxEVT_LEFT_UP, [this, panel = row.panel](wxMouseEvent&) {
@@ -677,35 +1414,32 @@ void ConversationSidebar::RemoveRow(const std::string& filePath)
 // ═══════════════════════════════════════════════════════════════════
 //  Internal — context menu for selected conversation(s)
 // ═══════════════════════════════════════════════════════════════════
+//
+// The sidebar no longer builds the menu itself.  It just hands the
+// selection (and an anchor window) up to the frame, which has the
+// project metadata it needs to build a Move-to-project submenu.
 
-void ConversationSidebar::ShowContextMenu(const std::string& /*filePath*/)
+void ConversationSidebar::ShowContextMenu(const std::string& filePath)
 {
-    wxMenu menu;
-
-    const bool isBusy = m_callbacks.isBusy && m_callbacks.isBusy();
-
-    wxMenuItem* deleteItem = nullptr;
-    size_t count = m_selected.size();
-    if (count <= 1) {
-        deleteItem = menu.Append(wxID_DELETE, "Delete conversation");
+    // Build the path list the frame will operate on.  If the
+    // right-clicked file is part of the current multi-selection we
+    // operate on all selected; otherwise we operate on just that one.
+    std::vector<std::string> paths;
+    if (!filePath.empty() && IsSelected(filePath) && m_selected.size() > 1) {
+        paths.assign(m_selected.begin(), m_selected.end());
+    }
+    else if (!filePath.empty()) {
+        paths.push_back(filePath);
     }
     else {
-        wxString label = wxString::Format("Delete %zu conversations", count);
-        deleteItem = menu.Append(wxID_DELETE, label);
+        paths.assign(m_selected.begin(), m_selected.end());
     }
 
-    if (deleteItem && isBusy) {
-        deleteItem->Enable(false);
+    if (paths.empty()) return;
+
+    if (m_callbacks.onChatContextMenuRequested) {
+        m_callbacks.onChatContextMenuRequested(paths, m_panel);
     }
-
-    menu.Bind(wxEVT_MENU, [this](wxCommandEvent&) {
-        if (m_callbacks.onDeleteRequested && !m_selected.empty()) {
-            std::vector<std::string> paths(m_selected.begin(), m_selected.end());
-            m_callbacks.onDeleteRequested(paths);
-        }
-    }, wxID_DELETE);
-
-    m_panel->PopupMenu(&menu);
 }
 
 // ═══════════════════════════════════════════════════════════════════

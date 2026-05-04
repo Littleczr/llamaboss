@@ -1,6 +1,6 @@
 // attachment_manager.h
 // Manages pending file and image attachments for chat messages.
-// Supports multiple simultaneous attachments (images + text files).
+// Supports multiple simultaneous attachments (images, text files, PDFs, and spreadsheets).
 // Owns attachment data and serialization logic; UI updates are
 // driven by a callback so this class has no wxWidgets dependency.
 
@@ -19,7 +19,7 @@ namespace Poco { class Logger; }
 // ═══════════════════════════════════════════════════════════════════
 
 struct AttachmentInfo {
-    enum class Kind { Image, TextFile };
+    enum class Kind { Image, TextFile, PdfFile, SpreadsheetFile, DocxFile };
     Kind        kind;
     std::string filename;     // "report.cpp", "photo.png"
     std::string mimeType;     // "text/x-c++src", "image/png"
@@ -38,7 +38,7 @@ struct AttachmentInfo {
 // ═══════════════════════════════════════════════════════════════════
 
 struct PendingAttachment {
-    enum class Type { Image, TextFile };
+    enum class Type { Image, TextFile, PdfFile, SpreadsheetFile, DocxFile };
     Type        type;
     std::string data;           // base64 for images, raw text for text files
     std::string name;           // display filename
@@ -68,6 +68,12 @@ public:
     bool AttachImageFromBase64(const std::string& base64,
                                const std::string& displayName);
     bool AttachTextFile(const std::string& filePath);
+    bool AttachPdfFile(const std::string& filePath,
+                       const std::string& toolRelativePath = std::string());
+    bool AttachSpreadsheetFile(const std::string& filePath,
+                               const std::string& toolRelativePath = std::string());
+    bool AttachDocxFile(const std::string& filePath,
+                        const std::string& toolRelativePath = std::string());
 
     // ── Remove / clear ────────────────────────────────────────────
 
@@ -79,6 +85,9 @@ public:
     bool   HasPending()  const { return !m_pending.empty(); }
     bool   HasImage()    const;    // true if any pending item is an image
     bool   HasTextFile() const;    // true if any pending item is a text file
+    bool   HasPdfFile()  const;    // true if any pending item is a PDF file
+    bool   HasSpreadsheetFile() const; // true if any pending item is a spreadsheet
+    bool   HasDocxFile()        const; // true if any pending item is a Word document
     size_t GetCount()    const { return m_pending.size(); }
 
     const PendingAttachment& GetAt(size_t index) const { return m_pending.at(index); }
@@ -101,6 +110,25 @@ public:
     // Images are skipped (they go through InjectImagesIntoRequest instead).
     std::string BakeTextFilesIntoMessage(const std::string& userText) const;
 
+    // Bakes PDF attachment routing hints into the message without dumping
+    // extracted PDF text into the visible chat. In agent mode this gives the
+    // model an exact pdf_extract_text tool path to call before answering.
+    std::string BakePdfFilesIntoMessage(const std::string& userText,
+                                        bool agentModeEnabled) const;
+
+    // Bakes spreadsheet routing hints into the message without dumping workbook
+    // cell data into the visible chat. In agent mode this gives the model an
+    // exact xlsx_inspect/xlsx_report tool path to use before answering.
+    std::string BakeSpreadsheetFilesIntoMessage(const std::string& userText,
+                                                bool agentModeEnabled) const;
+
+    // Bakes DOCX (Word document) routing hints into the message without
+    // dumping extracted text into the visible chat. In agent mode this gives
+    // the model an exact docx_extract_text / docx_inspect tool path to call
+    // before answering.
+    std::string BakeDocxFilesIntoMessage(const std::string& userText,
+                                         bool agentModeEnabled) const;
+
     // Injects ALL pending images into the Ollama /api/chat request JSON,
     // converting the last user message's "content" to a multimodal array.
     std::string InjectImagesIntoRequest(const std::string& requestJson) const;
@@ -122,6 +150,9 @@ public:
 
     static bool IsImageFile(const std::string& path);
     static bool IsTextFile(const std::string& path);
+    static bool IsPdfFile(const std::string& path);
+    static bool IsSpreadsheetFile(const std::string& path);
+    static bool IsDocxFile(const std::string& path);
     static std::string GuessMimeType(const std::string& filename);
 
     static constexpr size_t kMaxTextFileBytes = 100 * 1024;  // 100 KB

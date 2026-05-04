@@ -48,7 +48,14 @@ TopBarWidgets BuildTopBar(wxWindow* parent, wxBoxSizer* mainSizer,
     w.statusDot->SetCursor(wxCURSOR_HAND);
     pillSizer->Add(w.statusDot, 0, wxALIGN_CENTER_VERTICAL | wxLEFT, 10);
 
-    w.modelLabel = new wxStaticText(w.modelPill, wxID_ANY, "loading...");
+    w.modelLabel = new wxStaticText(
+        w.modelPill,
+        wxID_ANY,
+        "loading...",
+        wxDefaultPosition,
+        wxSize(360, -1),
+        wxST_ELLIPSIZE_MIDDLE
+    );
     w.modelLabel->SetForegroundColour(theme.textPrimary);
     w.modelLabel->SetCursor(wxCURSOR_HAND);
     wxFont modelFont = w.modelLabel->GetFont();
@@ -56,6 +63,36 @@ TopBarWidgets BuildTopBar(wxWindow* parent, wxBoxSizer* mainSizer,
     modelFont.SetWeight(wxFONTWEIGHT_BOLD);
     w.modelLabel->SetFont(modelFont);
     pillSizer->Add(w.modelLabel, 0, wxALIGN_CENTER_VERTICAL | wxLEFT, 6);
+
+    // ── Protocol chip (Phase 3b) ──
+    // Sits to the right of the model name showing "native" or "xml"
+    // once tool-protocol detection has completed for the active
+    // model.  Hidden until then, and hidden again across model
+    // switches.  Updated by MyFrame::OnToolProtocolDetected.
+    // Create the chip with a real initial string and a stable minimum
+    // width. On wxWidgets/MSW, a wxStaticText created with an empty label
+    // can keep a near-zero best size after SetLabel("native"), rendering as
+    // a tiny blue vertical artifact in the top bar. The label is cleared
+    // and hidden immediately below; UpdateProtocolChip() restores the text
+    // once protocol detection completes.
+    w.protocolChip = new wxStaticText(
+        w.modelPill,
+        wxID_ANY,
+        "native",
+        wxDefaultPosition,
+        wxSize(64, -1),
+        wxST_NO_AUTORESIZE
+    );
+    w.protocolChip->SetForegroundColour(theme.textMuted);
+    wxFont chipFont = w.protocolChip->GetFont();
+    chipFont.SetPointSize(10);
+    chipFont.SetWeight(wxFONTWEIGHT_NORMAL);
+    w.protocolChip->SetFont(chipFont);
+    w.protocolChip->SetMinSize(wxSize(64, -1));
+    w.protocolChip->SetLabel("");
+    w.protocolChip->Hide();
+    pillSizer->Add(w.protocolChip, 0, wxALIGN_CENTER_VERTICAL | wxLEFT, 8);
+
     pillSizer->AddSpacer(10);
 
     w.modelPill->SetSizer(pillSizer);

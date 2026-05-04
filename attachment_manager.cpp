@@ -5,10 +5,13 @@
 // Supports multiple simultaneous attachments.
 
 #include "attachment_manager.h"
+#include "path_safety.h"
 
 #include <fstream>
 #include <sstream>
 #include <algorithm>
+#include <cctype>
+#include <initializer_list>
 
 #include <Poco/Base64Encoder.h>
 #include <Poco/Base64Decoder.h>
@@ -21,6 +24,55 @@
 // Use wxFileName only for lightweight path queries (extension, existence, size).
 // No other wx UI dependency.
 #include <wx/filename.h>
+
+
+namespace {
+
+std::string LowerAscii(std::string s)
+{
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    return s;
+}
+
+bool ContainsAny(const std::string& haystack,
+                 std::initializer_list<const char*> needles)
+{
+    for (const char* n : needles) {
+        if (haystack.find(n) != std::string::npos)
+            return true;
+    }
+    return false;
+}
+
+bool LooksLikePdfFormFillRequest(const std::string& userText)
+{
+    const std::string t = LowerAscii(userText);
+
+    // High-confidence form-fill verbs. These should route attached PDFs to
+    // pdf_inspect_form -> pdf_fill_form, not to text extraction / drafting.
+    if (ContainsAny(t, {
+            "fill", "filled", "fill in", "complete this form",
+            "complete the form", "populate", "put this into the pdf",
+            "put it into the pdf", "pdf form", "form template"})) {
+        return true;
+    }
+
+    // Common disciplinary-template language Cesar uses with blank Allied forms.
+    // With an attached PDF, these usually mean "create the completed notice in
+    // the PDF", not "stop after a text draft".
+    if (ContainsAny(t, {
+            "write up", "write-up", "disciplinary notice", "disciplinary form",
+            "coaching", "counseling", "final warning", "written warning",
+            "facts", "expectation", "corrective action"})) {
+        return true;
+    }
+
+    return false;
+}
+
+} // namespace
 
 AttachmentManager::AttachmentManager(Poco::Logger* logger)
     : m_logger(logger)
@@ -96,7 +148,7 @@ bool AttachmentManager::AttachTextFile(const std::string& filePath)
     if (fileSize == wxInvalidSize || fileSize.GetValue() > kMaxTextFileBytes)
         return false;
 
-    std::ifstream ifs(filePath, std::ios::in);
+    std::ifstream ifs(path_safety::Utf8ToWide(filePath), std::ios::in);
     if (!ifs.is_open()) return false;
 
     std::ostringstream oss;
@@ -114,6 +166,103 @@ bool AttachmentManager::AttachTextFile(const std::string& filePath)
     if (m_logger)
         m_logger->information("Text file attached: " + m_pending.back().name +
             " (" + std::to_string(m_pending.back().data.size()) + " bytes)"
+            " [" + std::to_string(m_pending.size()) + " pending]");
+
+    NotifyChanged();
+    return true;
+}
+
+bool AttachmentManager::AttachPdfFile(const std::string& filePath,
+                                      const std::string& toolRelativePath)
+{
+    if (m_pending.size() >= kMaxAttachments) return false;
+
+    wxFileName fname(wxString::FromUTF8(filePath));
+    if (!fname.FileExists()) return false;
+    if (fname.GetExt().Lower() != "pdf") return false;
+
+    wxULongLong fileSize = fname.GetSize();
+
+    PendingAttachment item;
+    item.type         = PendingAttachment::Type::PdfFile;
+    // For PDFs, data is not raw file text. It is the safe relative tool arg
+    // for pdf_extract_text, prepared by MyFrame after importing to the cwd.
+    item.data         = toolRelativePath.empty()
+                      ? std::string(fname.GetFullName().ToUTF8().data())
+                      : toolRelativePath;
+    item.name         = std::string(fname.GetFullName().ToUTF8().data());
+    item.originalSize = (fileSize != wxInvalidSize)
+                      ? static_cast<size_t>(fileSize.GetValue()) : 0;
+    m_pending.push_back(std::move(item));
+
+    if (m_logger)
+        m_logger->information("PDF attached: " + m_pending.back().name +
+            " -> pdf_extract_text arg: " + m_pending.back().data +
+            " [" + std::to_string(m_pending.size()) + " pending]");
+
+    NotifyChanged();
+    return true;
+}
+
+bool AttachmentManager::AttachSpreadsheetFile(const std::string& filePath,
+                                               const std::string& toolRelativePath)
+{
+    if (m_pending.size() >= kMaxAttachments) return false;
+
+    wxFileName fname(wxString::FromUTF8(filePath));
+    if (!fname.FileExists()) return false;
+    if (fname.GetExt().Lower() != "xlsx") return false;
+
+    wxULongLong fileSize = fname.GetSize();
+
+    PendingAttachment item;
+    item.type         = PendingAttachment::Type::SpreadsheetFile;
+    // For spreadsheets, data is the safe relative tool arg for xlsx_inspect
+    // and xlsx_report, prepared by MyFrame after importing to the cwd.
+    item.data         = toolRelativePath.empty()
+                      ? std::string(fname.GetFullName().ToUTF8().data())
+                      : toolRelativePath;
+    item.name         = std::string(fname.GetFullName().ToUTF8().data());
+    item.originalSize = (fileSize != wxInvalidSize)
+                      ? static_cast<size_t>(fileSize.GetValue()) : 0;
+    m_pending.push_back(std::move(item));
+
+    if (m_logger)
+        m_logger->information("Spreadsheet attached: " + m_pending.back().name +
+            " -> xlsx tool arg: " + m_pending.back().data +
+            " [" + std::to_string(m_pending.size()) + " pending]");
+
+    NotifyChanged();
+    return true;
+}
+
+bool AttachmentManager::AttachDocxFile(const std::string& filePath,
+                                       const std::string& toolRelativePath)
+{
+    if (m_pending.size() >= kMaxAttachments) return false;
+
+    wxFileName fname(wxString::FromUTF8(filePath));
+    if (!fname.FileExists()) return false;
+    wxString ext = fname.GetExt().Lower();
+    if (ext != "docx" && ext != "docm") return false;
+
+    wxULongLong fileSize = fname.GetSize();
+
+    PendingAttachment item;
+    item.type         = PendingAttachment::Type::DocxFile;
+    // For DOCX, data is the safe relative tool arg for docx_extract_text /
+    // docx_inspect, prepared by MyFrame after importing to the cwd.
+    item.data         = toolRelativePath.empty()
+                      ? std::string(fname.GetFullName().ToUTF8().data())
+                      : toolRelativePath;
+    item.name         = std::string(fname.GetFullName().ToUTF8().data());
+    item.originalSize = (fileSize != wxInvalidSize)
+                      ? static_cast<size_t>(fileSize.GetValue()) : 0;
+    m_pending.push_back(std::move(item));
+
+    if (m_logger)
+        m_logger->information("DOCX attached: " + m_pending.back().name +
+            " -> docx tool arg: " + m_pending.back().data +
             " [" + std::to_string(m_pending.size()) + " pending]");
 
     NotifyChanged();
@@ -166,6 +315,27 @@ bool AttachmentManager::HasTextFile() const
     return false;
 }
 
+bool AttachmentManager::HasPdfFile() const
+{
+    for (const auto& item : m_pending)
+        if (item.type == PendingAttachment::Type::PdfFile) return true;
+    return false;
+}
+
+bool AttachmentManager::HasSpreadsheetFile() const
+{
+    for (const auto& item : m_pending)
+        if (item.type == PendingAttachment::Type::SpreadsheetFile) return true;
+    return false;
+}
+
+bool AttachmentManager::HasDocxFile() const
+{
+    for (const auto& item : m_pending)
+        if (item.type == PendingAttachment::Type::DocxFile) return true;
+    return false;
+}
+
 std::string AttachmentManager::GetDisplayLabel() const
 {
     if (m_pending.empty()) return "";
@@ -174,8 +344,13 @@ std::string AttachmentManager::GetDisplayLabel() const
         const auto& item = m_pending[0];
         if (item.type == PendingAttachment::Type::Image)
             return "  \xF0\x9F\x96\xBC  " + item.name;   // 🖼
-        else
+        if (item.type == PendingAttachment::Type::SpreadsheetFile)
+            return "  \xF0\x9F\x93\x8A  " + item.name;   // 📊
+        if (item.type == PendingAttachment::Type::PdfFile)
             return "  \xF0\x9F\x93\x84  " + item.name;   // 📄
+        if (item.type == PendingAttachment::Type::DocxFile)
+            return "  \xF0\x9F\x93\x84  " + item.name;   // 📄
+        return "  \xF0\x9F\x93\x84  " + item.name;       // 📄
     }
 
     // Multiple items — show paperclip + count + abbreviated file list
@@ -205,9 +380,16 @@ std::vector<AttachmentInfo> AttachmentManager::GetAttachmentInfo() const
 
     for (const auto& item : m_pending) {
         AttachmentInfo info;
-        info.kind     = (item.type == PendingAttachment::Type::Image)
-                        ? AttachmentInfo::Kind::Image
-                        : AttachmentInfo::Kind::TextFile;
+        if (item.type == PendingAttachment::Type::Image)
+            info.kind = AttachmentInfo::Kind::Image;
+        else if (item.type == PendingAttachment::Type::PdfFile)
+            info.kind = AttachmentInfo::Kind::PdfFile;
+        else if (item.type == PendingAttachment::Type::SpreadsheetFile)
+            info.kind = AttachmentInfo::Kind::SpreadsheetFile;
+        else if (item.type == PendingAttachment::Type::DocxFile)
+            info.kind = AttachmentInfo::Kind::DocxFile;
+        else
+            info.kind = AttachmentInfo::Kind::TextFile;
         info.filename = item.name;
         info.mimeType = GuessMimeType(item.name);
         info.byteSize = item.originalSize;
@@ -237,6 +419,132 @@ std::string AttachmentManager::BakeTextFilesIntoMessage(const std::string& userT
     return baked + userText;
 }
 
+std::string AttachmentManager::BakePdfFilesIntoMessage(const std::string& userText,
+                                                       bool agentModeEnabled) const
+{
+    // PDFs should feel like image attachments in the composer: the user sees
+    // a small chip/filename, not a wall of extracted text.  The model still
+    // needs a safe route to the contents, so we quietly add tool-routing
+    // instructions to the request text.  Important polish: form-fill requests
+    // should route to pdf_inspect_form -> pdf_fill_form, not stop at a review
+    // text draft after pdf_extract_text.
+    std::string baked;
+    const bool likelyFormFill = LooksLikePdfFormFillRequest(userText);
+
+    for (const auto& item : m_pending) {
+        if (item.type != PendingAttachment::Type::PdfFile) continue;
+
+        baked += "[Attached PDF: " + item.name + "]\n";
+        baked += "Safe pdf_extract_text tool argument: " + item.data + "\n";
+        baked += "Safe pdf_inspect_form tool argument: " + item.data + "\n";
+        baked += "Safe pdf_fill_form first-line argument: " + item.data + "\n";
+
+        if (agentModeEnabled) {
+            if (likelyFormFill) {
+                baked += "This appears to be a PDF form-fill request. First call "
+                         "pdf_inspect_form with exactly this args value: " + item.data + "\n";
+                baked += "After pdf_inspect_form returns exact field names, call "
+                         "pdf_fill_form using this PDF path on the first line and a JSON "
+                         "field map on the remaining lines. Do not create an intermediate "
+                         ".txt draft, do not ask the user to review before filling, and do "
+                         "not stop after pdf_extract_text unless the PDF has no fillable "
+                         "AcroForm fields.\n";
+            } else {
+                baked += "When the user's request depends on this PDF's text contents, "
+                         "call the pdf_extract_text tool with exactly this args value "
+                         "before answering: " + item.data + "\n";
+                baked += "Do not claim you have read this PDF until its text has been extracted.\n";
+            }
+        } else {
+            if (likelyFormFill) {
+                baked += "PDF form filling is not available in this non-agent request. Tell "
+                         "the user to enable Agent mode or run /pdf_inspect_form first, then "
+                         "/pdf_fill_form with the exact fields.\n";
+            } else {
+                baked += "PDF text is not embedded in this non-agent request. If the user "
+                         "needs the contents, tell them to enable Agent mode or run: "
+                         "/pdf_extract_text " + item.data + "\n";
+            }
+        }
+
+        baked += "\n";
+    }
+
+    if (baked.empty()) return userText;
+    return baked + userText;
+}
+
+std::string AttachmentManager::BakeSpreadsheetFilesIntoMessage(const std::string& userText,
+                                                               bool agentModeEnabled) const
+{
+    // Spreadsheets should feel like image/PDF attachments in the composer: the
+    // user sees a chip/filename, not raw workbook data. The model gets a safe
+    // tool route to inspect or report on the workbook only when needed.
+    std::string baked;
+
+    for (const auto& item : m_pending) {
+        if (item.type != PendingAttachment::Type::SpreadsheetFile) continue;
+
+        baked += "[Attached spreadsheet: " + item.name + "]\n";
+        baked += "Safe xlsx_inspect/xlsx_report tool argument: " + item.data + "\n";
+        baked += "Do not claim you have read this workbook until it has been inspected.\n";
+
+        if (agentModeEnabled) {
+            baked += "When the user's request depends on this workbook's contents, "
+                     "call the xlsx_inspect tool with exactly this args value before "
+                     "answering: " + item.data + "\n";
+            baked += "Only call xlsx_report if the user specifically asks for a Markdown "
+                     "report/artifact; xlsx_report requires approval.\n";
+        } else {
+            baked += "Workbook data is not embedded in this non-agent request. If the user "
+                     "needs the contents, tell them to enable Agent mode or run: "
+                     "/xlsx_inspect " + item.data + "\n";
+        }
+
+        baked += "\n";
+    }
+
+    if (baked.empty()) return userText;
+    return baked + userText;
+}
+
+std::string AttachmentManager::BakeDocxFilesIntoMessage(const std::string& userText,
+                                                        bool agentModeEnabled) const
+{
+    // DOCX should feel like image/PDF attachments in the composer: the user
+    // sees a chip/filename, not extracted document text. The model gets a
+    // safe tool route to inspect or extract from the document only when
+    // needed.
+    std::string baked;
+
+    for (const auto& item : m_pending) {
+        if (item.type != PendingAttachment::Type::DocxFile) continue;
+
+        baked += "[Attached Word document: " + item.name + "]\n";
+        baked += "Safe docx_extract_text/docx_inspect tool argument: " + item.data + "\n";
+        baked += "Do not claim you have read this document until it has been extracted or inspected.\n";
+
+        if (agentModeEnabled) {
+            baked += "When the user's request depends on this document's contents (summary, "
+                     "what it says, who it's about, what action is listed), call the "
+                     "docx_extract_text tool with exactly this args value before answering: "
+                     + item.data + "\n";
+            baked += "Use docx_inspect instead when the user only needs structure overview "
+                     "(heading list, table count, section count); docx_inspect is read-only "
+                     "and does not require approval.\n";
+        } else {
+            baked += "Document text is not embedded in this non-agent request. If the user "
+                     "needs the contents, tell them to enable Agent mode or run: "
+                     "/docx_extract_text " + item.data + "\n";
+        }
+
+        baked += "\n";
+    }
+
+    if (baked.empty()) return userText;
+    return baked + userText;
+}
+
 std::string AttachmentManager::InjectImagesIntoRequest(const std::string& requestJson) const
 {
     // Count pending images — bail early if none
@@ -255,7 +563,22 @@ std::string AttachmentManager::InjectImagesIntoRequest(const std::string& reques
             for (int i = static_cast<int>(messages->size()) - 1; i >= 0; --i) {
                 auto msg = messages->getObject(i);
                 if (msg->getValue<std::string>("role") == "user") {
-                    std::string textContent = msg->getValue<std::string>("content");
+                    // Defensive: only inject if content is still a plain
+                    // string. If something upstream already converted it
+                    // to an array (e.g. a future caller), bail out with a
+                    // log rather than throwing from getValue<string>.
+                    if (!msg->has("content") || msg->isNull("content")) {
+                        if (m_logger)
+                            m_logger->warning("InjectImagesIntoRequest: user message has no content; skipping injection");
+                        break;
+                    }
+                    auto contentVar = msg->get("content");
+                    if (!contentVar.isString()) {
+                        if (m_logger)
+                            m_logger->warning("InjectImagesIntoRequest: user content is not a string (already structured?); skipping injection");
+                        break;
+                    }
+                    std::string textContent = contentVar.convert<std::string>();
 
                     // Build OpenAI-style content array with all images + text.
                     Poco::JSON::Array::Ptr contentArray = new Poco::JSON::Array;
@@ -319,8 +642,19 @@ bool AttachmentManager::SaveImagesToDisk(const std::string& attachDir,
         const auto& item = m_pending[i];
         if (item.type != PendingAttachment::Type::Image) continue;
 
-        // Build base filename: "{messageIndex}_{originalName}"
-        std::string baseFilename = std::to_string(messageIndex) + "_" + item.name;
+        // Sanitize the original filename before letting it flow into
+        // the on-disk path.  item.name comes from a user-dropped or
+        // user-pasted attachment, so the threat surface is narrower
+        // than a model-emitted name — but the bug class is the same
+        // (path separators, traversal tokens, Windows-invalid chars,
+        // reserved device names, trailing dots) and routing every
+        // disk-write through the same sanitizer keeps the rules
+        // uniform across producers.
+        std::string safeName = path_safety::SanitizeFilename(
+            item.name, "image");
+
+        // Build base filename: "{messageIndex}_{safeName}"
+        std::string baseFilename = std::to_string(messageIndex) + "_" + safeName;
 
         // Deduplicate: if this name is already used, insert a suffix.
         // "2_photo.png" → "2_photo_2.png", "2_photo_3.png", ...
@@ -346,7 +680,7 @@ bool AttachmentManager::SaveImagesToDisk(const std::string& attachDir,
             std::istringstream base64Stream(item.data);
             Poco::Base64Decoder decoder(base64Stream);
 
-            std::ofstream outFile(fullPath, std::ios::binary);
+            std::ofstream outFile(path_safety::Utf8ToWide(fullPath), std::ios::binary);
             if (!outFile.is_open()) {
                 allOk = false;
                 if (m_logger)
@@ -387,16 +721,56 @@ bool AttachmentManager::IsImageFile(const std::string& path)
            ext == "gif" || ext == "bmp" || ext == "webp";
 }
 
-bool AttachmentManager::IsTextFile(const std::string& path)
+bool AttachmentManager::IsPdfFile(const std::string& path)
 {
     wxString ext = wxFileName(wxString::FromUTF8(path)).GetExt().Lower();
-    return ext == "txt" || ext == "md"   || ext == "json" ||
-           ext == "cpp" || ext == "h"    || ext == "hpp"  ||
-           ext == "py"  || ext == "js"   || ext == "ts"   ||
-           ext == "css" || ext == "html" || ext == "xml"  ||
-           ext == "yaml"|| ext == "yml"  || ext == "toml" ||
-           ext == "csv" || ext == "log"  || ext == "ini"  ||
-           ext == "cfg" || ext == "sh"   || ext == "bat";
+    return ext == "pdf";
+}
+
+bool AttachmentManager::IsSpreadsheetFile(const std::string& path)
+{
+    wxString ext = wxFileName(wxString::FromUTF8(path)).GetExt().Lower();
+    return ext == "xlsx";
+}
+
+bool AttachmentManager::IsDocxFile(const std::string& path)
+{
+    wxString ext = wxFileName(wxString::FromUTF8(path)).GetExt().Lower();
+    return ext == "docx" || ext == "docm";
+}
+
+bool AttachmentManager::IsTextFile(const std::string& path)
+{
+    wxFileName fn(wxString::FromUTF8(path));
+    wxString ext = fn.GetExt().Lower();
+
+    // ── Extension-based match ─────────────────────────────────────
+    if (ext == "txt" || ext == "md"   || ext == "json" ||
+        ext == "cpp" || ext == "h"    || ext == "hpp"  ||
+        ext == "py"  || ext == "js"   || ext == "ts"   ||
+        ext == "css" || ext == "html" || ext == "xml"  ||
+        ext == "yaml"|| ext == "yml"  || ext == "toml" ||
+        ext == "csv" || ext == "log"  || ext == "ini"  ||
+        ext == "cfg" || ext == "sh"   || ext == "bat"  ||
+        // Additional language / framework extensions
+        ext == "tsx" || ext == "jsx"  ||
+        ext == "rs"  || ext == "go"   || ext == "java" ||
+        ext == "kt"  || ext == "swift"|| ext == "rb"   ||
+        ext == "php" || ext == "sql"  || ext == "dockerfile")
+        return true;
+
+    // ── Dotfile / extensionless cases ─────────────────────────────
+    // wxFileName splits ".env" differently across platforms (sometimes
+    // name=".env" ext="" , sometimes name="" ext="env"), so the
+    // extension path above *may* already have matched — this is the
+    // belt-and-suspenders fallback that also catches "Dockerfile" and
+    // similar extensionless conventions.
+    wxString full = fn.GetFullName().Lower();
+    if (full == ".env"       || full == ".gitignore" ||
+        full == "dockerfile")
+        return true;
+
+    return false;
 }
 
 std::string AttachmentManager::GuessMimeType(const std::string& filename)
@@ -406,6 +780,9 @@ std::string AttachmentManager::GuessMimeType(const std::string& filename)
     if (dot == std::string::npos) return "application/octet-stream";
     std::string ext = filename.substr(dot + 1);
     for (auto& c : ext) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+
+    if (ext == "pdf")                return "application/pdf";
+    if (ext == "xlsx")               return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
 
     // Images
     if (ext == "png")                return "image/png";
@@ -428,8 +805,8 @@ std::string AttachmentManager::GuessMimeType(const std::string& filename)
     if (ext == "sh" || ext == "bat") return "text/plain";
     if (ext == "cpp" || ext == "h" || ext == "hpp") return "text/x-c++src";
     if (ext == "py")                 return "text/x-python";
-    if (ext == "js")                 return "text/javascript";
-    if (ext == "ts")                 return "text/typescript";
+    if (ext == "js"  || ext == "jsx") return "text/javascript";
+    if (ext == "ts"  || ext == "tsx") return "text/typescript";
 
     return "application/octet-stream";
 }
@@ -445,16 +822,18 @@ void AttachmentManager::NotifyChanged()
 
 std::string AttachmentManager::FileToBase64(const std::string& filePath)
 {
-    std::ifstream file(filePath, std::ios::binary);
+    std::ifstream file(path_safety::Utf8ToWide(filePath), std::ios::binary);
     if (!file.is_open()) return "";
 
     std::ostringstream base64Stream;
     Poco::Base64Encoder encoder(base64Stream);
+    // Disable Poco's default 72-char line breaks. With no newlines in the
+    // output we can return the stream contents directly, saving an O(n)
+    // whitespace-strip pass on top of the already-allocated base64 buffer
+    // (noticeable on multi-MB images).
+    encoder.rdbuf()->setLineLength(0);
     encoder << file.rdbuf();
     encoder.close();
 
-    std::string result = base64Stream.str();
-    result.erase(std::remove_if(result.begin(), result.end(), ::isspace),
-                 result.end());
-    return result;
+    return base64Stream.str();
 }

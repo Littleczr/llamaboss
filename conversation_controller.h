@@ -24,6 +24,12 @@ class ConversationController
 public:
     struct Callbacks {
         std::function<bool()>  isBusy;
+
+        // Fired at the end of UpdateWindowTitle().  The frame uses this
+        // to refresh the project status strip alongside the title, so
+        // every existing UpdateWindowTitle() call site automatically
+        // keeps the strip in sync.
+        std::function<void()>  onProjectStateChanged;
     };
 
     ConversationController(wxFrame& frame,

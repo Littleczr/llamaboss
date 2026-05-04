@@ -7,6 +7,7 @@
 #include "model_manager.h"
 #include "server_manager.h"
 #include "theme.h"
+#include "widgets.h"   // ApplyDialogThemeRecursive, ApplyDarkTitleBar
 
 #include <wx/filename.h>
 #include <wx/msgdlg.h>
@@ -44,81 +45,128 @@ wxBEGIN_EVENT_TABLE(ModelManagerDialog, wxDialog)
 wxEND_EVENT_TABLE()
 
 ModelManagerDialog::ModelManagerDialog(wxWindow* parent, const ThemeData* theme)
-    : wxDialog(parent, wxID_ANY, "Manage Models", wxDefaultPosition, wxSize(560, 400),
+    : wxDialog(parent, wxID_ANY, "Manage Models", wxDefaultPosition, wxSize(600, 440),
                wxDEFAULT_DIALOG_STYLE | wxRESIZE_BORDER)
     , m_theme(theme)
 {
     CreateControls();
     RefreshModelList();
+
+    if (m_theme)
+        ApplyDarkTitleBar(this, m_theme->name != "light");
+
+    Centre();
 }
 
 void ModelManagerDialog::CreateControls()
 {
-    auto* mainSizer = new wxBoxSizer(wxVERTICAL);
+    auto* rootSizer = new wxBoxSizer(wxVERTICAL);
 
-    // ── Header ─────────────────────────────────────────────────────
-    auto* headerLabel = new wxStaticText(this, wxID_ANY,
+    // Body panel gives us consistent padding around everything
+    auto* body = new wxPanel(this, wxID_ANY);
+    auto* bodySizer = new wxBoxSizer(wxVERTICAL);
+
+    // ── Header: muted folder path line ──────────────────────────
+    auto* headerLabel = new wxStaticText(body, wxID_ANY,
         "Models folder: " + ServerManager::GetModelsDir());
     wxFont hf = headerLabel->GetFont();
     hf.SetPointSize(9);
     headerLabel->SetFont(hf);
-    mainSizer->Add(headerLabel, 0, wxALL, 5);
+    bodySizer->Add(headerLabel, 0, wxBOTTOM, 10);
 
-    // ── Model list ─────────────────────────────────────────────────
-    m_modelList = new wxListCtrl(this, wxID_ANY, wxDefaultPosition, wxSize(-1, 220),
-                                 wxLC_REPORT | wxLC_SINGLE_SEL);
-    m_modelList->AppendColumn("Model", wxLIST_FORMAT_LEFT, 320);
-    m_modelList->AppendColumn("Size", wxLIST_FORMAT_RIGHT, 100);
-    mainSizer->Add(m_modelList, 1, wxEXPAND | wxLEFT | wxRIGHT, 5);
+    // ── Model list ──────────────────────────────────────────────
+    m_modelList = new wxListCtrl(body, wxID_ANY, wxDefaultPosition, wxSize(-1, 240),
+                                 wxLC_REPORT | wxLC_SINGLE_SEL | wxBORDER_NONE);
+    m_modelList->AppendColumn("Model", wxLIST_FORMAT_LEFT,  360);
+    m_modelList->AppendColumn("Size",  wxLIST_FORMAT_RIGHT, 100);
+    bodySizer->Add(m_modelList, 1, wxEXPAND | wxBOTTOM, 10);
 
-    // ── Action buttons ─────────────────────────────────────────────
+    // ── Action row: Delete (destructive), Refresh (neutral), Open (neutral) ──
     auto* actionSizer = new wxBoxSizer(wxHORIZONTAL);
-    m_deleteButton  = new wxButton(this, ID_MM_DELETE,     "Delete Selected");
-    m_refreshButton = new wxButton(this, ID_MM_REFRESH,    "Refresh");
-    auto* openBtn   = new wxButton(this, ID_MM_OPENFOLDER, "Open Folder");
+    m_deleteButton  = new wxButton(body, ID_MM_DELETE, "Delete Selected",
+        wxDefaultPosition, wxSize(-1, 30), wxBORDER_NONE);
+    m_refreshButton = new wxButton(body, ID_MM_REFRESH, "Refresh",
+        wxDefaultPosition, wxSize(-1, 30), wxBORDER_NONE);
+    auto* openBtn   = new wxButton(body, ID_MM_OPENFOLDER, "Open Folder",
+        wxDefaultPosition, wxSize(-1, 30), wxBORDER_NONE);
 
-    actionSizer->Add(m_deleteButton, 0, wxRIGHT, 5);
-    actionSizer->Add(m_refreshButton, 0, wxRIGHT, 5);
+    wxFont btnFont = m_deleteButton->GetFont();
+    btnFont.SetPointSize(9);
+    m_deleteButton->SetFont(btnFont);
+    m_refreshButton->SetFont(btnFont);
+    openBtn->SetFont(btnFont);
+
+    actionSizer->Add(m_deleteButton, 0, wxRIGHT, 6);
+    actionSizer->Add(m_refreshButton, 0, wxRIGHT, 6);
     actionSizer->AddStretchSpacer();
     actionSizer->Add(openBtn, 0);
-    mainSizer->Add(actionSizer, 0, wxEXPAND | wxALL, 5);
+    bodySizer->Add(actionSizer, 0, wxEXPAND | wxBOTTOM, 10);
 
-    // ── Status ─────────────────────────────────────────────────────
-    m_statusText = new wxStaticText(this, wxID_ANY, "");
-    mainSizer->Add(m_statusText, 0, wxALL, 5);
-
-    // ── Hint ───────────────────────────────────────────────────────
-    auto* hintText = new wxStaticText(this, wxID_ANY,
-        "To add models, download .gguf files and place them in the models folder.");
-    wxFont sf = hintText->GetFont();
+    // ── Status line ──────────────────────────────────────────────
+    m_statusText = new wxStaticText(body, wxID_ANY, "");
+    wxFont sf = m_statusText->GetFont();
     sf.SetPointSize(9);
-    sf.SetStyle(wxFONTSTYLE_ITALIC);
-    hintText->SetFont(sf);
-    mainSizer->Add(hintText, 0, wxLEFT | wxRIGHT | wxBOTTOM, 5);
+    m_statusText->SetFont(sf);
+    bodySizer->Add(m_statusText, 0, wxBOTTOM, 4);
 
-    // ── Close button ──────────────────────────────────────────────
-    auto* closeSizer = new wxBoxSizer(wxHORIZONTAL);
-    closeSizer->AddStretchSpacer();
-    closeSizer->Add(new wxButton(this, wxID_CLOSE, "Close"), 0);
-    mainSizer->Add(closeSizer, 0, wxEXPAND | wxALL, 5);
+    // ── Hint ─────────────────────────────────────────────────────
+    auto* hintText = new wxStaticText(body, wxID_ANY,
+        "To add models, download .gguf files and place them in the models folder.");
+    wxFont hint = hintText->GetFont();
+    hint.SetPointSize(9);
+    hint.SetStyle(wxFONTSTYLE_ITALIC);
+    hintText->SetFont(hint);
+    bodySizer->Add(hintText, 0, wxBOTTOM, 4);
 
-    SetSizer(mainSizer);
+    body->SetSizer(bodySizer);
+    rootSizer->Add(body, 1, wxEXPAND | wxALL, 18);
 
-    // ── Apply theme colors ───────────────────────────────────────
+    // ── Footer: Close button ─────────────────────────────────────
+    auto* footer = new wxPanel(this, wxID_ANY);
+    auto* footSizer = new wxBoxSizer(wxHORIZONTAL);
+    footSizer->AddStretchSpacer();
+    auto* closeBtn = new wxButton(footer, wxID_CLOSE, "Close",
+        wxDefaultPosition, wxSize(90, 32), wxBORDER_NONE);
+    wxFont cbf = closeBtn->GetFont();
+    cbf.SetPointSize(9);
+    cbf.SetWeight(wxFONTWEIGHT_SEMIBOLD);
+    closeBtn->SetFont(cbf);
+    footSizer->Add(closeBtn, 0);
+    footer->SetSizer(footSizer);
+    rootSizer->Add(footer, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 18);
+
+    SetSizer(rootSizer);
+    closeBtn->SetDefault();
+
+    // ═════════════════════════════════════════════════════════════
+    //  Apply theme
+    // ═════════════════════════════════════════════════════════════
     if (m_theme) {
-        SetBackgroundColour(m_theme->bgToolbar);
+        const ThemeData& t = *m_theme;
 
-        for (auto* child : GetChildren()) {
-            if (auto* lbl = dynamic_cast<wxStaticText*>(child)) {
-                lbl->SetForegroundColour(m_theme->textPrimary);
-            } else if (auto* btn = dynamic_cast<wxButton*>(child)) {
-                btn->SetBackgroundColour(m_theme->modelPillBg);
-                btn->SetForegroundColour(m_theme->textPrimary);
-            }
-        }
+        SetBackgroundColour(t.bgMain);
+        body->SetBackgroundColour(t.bgMain);
+        footer->SetBackgroundColour(t.bgMain);
 
-        m_modelList->SetBackgroundColour(m_theme->sidebarSelected);
-        m_modelList->SetForegroundColour(m_theme->textPrimary);
+        // Recursively paint labels + neutral buttons
+        ApplyDialogThemeRecursive(this, t.textPrimary, t.bgInputField, t.textPrimary);
+
+        // Header + hint + status = muted text
+        headerLabel->SetForegroundColour(t.textMuted);
+        m_statusText->SetForegroundColour(t.textMuted);
+        hintText->SetForegroundColour(t.textMuted);
+
+        // List control — input-field surface with primary text
+        m_modelList->SetBackgroundColour(t.bgInputField);
+        m_modelList->SetForegroundColour(t.textPrimary);
+
+        // Delete button is destructive — stopButton red
+        m_deleteButton->SetBackgroundColour(t.stopButton);
+        m_deleteButton->SetForegroundColour(t.stopButtonText);
+
+        // Close button is the primary footer action — accent blue
+        closeBtn->SetBackgroundColour(t.accentButton);
+        closeBtn->SetForegroundColour(t.accentButtonText);
     }
 }
 
@@ -127,7 +175,7 @@ void ModelManagerDialog::RefreshModelList()
     m_modelList->DeleteAllItems();
     m_modelPaths.clear();
 
-    auto models = ServerManager::ScanModels();
+    auto models = ServerManager::ScanModelPaths();
 
     long row = 0;
     for (const auto& path : models) {
