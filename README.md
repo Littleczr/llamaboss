@@ -6,6 +6,10 @@ tools.
 
 > Current milestone: **LlamaBoss Beta v0.1.0**
 
+<p align="center">
+  <img src="screenshot_beta_v0.1.0.jpg" alt="LlamaBoss Beta v0.1.0 screenshot" width="100%">
+</p>
+
 LlamaBoss is designed for people who want an AI assistant that can help with
 documents, spreadsheets, PDFs, scripts, project files, and repeatable workflows
 while keeping control on the local machine.
