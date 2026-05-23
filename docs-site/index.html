@@ -1,0 +1,215 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>LlamaBoss Documentation</title>
+  <meta name="description" content="LlamaBoss is a local Windows desktop AI assistant built around local models, approval-gated tools, projects, skills, and practical file workflows.">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <a class="skip-link" href="#content">Skip to content</a>
+  <header class="site-header">
+    <div class="container header-inner">
+      <a class="brand" href="#top" aria-label="LlamaBoss documentation home">
+        <span class="brand-mark">🦙</span>
+        <span><strong>LlamaBoss</strong><small>Documentation</small></span>
+      </a>
+      <nav class="top-nav" aria-label="Primary navigation">
+        <a href="#start">Start</a>
+        <a href="#architecture">Architecture</a>
+        <a href="#tools">Tools</a>
+        <a href="#deploy">Deploy</a>
+      </nav>
+    </div>
+  </header>
+
+  <main id="content">
+    <section id="top" class="hero section">
+      <div class="container hero-grid">
+        <div>
+          <p class="eyebrow">Beta documentation snapshot · generated from <code>LlamaBoss_Source_h_cpp_20260523_131552.zip</code></p>
+          <h1>Local-first AI assistant for Windows.</h1>
+          <p class="hero-copy">LlamaBoss is a native desktop app that connects a local chat experience to llama.cpp models, controlled tools, project workspaces, and Python-backed document workflows.</p>
+          <div class="hero-actions">
+            <a class="button primary" href="#start">Read the docs</a>
+            <a class="button ghost" href="#deploy">Deploy on Cloudflare</a>
+          </div>
+        </div>
+        <aside class="status-card" aria-label="Source snapshot summary">
+          <h2>Current source snapshot</h2>
+          <dl>
+            <div><dt>Files reviewed</dt><dd>119</dd></div>
+            <div><dt>C++ files</dt><dd>52</dd></div>
+            <div><dt>Header files</dt><dd>67</dd></div>
+            <div><dt>Built-in tools</dt><dd>32</dd></div>
+          </dl>
+          <p>The codebase is source-only in this bundle and is organized around wxWidgets UI, llama.cpp server orchestration, a ToolRouter registry, and Python helper lanes.</p>
+        </aside>
+      </div>
+    </section>
+
+    <section class="section soft" id="start">
+      <div class="container two-col">
+        <div>
+          <p class="eyebrow">Getting started</p>
+          <h2>What LlamaBoss does</h2>
+          <p>LlamaBoss is designed for people who want an AI assistant that can do useful local work without turning every task into a cloud workflow. It keeps the normal chat experience simple, while advanced actions run through controlled tools and approval cards.</p>
+        </div>
+        <div class="steps">
+          <article><span>1</span><h3>Load a local model</h3><p>Use the model manager/downloader flow to select a GGUF model and start a llama.cpp server session.</p></article>
+          <article><span>2</span><h3>Chat naturally</h3><p>Ask normal questions, attach files, or request work like reading source, creating reports, or listing directories.</p></article>
+          <article><span>3</span><h3>Let tools do the work</h3><p>The agent loop routes safe inspection tools automatically and pauses for approval before broader local automation.</p></article>
+          <article><span>4</span><h3>Use projects and skills</h3><p>Attach work to a project, keep project notes, and create reusable skills for repeatable workflows.</p></article>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="architecture">
+      <div class="container">
+        <p class="eyebrow">Architecture</p>
+        <h2>How the app is put together</h2>
+        <p class="section-lead">The source has matured into a clear set of subsystems. The main app remains native C++, while specialized work is routed into constrained helpers.</p>
+        <div class="cards grid-3">
+          <article class="card"><h3>Native app shell</h3><p><code>LlamaBoss.cpp</code>, <code>ui_builder</code>, <code>chat_display</code>, <code>conversation_sidebar</code>, and <code>theme</code> drive the wxWidgets desktop experience.</p></article>
+          <article class="card"><h3>Model runtime</h3><p><code>server_manager</code>, <code>model_manager</code>, <code>model_switcher</code>, and <code>model_downloader</code> manage local model selection, llama-server launch, readiness, and model display labels.</p></article>
+          <article class="card"><h3>Chat pipeline</h3><p><code>chat_client</code> sends requests, <code>chat_history</code> stores messages and tool replies, and <code>tool_protocol</code> detects XML vs native tool-call support.</p></article>
+          <article class="card"><h3>Agent loop</h3><p><code>agent_controller</code> parses assistant tool calls, dispatches tools, appends results, and continues until the model stops or a safety condition ends the loop.</p></article>
+          <article class="card"><h3>Tool registry</h3><p><code>tool_router</code> centralizes tool specs, schemas, validation, dispatch, and safety metadata so slash commands and agent calls share one path.</p></article>
+          <article class="card"><h3>Projects & skills</h3><p><code>project_manager</code>, <code>skill_prompt_builder</code>, and <code>skill_authoring_support</code> support project context, notes, workflows, and reusable task instructions.</p></article>
+        </div>
+      </div>
+    </section>
+
+    <section class="section soft" id="safety">
+      <div class="container two-col">
+        <div>
+          <p class="eyebrow">Safety model</p>
+          <h2>Useful tools, controlled blast radius.</h2>
+          <p>LlamaBoss is not trying to hide powerful behavior. It separates low-risk inspection from broader automation, then gives the user a review point before risky changes happen.</p>
+        </div>
+        <div class="checklist">
+          <p><strong>Read-only inspection can auto-run</strong> when the command/tool is clearly safe.</p>
+          <p><strong>PowerShell is classified</strong> into auto-run read-only commands, approval-required commands, or rejected malformed commands.</p>
+          <p><strong>File mutations are scoped</strong> to the conversation workspace or active project root.</p>
+          <p><strong>Python helpers are constrained</strong> to fixed helpers first, with script creation and package installs gated by approval.</p>
+          <p><strong>The agent loop has guardrails</strong> including iteration caps, malformed-call limits, repeated-tool detection, and cancel/approval states.</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="tools">
+      <div class="container">
+        <p class="eyebrow">Tool catalog</p>
+        <h2>Built-in tools in this snapshot</h2>
+        <p class="section-lead">These tool names are pulled from the current source snapshot. Descriptions below are written for public docs, not internal implementation comments.</p>
+        <div class="tool-groups">
+          <article>
+            <h3>Inspection</h3>
+            <ul>
+              <li><code>pwd</code>, <code>ls</code>, <code>read</code>, <code>read_head</code></li>
+              <li><code>grep</code> for literal text search</li>
+              <li><code>open</code> for safe media/document launch</li>
+            </ul>
+          </article>
+          <article>
+            <h3>Local automation</h3>
+            <ul>
+              <li><code>powershell</code> with read-only auto-run and approval for broader commands</li>
+              <li><code>write</code>, <code>overwrite_file</code>, <code>mkdir</code>, <code>edit</code>, <code>delete</code></li>
+            </ul>
+          </article>
+          <article>
+            <h3>Documents & data</h3>
+            <ul>
+              <li><code>csv_inspect</code>, <code>csv_report</code>, <code>csv_to_xlsx</code></li>
+              <li><code>xlsx_inspect</code>, <code>xlsx_report</code>, <code>xlsx_create_workbook</code></li>
+              <li><code>pdf_extract_text</code>, <code>pdf_inspect_form</code>, <code>pdf_fill_form</code></li>
+              <li><code>docx_extract_text</code>, <code>docx_inspect</code></li>
+            </ul>
+          </article>
+          <article>
+            <h3>Python lane</h3>
+            <ul>
+              <li><code>python_health</code></li>
+              <li><code>python_create_script</code></li>
+              <li><code>python_run_script</code></li>
+              <li><code>python_install_package</code></li>
+            </ul>
+          </article>
+          <article>
+            <h3>Memory & projects</h3>
+            <ul>
+              <li><code>notes_read</code>, <code>notes_append</code></li>
+              <li><code>project_notes_read</code>, <code>project_notes_append</code></li>
+            </ul>
+          </article>
+          <article>
+            <h3>Web inspection</h3>
+            <ul>
+              <li><code>web_fetch_url</code> for public HTTP/HTTPS text extraction without browser session access</li>
+            </ul>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <section class="section soft" id="workflows">
+      <div class="container">
+        <p class="eyebrow">Common workflows</p>
+        <h2>Good first documentation examples</h2>
+        <div class="cards grid-3">
+          <article class="card"><h3>Source code review</h3><p>Ask LlamaBoss to list, read, grep, and summarize files from a local repo. Mutating edits should pause for approval.</p></article>
+          <article class="card"><h3>Excel/report generation</h3><p>Use structured workbook creation for staffing reports, KPI sheets, CSV conversions, and formatted Excel output.</p></article>
+          <article class="card"><h3>PDF/DOCX workflows</h3><p>Extract text, inspect PDF forms, fill controlled form fields, and generate readable artifacts for review.</p></article>
+          <article class="card"><h3>Project memory</h3><p>Attach a chat to a project so instructions, notes, sources, and workflows stay anchored to one workspace.</p></article>
+          <article class="card"><h3>Skills</h3><p>Create reusable instructions and optional helper scripts for recurring local tasks such as source zipping or API-backed utilities.</p></article>
+          <article class="card"><h3>Local-first model testing</h3><p>Switch models, detect tool protocols, and compare how small local models behave on practical work.</p></article>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="deploy">
+      <div class="container two-col">
+        <div>
+          <p class="eyebrow">Cloudflare Pages</p>
+          <h2>Recommended deployment shape</h2>
+          <p>Keep the docs as a static site in the LlamaBoss repository, for example under <code>/website</code> or <code>/docs-site</code>. Cloudflare Pages can either deploy from Git on each push or accept a direct upload of the built static assets.</p>
+          <p>For the current page, there is no build step. The output directory is simply the folder containing <code>index.html</code>.</p>
+        </div>
+        <div class="terminal" aria-label="Deployment commands"><pre><code># Direct upload option
+cd docs-site
+npx wrangler pages deploy . --project-name llamaboss-docs
+
+# Git option
+# Connect the repository in Cloudflare Pages
+# Build command: none
+# Output directory: docs-site</code></pre></div>
+      </div>
+    </section>
+
+    <section class="section" id="source-map">
+      <div class="container">
+        <p class="eyebrow">Source map</p>
+        <h2>Key files worth documenting next</h2>
+        <div class="source-table" role="table" aria-label="Key source files">
+          <div role="row"><strong>File</strong><strong>Purpose</strong></div>
+          <div role="row"><code>agent_controller.*</code><span>Agent state machine, approval pause/resume, async tool result handling, loop guard behavior.</span></div>
+          <div role="row"><code>tool_router.*</code><span>Single built-in tool registry with descriptions, JSON schemas, validation, dispatch, and safety metadata.</span></div>
+          <div role="row"><code>python_runner.*</code><span>Controlled Python helper execution, generated scripts, document/spreadsheet/PDF helper lanes, process handling.</span></div>
+          <div role="row"><code>server_manager.*</code><span>llama-server process launch, readiness checks, log tails, runtime path selection, model/mmproj pairing.</span></div>
+          <div role="row"><code>project_manager.*</code><span>Project folders, notes, sources, workflows, active project state, project-relative paths.</span></div>
+          <div role="row"><code>tool_protocol.*</code><span>Per-model XML vs native tool-call protocol detection and caching.</span></div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <div class="container footer-inner">
+      <p>© LlamaBoss. Beta documentation draft.</p>
+      <p>Generated as a static Cloudflare Pages-ready site.</p>
+    </div>
+  </footer>
+</body>
+</html>
