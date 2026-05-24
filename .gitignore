@@ -1,0 +1,72 @@
+# Visual Studio
+.vs/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+*.VC.db
+*.VC.VC.opendb
+ipch/
+
+# Build outputs
+Debug/
+Release/
+x64/
+Win32/
+build/
+out/
+bin/
+obj/
+[Bb]uild/
+[Ll]ogs/
+
+# Compiler/linker/generated artifacts
+*.pdb
+*.ilk
+*.idb
+*.exe
+*.dll
+*.lib
+*.exp
+*.obj
+*.tlog
+*.lastbuildstate
+
+# Installers / packaging output
+installer_stage/
+output/
+*.msi
+*.zip
+*.7z
+*.nupkg
+
+# Runtime/model files
+models/
+runtimes/
+*.gguf
+*.bin
+
+# Local LlamaBoss data
+Workspace/
+Documents/
+Spreadsheets/
+PDFs/
+Scripts/
+Downloads/
+Workflows/
+Projects/
+Skills/
+NOTES.md
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Secrets / local config
+.env
+*.env
+secrets.json
+tokens.json
+credentials.json
