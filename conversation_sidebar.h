@@ -138,6 +138,10 @@ private:
 
         std::string filePath;
         std::string displayedTitle;
+        // Lowercased copy of displayedTitle kept in sync at row create /
+        // update time so FilterRows() can do a direct substring find on
+        // every keystroke without re-lowercasing every row's title.
+        std::string displayedTitleLower;
         std::string displayedTime;
         wxDateTime  modTime;
 

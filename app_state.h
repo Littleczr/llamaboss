@@ -16,6 +16,12 @@
 // including us (via AppState pointer in some files).
 struct ServerConfig;
 
+// Forward declaration to avoid pulling Poco JSON into every TU that
+// includes app_state.h.
+class SecretsStore;
+
+#include <memory>
+
 // Application state and configuration management
 class AppState
 {
@@ -112,6 +118,15 @@ public:
     std::string GetThemeName() const { return m_themeManager.GetActiveThemeName(); }
     void SetTheme(const std::string& themeName);
 
+    // ── Secrets / Connections ────────────────────────────────────
+    // SecretsStore owns %LOCALAPPDATA%\LlamaBoss\secrets.json.
+    // Lazily constructed on first access; Load() runs the first
+    // time too.  Mutations happen via the Connections dialog;
+    // callers are responsible for invoking Save() when the user
+    // accepts changes.  PythonRunner reads it (via the same
+    // pointer) when spawning python_run_script subprocesses.
+    SecretsStore* GetSecretsStore();
+
 private:
     // Configuration data
     std::string m_currentModel;
@@ -125,6 +140,11 @@ private:
     // Application components
     Poco::Logger* m_logger;
     ThemeManager m_themeManager;
+
+    // SecretsStore lifetime is managed via unique_ptr so the
+    // forward-declared type works in this header.  Constructed on
+    // first GetSecretsStore() call.
+    std::unique_ptr<SecretsStore> m_secretsStore;
 
     // Configuration file handling
     void LoadSettings();

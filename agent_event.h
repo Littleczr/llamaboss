@@ -170,6 +170,14 @@ struct AgentEvent {
         return e;
     }
 
+    static AgentEvent TurnComplete(const std::string& message)
+    {
+        AgentEvent e;
+        e.type              = AgentEventType::TurnComplete;
+        e.userFacingMessage = message;
+        return e;
+    }
+
     static AgentEvent LoopEnd(AgentEndReason reason,
                               const std::string& message)
     {
@@ -219,8 +227,10 @@ public:
             break;
 
         case AgentEventType::TurnComplete:
-            // Reserved for a future explicit final-answer event.  Today
-            // MyFrame's normal assistant-complete path owns final prose.
+            // Explicit non-streamed final answer emitted by deterministic
+            // helper-completion paths.  MyFrame renders it with the same
+            // assistant styling as a normal model reply.
+            OnAgentTurnComplete(event.userFacingMessage);
             break;
 
         case AgentEventType::LoopEnd:
@@ -244,6 +254,13 @@ public:
     virtual void OnAgentApprovalRequired(const ToolBlock& block)
     {
         OnAgentToolBlock(block, true);
+    }
+
+    // Explicit final answer for deterministic helper-completion paths
+    // that intentionally skip another model pass.
+    virtual void OnAgentTurnComplete(const std::string& message)
+    {
+        (void)message;
     }
 
     // Loop ended.  `userFacingMessage` is the text the controller

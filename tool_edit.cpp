@@ -2,7 +2,7 @@
 
 #include "tool_edit.h"
 #include "tool_path.h"
-#include "tool_path_safety.h"   // IsUnderCwd, Basename
+#include "tool_path_safety.h"   // IsUnderAllowedWriteRoot, Basename
 #include "tool_staged_write.h"  // StagedTempFile, CreateStagedTempFile
 #include "tool_open.h"          // ClassifyForOpen, FileRisk
 #include "path_safety.h"
@@ -14,7 +14,9 @@
 #include <sstream>
 #include <utility>
 
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
 #include <windows.h>
 
 namespace {
@@ -109,6 +111,26 @@ void RstripPath(std::string& s)
     }
 }
 
+// Normalize the tool-call argument grammar itself to LF before looking
+// for path / <<<OLD>>> / <<<NEW>>> line boundaries.  The file being
+// edited still gets its own line-ending detection later; this only
+// makes the parser tolerant of CRLF/CR-delimited tool args.
+std::string NormalizeArgNewlines(const std::string& s)
+{
+    std::string out;
+    out.reserve(s.size());
+
+    for (size_t i = 0; i < s.size(); ++i) {
+        if (s[i] == '\r') {
+            if (i + 1 < s.size() && s[i + 1] == '\n') ++i;
+            out.push_back('\n');
+        } else {
+            out.push_back(s[i]);
+        }
+    }
+    return out;
+}
+
 struct ParsedEditArgs {
     bool        ok = false;
     std::string path;
@@ -128,15 +150,17 @@ ParsedEditArgs ParseEditArgs(const std::string& args)
         return out;
     }
 
+    const std::string text = NormalizeArgNewlines(args);
+
     // ── Path on first line ───────────────────────────────────────
-    size_t nl1 = args.find('\n');
+    size_t nl1 = text.find('\n');
     if (nl1 == std::string::npos) {
         out.error = "edit args must contain a path on the first "
                     "line, then <<<OLD>>>...<<<NEW>>>... blocks.";
         return out;
     }
 
-    out.path = args.substr(0, nl1);
+    out.path = text.substr(0, nl1);
     RstripPath(out.path);
     if (out.path.empty()) {
         out.error = "edit requires a path on the first line of <args>.";
@@ -144,7 +168,7 @@ ParsedEditArgs ParseEditArgs(const std::string& args)
     }
 
     // ── <<<OLD>>> sentinel on its own line ───────────────────────
-    size_t oldPos = FindOnOwnLine(args, kOldSentinel, nl1 + 1);
+    size_t oldPos = FindOnOwnLine(text, kOldSentinel, nl1 + 1);
     if (oldPos == std::string::npos) {
         out.error = "missing <<<OLD>>> sentinel. The grammar is:\n"
                     "  <args>path/to/file\n"
@@ -160,18 +184,18 @@ ParsedEditArgs ParseEditArgs(const std::string& args)
     // the sentinel line.  If the sentinel is at the very end (no
     // following newline), there's no room for a <<<NEW>>>, so error.
     size_t oldSentinelEnd = oldPos + kOldSentinel.size();
-    if (oldSentinelEnd >= args.size()) {
+    if (oldSentinelEnd >= text.size()) {
         out.error = "missing <<<NEW>>> sentinel after <<<OLD>>>.";
         return out;
     }
-    if (args[oldSentinelEnd] != '\n') {
+    if (text[oldSentinelEnd] != '\n') {
         out.error = "<<<OLD>>> must be on its own line.";
         return out;
     }
     size_t oldStart = oldSentinelEnd + 1;
 
     // ── <<<NEW>>> sentinel on its own line, after oldStart ───────
-    size_t newPos = FindOnOwnLine(args, kNewSentinel, oldStart);
+    size_t newPos = FindOnOwnLine(text, kNewSentinel, oldStart);
     if (newPos == std::string::npos) {
         out.error = "missing <<<NEW>>> sentinel.";
         return out;
@@ -179,22 +203,26 @@ ParsedEditArgs ParseEditArgs(const std::string& args)
 
     // The newline that precedes <<<NEW>>> is the line-boundary of
     // the sentinel, not part of OLD.  Confirm and exclude it.
-    if (newPos == 0 || args[newPos - 1] != '\n') {
+    if (newPos == 0 || text[newPos - 1] != '\n') {
         // Shouldn't happen because FindOnOwnLine guarantees left-
         // boundary, but defensive.
         out.error = "<<<NEW>>> must be on its own line.";
         return out;
     }
-    out.oldString = args.substr(oldStart, (newPos - 1) - oldStart);
+    size_t oldEnd = newPos;
+    if (oldEnd > oldStart && text[oldEnd - 1] == '\n') {
+        --oldEnd;
+    }
+    out.oldString = text.substr(oldStart, oldEnd - oldStart);
 
     // ── New string runs from after-the-newline-after-NEW to end ──
     size_t newSentinelEnd = newPos + kNewSentinel.size();
-    if (newSentinelEnd == args.size()) {
+    if (newSentinelEnd == text.size()) {
         // <<<NEW>>> is the last thing in args -- new_string is empty
         // (delete OLD).  Allowed.
         out.newString.clear();
-    } else if (args[newSentinelEnd] == '\n') {
-        out.newString = args.substr(newSentinelEnd + 1);
+    } else if (text[newSentinelEnd] == '\n') {
+        out.newString = text.substr(newSentinelEnd + 1);
     } else {
         out.error = "<<<NEW>>> must be on its own line.";
         return out;
@@ -481,7 +509,7 @@ EditResult EditFile(const std::string& argsBlob,
         return r;
     }
 
-    std::string resolved = ResolveToolPath(parsed.path, ctx.cwd);
+    std::string resolved = tool_path_safety::ResolveProjectAwareToolPath(parsed.path, ctx.cwd, ctx.activeProjectRoot);
     if (resolved.empty()) {
         r.chips.push_back("failed");
         r.errorBody = "Could not resolve path: " + parsed.path;
@@ -489,11 +517,11 @@ EditResult EditFile(const std::string& argsBlob,
         return r;
     }
 
-    if (!tool_path_safety::IsUnderCwd(resolved, ctx.cwd)) {
+    if (!tool_path_safety::IsUnderAllowedWriteRoot(resolved, ctx.cwd, ctx.activeProjectRoot, ctx.skillsRoot)) {
         r.chips.push_back("blocked");
-        r.errorBody = "Refuses to edit outside the working "
-                      "directory.\n  resolved: " + resolved +
-                      "\n  cwd:      " + ctx.cwd;
+        r.errorBody = "Refuses to edit outside the allowed write roots."
+                      "\n  resolved: " + resolved +
+                      tool_path_safety::AllowedWriteRootsDiagnostic(ctx.cwd, ctx.activeProjectRoot, ctx.skillsRoot);
         r.chips.push_back(ElapsedChip(t0));
         return r;
     }
@@ -570,11 +598,27 @@ EditResult EditFile(const std::string& argsBlob,
     if (fileSize > 0) {
         f.seekg(0, std::ios::beg);
         f.read(&fileContent[0], fileSize);
-        if (f.gcount() < fileSize) {
-            fileContent.resize((size_t)f.gcount());
+        if (f.gcount() != fileSize) {
+            std::streamsize got = f.gcount();
+            f.close();
+
+            r.chips.push_back("failed");
+            r.errorBody = "Could not read the complete file: " + resolved +
+                          " (expected " + HumanBytes((size_t)fileSize) +
+                          ", read " + HumanBytes(got > 0 ? (size_t)got : 0) + ").";
+            r.chips.push_back(ElapsedChip(t0));
+            return r;
         }
     }
     f.close();
+
+    if (fileContent.find('\0') != std::string::npos) {
+        r.chips.push_back("blocked");
+        r.errorBody = "Refuses to edit files that appear to be binary or "
+                      "UTF-16 encoded (NUL bytes found): " + resolved;
+        r.chips.push_back(ElapsedChip(t0));
+        return r;
+    }
 
     // ── Detect dominant ending and normalize all sides to LF ─────
     LineEnding native = DetectLineEnding(fileContent);

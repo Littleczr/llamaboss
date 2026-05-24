@@ -26,6 +26,8 @@
 
 #include <string>
 
+#include "tool_path.h"  // ResolveToolPath
+
 namespace tool_path_safety {
 
 // Lowercase a single ASCII byte; non-ASCII passes through.  Used for
@@ -86,6 +88,143 @@ inline bool IsUnderCwd(const std::string& absPath, const std::string& cwd)
     if (a.size() == r.size()) return true;
     if (r.back() == '\\') return true;
     return a[r.size()] == '\\';
+}
+
+// True iff two canonical absolute Windows paths refer to the same
+// normalized path for our containment purposes.
+inline bool SamePath(const std::string& aIn, const std::string& bIn)
+{
+    if (aIn.empty() || bIn.empty()) return false;
+
+    std::string a = NormalizeForCompare(aIn);
+    std::string b = NormalizeForCompare(bIn);
+
+    while (a.size() > 3 && a.back() == '\\') a.pop_back();
+    while (b.size() > 3 && b.back() == '\\') b.pop_back();
+
+    return a == b;
+}
+
+// Project/Skills-aware mutation boundary.  Normal chats may modify files
+// inside the conversation cwd.  When a chat is attached to a project,
+// that durable project root is also an allowed mutation root, so the
+// model can create project folders, workflow files, notes, and outputs
+// without asking the user to /cd away from the chat Workspace first.
+// Global reusable Skills are also user-authored durable assets, so the
+// Skills root is writable through the same approval-gated mutation tools.
+
+// True iff `input` is a relative path that should be rooted at the
+// active project folder instead of the conversation workspace.  Keep
+// this deliberately narrow: only the standard project lanes and the
+// two root project files are rebased.  Arbitrary relative paths still
+// resolve against ctx.cwd so normal chat-workspace behavior stays
+// intact.
+inline bool IsKnownProjectRelativePath(const std::string& input)
+{
+    std::string s = input;
+
+    auto trim = [](std::string& v) {
+        while (!v.empty() && (v.front() == ' ' || v.front() == '\t' ||
+                              v.front() == '\r' || v.front() == '\n')) {
+            v.erase(v.begin());
+        }
+        while (!v.empty() && (v.back() == ' ' || v.back() == '\t' ||
+                              v.back() == '\r' || v.back() == '\n')) {
+            v.pop_back();
+        }
+    };
+
+    trim(s);
+    if (s.size() >= 2 &&
+        ((s.front() == '"' && s.back() == '"') ||
+         (s.front() == '\'' && s.back() == '\''))) {
+        s = s.substr(1, s.size() - 2);
+        trim(s);
+    }
+    if (s.empty()) return false;
+
+    // Absolute paths and traversal attempts keep the existing resolver
+    // behavior.  This helper is only for normal project-relative lanes.
+    if (s.size() >= 3 && ((s[0] >= 'A' && s[0] <= 'Z') ||
+                          (s[0] >= 'a' && s[0] <= 'z')) &&
+        s[1] == ':' && (s[2] == '\\' || s[2] == '/')) return false;
+    if (s.size() >= 2 && (s[0] == '\\' || s[0] == '/') &&
+        (s[1] == '\\' || s[1] == '/')) return false;
+    if (s[0] == '\\' || s[0] == '/') return false;
+    if (s.rfind("..", 0) == 0) return false;
+
+    while (s.rfind(".\\", 0) == 0 || s.rfind("./", 0) == 0) {
+        s = s.substr(2);
+    }
+    if (s.empty() || s.rfind("..", 0) == 0) return false;
+
+    std::string key;
+    key.reserve(s.size());
+    for (char c : s) {
+        char n = (c == '\\') ? '/' : LowerAscii(c);
+        key += n;
+    }
+
+    // Optional human/model prefix: project/Inputs/foo.txt.
+    if (key.rfind("project/", 0) == 0) {
+        key = key.substr(8);
+    }
+
+    if (key == "project.md" || key == "project.json" || key == "requirements.txt") return true;
+
+    static const char* kProjectDirs[] = {
+        "inputs", "outputs", "workflows", "notes", "sources", "templates"
+    };
+
+    for (const char* dir : kProjectDirs) {
+        std::string d(dir);
+        if (key == d) return true;
+        if (key.rfind(d + "/", 0) == 0) return true;
+    }
+
+    return false;
+}
+
+// Project-aware path resolver for tools.  In project chats, known
+// project-relative paths such as `Inputs\\x.txt`, `Outputs\\report.md`,
+// `Workflows\\helper.py`, `Notes\\NOTES.md`, `Sources\\policy.pdf`,
+// `Templates\\form.docx`, `PROJECT.md`, `project.json`, and `requirements.txt` resolve under
+// activeProjectRoot.  All other paths preserve legacy behavior and resolve
+// against cwd.
+inline std::string ResolveProjectAwareToolPath(const std::string& input,
+                                               const std::string& cwd,
+                                               const std::string& activeProjectRoot)
+{
+    if (!activeProjectRoot.empty() && IsKnownProjectRelativePath(input)) {
+        std::string resolved = ResolveToolPath(input, activeProjectRoot);
+        if (!resolved.empty()) return resolved;
+    }
+    return ResolveToolPath(input, cwd);
+}
+
+inline bool IsUnderAllowedWriteRoot(const std::string& absPath,
+                                    const std::string& cwd,
+                                    const std::string& activeProjectRoot,
+                                    const std::string& skillsRoot)
+{
+    if (IsUnderCwd(absPath, cwd)) return true;
+    if (!activeProjectRoot.empty() && IsUnderCwd(absPath, activeProjectRoot)) return true;
+    if (!skillsRoot.empty() && IsUnderCwd(absPath, skillsRoot)) return true;
+    return false;
+}
+
+inline std::string AllowedWriteRootsDiagnostic(const std::string& cwd,
+                                               const std::string& activeProjectRoot,
+                                               const std::string& skillsRoot)
+{
+    std::string s = "\n  cwd:      " + cwd;
+    if (!activeProjectRoot.empty()) {
+        s += "\n  project:  " + activeProjectRoot;
+    }
+    if (!skillsRoot.empty()) {
+        s += "\n  skills:   " + skillsRoot;
+    }
+    return s;
 }
 
 // Returns the basename portion of an absolute Windows path.  Empty

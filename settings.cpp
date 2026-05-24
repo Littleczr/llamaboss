@@ -1,18 +1,30 @@
-﻿// settings.cpp
+// settings.cpp
 //
 // Settings dialog for LlamaBoss.
 // Section-organised layout with dark-themed surfaces:
 //   • Model (combo, action buttons, status)
 //   • Context length (snap-to-tick slider)
+//   • Behavior (agent-default checkbox)
+//   • Connections (skill API keys)
 //   • Appearance (theme dropdown, font size slider)
 //   • OK / Cancel footer
 //
 // Model selection scans %LOCALAPPDATA%\LlamaBoss\models\ for .gguf files.
 // No Ollama API dependency.
+//
+// Button language: Telegram-flavoured. All committal actions are plain
+// wxButtons rendered with t.accentButton fill + t.accentButtonText label
+// (the same DNA as the chat Send button). Cancel is a flat borderless
+// wxButton with a muted label, sitting as a quiet secondary affordance
+// next to the solid OK. The previous BracketButton / OutlinedButton
+// affordances were the right read for the chat surface (monospace,
+// crisp, terminal-like) but felt out of place for a settings sheet.
 
 #include "settings.h"
+#include "connections_dialog.h"
 #include "model_downloader.h"
 #include "model_manager.h"
+#include "secrets_store.h"
 #include "server_manager.h"
 #include "theme.h"
 #include "widgets.h"   // TickSlider, ApplyDialogThemeRecursive, ApplyDarkTitleBar
@@ -25,7 +37,6 @@
 
 #include <sstream>
 #include <iomanip>
-#include <functional>
 
 // ── Helper: human-readable file size ─────────────────────────────
 static std::string FormatFileSize(const std::string& path)
@@ -69,9 +80,10 @@ SettingsDialog::SettingsDialog(wxWindow* parent,
                                int currentCtxSize,
                                int currentFontSize,
                                bool currentAgentDefaultOn,
-                               const ThemeData& theme)
+                               const ThemeData& theme,
+                               SecretsStore* secretsStore)
     : wxDialog(parent, wxID_ANY, "Settings",
-               wxDefaultPosition, wxSize(580, 700))
+               wxDefaultPosition, wxSize(600, 840))
     , m_selectedModel(currentModelPath)
     , m_selectedTheme(currentTheme)
     , m_selectedCtxSize(currentCtxSize)
@@ -85,14 +97,17 @@ SettingsDialog::SettingsDialog(wxWindow* parent,
     , m_originalFolderOverride(ServerManager::GetModelsDirOverride())
     , m_theme(&theme)
 {
+    m_secretsStore = secretsStore;
+
     wxFont f = GetFont();
-    f.SetPointSize(10);
+    f.SetPointSize(11);
     f.SetWeight(wxFONTWEIGHT_NORMAL);
     SetFont(f);
 
     CreateControls();
     PopulateModelList();
     UpdateFolderUi();
+    UpdateConnectionsLabel();
     ApplyTheme();
 
     // Match the title bar to the body when dark theme is active.
@@ -123,31 +138,16 @@ SettingsDialog::~SettingsDialog()
 //  Construction helpers
 // ═══════════════════════════════════════════════════════════════════
 
-wxButton* SettingsDialog::MakeNeutralButton(wxWindow* parent, const wxString& label)
-{
-    auto* btn = new wxButton(parent, wxID_ANY, label,
-        wxDefaultPosition, wxSize(-1, 30), wxBORDER_NONE);
-    wxFont bf = btn->GetFont();
-    bf.SetPointSize(9);
-    btn->SetFont(bf);
-    return btn;
-}
-
-wxButton* SettingsDialog::MakePrimaryButton(wxWindow* parent, const wxString& label)
-{
-    auto* btn = new wxButton(parent, wxID_ANY, label,
-        wxDefaultPosition, wxSize(-1, 30), wxBORDER_NONE);
-    wxFont bf = btn->GetFont();
-    bf.SetPointSize(9);
-    bf.SetWeight(wxFONTWEIGHT_SEMIBOLD);
-    btn->SetFont(bf);
-    return btn;
-}
-
 wxPanel* SettingsDialog::MakeSectionDivider(wxWindow* parent)
 {
+    // Telegram-style gap band: 10px tall, painted with t.bgMain in
+    // ApplyTheme() so it reads darker than the dialog surface — feels
+    // like a slot between sections rather than a thin border. Tracked
+    // in m_dividers so we paint it deterministically instead of doing
+    // the old "find every 1px panel" recursive walk.
     auto* line = new wxPanel(parent, wxID_ANY,
-        wxDefaultPosition, wxSize(-1, 1));
+        wxDefaultPosition, wxSize(-1, 10));
+    m_dividers.push_back(line);
     return line;
 }
 
@@ -155,10 +155,41 @@ wxStaticText* SettingsDialog::MakeSectionHeader(wxWindow* parent, const wxString
 {
     auto* lbl = new wxStaticText(parent, wxID_ANY, text);
     wxFont hf = lbl->GetFont();
-    hf.SetPointSize(10);
+    hf.SetPointSize(12);
     hf.SetWeight(wxFONTWEIGHT_SEMIBOLD);
     lbl->SetFont(hf);
     return lbl;
+}
+
+// ── Helper: make an accent (Send-style) push button ──────────────
+//
+// Mirrors the chat Send button: plain wxButton with t.accentButton fill
+// and t.accentButtonText label. Native Win11 chrome handles the rounded
+// corners. We register every accent button so ApplyTheme() can re-tint
+// them after ApplyDialogThemeRecursive() runs the neutral cascade.
+//
+// `height = 32` is the standard footer/action-row size. Use 26 for the
+// smaller inline buttons that sit next to text (Change, Reset, Manage).
+wxButton* SettingsDialog::MakeAccentButton(wxWindow* parent,
+                                           wxWindowID id,
+                                           const wxString& label,
+                                           int height)
+{
+    // wxBORDER_NONE is the magic ingredient: without it, the Win11
+    // native button chrome paints a tinted outline over our solid fill
+    // (the result reads as a light-cyan ring around the button instead
+    // of a clean solid). Same trick the sidebar's New Chat and the chat
+    // Send button use.
+    auto* btn = new wxButton(parent, id, label,
+                             wxDefaultPosition,
+                             wxSize(-1, height),
+                             wxBORDER_NONE);
+    wxFont bf = btn->GetFont();
+    bf.SetPointSize(10);
+    bf.SetWeight(wxFONTWEIGHT_SEMIBOLD);
+    btn->SetFont(bf);
+    m_accentBtns.push_back(btn);
+    return btn;
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -184,16 +215,19 @@ void SettingsDialog::CreateControls()
         wxCB_DROPDOWN | wxCB_READONLY);
     bodySizer->Add(m_modelComboBox, 0, wxEXPAND | wxBOTTOM, 8);
 
-    // Action buttons row
+    // Action buttons row — solid accent push buttons, Send-style.
+    // The three actions read as peers (open three modal flows), so they
+    // share size and weight; horizontal gap keeps them readable as a
+    // group rather than a single chunky bar.
     auto* actionSizer = new wxBoxSizer(wxHORIZONTAL);
-    auto* downloadBtn = MakeNeutralButton(body, "Download Models...");
-    auto* manageBtn   = MakeNeutralButton(body, "Manage Models...");
-    auto* openBtn     = MakeNeutralButton(body, "Open Models Folder");
+    auto* downloadBtn = MakeAccentButton(body, wxID_ANY, "Download models");
+    auto* manageBtn   = MakeAccentButton(body, wxID_ANY, "Manage models");
+    auto* openBtn     = MakeAccentButton(body, wxID_ANY, "Open folder");
     downloadBtn->Bind(wxEVT_BUTTON, &SettingsDialog::OnDownloadModels, this);
     manageBtn  ->Bind(wxEVT_BUTTON, &SettingsDialog::OnManageModels,   this);
     openBtn    ->Bind(wxEVT_BUTTON, &SettingsDialog::OnOpenModelsFolder, this);
-    actionSizer->Add(downloadBtn, 0, wxRIGHT, 6);
-    actionSizer->Add(manageBtn,   0, wxRIGHT, 6);
+    actionSizer->Add(downloadBtn, 0, wxRIGHT, 8);
+    actionSizer->Add(manageBtn,   0, wxRIGHT, 8);
     actionSizer->Add(openBtn,     0);
     bodySizer->Add(actionSizer, 0, wxBOTTOM, 10);
 
@@ -202,36 +236,39 @@ void SettingsDialog::CreateControls()
     // Reset is hidden when no override is active (casual mode). The
     // muted "Default: ..." line below is likewise shown only when
     // the user has pointed at a custom folder.
+    //
+    // Inline buttons get the 26px short variant so they don't tower
+    // over the text label they sit beside.
     auto* locRow = new wxBoxSizer(wxHORIZONTAL);
 
     auto* locLabel = new wxStaticText(body, wxID_ANY, "Location:");
-    { wxFont lf = locLabel->GetFont(); lf.SetPointSize(9); locLabel->SetFont(lf); }
+    { wxFont lf = locLabel->GetFont(); lf.SetPointSize(10); locLabel->SetFont(lf); }
     locRow->Add(locLabel, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 6);
 
     m_locationPath = new wxStaticText(body, wxID_ANY, "",
         wxDefaultPosition, wxDefaultSize, wxST_ELLIPSIZE_MIDDLE);
-    { wxFont pf = m_locationPath->GetFont(); pf.SetPointSize(9); m_locationPath->SetFont(pf); }
+    { wxFont pf = m_locationPath->GetFont(); pf.SetPointSize(10); m_locationPath->SetFont(pf); }
     locRow->Add(m_locationPath, 1, wxALIGN_CENTER_VERTICAL | wxRIGHT, 8);
 
-    m_changeBtn = MakeNeutralButton(body, "Change...");
-    m_resetBtn  = MakeNeutralButton(body, "Reset");
+    m_changeBtn = MakeAccentButton(body, wxID_ANY, "Change", 26);
+    m_resetBtn  = MakeAccentButton(body, wxID_ANY, "Reset",  26);
     m_changeBtn->Bind(wxEVT_BUTTON, &SettingsDialog::OnChangeFolder, this);
     m_resetBtn ->Bind(wxEVT_BUTTON, &SettingsDialog::OnResetFolder,  this);
-    locRow->Add(m_changeBtn, 0, wxRIGHT, 6);
-    locRow->Add(m_resetBtn,  0);
+    locRow->Add(m_changeBtn, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 6);
+    locRow->Add(m_resetBtn,  0, wxALIGN_CENTER_VERTICAL);
 
     bodySizer->Add(locRow, 0, wxEXPAND | wxBOTTOM, 4);
 
     // Muted "Default: <path>" row — hidden when no override is active.
     m_defaultPathRow = new wxStaticText(body, wxID_ANY, "",
         wxDefaultPosition, wxDefaultSize, wxST_ELLIPSIZE_MIDDLE);
-    { wxFont df = m_defaultPathRow->GetFont(); df.SetPointSize(9); m_defaultPathRow->SetFont(df); }
+    { wxFont df = m_defaultPathRow->GetFont(); df.SetPointSize(10); m_defaultPathRow->SetFont(df); }
     bodySizer->Add(m_defaultPathRow, 0, wxEXPAND | wxBOTTOM, 6);
 
     // Status line (muted)
     m_statusText = new wxStaticText(body, wxID_ANY, "");
     wxFont sf = m_statusText->GetFont();
-    sf.SetPointSize(9);
+    sf.SetPointSize(10);
     m_statusText->SetFont(sf);
     bodySizer->Add(m_statusText, 0, wxBOTTOM, 14);
 
@@ -246,7 +283,7 @@ void SettingsDialog::CreateControls()
     auto* ctxValueLabel = new wxStaticText(body, wxID_ANY,
         wxString::FromUTF8(FormatCtxSize(m_selectedCtxSize)));
     wxFont cvf = ctxValueLabel->GetFont();
-    cvf.SetPointSize(9);
+    cvf.SetPointSize(10);
     cvf.SetWeight(wxFONTWEIGHT_SEMIBOLD);
     ctxValueLabel->SetFont(cvf);
     ctxHeaderRow->Add(ctxValueLabel, 0, wxALIGN_CENTER_VERTICAL);
@@ -255,7 +292,7 @@ void SettingsDialog::CreateControls()
     auto* ctxHint = new wxStaticText(body, wxID_ANY,
         "How much of the conversation the model can keep in memory.");
     wxFont chf = ctxHint->GetFont();
-    chf.SetPointSize(9);
+    chf.SetPointSize(10);
     ctxHint->SetFont(chf);
     bodySizer->Add(ctxHint, 0, wxBOTTOM, 8);
 
@@ -282,15 +319,43 @@ void SettingsDialog::CreateControls()
     m_agentDefaultCheckBox = new wxCheckBox(
         body, wxID_ANY, "Start new chats with agent mode enabled");
     { wxFont acf = m_agentDefaultCheckBox->GetFont();
-      acf.SetPointSize(10);
+      acf.SetPointSize(11);
       m_agentDefaultCheckBox->SetFont(acf); }
     m_agentDefaultCheckBox->SetValue(m_selectedAgentDefault);
     bodySizer->Add(m_agentDefaultCheckBox, 0, wxBOTTOM, 4);
 
     auto* agentHint = new wxStaticText(body, wxID_ANY,
         "The robot button toggles agent mode for the current chat.");
-    { wxFont ah = agentHint->GetFont(); ah.SetPointSize(9); agentHint->SetFont(ah); }
+    { wxFont ah = agentHint->GetFont(); ah.SetPointSize(10); agentHint->SetFont(ah); }
     bodySizer->Add(agentHint, 0, wxBOTTOM, 14);
+
+    // ─────────────────────────────────────────────────────────────
+    //  SECTION 3b — CONNECTIONS
+    // ─────────────────────────────────────────────────────────────
+    //  API keys for service skills.  Each entry maps to one
+    //  environment variable exposed to skill scripts running through
+    //  python_run_script.  Stored as plaintext JSON at
+    //  %LOCALAPPDATA%\LlamaBoss\secrets.json (user-only ACL).
+    bodySizer->Add(MakeSectionDivider(body), 0, wxEXPAND | wxBOTTOM, 14);
+    bodySizer->Add(MakeSectionHeader(body, "Connections"), 0, wxBOTTOM, 8);
+
+    auto* connRow = new wxBoxSizer(wxHORIZONTAL);
+    m_connectionsLabel = new wxStaticText(body, wxID_ANY,
+        "No connections configured");
+    { wxFont cf = m_connectionsLabel->GetFont(); cf.SetPointSize(11);
+      m_connectionsLabel->SetFont(cf); }
+    connRow->Add(m_connectionsLabel, 1, wxALIGN_CENTER_VERTICAL);
+
+    m_manageConnBtn = MakeAccentButton(body, wxID_ANY, "Manage", 26);
+    m_manageConnBtn->Bind(wxEVT_BUTTON,
+                          &SettingsDialog::OnManageConnections, this);
+    connRow->Add(m_manageConnBtn, 0, wxLEFT, 10);
+    bodySizer->Add(connRow, 0, wxEXPAND | wxBOTTOM, 6);
+
+    auto* connHint = new wxStaticText(body, wxID_ANY,
+        "Skill scripts read these via os.environ (e.g. GMAIL_API_KEY).");
+    { wxFont ch = connHint->GetFont(); ch.SetPointSize(10); connHint->SetFont(ch); }
+    bodySizer->Add(connHint, 0, wxBOTTOM, 14);
 
     // ─────────────────────────────────────────────────────────────
     //  SECTION 4 — APPEARANCE
@@ -305,15 +370,28 @@ void SettingsDialog::CreateControls()
     themeRow->Add(themeLabel, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 10);
 
     wxArrayString themeChoices;
-    themeChoices.Add("Dark");
-    themeChoices.Add("Light");
-    themeChoices.Add("System");
+    for (const auto& c : ThemeManager::GetThemeChoices()) {
+        themeChoices.Add(wxString::FromUTF8(c.displayName));
+    }
     m_themeComboBox = new wxComboBox(body, wxID_ANY, "",
         wxDefaultPosition, wxSize(-1, 28), themeChoices,
         wxCB_DROPDOWN | wxCB_READONLY);
-    if (m_selectedTheme == "light")       m_themeComboBox->SetSelection(1);
-    else if (m_selectedTheme == "system") m_themeComboBox->SetSelection(2);
-    else                                  m_themeComboBox->SetSelection(0);
+
+    // Find the index matching the user's stored theme. If the stored
+    // value doesn't appear in the list (e.g. a theme was removed in a
+    // future build), fall back to index 0 (Dark) so the dropdown
+    // always has a valid selection.
+    int initialIdx = 0;
+    {
+        const auto& choices = ThemeManager::GetThemeChoices();
+        for (size_t i = 0; i < choices.size(); ++i) {
+            if (m_selectedTheme == choices[i].internalName) {
+                initialIdx = static_cast<int>(i);
+                break;
+            }
+        }
+    }
+    m_themeComboBox->SetSelection(initialIdx);
     themeRow->Add(m_themeComboBox, 1);
     bodySizer->Add(themeRow, 0, wxEXPAND | wxBOTTOM, 14);
 
@@ -326,7 +404,7 @@ void SettingsDialog::CreateControls()
     auto* fontValueLabel = new wxStaticText(body, wxID_ANY,
         wxString::Format("%dpt", m_selectedFontSize));
     wxFont fvf = fontValueLabel->GetFont();
-    fvf.SetPointSize(9);
+    fvf.SetPointSize(10);
     fvf.SetWeight(wxFONTWEIGHT_SEMIBOLD);
     fontValueLabel->SetFont(fvf);
     fontHeaderRow->Add(fontValueLabel, 0, wxALIGN_CENTER_VERTICAL);
@@ -347,29 +425,35 @@ void SettingsDialog::CreateControls()
     rootSizer->Add(body, 1, wxEXPAND | wxALL, 18);
 
     // ─────────────────────────────────────────────────────────────
-    //  FOOTER — OK / Cancel (right-aligned)
+    //  FOOTER — flat Cancel + solid OK
     // ─────────────────────────────────────────────────────────────
+    //  Asymmetric on purpose — same idea as Telegram's modal footers:
+    //  the commit action carries the accent fill, the dismissal sits
+    //  as a quiet borderless label nearby. Both are real wxButtons so
+    //  the wxDialog default-button machinery handles Enter (→ OK) and
+    //  Escape (→ Cancel) for free, no manual char hook needed.
     auto* footer = new wxPanel(this, wxID_ANY);
     auto* footSizer = new wxBoxSizer(wxHORIZONTAL);
     footSizer->AddStretchSpacer();
 
     m_cancelBtn = new wxButton(footer, wxID_CANCEL, "Cancel",
-        wxDefaultPosition, wxSize(90, 32), wxBORDER_NONE);
-    m_okBtn     = new wxButton(footer, wxID_OK,     "OK",
-        wxDefaultPosition, wxSize(90, 32), wxBORDER_NONE);
-    wxFont bf = m_okBtn->GetFont();
-    bf.SetPointSize(9);
-    bf.SetWeight(wxFONTWEIGHT_SEMIBOLD);
-    m_okBtn->SetFont(bf);
-    m_cancelBtn->SetFont(bf);
+                               wxDefaultPosition, wxSize(-1, 32),
+                               wxBORDER_NONE);
+    { wxFont cbf = m_cancelBtn->GetFont();
+      cbf.SetPointSize(10);
+      cbf.SetWeight(wxFONTWEIGHT_SEMIBOLD);
+      m_cancelBtn->SetFont(cbf); }
 
-    footSizer->Add(m_cancelBtn, 0, wxRIGHT, 8);
-    footSizer->Add(m_okBtn,     0);
+    m_okBtn = MakeAccentButton(footer, wxID_OK, "OK", 32);
+    m_okBtn->SetMinSize(wxSize(96, 32));
+    m_okBtn->SetDefault();
+
+    footSizer->Add(m_cancelBtn, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 12);
+    footSizer->Add(m_okBtn,     0, wxALIGN_CENTER_VERTICAL);
     footer->SetSizer(footSizer);
     rootSizer->Add(footer, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 18);
 
     SetSizer(rootSizer);
-    m_okBtn->SetDefault();
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -381,31 +465,27 @@ void SettingsDialog::ApplyTheme()
     if (!m_theme) return;
     const ThemeData& t = *m_theme;
 
-    SetBackgroundColour(t.bgMain);
+    SetBackgroundColour(t.bgDialogSurface);
 
     for (auto* child : GetChildren()) {
         if (auto* p = dynamic_cast<wxPanel*>(child))
-            p->SetBackgroundColour(t.bgMain);
+            p->SetBackgroundColour(t.bgDialogSurface);
     }
 
     // Apply label colors + neutral button fill to every widget recursively.
-    // This fixes the old dialog's bug: GetChildren() isn't recursive, so
-    // nested buttons (OK/Cancel) never got themed.
+    // The recursive helper tints every wxButton with bgInputField — we
+    // re-tint the accent buttons and Cancel below to override that.
     ApplyDialogThemeRecursive(this, t.textPrimary, t.bgInputField, t.textPrimary);
 
-    // Section dividers: 1px panels that got painted with textPrimary by the
-    // cascade. Retarget them to borderSubtle by finding them by height.
-    std::function<void(wxWindow*)> fixDividers = [&](wxWindow* w) {
-        for (auto* child : w->GetChildren()) {
-            if (auto* p = dynamic_cast<wxPanel*>(child)) {
-                if (p->GetSize().y == 1)
-                    p->SetBackgroundColour(t.borderSubtle);
-            }
-            if (child->GetChildren().GetCount() > 0)
-                fixDividers(child);
-        }
-    };
-    fixDividers(this);
+    // Section gap bands — paint every registered divider with
+    // borderSubtle so they read lighter than the dialog surface
+    // (#2B3845 vs #17212B), landing a raised-separator look rather
+    // than a dark slot. The old recursive "find every 1px panel"
+    // walker is gone; dividers are now 10px tall and tracked
+    // explicitly by MakeSectionDivider().
+    for (auto* div : m_dividers) {
+        if (div) div->SetBackgroundColour(t.borderSubtle);
+    }
 
     // Combo boxes — Windows still renders OS chrome on the dropdown arrow,
     // but at least the edit field matches the dark surfaces.
@@ -430,7 +510,7 @@ void SettingsDialog::ApplyTheme()
     // wxStaticText and wxButton only), so tint the label + surface here.
     if (m_agentDefaultCheckBox) {
         m_agentDefaultCheckBox->SetForegroundColour(t.textPrimary);
-        m_agentDefaultCheckBox->SetBackgroundColour(t.bgMain);
+        m_agentDefaultCheckBox->SetBackgroundColour(t.bgDialogSurface);
     }
 
     // Hand the sliders our theme palette
@@ -451,11 +531,23 @@ void SettingsDialog::ApplyTheme()
             t.textMuted);
     }
 
-    // Primary button gets accent treatment (the recursive helper made it
-    // neutral like everything else).
-    if (m_okBtn) {
-        m_okBtn->SetBackgroundColour(t.accentButton);
-        m_okBtn->SetForegroundColour(t.accentButtonText);
+    // Accent buttons — Send-style solid fill. Mirrors what
+    // _sendButton gets in MyFrame::ApplyTheme(): accentButton bg,
+    // accentButtonText fg. Native Win11 chrome supplies the rounded
+    // corners; we just paint the surface.
+    for (auto* btn : m_accentBtns) {
+        if (!btn) continue;
+        btn->SetBackgroundColour(t.accentButton);
+        btn->SetForegroundColour(t.accentButtonText);
+        btn->Refresh();
+    }
+
+    // Cancel: flat, borderless, muted text. The dialog surface bg lets
+    // it disappear into the footer until the user reaches for it.
+    if (m_cancelBtn) {
+        m_cancelBtn->SetBackgroundColour(t.bgDialogSurface);
+        m_cancelBtn->SetForegroundColour(t.textMuted);
+        m_cancelBtn->Refresh();
     }
 
     Refresh();
@@ -513,9 +605,14 @@ void SettingsDialog::OnOK(wxCommandEvent&)
     }
 
     int themeSel = m_themeComboBox->GetSelection();
-    m_selectedTheme = (themeSel == 2) ? "system"
-                    : (themeSel == 1) ? "light"
-                    :                   "dark";
+    {
+        const auto& choices = ThemeManager::GetThemeChoices();
+        if (themeSel >= 0 && static_cast<size_t>(themeSel) < choices.size()) {
+            m_selectedTheme = choices[static_cast<size_t>(themeSel)].internalName;
+        }
+        // else: leave m_selectedTheme at its current value — no valid
+        // selection means we don't overwrite the user's prior choice.
+    }
 
     // Checkbox is authoritative — the live value may have been toggled
     // since construction without m_selectedAgentDefault being updated.
@@ -637,4 +734,52 @@ void SettingsDialog::OnResetFolder(wxCommandEvent&)
     ServerManager::SetModelsDirOverride("");
     UpdateFolderUi();
     PopulateModelList();
+}
+
+// ─── Connections ────────────────────────────────────────────────
+
+void SettingsDialog::OnManageConnections(wxCommandEvent&)
+{
+    if (!m_secretsStore) {
+        wxMessageBox(
+            "Secrets store is not available. Restart LlamaBoss "
+            "and try again.",
+            "Connections", wxOK | wxICON_INFORMATION, this);
+        return;
+    }
+
+    ConnectionsDialog dlg(this, m_secretsStore, *m_theme);
+    dlg.ShowModal();
+
+    // Save immediately on dialog close.  Connections are user-edited
+    // state that should persist even if the user later hits Cancel on
+    // Settings — keys are not bundled with the rest of the dialog
+    // settings.
+    const bool saved = m_secretsStore->Save();
+    if (!saved) {
+        wxMessageBox(
+            "Connections were updated for this session, but LlamaBoss "
+            "could not save them to disk. They may be lost after restart.",
+            "Connections Not Saved", wxOK | wxICON_WARNING, this);
+    }
+
+    UpdateConnectionsLabel();
+}
+
+void SettingsDialog::UpdateConnectionsLabel()
+{
+    if (!m_connectionsLabel) return;
+    size_t count = 0;
+    if (m_secretsStore) count = m_secretsStore->ListConnections().size();
+
+    if (count == 0) {
+        m_connectionsLabel->SetLabel("No connections configured");
+    } else if (count == 1) {
+        m_connectionsLabel->SetLabel("1 connection configured");
+    } else {
+        m_connectionsLabel->SetLabel(
+            wxString::Format("%zu connections configured", count));
+    }
+    if (m_connectionsLabel->GetParent())
+        m_connectionsLabel->GetParent()->Layout();
 }

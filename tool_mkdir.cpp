@@ -2,7 +2,7 @@
 
 #include "tool_mkdir.h"
 #include "tool_path.h"
-#include "tool_path_safety.h"   // IsUnderCwd, Basename, ParentDir
+#include "tool_path_safety.h"   // IsUnderAllowedWriteRoot, Basename, ParentDir
 #include "path_safety.h"
 
 #include <chrono>
@@ -55,7 +55,7 @@ MkdirResult MakeDirectory(const std::string& pathIn,
         return r;
     }
 
-    std::string resolved = ResolveToolPath(requested, ctx.cwd);
+    std::string resolved = tool_path_safety::ResolveProjectAwareToolPath(requested, ctx.cwd, ctx.activeProjectRoot);
     if (resolved.empty()) {
         r.chips.push_back("failed");
         r.errorBody = "Could not resolve path: " + requested;
@@ -64,11 +64,11 @@ MkdirResult MakeDirectory(const std::string& pathIn,
     }
 
     // ── Containment ──────────────────────────────────────────────
-    if (!tool_path_safety::IsUnderCwd(resolved, ctx.cwd)) {
+    if (!tool_path_safety::IsUnderAllowedWriteRoot(resolved, ctx.cwd, ctx.activeProjectRoot, ctx.skillsRoot)) {
         r.chips.push_back("blocked");
-        r.errorBody = "Refuses to create directories outside the "
-                      "working directory.\n  resolved: " + resolved +
-                      "\n  cwd:      " + ctx.cwd;
+        r.errorBody = "Refuses to create directories outside the allowed write roots."
+                      "\n  resolved: " + resolved +
+                      tool_path_safety::AllowedWriteRootsDiagnostic(ctx.cwd, ctx.activeProjectRoot, ctx.skillsRoot);
         r.chips.push_back(ElapsedChip(t0));
         return r;
     }

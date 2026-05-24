@@ -15,6 +15,55 @@
 #include <fstream>
 #include <algorithm>
 
+namespace {
+
+// Decode JSON-style escape sequences from a string extracted out of a
+// JSON value, for single-line UI label display.  Handles:
+//   \"  \\  \/  \b  \f  \n  \r  \t
+// Whitespace-control escapes (\b \f \n \r \t) collapse to a single
+// space because the sidebar shows titles on one line -- letting a real
+// newline through would make wxStaticText render a multi-line label,
+// which is uglier than the literal-`\n` artifact we are fixing.
+// Unknown escapes drop the backslash and keep the following character,
+// matching the lenient behaviour of most JSON readers.
+//
+// \uXXXX is intentionally NOT handled: Poco's Stringifier (used to
+// write our conversation files) emits non-ASCII as raw UTF-8 by
+// default, so \uXXXX sequences are vanishingly rare in our files.
+// If that changes, extend this helper rather than parsing whole JSON.
+std::string JsonUnescapeForLabel(const std::string& in)
+{
+    std::string out;
+    out.reserve(in.size());
+    for (size_t i = 0; i < in.size(); ++i) {
+        const char c = in[i];
+        if (c != '\\' || i + 1 >= in.size()) {
+            out += c;
+            continue;
+        }
+        const char next = in[i + 1];
+        switch (next) {
+        case '"':  out += '"';  ++i; break;
+        case '\\': out += '\\'; ++i; break;
+        case '/':  out += '/';  ++i; break;
+        case 'b': case 'f': case 'n': case 'r': case 't':
+            out += ' ';
+            ++i;
+            break;
+        default:
+            // Unknown escape: drop the backslash and keep the following
+            // character.  Alternative would be to keep both literally;
+            // dropping the backslash gives a cleaner-looking label.
+            out += next;
+            ++i;
+            break;
+        }
+    }
+    return out;
+}
+
+} // namespace
+
 // ═══════════════════════════════════════════════════════════════════
 //  Construction
 // ═══════════════════════════════════════════════════════════════════
@@ -32,14 +81,14 @@ ConversationSidebar::ConversationSidebar(wxWindow* parent,
 
     // ── Outer panel (sidebar + right border) ─────────────────────
     m_panel = new wxPanel(parent, wxID_ANY);
-    m_panel->SetBackgroundColour(theme.bgSidebar);
+    m_panel->SetBackgroundColour(theme.bgDialogSurface);
     m_panel->SetMinSize(wxSize(260, -1));
 
     auto* outerSizer = new wxBoxSizer(wxHORIZONTAL);
 
     // ── Content area ─────────────────────────────────────────────
     m_content = new wxPanel(m_panel, wxID_ANY);
-    m_content->SetBackgroundColour(theme.bgSidebar);
+    m_content->SetBackgroundColour(theme.bgDialogSurface);
     auto* contentSizer = new wxBoxSizer(wxVERTICAL);
 
     // "+ New Chat" button
@@ -68,7 +117,7 @@ ConversationSidebar::ConversationSidebar(wxWindow* parent,
     // Scrollable conversation list
     m_listWindow = new wxScrolledWindow(m_content, wxID_ANY,
         wxDefaultPosition, wxDefaultSize, wxVSCROLL);
-    m_listWindow->SetBackgroundColour(theme.bgSidebar);
+    m_listWindow->SetBackgroundColour(theme.bgDialogSurface);
     m_listWindow->SetScrollRate(0, 8);
     m_listSizer = new wxBoxSizer(wxVERTICAL);
     m_listWindow->SetSizer(m_listSizer);
@@ -465,13 +514,13 @@ void ConversationSidebar::ApplyTheme(const ThemeData& theme)
 {
     m_theme = &theme;
 
-    m_panel->SetBackgroundColour(theme.bgSidebar);
-    m_content->SetBackgroundColour(theme.bgSidebar);
+    m_panel->SetBackgroundColour(theme.bgDialogSurface);
+    m_content->SetBackgroundColour(theme.bgDialogSurface);
     m_newChatButton->SetBackgroundColour(theme.modelPillBg);
     m_newChatButton->SetForegroundColour(theme.textPrimary);
     m_searchBox->SetBackgroundColour(theme.bgInputField);
     m_searchBox->SetForegroundColour(theme.textPrimary);
-    m_listWindow->SetBackgroundColour(theme.bgSidebar);
+    m_listWindow->SetBackgroundColour(theme.bgDialogSurface);
     m_border->SetBackgroundColour(theme.borderSubtle);
 
     // Cached rows do not get rebuilt on theme changes, so recolor them here.
@@ -489,7 +538,7 @@ void ConversationSidebar::ApplyTheme(const ThemeData& theme)
     // Recolor cached project headers — same lifetime story as rows.
     for (auto& [id, header] : m_projectHeaders) {
         if (header.panel)
-            header.panel->SetBackgroundColour(theme.bgSidebar);
+            header.panel->SetBackgroundColour(theme.bgDialogSurface);
         if (header.triangle)
             header.triangle->SetForegroundColour(theme.textMuted);
         if (header.nameLabel)
@@ -512,7 +561,7 @@ wxColour ConversationSidebar::GetRowBackground(const std::string& filePath) cons
         return m_theme->modelPillBg;
     if (IsSelected(filePath))
         return m_theme->sidebarSelected;
-    return m_theme->bgSidebar;
+    return m_theme->bgDialogSurface;
 }
 
 void ConversationSidebar::RefreshAllRowBackgrounds()
@@ -560,10 +609,11 @@ void ConversationSidebar::FilterRows()
 
         bool show = true;
         if (nowFiltered) {
-            std::string titleLower = row.displayedTitle;
-            std::transform(titleLower.begin(), titleLower.end(),
-                           titleLower.begin(), ::tolower);
-            show = (titleLower.find(m_searchFilter) != std::string::npos);
+            // displayedTitleLower is kept in sync at row create / update
+            // time, so the per-keystroke filter is now a single find()
+            // instead of N lowercase transforms across the whole list.
+            show = (row.displayedTitleLower.find(m_searchFilter)
+                    != std::string::npos);
         }
 
         row.panel->Show(show);
@@ -677,11 +727,36 @@ ConversationSidebar::ScanConversations()
                         if (openQuote == std::string::npos) return false;
                         size_t end = openQuote + 1;
                         while (end < line.size()) {
-                            if (line[end] == '"' && line[end - 1] != '\\') break;
+                            if (line[end] == '"') {
+                                // Count consecutive backslashes immediately
+                                // preceding this candidate terminator.  An
+                                // EVEN count (including zero) means the
+                                // quote is unescaped and really is the
+                                // closing quote.  An ODD count means the
+                                // immediately-preceding backslash escapes
+                                // the quote, which is then string data.
+                                //
+                                // Naive `line[end - 1] != '\\'` mishandles
+                                // values like "C:\\path\\" -- the closing
+                                // quote is preceded by a single backslash,
+                                // but that backslash is the second half of
+                                // a `\\` pair encoding a literal backslash
+                                // in the value, so the quote really does
+                                // terminate.  We have to look further back.
+                                size_t backslashes = 0;
+                                size_t k = end;
+                                while (k > openQuote + 1 &&
+                                       line[k - 1] == '\\') {
+                                    ++backslashes;
+                                    --k;
+                                }
+                                if ((backslashes % 2) == 0) break;
+                            }
                             ++end;
                         }
                         if (end >= line.size()) return false;
                         out = line.substr(openQuote + 1, end - openQuote - 1);
+                        out = JsonUnescapeForLabel(out);
                         return true;
                     };
 
@@ -894,7 +969,7 @@ ConversationSidebar::CreateProjectHeader(const std::string& groupId,
     header.collapsed   = collapsed;
 
     header.panel = new wxPanel(m_listWindow, wxID_ANY);
-    header.panel->SetBackgroundColour(m_theme->bgSidebar);
+    header.panel->SetBackgroundColour(m_theme->bgDialogSurface);
     header.panel->SetCursor(wxCursor(wxCURSOR_HAND));
 
     auto* sizer = new wxBoxSizer(wxHORIZONTAL);
@@ -1096,7 +1171,7 @@ void ConversationSidebar::OnDragHoverHeader(const std::string& groupId,
 
     // Reuse sidebarHover for highlight — same color the chat rows
     // use on mouse-over, so the visual language is consistent.
-    wxColour bg = hovering ? m_theme->sidebarHover : m_theme->bgSidebar;
+    wxColour bg = hovering ? m_theme->sidebarHover : m_theme->bgDialogSurface;
     it->second.panel->SetBackgroundColour(bg);
     it->second.panel->Refresh();
 }
@@ -1132,6 +1207,11 @@ ConversationSidebar::CreateRow(const ConversationEntry& entry)
     if (row.displayedTitle.size() > 35)
         row.displayedTitle = row.displayedTitle.substr(0, 32) + "...";
 
+    row.displayedTitleLower = row.displayedTitle;
+    std::transform(row.displayedTitleLower.begin(),
+                   row.displayedTitleLower.end(),
+                   row.displayedTitleLower.begin(), ::tolower);
+
     row.displayedTime = RelativeTimeString(entry.modTime);
 
     row.panel = new wxPanel(m_listWindow, wxID_ANY);
@@ -1154,7 +1234,7 @@ ConversationSidebar::CreateRow(const ConversationEntry& entry)
     // the project name.  The leading indent is intentionally larger
     // than the header's triangle padding (8px) — chat titles align
     // roughly under the project name's first character.
-    topSizer->Add(row.titleLabel, 1, wxLEFT | wxTOP, 24);
+    topSizer->Add(row.titleLabel, 1, wxLEFT | wxTOP, 12);
 
     // Trash icon — hidden by default, shown on hover
     row.deleteBtn = new wxStaticText(row.panel, wxID_ANY,
@@ -1384,6 +1464,10 @@ void ConversationSidebar::UpdateRow(RowWidgets& row,
 
     if (newTitle != row.displayedTitle) {
         row.displayedTitle = newTitle;
+        row.displayedTitleLower = newTitle;
+        std::transform(row.displayedTitleLower.begin(),
+                       row.displayedTitleLower.end(),
+                       row.displayedTitleLower.begin(), ::tolower);
         if (row.titleLabel)
             row.titleLabel->SetLabel(wxString::FromUTF8(newTitle));
     }

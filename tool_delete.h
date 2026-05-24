@@ -20,11 +20,10 @@
 // The model has no way to wipe a tree of files in one call.  This
 // is on purpose: every deletion is auditable as a single tool
 // block in chat history.  A multi-file cleanup walks naturally
-// through ls + per-entry delete iterations.  PowerShell's
-// Remove-Item is also rejected by command_policy (Remove-* verb
-// prefix is not on the read-only allowlist), so there is no
-// shell-side back door either -- the read-only policy and the
-// no-recursive-delete policy are mutually consistent.
+// through ls + per-entry delete iterations.  PowerShell remains
+// more flexible for developer/system workflows, but Remove-Item and
+// other non-read-only shell commands now pause for explicit approval
+// before they execute, keeping that broader path visible to the user.
 //
 // ─── Safety floor (same shape as write/edit/mkdir) ───────────────
 // 1. Containment: the resolved path must be inside ctx.cwd.

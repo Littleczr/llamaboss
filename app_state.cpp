@@ -1,5 +1,6 @@
 ﻿// app_state.cpp
 #include "app_state.h"
+#include "secrets_store.h"
 #include "server_manager.h"   // for ServerConfig (MakeServerConfig)
 
 // wxWidgets headers
@@ -39,6 +40,21 @@ AppState::~AppState()
     LogShutdownMessage();
     // No more Ollama model unloading — ServerManager handles process cleanup
 }
+
+// ── Secrets / Connections ───────────────────────────────────────
+// Lazy-constructed so AppState's own ctor stays trivial and so a
+// missing/malformed secrets.json doesn't abort startup.  The first
+// call constructs the store and runs Load(); a missing file is
+// treated as "empty store" (see SecretsStore::Load).
+SecretsStore* AppState::GetSecretsStore()
+{
+    if (!m_secretsStore) {
+        m_secretsStore = std::make_unique<SecretsStore>();
+        m_secretsStore->Load();
+    }
+    return m_secretsStore.get();
+}
+
 
 bool AppState::Initialize()
 {

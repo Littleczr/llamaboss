@@ -27,6 +27,15 @@ static bool StartsWith(const std::string& s, const std::string& prefix)
            s.compare(0, prefix.size(), prefix) == 0;
 }
 
+static bool IsHiddenGoalReplaySystemMessage(const std::string& content)
+{
+    // Goal continuation instructions are intentionally persisted in the
+    // transcript so future model turns retain the control context, but they
+    // are internal orchestration prompts and should not render back into the
+    // visible chat when a saved conversation is replayed.
+    return StartsWith(content, "Goal continuation instruction:");
+}
+
 static std::string TrimCopy(std::string s)
 {
     auto notSpace = [](unsigned char c) { return !std::isspace(c); };
@@ -329,71 +338,106 @@ void ConversationController::DeleteConversations(
         wxYES_NO | wxICON_WARNING);
     if (result != wxYES) return;
 
+    // ── Pass 1 (fast): remove .json files, collect sidecar dirs ──
+    //
+    // The .json is what ConversationSidebar::ScanConversations keys off
+    // of, so once it's gone the chat is effectively "deleted" from the
+    // user's POV.  We do all of those first, refresh the sidebar so the
+    // rows visibly disappear, and only then do the slow recursive
+    // directory cleanups (Pass 2 below).  Without this split the UI
+    // thread is wedged inside wxFileName::Rmdir for every chat's
+    // attachments/files/Workflows tree before anything updates, which
+    // is what makes bulk delete feel sluggish at higher chat counts.
+    struct PendingCleanup {
+        std::string filePath;
+        wxString    attachDir;
+        wxString    filesDir;
+        wxString    workflowDir;
+    };
+    std::vector<PendingCleanup> cleanups;
+    cleanups.reserve(filePaths.size());
+
     bool clearedActive = false;
     int deleted = 0;
 
     for (const auto& filePath : filePaths) {
-        if (wxRemoveFile(wxString::FromUTF8(filePath))) {
-            ++deleted;
+        if (!wxRemoveFile(wxString::FromUTF8(filePath)))
+            continue;
 
-            // Clean up sidecar attachment directory
-            wxFileName convFn(wxString::FromUTF8(filePath));
-            std::string stem(convFn.GetName().ToUTF8().data());
-            wxString attachDirWx = wxString::FromUTF8(
-                ChatHistory::GetConversationsDir() + "/attachments/" + stem);
-            if (wxDirExists(attachDirWx)) {
-                wxLogNull suppressErrors;
-                if (!wxFileName::Rmdir(attachDirWx, wxPATH_RMDIR_RECURSIVE)) {
-                    if (auto* logger = m_appState.GetLogger())
-                        logger->warning("Could not fully remove attachment dir: " +
-                            std::string(attachDirWx.ToUTF8().data()));
-                }
-            }
+        ++deleted;
 
-            // Clean up sidecar generated-files directory (Phase 3)
-            wxString filesDirWx = wxString::FromUTF8(
-                ChatHistory::GetConversationsDir() + "/files/" + stem);
-            if (wxDirExists(filesDirWx)) {
-                wxLogNull suppressErrors;
-                if (!wxFileName::Rmdir(filesDirWx, wxPATH_RMDIR_RECURSIVE)) {
-                    if (auto* logger = m_appState.GetLogger())
-                        logger->warning("Could not fully remove generated files dir: " +
-                            std::string(filesDirWx.ToUTF8().data()));
-                }
-            }
+        wxFileName convFn(wxString::FromUTF8(filePath));
+        std::string stem(convFn.GetName().ToUTF8().data());
 
-            // Clean up the per-conversation workflow folder.  This is the
-            // user-visible folder that contains Workspace, attachments,
-            // artifacts, scripts, reports, PDFs, etc. for this chat.
-            wxString workflowDirWx = wxString::FromUTF8(
-                ChatHistory::GetWorkflowDir(filePath));
-            if (wxDirExists(workflowDirWx)) {
-                wxLogNull suppressErrors;
-                if (!wxFileName::Rmdir(workflowDirWx, wxPATH_RMDIR_RECURSIVE)) {
-                    if (auto* logger = m_appState.GetLogger())
-                        logger->warning("Could not fully remove workflow dir: " +
-                            std::string(workflowDirWx.ToUTF8().data()));
-                }
-            }
+        PendingCleanup pc;
+        pc.filePath    = filePath;
+        pc.attachDir   = wxString::FromUTF8(
+            ChatHistory::GetConversationsDir() + "/attachments/" + stem);
+        pc.filesDir    = wxString::FromUTF8(
+            ChatHistory::GetConversationsDir() + "/files/" + stem);
+        pc.workflowDir = wxString::FromUTF8(
+            ChatHistory::GetWorkflowDir(filePath));
+        cleanups.push_back(std::move(pc));
 
-            // If deleting the currently active conversation, clear the display
-            if (!clearedActive && filePath == m_chatHistory->GetFilePath()) {
-                m_chatHistory->Clear();
-                m_chatDisplay->Clear();
-                m_attachments.Clear();
-                UpdateWindowTitle();
-                clearedActive = true;
-            }
-
-            if (auto* logger = m_appState.GetLogger())
-                logger->information("Deleted conversation: " + filePath);
+        // If deleting the currently active conversation, clear the
+        // display now -- before the sidebar refresh -- so the refresh
+        // reflects the cleared state.
+        if (!clearedActive && filePath == m_chatHistory->GetFilePath()) {
+            m_chatHistory->Clear();
+            m_chatDisplay->Clear();
+            m_attachments.Clear();
+            UpdateWindowTitle();
+            clearedActive = true;
         }
     }
 
+    // ── Sidebar update: chats visibly disappear here ──
     if (deleted > 0) {
         m_sidebar.ClearSelection();
         if (m_sidebar.IsVisible())
             m_sidebar.Refresh(m_chatHistory->GetFilePath());
+    }
+
+    // ── Pass 2 (slow): recursive sidecar/workflow cleanup ──
+    //
+    // Wait cursor while these run so the user sees work is still in
+    // progress even though the sidebar already updated.  This loop
+    // remains on the UI thread by design -- moving it off-thread would
+    // need coordination with anything else that touches the same
+    // conversation paths, and the perceived hitch after the sidebar
+    // updates is much smaller than the original "everything wedges
+    // before anything visibly changes" feel.
+    if (!cleanups.empty()) {
+        wxBusyCursor wait;
+        for (const auto& pc : cleanups) {
+            if (wxDirExists(pc.attachDir)) {
+                wxLogNull suppressErrors;
+                if (!wxFileName::Rmdir(pc.attachDir, wxPATH_RMDIR_RECURSIVE)) {
+                    if (auto* logger = m_appState.GetLogger())
+                        logger->warning("Could not fully remove attachment dir: " +
+                            std::string(pc.attachDir.ToUTF8().data()));
+                }
+            }
+            if (wxDirExists(pc.filesDir)) {
+                wxLogNull suppressErrors;
+                if (!wxFileName::Rmdir(pc.filesDir, wxPATH_RMDIR_RECURSIVE)) {
+                    if (auto* logger = m_appState.GetLogger())
+                        logger->warning("Could not fully remove generated files dir: " +
+                            std::string(pc.filesDir.ToUTF8().data()));
+                }
+            }
+            if (wxDirExists(pc.workflowDir)) {
+                wxLogNull suppressErrors;
+                if (!wxFileName::Rmdir(pc.workflowDir, wxPATH_RMDIR_RECURSIVE)) {
+                    if (auto* logger = m_appState.GetLogger())
+                        logger->warning("Could not fully remove workflow dir: " +
+                            std::string(pc.workflowDir.ToUTF8().data()));
+                }
+            }
+
+            if (auto* logger = m_appState.GetLogger())
+                logger->information("Deleted conversation: " + pc.filePath);
+        }
     }
 
     if (deleted < (int)filePaths.size()) {
@@ -548,6 +592,9 @@ void ConversationController::ReplayConversation()
             );
         }
         else if (role == "system") {
+            if (IsHiddenGoalReplaySystemMessage(content)) {
+                continue;
+            }
             m_chatDisplay->DisplaySystemMessage(content);
         }
     }

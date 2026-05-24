@@ -70,3 +70,4 @@ venv/
 secrets.json
 tokens.json
 credentials.json
+vcpkg_installed/

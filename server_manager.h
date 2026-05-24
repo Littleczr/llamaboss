@@ -200,6 +200,7 @@ private:
 #ifdef __WXMSW__
     HANDLE m_processHandle = INVALID_HANDLE_VALUE;
     HANDLE m_threadHandle  = INVALID_HANDLE_VALUE;
+    HANDLE m_jobHandle     = NULL;   // Kills llama-server if LlamaBoss closes/crashes.
     DWORD  m_processId     = 0;
 #endif
 

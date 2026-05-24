@@ -15,6 +15,7 @@
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include "ui_event_post.h"
 
 wxDEFINE_EVENT(wxEVT_GREP_COMPLETE, wxCommandEvent);
 
@@ -430,12 +431,9 @@ public:
         result.chips.push_back(FormatElapsed(elapsed));
 
         // ── Post back to UI thread, if it's still alive ──────────
-        auto alive = m_alive.lock();
-        if (alive && alive->load()) {
-            auto* evt = new wxCommandEvent(wxEVT_GREP_COMPLETE);
-            evt->SetClientObject(new GrepResultClientData(std::move(result)));
-            m_handler->QueueEvent(evt);
-        }
+        auto* evt = new wxCommandEvent(wxEVT_GREP_COMPLETE);
+        evt->SetClientObject(new GrepResultClientData(std::move(result)));
+        LbQueueEventIfAlive(m_handler, m_alive, evt);
 
         m_running->store(false);
         return (ExitCode)0;

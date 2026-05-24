@@ -3,6 +3,7 @@
 #include "tool_open.h"
 
 #include "tool_path.h"
+#include "tool_path_safety.h"
 #include "tool_read.h"
 #include "chat_history.h"
 
@@ -1111,7 +1112,7 @@ OpenResult OpenFile(const std::string&                  inputPath,
     // ── Resolution: direct path first ────────────────────────────
     std::string resolved;
     {
-        std::string r0 = ResolveToolPath(openInput, ctx.cwd);
+        std::string r0 = tool_path_safety::ResolveProjectAwareToolPath(openInput, ctx.cwd, ctx.activeProjectRoot);
         if (!r0.empty() && (IsFile(r0) || IsDirectory(r0))) {
             resolved = std::move(r0);
         }
@@ -1127,7 +1128,7 @@ OpenResult OpenFile(const std::string&                  inputPath,
         std::string parentRaw = ParentPartRaw(openInput);
         std::string leafRaw   = LeafPartRaw(openInput);
         if (!parentRaw.empty() && !leafRaw.empty()) {
-            std::string parentDir = ResolveToolPath(parentRaw, ctx.cwd);
+            std::string parentDir = tool_path_safety::ResolveProjectAwareToolPath(parentRaw, ctx.cwd, ctx.activeProjectRoot);
             std::vector<std::string> entries;
             if (!parentDir.empty() && IsDirectory(parentDir)) {
                 if (EnumerateDirectoryEntryNames(parentDir, entries)) {

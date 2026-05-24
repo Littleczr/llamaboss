@@ -28,8 +28,22 @@
 #include <fstream>
 #include <mutex>
 #include <sstream>
+#include "ui_event_post.h"
 #include <iomanip>
 #include <algorithm>
+
+#ifdef __WXMSW__
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#ifdef min
+#undef min
+#endif
+#ifdef max
+#undef max
+#endif
+#endif
 
 // ── Events ──────────────────────────────────────────────────────
 wxDEFINE_EVENT(wxEVT_DOWNLOAD_PROGRESS, wxCommandEvent);
@@ -43,6 +57,77 @@ wxDEFINE_EVENT(wxEVT_DOWNLOAD_ERROR,    wxCommandEvent);
 static std::string BundleNameFor(const DownloadableModel& m);
 static std::string BuildMmprojUrl(const DownloadableModel& m);
 static std::string BuildMmprojDestPath(const DownloadableModel& m);
+
+// ─────────────────────────────────────────────────────────────────
+//  Button helpers (file-local)
+// ─────────────────────────────────────────────────────────────────
+//
+// Same Telegram-style recipe used in settings.cpp / model_manager.cpp /
+// project_attach_dialog.cpp: wxButton + wxBORDER_NONE so Win11 doesn't
+// paint native chrome over the solid fill, semibold 10pt label, theme
+// palette applied in place. The per-row action button uses these to
+// flip between download/cancel/retry/downloaded states by reapplying
+// a different palette over the same wxButton.
+//
+namespace {
+
+wxButton* MakeAccentButton(wxWindow* parent, wxWindowID id,
+                           const wxString& label, const ThemeData& t,
+                           int height = 32)
+{
+    auto* btn = new wxButton(parent, id, label,
+                             wxDefaultPosition, wxSize(-1, height),
+                             wxBORDER_NONE);
+    wxFont bf = btn->GetFont();
+    bf.SetPointSize(10);
+    bf.SetWeight(wxFONTWEIGHT_SEMIBOLD);
+    btn->SetFont(bf);
+    btn->SetBackgroundColour(t.accentButton);
+    btn->SetForegroundColour(t.accentButtonText);
+    return btn;
+}
+
+wxButton* MakeFlatButton(wxWindow* parent, wxWindowID id,
+                         const wxString& label, const ThemeData& t,
+                         int height = 32)
+{
+    auto* btn = new wxButton(parent, id, label,
+                             wxDefaultPosition, wxSize(-1, height),
+                             wxBORDER_NONE);
+    wxFont bf = btn->GetFont();
+    bf.SetPointSize(10);
+    bf.SetWeight(wxFONTWEIGHT_SEMIBOLD);
+    btn->SetFont(bf);
+    btn->SetBackgroundColour(t.bgDialogSurface);
+    btn->SetForegroundColour(t.textMuted);
+    return btn;
+}
+
+// Re-tint helpers for the per-row action button. The widget itself
+// stays put; we only swap palette + label as the download moves
+// between states.
+void TintAccent(wxButton* btn, const ThemeData& t)
+{
+    btn->SetBackgroundColour(t.accentButton);
+    btn->SetForegroundColour(t.accentButtonText);
+    btn->Refresh();
+}
+
+void TintDestructive(wxButton* btn, const ThemeData& t)
+{
+    btn->SetBackgroundColour(t.stopButton);
+    btn->SetForegroundColour(t.stopButtonText);
+    btn->Refresh();
+}
+
+void TintFlatMuted(wxButton* btn, const ThemeData& t)
+{
+    btn->SetBackgroundColour(t.bgDialogSurface);
+    btn->SetForegroundColour(t.textMuted);
+    btn->Refresh();
+}
+
+}  // namespace
 
 // ═══════════════════════════════════════════════════════════════════
 //  Curated model catalog
@@ -179,6 +264,81 @@ static bool QuietRemoveFileUtf8(const std::string& path)
     return wxRemoveFile(wxPath);
 }
 
+#ifdef __WXMSW__
+static std::string LastWindowsErrorUtf8()
+{
+    DWORD err = GetLastError();
+    if (err == ERROR_SUCCESS) return std::string();
+
+    LPWSTR buffer = nullptr;
+    DWORD chars = FormatMessageW(
+        FORMAT_MESSAGE_ALLOCATE_BUFFER |
+        FORMAT_MESSAGE_FROM_SYSTEM |
+        FORMAT_MESSAGE_IGNORE_INSERTS,
+        nullptr,
+        err,
+        MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
+        reinterpret_cast<LPWSTR>(&buffer),
+        0,
+        nullptr);
+
+    std::string msg;
+    if (chars > 0 && buffer) {
+        wxString wxMsg(buffer);
+        msg = std::string(wxMsg.utf8_string());
+        while (!msg.empty() && (msg.back() == '\r' || msg.back() == '\n' || msg.back() == ' ' || msg.back() == '\t')) {
+            msg.pop_back();
+        }
+    }
+
+    if (buffer) LocalFree(buffer);
+
+    if (msg.empty()) {
+        msg = "Windows error " + std::to_string(static_cast<unsigned long>(err));
+    }
+    return msg;
+}
+#endif
+
+static bool PromoteDownloadUtf8(const std::string& tempPath,
+                                const std::string& destPath,
+                                std::string* errorOut)
+{
+    if (errorOut) errorOut->clear();
+
+#ifdef __WXMSW__
+    std::wstring tempWide = path_safety::Utf8ToWide(tempPath);
+    std::wstring destWide = path_safety::Utf8ToWide(destPath);
+
+    // Important: do not delete the existing model before the replacement is
+    // guaranteed. MoveFileExW with MOVEFILE_REPLACE_EXISTING preserves the
+    // old final file when the replacement fails, such as when antivirus,
+    // permissions, or a running llama.cpp server has the file locked.
+    if (MoveFileExW(tempWide.c_str(),
+                    destWide.c_str(),
+                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        return true;
+    }
+
+    if (errorOut) *errorOut = LastWindowsErrorUtf8();
+    return false;
+#else
+    wxLogNull noLog;
+
+    // Non-Windows fallback: wxRenameFile(..., true) requests overwrite without
+    // pre-deleting the destination. This keeps the old behavior portable while
+    // avoiding the destructive remove-first sequence.
+    if (wxRenameFile(wxString::FromUTF8(tempPath),
+                     wxString::FromUTF8(destPath),
+                     true)) {
+        return true;
+    }
+
+    if (errorOut) *errorOut = "rename failed";
+    return false;
+#endif
+}
+
 static wxString FriendlyDownloadError(const std::string& raw)
 {
     wxString msg = wxString::FromUTF8(raw);
@@ -216,17 +376,10 @@ bool DownloadThread::SafePost(wxCommandEvent* ev)
     // Cancelled? Drop the event on the floor.
     if (m_cancelFlag->load()) { delete ev; return false; }
 
-    // Verify the handler is still alive. The dialog's destructor flips
-    // this sentinel to false, so a detached thread that's mid-read when
-    // the user closes the dialog won't post to a freed wxEvtHandler.
-    // Small race remains between this check and wxQueueEvent, but the
-    // window is vanishingly small compared to the previous (seconds-long)
-    // gap while the thread was still writing to disk after dialog close.
-    auto alive = m_aliveToken.lock();
-    if (!alive || !alive->load()) { delete ev; return false; }
-
-    wxQueueEvent(m_handler, ev);
-    return true;
+    // Verify the handler is still alive and queue under the shared UI-post
+    // mutex. This closes the old check-then-wxQueueEvent race when the
+    // dialog is being destroyed while a detached download thread finishes.
+    return LbQueueEventIfAlive(m_handler, m_aliveToken, ev);
 }
 
 wxThread::ExitCode DownloadThread::Entry()
@@ -459,11 +612,21 @@ wxThread::ExitCode DownloadThread::Entry()
                 }
             }
 
-            // ── Rename temp → final ──────────────────────────────
-            if (wxFileExists(wxString::FromUTF8(m_destPath))) QuietRemoveFileUtf8(m_destPath);
-            if (!wxRenameFile(tempPath, m_destPath)) {
+            // ── Promote temp → final ────────────────────────────
+            // Never remove the existing final model first. If replacement fails,
+            // the old working .gguf must remain intact and the .download file is
+            // left in place for troubleshooting or possible manual recovery.
+            std::string promoteError;
+            if (!PromoteDownloadUtf8(tempPath, m_destPath, &promoteError)) {
                 auto* ev = new wxCommandEvent(wxEVT_DOWNLOAD_ERROR);
-                ev->SetString("Could not save file to:\n" + m_destPath);
+
+                std::string msg = "Could not save downloaded file to:\n" + m_destPath;
+                if (!promoteError.empty()) {
+                    msg += "\n\nReason: " + promoteError;
+                }
+                msg += "\n\nYour existing model file was not removed. The temporary download remains at:\n" + tempPath;
+
+                ev->SetString(msg);
                 SafePost(ev);
                 return (ExitCode)0;
             }
@@ -551,7 +714,7 @@ ModelDownloaderDialog::~ModelDownloaderDialog()
     // that function is a no-op once wxQueueEvent has been called. By
     // flipping m_handlerAlive first, any worker thread that's about to
     // post sees a dead handler and bails out cleanly.
-    if (m_handlerAlive) m_handlerAlive->store(false);
+    LbMarkUiEventTargetDead(m_handlerAlive);
     if (m_cancelFlag)   m_cancelFlag->store(true);
 }
 
@@ -561,13 +724,13 @@ ModelDownloaderDialog::~ModelDownloaderDialog()
 
 void ModelDownloaderDialog::BuildUI()
 {
-    const wxColour bgMain    = m_theme ? m_theme->bgMain      : GetBackgroundColour();
-    const wxColour bgToolbar = m_theme ? m_theme->bgToolbar   : GetBackgroundColour();
+    const wxColour dialogSurface = m_theme ? m_theme->bgDialogSurface : GetBackgroundColour();
+    const wxColour bgToolbar     = m_theme ? m_theme->bgToolbar       : GetBackgroundColour();
     const wxColour textPri   = m_theme ? m_theme->textPrimary : GetForegroundColour();
     const wxColour textMuted = m_theme ? m_theme->textMuted   : wxColour(128,128,128);
     const wxColour border    = m_theme ? m_theme->borderSubtle: wxColour(200,200,200);
 
-    if (m_theme) SetBackgroundColour(bgMain);
+    if (m_theme) SetBackgroundColour(dialogSurface);
 
     auto* outer = new wxBoxSizer(wxVERTICAL);
 
@@ -617,7 +780,7 @@ void ModelDownloaderDialog::BuildUI()
     m_scroll = new wxScrolledWindow(this, wxID_ANY,
         wxDefaultPosition, wxDefaultSize, wxVSCROLL | wxBORDER_NONE);
     m_scroll->SetScrollRate(0, 14);
-    m_scroll->SetBackgroundColour(bgMain);
+    m_scroll->SetBackgroundColour(dialogSurface);
 
     auto* listSizer = new wxBoxSizer(wxVERTICAL);
     m_rows.resize(kModels.size());
@@ -649,15 +812,14 @@ void ModelDownloaderDialog::BuildUI()
 
     // ── Close button bar ─────────────────────────────────────────
     auto* btnPanel = new wxPanel(this);
-    btnPanel->SetBackgroundColour(bgMain);
+    btnPanel->SetBackgroundColour(dialogSurface);
     auto* btnSizer = new wxBoxSizer(wxHORIZONTAL);
     btnSizer->AddStretchSpacer();
-    auto* closeBtn = new wxButton(btnPanel, wxID_CANCEL, "Close");
-    if (m_theme) {
-        closeBtn->SetBackgroundColour(m_theme->modelPillBg);
-        closeBtn->SetForegroundColour(textPri);
-    }
-    btnSizer->Add(closeBtn, 0, wxALL, 10);
+    const ThemeData fallback = ThemeManager::GetDarkTheme();
+    const ThemeData& tCloseTheme = m_theme ? *m_theme : fallback;
+    auto* closeBtn = MakeFlatButton(btnPanel, wxID_CANCEL, "Close",
+                                    tCloseTheme);
+    btnSizer->Add(closeBtn, 0, wxALIGN_CENTER_VERTICAL | wxALL, 14);
     btnPanel->SetSizer(btnSizer);
     outer->Add(btnPanel, 0, wxEXPAND);
 
@@ -668,15 +830,14 @@ void ModelDownloaderDialog::BuildModelRow(wxSizer* listSizer,
                                            size_t idx,
                                            const DownloadableModel& model)
 {
-    const wxColour bgMain    = m_theme ? m_theme->bgMain       : GetBackgroundColour();
-    const wxColour textPri   = m_theme ? m_theme->textPrimary  : GetForegroundColour();
+    const wxColour dialogSurface = m_theme ? m_theme->bgDialogSurface : GetBackgroundColour();
+    const wxColour textPri       = m_theme ? m_theme->textPrimary     : GetForegroundColour();
     const wxColour textMuted = m_theme ? m_theme->textMuted    : wxColour(128,128,128);
     const wxColour accent    = m_theme ? m_theme->accentButton : wxColour(60,120,220);
-    const wxColour accentTxt = m_theme ? m_theme->accentButtonText : *wxWHITE;
 
     ModelRow& row = m_rows[idx];
     row.rowPanel = new wxPanel(m_scroll);
-    row.rowPanel->SetBackgroundColour(bgMain);
+    row.rowPanel->SetBackgroundColour(dialogSurface);
 
     auto* rowSizer = new wxBoxSizer(wxVERTICAL);
 
@@ -721,28 +882,30 @@ void ModelDownloaderDialog::BuildModelRow(wxSizer* listSizer,
     row.sizeLabel->SetForegroundColour(textMuted);
     topLine->Add(row.sizeLabel, 0, wxALIGN_CENTER_VERTICAL | wxLEFT | wxRIGHT, 14);
 
-    // Single button — label and style change with state.
-    // Handler checks row state so we never need to rebind.
+    // Single button — label and palette change with state. Handler
+    // checks row state so we never need to rebind. Width is pinned so
+    // the column stays aligned regardless of label length
+    // ("Download" vs "✓ Downloaded" vs "Retry").
     bool alreadyDone = IsAlreadyDownloaded(model);
     row.downloaded   = alreadyDone;
 
+    const ThemeData fallback = ThemeManager::GetDarkTheme();
+    const ThemeData& t = m_theme ? *m_theme : fallback;
+
     std::string btnLabel = alreadyDone
-        ? "\xe2\x9c\x93 Downloaded" : "Download";      // ✓ or plain
-    row.actionBtn = new wxButton(row.rowPanel, wxID_ANY,
-        wxString::FromUTF8(btnLabel), wxDefaultPosition, wxSize(120,-1));
+        ? "\xe2\x9c\x93 Downloaded" : "Download";
 
     if (alreadyDone) {
+        // Already-done rows start in the flat-muted disabled state.
+        row.actionBtn = MakeFlatButton(row.rowPanel, wxID_ANY,
+            wxString::FromUTF8(btnLabel), t, 32);
         row.actionBtn->Enable(false);
-        if (m_theme) {
-            row.actionBtn->SetBackgroundColour(m_theme->bgInputArea);
-            row.actionBtn->SetForegroundColour(textMuted);
-        }
     } else {
-        if (m_theme) {
-            row.actionBtn->SetBackgroundColour(accent);
-            row.actionBtn->SetForegroundColour(accentTxt);
-        }
+        // Available rows start in the accent state.
+        row.actionBtn = MakeAccentButton(row.rowPanel, wxID_ANY,
+            wxString::FromUTF8(btnLabel), t, 32);
     }
+    row.actionBtn->SetMinSize(wxSize(140, 32));
 
     // Single permanent handler — checks state at click time
     row.actionBtn->Bind(wxEVT_BUTTON, [this, idx](wxCommandEvent&) {
@@ -780,23 +943,22 @@ void ModelDownloaderDialog::BuildModelRow(wxSizer* listSizer,
 void ModelDownloaderDialog::SetRowDownloading(size_t idx)
 {
     ModelRow& row = m_rows[idx];
-    const wxColour stopBg  = m_theme ? m_theme->stopButton     : wxColour(180,50,50);
-    const wxColour stopTxt = m_theme ? m_theme->stopButtonText : *wxWHITE;
-    const wxColour muted   = m_theme ? m_theme->textMuted      : wxColour(128,128,128);
+    const ThemeData fallback = ThemeManager::GetDarkTheme();
+    const ThemeData& t = m_theme ? *m_theme : fallback;
 
     row.downloading = true;
 
     row.gauge->SetValue(0);
     row.gauge->Show();
     row.statusLabel->SetLabel("Connecting...");
-    row.statusLabel->SetForegroundColour(muted);
+    row.statusLabel->SetForegroundColour(t.textMuted);
 
+    // Flip the action button to "Cancel" with the destructive (red)
+    // palette — solid red signals the stop nature without surrendering
+    // the click target. Same widget, fresh palette + label.
     row.actionBtn->SetLabel("Cancel");
     row.actionBtn->Enable(true);
-    if (m_theme) {
-        row.actionBtn->SetBackgroundColour(stopBg);
-        row.actionBtn->SetForegroundColour(stopTxt);
-    }
+    TintDestructive(row.actionBtn, t);
 
     row.rowPanel->Layout();
     m_scroll->FitInside();
@@ -805,8 +967,10 @@ void ModelDownloaderDialog::SetRowDownloading(size_t idx)
 void ModelDownloaderDialog::SetRowComplete(size_t idx)
 {
     ModelRow& row = m_rows[idx];
-    const wxColour muted   = m_theme ? m_theme->textMuted   : wxColour(128,128,128);
-    const wxColour success = m_theme ? m_theme->chatAssistant: wxColour(80,180,80);
+    const ThemeData fallback = ThemeManager::GetDarkTheme();
+    const ThemeData& t = m_theme ? *m_theme : fallback;
+    const wxColour success = m_theme ? m_theme->chatAssistant
+                                     : wxColour(80,180,80);
 
     row.downloading = false;
     row.downloaded  = true;
@@ -815,12 +979,11 @@ void ModelDownloaderDialog::SetRowComplete(size_t idx)
     row.statusLabel->SetLabel(wxString::FromUTF8("\xe2\x9c\x93 Downloaded successfully"));
     row.statusLabel->SetForegroundColour(success);
 
+    // Settled state: flat muted, disabled. The "✓ Downloaded" label
+    // reads as a finished marker rather than an actionable button.
     row.actionBtn->SetLabel(wxString::FromUTF8("\xe2\x9c\x93 Downloaded"));
+    TintFlatMuted(row.actionBtn, t);
     row.actionBtn->Enable(false);
-    if (m_theme) {
-        row.actionBtn->SetBackgroundColour(m_theme->bgInputArea);
-        row.actionBtn->SetForegroundColour(muted);
-    }
 
     row.rowPanel->Layout();
     m_scroll->FitInside();
@@ -829,8 +992,8 @@ void ModelDownloaderDialog::SetRowComplete(size_t idx)
 void ModelDownloaderDialog::SetRowError(size_t idx, const std::string& msg)
 {
     ModelRow& row = m_rows[idx];
-    const wxColour accent    = m_theme ? m_theme->accentButton    : wxColour(60,120,220);
-    const wxColour accentTxt = m_theme ? m_theme->accentButtonText: *wxWHITE;
+    const ThemeData fallback = ThemeManager::GetDarkTheme();
+    const ThemeData& t = m_theme ? *m_theme : fallback;
 
     row.downloading = false;
 
@@ -838,12 +1001,10 @@ void ModelDownloaderDialog::SetRowError(size_t idx, const std::string& msg)
     row.statusLabel->SetLabel("Error: " + msg);
     row.statusLabel->SetForegroundColour(wxColour(200, 60, 60));
 
+    // Retry — back to accent palette, "Retry" label.
     row.actionBtn->SetLabel("Retry");
     row.actionBtn->Enable(true);
-    if (m_theme) {
-        row.actionBtn->SetBackgroundColour(accent);
-        row.actionBtn->SetForegroundColour(accentTxt);
-    }
+    TintAccent(row.actionBtn, t);
 
     row.rowPanel->Layout();
     m_scroll->FitInside();
@@ -907,20 +1068,16 @@ void ModelDownloaderDialog::OnCancelClicked()
 
     // Restore row to its original idle state
     ModelRow& row = m_rows[idx];
-    const wxColour muted     = m_theme ? m_theme->textMuted       : wxColour(128,128,128);
-    const wxColour accent    = m_theme ? m_theme->accentButton    : wxColour(60,120,220);
-    const wxColour accentTxt = m_theme ? m_theme->accentButtonText: *wxWHITE;
+    const ThemeData fallback = ThemeManager::GetDarkTheme();
+    const ThemeData& t = m_theme ? *m_theme : fallback;
 
     row.downloading = false;
     row.gauge->Hide();
     row.statusLabel->SetLabel(wxString::FromUTF8(kModels[idx].description));
-    row.statusLabel->SetForegroundColour(muted);
+    row.statusLabel->SetForegroundColour(t.textMuted);
     row.actionBtn->SetLabel("Download");
     row.actionBtn->Enable(true);
-    if (m_theme) {
-        row.actionBtn->SetBackgroundColour(accent);
-        row.actionBtn->SetForegroundColour(accentTxt);
-    }
+    TintAccent(row.actionBtn, t);
     row.rowPanel->Layout();
     m_scroll->FitInside();
 }
@@ -1036,6 +1193,7 @@ void ModelDownloaderDialog::OnDownloadError(wxCommandEvent& ev)
 
 void ModelDownloaderDialog::OnClose(wxCloseEvent& ev)
 {
+    LbMarkUiEventTargetDead(m_handlerAlive);
     if (m_cancelFlag) m_cancelFlag->store(true);
     ev.Skip();
 }

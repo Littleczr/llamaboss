@@ -5,6 +5,7 @@
 #include "theme.h"
 #include "path_safety.h"
 #include <wx/clipbrd.h>
+#include <wx/caret.h>
 #include <wx/filedlg.h>
 #include <wx/file.h>
 #include <wx/filefn.h>
@@ -20,6 +21,19 @@ namespace {
 int DisplayCharCount(const std::string& s)
 {
     return static_cast<int>(wxString::FromUTF8(s).length());
+}
+
+void HideRichTextCaret(wxRichTextCtrl* ctrl)
+{
+    if (!ctrl) return;
+
+    // wxRichTextCtrl is used here as a read-only transcript.  Programmatic
+    // writes and mouse clicks can still move the insertion point, which makes
+    // wxWidgets show a blinking caret.  Hiding the wxCaret keeps selection and
+    // clickable ranges working without making the transcript look editable.
+    if (wxCaret* caret = ctrl->GetCaret()) {
+        caret->Hide();
+    }
 }
 
 std::string ToLowerAscii(std::string s)
@@ -168,6 +182,37 @@ std::string RepeatText(const std::string& token, int count)
     return out;
 }
 
+// Returns the effective point size of the control's font, falling back
+// to a sane default when GetPointSize() returns 0 or negative (which
+// can happen on a freshly-constructed wxFont before the host frame
+// installs the chat font).  Called at the top of every renderer that
+// builds wxRichTextAttr instances off the base font size.
+int ResolveBaseFontSize(wxRichTextCtrl* ctrl, int fallback = 14)
+{
+    if (!ctrl) return fallback;
+    const int sz = ctrl->GetFont().GetPointSize();
+    return (sz > 0) ? sz : fallback;
+}
+
+// Builds a Consolas-faced text attribute at the given color, size, and
+// (optional) style.  Style is set EXPLICITLY -- the original ad-hoc
+// attrs sometimes omitted SetFontStyle(), which means "inherit from
+// surrounding style".  In the call sites this helper replaces, every
+// write happens in a fresh BeginStyle scope where no italic is
+// inherited, so explicit NORMAL produces byte-identical output while
+// being defensive against future code that calls these writes inside
+// an outer italic scope.
+wxRichTextAttr MakeMonoAttr(const wxColour& color, int size,
+                            wxFontStyle style = wxFONTSTYLE_NORMAL)
+{
+    wxRichTextAttr a;
+    a.SetTextColour(color);
+    a.SetFontStyle(style);
+    a.SetFontSize(size);
+    a.SetFontFaceName("Consolas");
+    return a;
+}
+
 } // namespace
 ChatDisplay::ChatDisplay(wxRichTextCtrl* displayCtrl)
     : m_displayCtrl(displayCtrl)
@@ -196,6 +241,21 @@ ChatDisplay::ChatDisplay(wxRichTextCtrl* displayCtrl)
 
     // ── Code block copy: click handler ────────────────────────────
     m_displayCtrl->Bind(wxEVT_LEFT_UP, [this](wxMouseEvent& event) {
+        // wxRichTextCtrl captures the mouse on left-down for text selection.
+        // If we consume the matching left-up for our inline affordances
+        // (Copy/file chips/details), wxWidgets can keep this control in the
+        // capture stack.  A rapid second click then trips the debug assert:
+        // "Recapturing the mouse in the same window?".
+        //
+        // We intentionally still do not Skip() handled affordance clicks
+        // because some handlers mutate rich-text ranges.  Instead, release
+        // this control's capture before returning.
+        auto releaseDisplayCapture = [this]() {
+            if (m_displayCtrl && m_displayCtrl->HasCapture()) {
+                m_displayCtrl->ReleaseMouse();
+            }
+        };
+
         long pos = 0;
         auto hit = m_displayCtrl->HitTest(event.GetPosition(), &pos);
         if (hit == wxTE_HT_ON_TEXT || hit == wxTE_HT_BEFORE) {
@@ -206,13 +266,16 @@ ChatDisplay::ChatDisplay(wxRichTextCtrl* displayCtrl)
                 if (wxTheClipboard->Open()) {
                     wxTheClipboard->SetData(new wxTextDataObject(wxString::FromUTF8(code)));
                     wxTheClipboard->Close();
+                    m_markdownRenderer->MarkCopyLinkCopied(static_cast<size_t>(blockIdx));
                 }
+                releaseDisplayCapture();
                 return;
             }
             // File chip — new behavior
             int chipIdx = HitTestFileChip(pos);
             if (chipIdx >= 0) {
                 HandleFileChipClick(static_cast<size_t>(chipIdx));
+                releaseDisplayCapture();
                 return;
             }
             // Tool block "[details]" affordance.  While a turn is still
@@ -221,9 +284,29 @@ ChatDisplay::ChatDisplay(wxRichTextCtrl* displayCtrl)
             if (tbIdx >= 0) {
                 if (!m_toolBlockInteractionEnabled) {
                     wxBell();
+                    releaseDisplayCapture();
                     return;
                 }
                 HandleToolBlockAffordanceClick(static_cast<size_t>(tbIdx));
+                releaseDisplayCapture();
+                return;
+            }
+            // Approval buttons (Allow Once / Allow Always / Deny).
+            // Same interaction-enabled gate as the affordance, since
+            // the callback may trigger further chat doc mutations
+            // (denial system message, next tool block stream, etc.).
+            // In practice approval cards only appear while the agent
+            // is paused — interaction will already be enabled — but
+            // this stays consistent with the rest of the click chain.
+            int abIdx = HitTestApprovalButton(pos);
+            if (abIdx >= 0) {
+                if (!m_toolBlockInteractionEnabled) {
+                    wxBell();
+                    releaseDisplayCapture();
+                    return;
+                }
+                HandleApprovalButtonClick(static_cast<size_t>(abIdx));
+                releaseDisplayCapture();
                 return;
             }
         }
@@ -236,24 +319,61 @@ ChatDisplay::ChatDisplay(wxRichTextCtrl* displayCtrl)
     });
 
     // ── Code block copy: hand cursor on hover ─────────────────────
-    m_displayCtrl->Bind(wxEVT_MOTION, [this](wxMouseEvent& event) {
-        long pos = 0;
-        auto hit = m_displayCtrl->HitTest(event.GetPosition(), &pos);
-        bool overLink = false;
-        if (hit == wxTE_HT_ON_TEXT || hit == wxTE_HT_BEFORE) {
-            overLink = (m_markdownRenderer->HitTestCopyLink(pos) >= 0)
-                    || (HitTestFileChip(pos) >= 0)
-                    || (m_toolBlockInteractionEnabled &&
-                        HitTestToolBlockAffordance(pos) >= 0);
-        }
-        if (overLink) {
-            m_displayCtrl->SetCursor(wxCursor(wxCURSOR_HAND));
-            // Don't Skip — prevents wxRichTextCtrl from resetting cursor
-        } else {
-            m_displayCtrl->SetCursor(wxCursor(wxCURSOR_IBEAM));
-            event.Skip();
-        }
-    });
+    // wxEVT_MOTION fires on every pixel of cursor movement, but a single
+    // character cell spans many pixels.  Cache the last resolved
+    // character position (with a sentinel of -1 for off-text) so that
+    // motion within the same cell bails out before re-running the
+    // 4-way HitTest scan over file chips, tool blocks, and approval
+    // buttons.  In long agent runs these vectors grow to dozens of
+    // entries; without the cache the scan ran on every motion pixel.
+    //
+    // Caveat: if SetToolBlockInteractionEnabled() flips state while
+    // the mouse is stationary, the cached cursor decision stays put
+    // until the next character-transition.  Acceptable for a perf
+    // optimization -- one mouse twitch and the cursor catches up.
+    m_displayCtrl->Bind(wxEVT_MOTION,
+        [this, lastPos = -1L, lastOverLink = false]
+        (wxMouseEvent& event) mutable {
+            long pos = 0;
+            auto hit = m_displayCtrl->HitTest(event.GetPosition(), &pos);
+
+            const bool onText =
+                (hit == wxTE_HT_ON_TEXT || hit == wxTE_HT_BEFORE);
+            // Coalesce all "off text" hits to a single cache key so we
+            // bail on every motion event that leaves the text area.
+            const long effectivePos = onText ? pos : -1L;
+
+            if (effectivePos == lastPos) {
+                // Same cell (or same off-text state) -- the cursor we
+                // set last time is still correct.  Preserve the original
+                // Skip() semantics: Skip when IBEAM (text-selection drag
+                // needs the event), don't Skip when HAND (otherwise
+                // wxRichTextCtrl resets the cursor).
+                if (!lastOverLink) event.Skip();
+                return;
+            }
+
+            bool overLink = false;
+            if (onText) {
+                overLink = (m_markdownRenderer->HitTestCopyLink(pos) >= 0)
+                        || (HitTestFileChip(pos) >= 0)
+                        || (m_toolBlockInteractionEnabled &&
+                            HitTestToolBlockAffordance(pos) >= 0)
+                        || (m_toolBlockInteractionEnabled &&
+                            HitTestApprovalButton(pos) >= 0);
+            }
+
+            lastPos      = effectivePos;
+            lastOverLink = overLink;
+
+            if (overLink) {
+                m_displayCtrl->SetCursor(wxCursor(wxCURSOR_HAND));
+                // Don't Skip — prevents wxRichTextCtrl from resetting cursor
+            } else {
+                m_displayCtrl->SetCursor(wxCursor(wxCURSOR_IBEAM));
+                event.Skip();
+            }
+        });
 }
 
 // Destructor defined here (not in header) because unique_ptr<MarkdownRenderer>
@@ -324,6 +444,7 @@ void ChatDisplay::OnThinkingTick()
     m_thinkingDotsEndPos = m_displayCtrl->GetInsertionPoint();
     // Don't scroll on every tick — dots sit at a fixed position, and
     // scrolling here would fight the user if they've scrolled up to read.
+    HideRichTextCaret(m_displayCtrl);
 }
 
 void ChatDisplay::ClearThinkingIndicator()
@@ -337,6 +458,7 @@ void ChatDisplay::ClearThinkingIndicator()
         // After Remove, the end of the document is exactly where the dots
         // began.  Subsequent render calls will use SetInsertionPointToEnd()
         // themselves, so no extra positioning needed here.
+        HideRichTextCaret(m_displayCtrl);
     }
 
     m_thinkingActive       = false;
@@ -418,20 +540,11 @@ void ChatDisplay::PresentFile(const PresentedFile& file)
     int innerWidth = std::max(44, DisplayCharCount(contentLine));
     if (!actionsPreview.empty()) innerWidth = std::max(innerWidth, DisplayCharCount(actionsPreview));
 
-    wxFont baseFont = m_displayCtrl->GetFont();
-    int baseSize = baseFont.GetPointSize();
-    if (baseSize <= 0) baseSize = 14;
+    const int baseSize = ResolveBaseFontSize(m_displayCtrl);
 
-    wxRichTextAttr cardAttr;
-    cardAttr.SetTextColour(m_stdoutColor);
-    cardAttr.SetFontSize(baseSize);
-    cardAttr.SetFontFaceName("Consolas");
-
-    wxRichTextAttr actionAttr;
-    actionAttr.SetTextColour(m_fileChipColor);
-    actionAttr.SetFontStyle(wxFONTSTYLE_ITALIC);
-    actionAttr.SetFontSize(baseSize);
-    actionAttr.SetFontFaceName("Consolas");
+    wxRichTextAttr cardAttr   = MakeMonoAttr(m_stdoutColor,   baseSize);
+    wxRichTextAttr actionAttr = MakeMonoAttr(m_fileChipColor, baseSize,
+                                             wxFONTSTYLE_ITALIC);
 
     auto writeCardText = [&](const std::string& s) {
         m_displayCtrl->BeginStyle(cardAttr);
@@ -572,9 +685,7 @@ int ChatDisplay::HitTestToolBlockAffordance(long pos) const
 long ChatDisplay::WriteToolBodyAtCursor(const std::string& body,
                                         const std::string& errorBody)
 {
-    wxFont baseFont = m_displayCtrl->GetFont();
-    int baseSize = baseFont.GetPointSize();
-    if (baseSize <= 0) baseSize = 14;
+    const int baseSize = ResolveBaseFontSize(m_displayCtrl);
 
     // P3c-iii.1: strip trailing whitespace from each section before
     // writing, then unconditionally append a single '\n'.  This kills
@@ -596,10 +707,7 @@ long ChatDisplay::WriteToolBodyAtCursor(const std::string& body,
     long before = m_displayCtrl->GetInsertionPoint();
 
     if (!bodyTrim.empty()) {
-        wxRichTextAttr outAttr;
-        outAttr.SetTextColour(m_stdoutColor);
-        outAttr.SetFontSize(baseSize);
-        outAttr.SetFontFaceName("Consolas");
+        wxRichTextAttr outAttr = MakeMonoAttr(m_stdoutColor, baseSize);
 
         m_displayCtrl->BeginStyle(outAttr);
         m_displayCtrl->WriteText(wxString::FromUTF8(bodyTrim));
@@ -607,10 +715,7 @@ long ChatDisplay::WriteToolBodyAtCursor(const std::string& body,
         m_displayCtrl->EndStyle();
     }
     if (!errorTrim.empty()) {
-        wxRichTextAttr errAttr;
-        errAttr.SetTextColour(wxColour(220, 90, 90));
-        errAttr.SetFontSize(baseSize);
-        errAttr.SetFontFaceName("Consolas");
+        wxRichTextAttr errAttr = MakeMonoAttr(wxColour(220, 90, 90), baseSize);
 
         m_displayCtrl->BeginStyle(errAttr);
         m_displayCtrl->WriteText(wxString::FromUTF8(errorTrim));
@@ -636,6 +741,15 @@ void ChatDisplay::ShiftOtherRegions(const ToolBlockRegion* skip,
         if (tb.affordanceStart >= pivot) tb.affordanceStart += delta;
         if (tb.affordanceEnd   >= pivot) tb.affordanceEnd   += delta;
     }
+    // Approval row: at most one is live at any time, but its position
+    // shifts the same way file chips do.  When [show details] above
+    // expands/collapses the body, the row below must follow.
+    for (auto& ab : m_approvalButtons) {
+        if (ab.startPos >= pivot) ab.startPos += delta;
+        if (ab.endPos   >= pivot) ab.endPos   += delta;
+    }
+    if (m_approvalRowStart >= pivot) m_approvalRowStart += delta;
+    if (m_approvalRowEnd   >= pivot) m_approvalRowEnd   += delta;
 }
 
 void ChatDisplay::SetAffordanceText(ToolBlockRegion& r, const wxString& newText)
@@ -650,15 +764,9 @@ void ChatDisplay::SetAffordanceText(ToolBlockRegion& r, const wxString& newText)
         return;
     }
 
-    wxFont baseFont = m_displayCtrl->GetFont();
-    int baseSize = baseFont.GetPointSize();
-    if (baseSize <= 0) baseSize = 14;
-
-    wxRichTextAttr affAttr;
-    affAttr.SetTextColour(m_fileChipColor);
-    affAttr.SetFontStyle(wxFONTSTYLE_ITALIC);
-    affAttr.SetFontSize(baseSize);
-    affAttr.SetFontFaceName("Consolas");
+    wxRichTextAttr affAttr = MakeMonoAttr(m_fileChipColor,
+                                          ResolveBaseFontSize(m_displayCtrl),
+                                          wxFONTSTYLE_ITALIC);
 
     m_displayCtrl->SetInsertionPoint(r.affordanceStart);
     m_displayCtrl->Remove(r.affordanceStart, r.affordanceEnd);
@@ -724,6 +832,74 @@ void ChatDisplay::HandleToolBlockAffordanceClick(size_t idx)
     // Keep the affordance line visible after the toggle so the user
     // can immediately click again or see the result of their click.
     m_displayCtrl->ShowPosition(r.affordanceStart);
+}
+
+// ── Approval buttons ─────────────────────────────────────────────
+// Lifecycle: DisplayToolBlock writes the row when block.requiresApproval
+// is true (see below).  Resolution happens in one of two ways:
+//   - User clicks one of the buttons → HandleApprovalButtonClick fires,
+//     which calls ClearApprovalButtons to wipe the row, then invokes
+//     the registered callback with the chosen ApprovalChoice.
+//   - User types the keyboard fallback ("approve" / "approve once" /
+//     "deny", etc.) in the frame's TryHandlePendingApprovalInput → the
+//     frame calls ClearApprovalButtons explicitly before dispatching.
+// Either path leaves m_approvalButtons empty and the row removed from
+// the rich-text doc, so any subsequent DisplayToolBlock starts clean.
+
+void ChatDisplay::SetApprovalCallback(std::function<void(ApprovalChoice)> callback)
+{
+    m_approvalCallback = std::move(callback);
+}
+
+int ChatDisplay::HitTestApprovalButton(long pos) const
+{
+    for (size_t i = 0; i < m_approvalButtons.size(); ++i) {
+        if (pos >= m_approvalButtons[i].startPos &&
+            pos <  m_approvalButtons[i].endPos)
+            return static_cast<int>(i);
+    }
+    return -1;
+}
+
+void ChatDisplay::HandleApprovalButtonClick(size_t idx)
+{
+    if (idx >= m_approvalButtons.size()) return;
+    ApprovalChoice choice = m_approvalButtons[idx].choice;
+
+    // Snapshot the callback before mutating UI state so it can't be
+    // re-entered with stale buttons in the vector.
+    auto cb = m_approvalCallback;
+
+    // Wipe the row first so the user sees their click commit before
+    // any follow-up rendering (denial system message, next tool block,
+    // etc.) starts streaming.
+    ClearApprovalButtons();
+
+    if (cb) cb(choice);
+}
+
+void ChatDisplay::ClearApprovalButtons()
+{
+    if (m_approvalRowStart < 0) return;
+
+    long rowStart = m_approvalRowStart;
+    long rowEnd   = m_approvalRowEnd;
+    long delta    = -(rowEnd - rowStart);
+    long pivot    = rowEnd;
+
+    // Reset tracking state BEFORE shifting so the now-defunct approval
+    // entries aren't included in ShiftOtherRegions' update pass.
+    m_approvalButtons.clear();
+    m_approvalRowStart = -1;
+    m_approvalRowEnd   = -1;
+
+    m_displayCtrl->Remove(rowStart, rowEnd);
+
+    // Approval rows live at the chat tail when visible, so in practice
+    // nothing follows them and ShiftOtherRegions is a no-op.  Calling
+    // it anyway keeps the invariant clean in case future flows queue
+    // content beneath an unresolved approval.
+    ShiftOtherRegions(nullptr, pivot, delta);
 }
 
 void ChatDisplay::DisplayUserMessage(const std::string& text,
@@ -871,11 +1047,7 @@ void ChatDisplay::DisplayToolBlock(const ToolBlock& block, bool startExpanded)
 
     // ── Command echo: "> <commandEcho>" — monospace, system color.
     if (!block.commandEcho.empty()) {
-        wxRichTextAttr cmdAttr;
-        cmdAttr.SetTextColour(m_systemColor);
-        cmdAttr.SetFontStyle(wxFONTSTYLE_NORMAL);
-        cmdAttr.SetFontSize(baseSize);
-        cmdAttr.SetFontFaceName("Consolas");
+        wxRichTextAttr cmdAttr = MakeMonoAttr(m_systemColor, baseSize);
 
         m_displayCtrl->BeginStyle(cmdAttr);
         m_displayCtrl->WriteText(wxString::FromUTF8("> " + block.commandEcho + "\n"));
@@ -920,11 +1092,8 @@ void ChatDisplay::DisplayToolBlock(const ToolBlock& block, bool startExpanded)
     if (!block.body.empty() || !block.errorBody.empty()) {
         long affStart = m_displayCtrl->GetInsertionPoint();
 
-        wxRichTextAttr affAttr;
-        affAttr.SetTextColour(m_fileChipColor);
-        affAttr.SetFontStyle(wxFONTSTYLE_ITALIC);
-        affAttr.SetFontSize(baseSize);
-        affAttr.SetFontFaceName("Consolas");
+        wxRichTextAttr affAttr = MakeMonoAttr(m_fileChipColor, baseSize,
+                                              wxFONTSTYLE_ITALIC);
 
         m_displayCtrl->BeginStyle(affAttr);
         m_displayCtrl->WriteText(expanded ? "[hide details]" : "[show details]");
@@ -945,10 +1114,63 @@ void ChatDisplay::DisplayToolBlock(const ToolBlock& block, bool startExpanded)
         m_displayCtrl->WriteText("\n");
     }
 
+    // ── Approval button row.  Written even when body+errorBody are
+    // empty (an approval card commonly has only commandEcho + the
+    // proposed tool name visible by default).  Style matches the
+    // [show details] affordance so click targets read uniformly.
+    // The trailing \n is captured INSIDE m_approvalRowEnd so
+    // ClearApprovalButtons removes the entire visual line in one
+    // Remove() call.
+    if (block.requiresApproval) {
+        // Defensive: if a previous approval card is somehow still
+        // tracked (shouldn't happen — both the frame's typed fallback
+        // and HandleApprovalButtonClick wipe it on resolution), clear
+        // its visible row before writing the new one.
+        ClearApprovalButtons();
+
+        long rowStart = m_displayCtrl->GetInsertionPoint();
+
+        wxRichTextAttr btnAttr = MakeMonoAttr(m_fileChipColor, baseSize,
+                                              wxFONTSTYLE_ITALIC);
+
+        m_displayCtrl->BeginStyle(btnAttr);
+
+        long onceStart = m_displayCtrl->GetInsertionPoint();
+        m_displayCtrl->WriteText("[ Allow Once ]");
+        long onceEnd = m_displayCtrl->GetInsertionPoint();
+
+        m_displayCtrl->WriteText("   ");
+
+        long alwaysStart = m_displayCtrl->GetInsertionPoint();
+        m_displayCtrl->WriteText("[ Allow Always ]");
+        long alwaysEnd = m_displayCtrl->GetInsertionPoint();
+
+        m_displayCtrl->WriteText("   ");
+
+        long denyStart = m_displayCtrl->GetInsertionPoint();
+        m_displayCtrl->WriteText("[ Deny ]");
+        long denyEnd = m_displayCtrl->GetInsertionPoint();
+
+        m_displayCtrl->EndStyle();
+        m_displayCtrl->WriteText("\n");
+
+        long rowEnd = m_displayCtrl->GetInsertionPoint();
+
+        ApprovalButtonRegion once   { onceStart,   onceEnd,   ApprovalChoice::Once   };
+        ApprovalButtonRegion always { alwaysStart, alwaysEnd, ApprovalChoice::Always };
+        ApprovalButtonRegion deny   { denyStart,   denyEnd,   ApprovalChoice::Deny   };
+        m_approvalButtons.push_back(once);
+        m_approvalButtons.push_back(always);
+        m_approvalButtons.push_back(deny);
+        m_approvalRowStart = rowStart;
+        m_approvalRowEnd   = rowEnd;
+    }
+
     // Trailing blank line for separation.
     m_displayCtrl->WriteText("\n");
 
     EnsureVisibleAtEnd();
+    HideRichTextCaret(m_displayCtrl);
 }
 
 void ChatDisplay::DisplayAssistantPrefix(const std::string& modelName)
@@ -991,6 +1213,7 @@ void ChatDisplay::DisplayAssistantPrefix(const std::string& modelName, const wxC
     // Kick off the animated dots.  They'll be cleared by the first delta
     // that carries visible characters (see DisplayAssistantDelta).
     StartThinkingIndicator();
+    HideRichTextCaret(m_displayCtrl);
 }
 
 void ChatDisplay::DisplayAssistantDelta(const std::string& delta)
@@ -1021,31 +1244,55 @@ void ChatDisplay::DisplayAssistantDelta(const std::string& delta)
     // ── Probe phase: accumulate first few bytes to detect <think> ──
     // The tag is 7 characters and may arrive split across deltas
     // (e.g. "<thi" + "nk>\n...").  We buffer until we can decide.
+    //
+    // Leading whitespace is tolerated -- some models emit "\n<think>"
+    // or "  <think>" as the first delta.  Matching only at byte 0
+    // would render the literal tag in streaming while the replay path
+    // (DisplayAssistantMessage, which uses find()) would handle it
+    // correctly -- same response, different display.  We find the
+    // first non-whitespace byte and probe from there, falling back to
+    // "keep buffering" while the buffer is entirely whitespace.
     if (m_isFirstAssistantDelta) {
         m_thinkProbeBuffer += remainingDelta;
 
-        // Check if buffer starts with <think>
-        if (m_thinkProbeBuffer.size() >= thought_start_marker.size()) {
-            if (m_thinkProbeBuffer.compare(0, thought_start_marker.size(),
+        const size_t firstNonWs =
+            m_thinkProbeBuffer.find_first_not_of(" \t\r\n");
+
+        if (firstNonWs == std::string::npos) {
+            // Entirely whitespace so far -- wait for more bytes.
+            return;
+        }
+
+        const size_t availLen = m_thinkProbeBuffer.size() - firstNonWs;
+
+        // Enough bytes after the leading whitespace to compare against
+        // the full marker?
+        if (availLen >= thought_start_marker.size()) {
+            if (m_thinkProbeBuffer.compare(firstNonWs,
+                                           thought_start_marker.size(),
                                            thought_start_marker) == 0) {
-                // Confirmed: thinking model response
+                // Confirmed: thinking model response.  Drop both the
+                // leading whitespace and the tag.
                 m_isInThoughtBlock = true;
                 m_isFirstAssistantDelta = false;
-                remainingDelta = m_thinkProbeBuffer.substr(thought_start_marker.size());
+                remainingDelta = m_thinkProbeBuffer.substr(
+                    firstNonWs + thought_start_marker.size());
                 m_thinkProbeBuffer.clear();
                 // Fall through to process remainingDelta as thought content
             }
             else {
                 // Not a <think> tag — flush entire buffer as normal content
+                // (including the leading whitespace; downstream trim handles it).
                 m_isFirstAssistantDelta = false;
                 remainingDelta = m_thinkProbeBuffer;
                 m_thinkProbeBuffer.clear();
                 // Fall through to process remainingDelta as normal content
             }
         }
-        else if (thought_start_marker.compare(0, m_thinkProbeBuffer.size(),
-                                              m_thinkProbeBuffer) == 0) {
-            // Partial prefix match (e.g. "<thi") — keep buffering, don't render yet
+        else if (thought_start_marker.compare(0, availLen,
+                                              m_thinkProbeBuffer,
+                                              firstNonWs, availLen) == 0) {
+            // Partial prefix match (e.g. " <thi") — keep buffering.
             return;
         }
         else {
@@ -1139,6 +1386,8 @@ void ChatDisplay::DisplayAssistantDelta(const std::string& delta)
             }
         }
     }
+
+    HideRichTextCaret(m_displayCtrl);
 }
 
 void ChatDisplay::DisplayAssistantComplete()
@@ -1176,6 +1425,7 @@ void ChatDisplay::DisplayAssistantComplete()
     m_thinkProbeBuffer.clear();
     m_thinkEndProbeBuffer.clear();
     m_currentAssistantStartPos = -1;
+    HideRichTextCaret(m_displayCtrl);
 }
 
 void ChatDisplay::CancelPendingAssistantDisplay()
@@ -1186,6 +1436,35 @@ void ChatDisplay::CancelPendingAssistantDisplay()
         SetInsertionPointToEnd();
         long end = m_displayCtrl->GetInsertionPoint();
         if (end > m_currentAssistantStartPos) {
+            // Prune region entries that lived inside the range about to be
+            // removed.  Without this, their stale startPos/endPos remain in
+            // the vectors, and the HitTest* scans can later match clicks
+            // against new content that lands at the same offsets.
+            //
+            // Earlier regions (from prior turns) with positions below the
+            // pivot stay put -- the doc range they reference isn't being
+            // touched, so they remain valid click targets.
+            const long pivot = m_currentAssistantStartPos;
+            m_fileChips.erase(
+                std::remove_if(m_fileChips.begin(), m_fileChips.end(),
+                    [pivot](const FileChipRegion& r) {
+                        return r.startPos >= pivot;
+                    }),
+                m_fileChips.end());
+            m_toolBlocks.erase(
+                std::remove_if(m_toolBlocks.begin(), m_toolBlocks.end(),
+                    [pivot](const ToolBlockRegion& r) {
+                        return r.bodyStart >= pivot;
+                    }),
+                m_toolBlocks.end());
+            // Approval row + its three buttons are written as one unit
+            // at the same insertion point, so they prune atomically.
+            if (m_approvalRowStart >= pivot) {
+                m_approvalButtons.clear();
+                m_approvalRowStart = -1;
+                m_approvalRowEnd   = -1;
+            }
+
             m_displayCtrl->Remove(m_currentAssistantStartPos, end);
         }
     }
@@ -1202,6 +1481,7 @@ void ChatDisplay::CancelPendingAssistantDisplay()
     m_currentAssistantStartPos = -1;
 
     EnsureVisibleAtEnd();
+    HideRichTextCaret(m_displayCtrl);
 
 }
 
@@ -1237,20 +1517,17 @@ void ChatDisplay::DisplayAssistantMessage(const std::string& modelName,
             const std::string kThinkEnd   = "</think>";
 
             std::string toProcess = trimmed;
-            bool renderedAny = false;
 
             while (!toProcess.empty()) {
                 size_t ts = toProcess.find(kThinkStart);
                 if (ts == std::string::npos) {
                     // No (more) think block — render remainder as answer
                     m_markdownRenderer->ProcessDelta(toProcess, accentColor);
-                    renderedAny = true;
                     toProcess.clear();
                 } else {
                     // Render any answer text that precedes the think block
                     if (ts > 0) {
                         m_markdownRenderer->ProcessDelta(toProcess.substr(0, ts), accentColor);
-                        renderedAny = true;
                     }
 
                     size_t contentStart = ts + kThinkStart.size();
@@ -1264,7 +1541,6 @@ void ChatDisplay::DisplayAssistantMessage(const std::string& modelName,
                         if (f != std::string::npos && f > 0) thought.erase(0, f);
                         if (!thought.empty()) {
                             AppendFormattedText(thought, m_thoughtColor);
-                            renderedAny = true;
                         }
                         toProcess.clear();
                     } else {
@@ -1274,7 +1550,6 @@ void ChatDisplay::DisplayAssistantMessage(const std::string& modelName,
                         if (f != std::string::npos && f > 0) thought.erase(0, f);
                         if (!thought.empty()) {
                             AppendFormattedText(thought, m_thoughtColor);
-                            renderedAny = true;
                         }
                         // Continue with whatever follows </think>
                         toProcess = toProcess.substr(te + kThinkEnd.size());
@@ -1289,7 +1564,6 @@ void ChatDisplay::DisplayAssistantMessage(const std::string& modelName,
             }
 
             m_markdownRenderer->Flush(accentColor);
-            (void)renderedAny;
         }
     }
 
@@ -1303,6 +1577,7 @@ void ChatDisplay::DisplayAssistantMessage(const std::string& modelName,
     m_currentAssistantStartPos = -1;
 
     EnsureVisibleAtEnd();
+    HideRichTextCaret(m_displayCtrl);
 }
 
 void ChatDisplay::Clear()
@@ -1316,12 +1591,35 @@ void ChatDisplay::Clear()
     m_fileChips.clear();
     m_toolBlocks.clear();
 
+    // Approval card state.  If Clear() ever fires while an approval row
+    // is live (unusual, but possible if a new chat is started without
+    // resolving a pending tool approval), its position offsets point
+    // into a doc that no longer exists.  Wipe explicitly.
+    m_approvalButtons.clear();
+    m_approvalRowStart = -1;
+    m_approvalRowEnd   = -1;
+
+    // Per-turn streaming state.  Same defensive reasoning: a Clear()
+    // during streaming would leave m_currentAssistantStartPos and the
+    // think-probe buffers pointing at content that no longer exists.
+    m_isInThoughtBlock = false;
+    m_isFirstAssistantDelta = true;
+    m_hasRenderedAssistantContent = false;
+    m_thinkProbeBuffer.clear();
+    m_thinkEndProbeBuffer.clear();
+    m_currentAssistantStartPos = -1;
+
+    // Animation state tracks a doc range too.
+    m_animActive   = false;
+    m_animStartPos = -1;
+
     // Drop the persistence context too — the new conversation's context
     // (if any) will be set by whoever drives the next stream.
     ClearFilePersistenceContext();
 
     if (m_displayCtrl) {
         m_displayCtrl->Clear();
+        HideRichTextCaret(m_displayCtrl);
     }
     if (m_markdownRenderer) {
         m_markdownRenderer->Reset();
@@ -1436,6 +1734,7 @@ void ChatDisplay::EndAnimationFrame()
 {
     m_displayCtrl->Thaw();
     EnsureVisibleAtEnd();
+    HideRichTextCaret(m_displayCtrl);
 }
 
 void ChatDisplay::ClearAnimation()
@@ -1462,12 +1761,14 @@ void ChatDisplay::AppendFormattedText(const std::string& text, const wxColour& c
     m_displayCtrl->BeginStyle(attr);
     m_displayCtrl->WriteText(wxString::FromUTF8(text));
     m_displayCtrl->EndStyle();
+    HideRichTextCaret(m_displayCtrl);
 }
 
 void ChatDisplay::SetInsertionPointToEnd()
 {
     if (m_displayCtrl) {
         m_displayCtrl->SetInsertionPointEnd();
+        HideRichTextCaret(m_displayCtrl);
     }
 }
 
@@ -1475,5 +1776,6 @@ void ChatDisplay::EnsureVisibleAtEnd()
 {
     if (m_displayCtrl) {
         m_displayCtrl->ShowPosition(m_displayCtrl->GetLastPosition());
+        HideRichTextCaret(m_displayCtrl);
     }
 }

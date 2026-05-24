@@ -40,6 +40,18 @@ struct ProjectWorkflowScriptInfo
     unsigned long long sizeBytes = 0;
 };
 
+// ── Skill type aliases ───────────────────────────────────────────
+// Skills and project workflows share the same on-disk shape
+// (a named folder/file with optional helper .py), so they share
+// the underlying struct. The aliases below let Skill call sites
+// read naturally without churning the project-workflow code path.
+//
+// TODO: eventually rename the underlying structs to a neutral
+// name (e.g. WorkflowEntry / WorkflowScriptEntry) and keep both
+// ProjectWorkflowInfo and SkillInfo as aliases for source-compat.
+using SkillInfo       = ProjectWorkflowInfo;
+using SkillScriptInfo = ProjectWorkflowScriptInfo;
+
 class ProjectManager
 {
 public:
@@ -136,42 +148,49 @@ public:
 
     // ── Skills ───────────────────────────────────────────────────
     // User-facing Skills are cross-project, reusable abilities that live at
-    // %USERPROFILE%\LlamaBoss\Skills.  Internally these still use the
-    // GlobalWorkflow function names so existing call sites stay small. Each
-    // Skill is a `.workflow.md` instruction contract plus an optional same-
-    // stem `.py` helper script.  No PROJECT.md, Sources, Templates, or
-    // Outputs scaffolding -- Skills are intentionally lightweight.  Resolution
+    // %USERPROFILE%\LlamaBoss\Skills.  Each Skill is a folder containing a
+    // `SKILL.md` instruction contract plus an optional same-folder `.py`
+    // helper script.  No PROJECT.md, Sources, Templates, or Outputs
+    // scaffolding -- Skills are intentionally lightweight.  Resolution
     // precedence is project-wins when a project is attached, so a project
     // workflow with the same filename shadows a Skill.
+    //
+    // Note: the underlying struct types are still named ProjectWorkflowInfo
+    // and ProjectWorkflowScriptInfo (shared with the per-project workflow
+    // lane).  Use the SkillInfo / SkillScriptInfo aliases declared at the
+    // top of this header in new code.  A handful of private helpers in
+    // project_manager.cpp (CreateWorkflowInternal, ListWorkflowsInDir,
+    // MigrateFlatWorkflowsToFolders, etc.) also keep the generic
+    // "Workflow" name because they are reused across both lanes.
 
     // %USERPROFILE%\LlamaBoss\Skills, with the same home/documents
     // fallbacks used by GetProjectsDir().
-    static std::string GetGlobalWorkflowsDir();
-    static bool EnsureGlobalWorkflowsRoot();
+    static std::string GetSkillsDir();
+    static bool EnsureSkillsRoot();
 
-    // Create a new Skill `.workflow.md` contract and, optionally, a same-stem
-    // `.py` helper under %USERPROFILE%\LlamaBoss\Skills.  Returns false if
-    // the name is blank or the workflow file cannot be written.
-    static bool CreateGlobalWorkflow(const std::string& workflowName,
-                                     ProjectWorkflowInfo& outWorkflow,
-                                     std::string& outError);
+    // Create a new Skill folder with a `SKILL.md` contract and, optionally, a
+    // same-folder `.py` helper under %USERPROFILE%\LlamaBoss\Skills.  Returns
+    // false if the name is blank or the Skill file cannot be written.
+    static bool CreateSkill(const std::string& skillName,
+                            SkillInfo& outSkill,
+                            std::string& outError);
 
-    static bool CreateGlobalWorkflowWithScript(const std::string& workflowName,
-                                               ProjectWorkflowInfo& outWorkflow,
-                                               ProjectWorkflowScriptInfo& outScript,
-                                               std::string& outError);
-
-    static std::vector<ProjectWorkflowInfo> ListGlobalWorkflows(std::size_t maxItems = 50);
-
-    static std::vector<ProjectWorkflowScriptInfo> ListGlobalWorkflowScripts(std::size_t maxItems = 50);
-
-    static bool ResolveGlobalWorkflow(const std::string& requested,
-                                      ProjectWorkflowInfo& outWorkflow,
+    static bool CreateSkillWithScript(const std::string& skillName,
+                                      SkillInfo& outSkill,
+                                      SkillScriptInfo& outScript,
                                       std::string& outError);
 
-    static bool ResolveGlobalWorkflowScript(const std::string& requested,
-                                            ProjectWorkflowScriptInfo& outScript,
-                                            std::string& outError);
+    static std::vector<SkillInfo> ListSkills(std::size_t maxItems = 50);
+
+    static std::vector<SkillScriptInfo> ListSkillScripts(std::size_t maxItems = 50);
+
+    static bool ResolveSkill(const std::string& requested,
+                             SkillInfo& outSkill,
+                             std::string& outError);
+
+    static bool ResolveSkillScript(const std::string& requested,
+                                   SkillScriptInfo& outScript,
+                                   std::string& outError);
 
 private:
     static std::string SanitizeId(const std::string& name);

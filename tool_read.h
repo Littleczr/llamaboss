@@ -18,6 +18,7 @@
 
 #include "tool_context.h"
 
+#include <cstddef>
 #include <string>
 #include <vector>
 
@@ -47,3 +48,10 @@ struct ReadResult {
 // are detected via a null-byte scan on the first 4 KiB and rendered
 // as a 256-byte hex preview.
 ReadResult ReadFile(const std::string& inputPath, const ToolContext& ctx);
+
+// Reads only the first maxLines logical lines of a text file.  Same
+// path resolution and binary handling as ReadFile, but intentionally
+// keeps the body small for project setup/code inspection loops.
+ReadResult ReadFileHead(const std::string& inputPath,
+                        const ToolContext& ctx,
+                        size_t maxLines);
