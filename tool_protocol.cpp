@@ -1,4 +1,4 @@
-﻿#define _CRT_SECURE_NO_WARNINGS
+#define _CRT_SECURE_NO_WARNINGS
 
 // tool_protocol.cpp
 
@@ -22,6 +22,7 @@
 #include <chrono>
 #include <ostream>
 #include <sstream>
+#include "ui_event_post.h"
 
 wxDEFINE_EVENT(wxEVT_TOOL_PROTOCOL_DETECTED, wxThreadEvent);
 
@@ -363,6 +364,19 @@ bool RunSmokeTest(const std::string& baseUrl,
     }
 }
 
+
+bool SafeQueueProtocolDetectionResult(
+    wxEvtHandler*                    handler,
+    std::weak_ptr<std::atomic<bool>> aliveToken,
+    const ProtocolDetectionResult&   result)
+{
+    if (!handler) return false;
+
+    auto* ev = new wxThreadEvent(wxEVT_TOOL_PROTOCOL_DETECTED);
+    ev->SetPayload<ProtocolDetectionResult>(result);
+    return LbQueueEventIfAlive(handler, aliveToken, ev);
+}
+
 } // anonymous namespace
 
 const char* ToolProtocolName(ToolProtocol p)
@@ -446,13 +460,7 @@ ProtocolProbeWorker::ProtocolProbeWorker(
 
 bool ProtocolProbeWorker::SafePost(wxThreadEvent* ev)
 {
-    auto strong = m_aliveToken.lock();
-    if (!strong || !*strong) {
-        delete ev;
-        return false;
-    }
-    wxQueueEvent(m_handler, ev);
-    return true;
+    return LbQueueEventIfAlive(m_handler, m_aliveToken, ev);
 }
 
 wxThread::ExitCode ProtocolProbeWorker::Entry()
@@ -514,10 +522,7 @@ bool KickOffToolProtocolDetection(
         r.modelPath = modelPath;
         r.reason    = "server is running without --jinja; native tool calling unavailable";
 
-        auto* ev = new wxThreadEvent(wxEVT_TOOL_PROTOCOL_DETECTED);
-        ev->SetPayload<ProtocolDetectionResult>(r);
-        wxQueueEvent(handler, ev);
-        return true;
+        return SafeQueueProtocolDetectionResult(handler, aliveToken, r);
     }
 
     // Cache hit fast-path: post the cached result on this thread,
@@ -532,10 +537,7 @@ bool KickOffToolProtocolDetection(
         r.modelPath = modelPath;
         r.reason    = "cache hit";
 
-        auto* ev = new wxThreadEvent(wxEVT_TOOL_PROTOCOL_DETECTED);
-        ev->SetPayload<ProtocolDetectionResult>(r);
-        wxQueueEvent(handler, ev);
-        return true;
+        return SafeQueueProtocolDetectionResult(handler, aliveToken, r);
     }
 
     // Cache miss — spawn the probe worker.  Detached thread; it

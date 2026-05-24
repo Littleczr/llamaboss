@@ -2,6 +2,7 @@
 
 #include "tool_ls.h"
 #include "tool_path.h"
+#include "tool_path_safety.h"
 
 #include <algorithm>
 #include <chrono>
@@ -161,7 +162,7 @@ LsResult ListDirectory(const std::string& inputPath, const ToolContext& ctx)
     // Empty arg means "list ctx.cwd itself".  ResolveToolPath with
     // the cwd as both input and reference canonicalizes it.
     const std::string target = inputPath.empty() ? ctx.cwd : inputPath;
-    std::string resolved = ResolveToolPath(target, ctx.cwd);
+    std::string resolved = tool_path_safety::ResolveProjectAwareToolPath(target, ctx.cwd, ctx.activeProjectRoot);
     if (resolved.empty()) {
         r.chips.push_back("failed");
         r.errorBody = "Could not resolve path: " + target;
@@ -292,8 +293,25 @@ LsResult ListDirectory(const std::string& inputPath, const ToolContext& ctx)
     }
 
     // ── Empty directory ──────────────────────────────────────────
+    // Hint BEFORE path.  Earlier versions led with the path so the
+    // model could use the cwd as a reasoning cue, but in practice
+    // that backfired: when the cwd path coincidentally contained
+    // the project or topic name (e.g. C:\Users\Cesar\LlamaBoss\
+    // Workflows\chat_xxx and the user asks about "LlamaBoss source
+    // code"), small models grabbed the path as a confident lead and
+    // climbed to the parent, never consulting notes.  Hint-first
+    // reverses precedence: the actionable suggestion is what the
+    // model reads first, and the path is kept for cases where the
+    // model wisely consults notes and then wants to compare what it
+    // finds against the cwd location.
     if (emitted == 0 && !hitEntryCap && !hitByteCap) {
-        ss << "(empty directory)\n";
+        ss << "HINT: this directory is empty.  If the user is asking about "
+              "source code, project files, or named saved locations they "
+              "likely have a saved path for, call notes_read FIRST -- "
+              "before climbing to a parent directory or guessing sibling "
+              "paths.  The cwd path below is the conversation workspace, "
+              "not a clue to where the user's files actually live.\n";
+        ss << "(empty directory: " << resolved << ")\n";
     }
 
     // ── Truncation marker ────────────────────────────────────────

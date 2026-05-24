@@ -318,6 +318,14 @@ private:
     int           m_consecutiveMalformed = 0;
     std::vector<std::string> m_recentToolSignatures;
 
+    // Phase 7b: soft-hint nudge.  When WouldTripLoopGuard reports a
+    // repeatCount one short of the kill threshold, the dispatch site
+    // stores a notice here.  FeedResultAndIterate appends it to the
+    // upcoming tool result body (one-shot) so the model has a chance
+    // to break the pattern before the hard stop on the next iteration.
+    // Cleared on Begin() and EndLoop() so it never leaks across loops.
+    std::string   m_pendingSoftHint;
+
     // When the current iteration triggered an async tool call, we
     // stash the invocation here so HandleGrepComplete can build the
     // ToolBlock and round-trip it to history properly.

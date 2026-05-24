@@ -92,6 +92,47 @@ std::string Lower(std::string s)
     return s;
 }
 
+// Gemma can drift into brace-style calls that still wrap the payload in
+// either XML-ish <args>...</args> tags or a textual `args:` prefix, e.g.:
+//
+//   <|tool_call>call:python_run_script{
+//   <args>helper.py
+//   input.txt</args>
+//   }<tool_call|>
+//
+//   <|tool_call>call:python_run_script{args:
+//   helper.py
+//   input.txt
+//   }<tool_call|>
+//
+// Normalize those narrow compatibility forms back to the plain legacy args
+// body that validators and dispatchers already expect. This only runs on the
+// Gemma-native brace parser, never on normal XML tool calls.
+std::string NormalizeGemmaNativeArgs(std::string args)
+{
+    args = Trim(args);
+
+    if (args.size() >= kArgsOpen.size() + kArgsClose.size() &&
+        args.compare(0, kArgsOpen.size(), kArgsOpen) == 0 &&
+        args.compare(args.size() - kArgsClose.size(),
+                     kArgsClose.size(),
+                     kArgsClose) == 0) {
+        args = args.substr(kArgsOpen.size(),
+                           args.size() - kArgsOpen.size() - kArgsClose.size());
+        return Trim(args);
+    }
+
+    constexpr const char* kArgsColon = "args:";
+    constexpr size_t kArgsColonLen = 5;
+    if (args.size() >= kArgsColonLen &&
+        Lower(args.substr(0, kArgsColonLen)) == kArgsColon) {
+        args = args.substr(kArgsColonLen);
+        return Trim(args);
+    }
+
+    return args;
+}
+
 size_t MaxOpenMarkerBytes()
 {
     return std::max({kOpenXml.size(),
@@ -107,6 +148,58 @@ const std::string& CloseForOpenerLen(size_t openerLen)
 {
     if (openerLen == kOpenGemmaNative.size()) return kCloseGemmaNative;
     return kClose;
+}
+
+// Find the closer that pairs with a matched opener.  Most
+// <|tool_call>call:... blocks use Gemma's native <tool_call|> closer,
+// but gemma-4-e4b-it can drift into a hybrid shape:
+//
+//   <|tool_call>call:
+//   <name>tool</name>
+//   <args>...</args>
+//   </tool_call>
+//
+// Accepting the normal XML closer for this hybrid prevents a malformed-call
+// cascade after a tool error, while the inner parser still validates the
+// actual tool name/args before dispatch.
+bool FindCloseMarker(const std::string& text,
+                     size_t             contentStart,
+                     size_t             openerLen,
+                     size_t&            closePosOut,
+                     std::string&       closerOut)
+{
+    if (openerLen != kOpenGemmaNative.size()) {
+        size_t pos = text.find(kClose, contentStart);
+        if (pos == std::string::npos) return false;
+        closePosOut = pos;
+        closerOut = kClose;
+        return true;
+    }
+
+    size_t nativePos = text.find(kCloseGemmaNative, contentStart);
+    size_t xmlPos    = text.find(kClose, contentStart);
+
+    if (nativePos == std::string::npos && xmlPos == std::string::npos) {
+        return false;
+    }
+    if (xmlPos != std::string::npos &&
+        (nativePos == std::string::npos || xmlPos < nativePos)) {
+        closePosOut = xmlPos;
+        closerOut = kClose;
+        return true;
+    }
+
+    closePosOut = nativePos;
+    closerOut = kCloseGemmaNative;
+    return true;
+}
+
+std::string MissingCloseReason(size_t openerLen)
+{
+    if (openerLen == kOpenGemmaNative.size()) {
+        return "unterminated tool call (missing </tool_call> or <tool_call|>)";
+    }
+    return "unterminated tool call (missing " + kClose + ")";
 }
 
 bool FindFirstOpenMarker(const std::string& text,
@@ -175,11 +268,27 @@ bool ParseInnerBlock(const std::string& inner,
         return false;
     }
 
+    // Fail closed on a partial <args> envelope.  The args tag is optional,
+    // but once the model starts one, it must close it.  Treating
+    // "<args>some/path" as "no args" can silently execute an optional-arg
+    // tool such as ls against the cwd instead of the intended target.
+    if (argsA != std::string::npos && argsB == std::string::npos) {
+        out.valid         = false;
+        out.invalidReason = "missing </args> tag. Format must be: <tool_call><name>TOOL_NAME</name><args>ARGS</args></tool_call>";
+        return false;
+    }
+
     std::string rawName = inner.substr(nameA + kNameOpen.size(),
                                        nameB - (nameA + kNameOpen.size()));
     out.name = Lower(Trim(rawName));
 
-    if (argsA != std::string::npos && argsB != std::string::npos) {
+    if (out.name.empty()) {
+        out.valid         = false;
+        out.invalidReason = "empty <name>...</name> tag. Tool name is required.";
+        return false;
+    }
+
+    if (argsA != std::string::npos) {
         out.args = Trim(inner.substr(argsA + kArgsOpen.size(),
                                      argsB - (argsA + kArgsOpen.size())));
     } else {
@@ -276,7 +385,8 @@ bool ParseInnerBlockGemmaNative(const std::string& inner,
                                 "<tool_call|>";
             return false;
         }
-        out.args = Trim(inner.substr(braceA + 1, braceB - braceA - 1));
+        out.args = NormalizeGemmaNativeArgs(
+            inner.substr(braceA + 1, braceB - braceA - 1));
     }
 
     std::string reason;
@@ -304,9 +414,142 @@ bool ParseInnerByVariant(size_t             openerLen,
                          ToolInvocation&    out)
 {
     if (openerLen == kOpenGemmaNative.size()) {
+        // Hybrid drift observed in Gemma: colon opener, but XML <name>/<args>
+        // body and </tool_call> closer.  Parse it through the XML path.
+        std::string t = Trim(inner);
+        if (t.find(kNameOpen) != std::string::npos) {
+            return ParseInnerBlock(inner, rawBlock, out);
+        }
         return ParseInnerBlockGemmaNative(inner, rawBlock, out);
     }
     return ParseInnerBlock(inner, rawBlock, out);
+}
+
+// Gemma 4 e4b occasionally emits a nearly-complete brace-style call at the
+// very end of a reply, but omits BOTH supported closers. Observed shape:
+//
+//   <|tool_call>call:python_run_script{
+//   <args>helper.py
+//   arg1
+//   arg2</args>
+//   }
+//
+// The normal parser has no closing marker to latch onto and would surface an
+// "unterminated tool call" error, even though the intent is unambiguous. Keep
+// recovery deliberately narrow:
+//   * only the Gemma-native colon opener,
+//   * only when the call consumes the response tail,
+//   * only when the tail ends in a final `}`,
+//   * only when a balanced <args>...</args> envelope precedes that brace.
+//
+// This prevents arbitrary half-written tool calls from dispatching while
+// recovering the concrete malformed pattern seen in local-model testing.
+bool TryRecoverTerminalGemmaHybridWithoutCloser(
+    const std::string& text,
+    size_t             openPos,
+    size_t             openerLen,
+    ToolInvocation&    invocationOut)
+{
+    if (openerLen != kOpenGemmaNative.size()) return false;
+    if (openPos >= text.size()) return false;
+
+    std::string rawTail = text.substr(openPos);
+    if (rawTail.size() > kMaxToolCallBlockBytes) return false;
+
+    std::string inner = rawTail.substr(openerLen);
+    std::string trimmed = Trim(inner);
+    if (trimmed.empty() || trimmed.back() != '}') return false;
+
+    size_t argsA = trimmed.find(kArgsOpen);
+    size_t argsB = trimmed.rfind(kArgsClose);
+    size_t finalBrace = trimmed.rfind('}');
+    if (argsA == std::string::npos || argsB == std::string::npos ||
+        finalBrace == std::string::npos) {
+        return false;
+    }
+    if (argsB < argsA + kArgsOpen.size()) return false;
+    if (argsB + kArgsClose.size() > finalBrace) return false;
+
+    ToolInvocation recovered;
+    bool parsed = ParseInnerByVariant(openerLen, inner, rawTail, recovered);
+    if (!parsed) return false;
+
+    invocationOut = recovered;
+    return true;
+}
+
+
+// Gemma 4 e4b can also emit an even more compressed malformed native tail
+// during conversational Skill design, with no brace body and no official
+// closer. Observed shapes:
+//
+//   <|tool_call>call:notes_read</args>
+//   <|tool_call>call:powershell</args>Get-ChildItem ...</args>
+//   <|tool_call>call:python_run_script</args>helper.py\ninput</args>
+//
+// The first </args> mistakenly terminates the tool name; an optional second
+// </args> terminates the argument body. Recovery remains intentionally narrow:
+// only Gemma's colon opener, only at end-of-response, only identifier-like
+// known tool names, and only the exact stray </args> boundary shape.
+bool TryRecoverTerminalGemmaDanglingArgsWithoutCloser(
+    const std::string& text,
+    size_t             openPos,
+    size_t             openerLen,
+    ToolInvocation&    invocationOut)
+{
+    if (openerLen != kOpenGemmaNative.size()) return false;
+    if (openPos >= text.size()) return false;
+
+    std::string rawTail = text.substr(openPos);
+    if (rawTail.size() > kMaxToolCallBlockBytes) return false;
+
+    std::string inner = Trim(rawTail.substr(openerLen));
+    if (inner.empty()) return false;
+
+    const size_t nameBoundary = inner.find(kArgsClose);
+    if (nameBoundary == std::string::npos) return false;
+
+    std::string rawName = Trim(inner.substr(0, nameBoundary));
+    if (rawName.empty()) return false;
+    for (unsigned char ch : rawName) {
+        if (!(std::isalnum(ch) || ch == '_')) return false;
+    }
+
+    std::string remainder = Trim(inner.substr(nameBoundary + kArgsClose.size()));
+    std::string recoveredArgs;
+    if (!remainder.empty()) {
+        if (remainder.size() < kArgsClose.size() ||
+            remainder.compare(remainder.size() - kArgsClose.size(),
+                              kArgsClose.size(),
+                              kArgsClose) != 0) {
+            return false;
+        }
+        recoveredArgs = Trim(remainder.substr(
+            0, remainder.size() - kArgsClose.size()));
+    }
+
+    ToolInvocation recovered;
+    recovered.rawBlock = rawTail;
+    recovered.name = Lower(rawName);
+    recovered.args = recoveredArgs;
+
+    std::string reason;
+    if (!IsKnownToolName(recovered.name)) {
+        recovered.valid = false;
+        recovered.invalidReason = "unknown tool: " + recovered.name;
+        invocationOut = recovered;
+        return true;
+    }
+    if (!ValidateToolArgs(recovered.name, recovered.args, reason)) {
+        recovered.valid = false;
+        recovered.invalidReason = reason;
+        invocationOut = recovered;
+        return true;
+    }
+
+    recovered.valid = true;
+    invocationOut = recovered;
+    return true;
 }
 
 } // namespace
@@ -337,10 +580,26 @@ ParsedAssistantResponse ParseAssistantResponse(const std::string& text)
     }
 
     size_t contentStart = openPos + openLen;
-    const std::string& closer = CloseForOpenerLen(openLen);
-    size_t closePos     = text.find(closer, contentStart);
+    size_t closePos = std::string::npos;
+    std::string closer;
 
-    if (closePos == std::string::npos) {
+    if (!FindCloseMarker(text, contentStart, openLen, closePos, closer)) {
+        // Recover the narrow Gemma hybrid that reaches end-of-response with a
+        // final brace but no explicit </tool_call> / <tool_call|> closer.
+        // The streaming UI already withholds this tail because it contains a
+        // recognized opener; batch completion is the right place to decide if
+        // it is safe to dispatch.
+        ToolInvocation recovered;
+        if (TryRecoverTerminalGemmaHybridWithoutCloser(
+                text, openPos, openLen, recovered) ||
+            TryRecoverTerminalGemmaDanglingArgsWithoutCloser(
+                text, openPos, openLen, recovered)) {
+            out.invocation    = recovered;
+            out.hasInvocation = true;
+            out.prose         = text.substr(0, openPos);
+            return out;
+        }
+
         // Unclosed block — strip the broken tail from user-visible prose.
         // Also cap the diagnostic body so one runaway <tool_call> does
         // not get stored in full in chat history.
@@ -351,9 +610,9 @@ ParsedAssistantResponse ParseAssistantResponse(const std::string& text)
         if (rawTail.size() > kMaxToolCallBlockBytes) {
             m.reason = "unterminated tool call exceeded " +
                        std::to_string(kMaxToolCallBlockBytes) +
-                       " bytes before " + closer + " was found";
+                       " bytes before a valid closer was found";
         } else {
-            m.reason = "unterminated tool call (missing " + closer + ")";
+            m.reason = MissingCloseReason(openLen);
         }
         out.malformed.push_back(m);
         out.prose = text.substr(0, openPos);
@@ -463,9 +722,9 @@ bool ToolCallStreamDetector::Feed(const std::string& delta)
     // -> <tool_call|>).  m_openMarkerLen, set in Phase 1, is the
     // disambiguator.
     size_t contentStart = m_openMarkerLen;
-    const std::string& closer = CloseForOpenerLen(m_openMarkerLen);
-    size_t closePos     = m_buffer.find(closer, contentStart);
-    if (closePos == std::string::npos) {
+    size_t closePos = std::string::npos;
+    std::string closer;
+    if (!FindCloseMarker(m_buffer, contentStart, m_openMarkerLen, closePos, closer)) {
         // No close yet — keep buffering, but never without a hard cap.
         // Once the cap is exceeded, surface an invalid invocation so
         // the agent loop can feed an error back to the model instead
@@ -477,7 +736,7 @@ bool ToolCallStreamDetector::Feed(const std::string& delta)
             m_invocation.invalidReason =
                 "unterminated tool call exceeded " +
                 std::to_string(kMaxToolCallBlockBytes) +
-                " bytes before " + closer + " was found";
+                " bytes before a valid closer was found";
             m_complete = true;
             return true;
         }

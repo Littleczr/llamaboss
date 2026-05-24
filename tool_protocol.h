@@ -1,4 +1,4 @@
-﻿// tool_protocol.h
+// tool_protocol.h
 //
 // Phase 3b: per-model tool-call protocol detection.
 //
@@ -83,10 +83,10 @@ wxDECLARE_EVENT(wxEVT_TOOL_PROTOCOL_DETECTED, wxThreadEvent);
 //        be empty for text-only models).  Stable across runs as
 //        long as the model file isn't moved.
 // Value: a single string in the format
-//          "v1|<protocol>|<unix_seconds_when_detected>"
-//        where <protocol> is "native" or "xml".  The leading "v1"
-//        lets future schema bumps invalidate older entries without
-//        a manual cache wipe.
+//          "v2|<protocol>|<unix_seconds_when_detected>"
+//        where <protocol> is "native" or "xml".  The leading schema
+//        token lets future bumps invalidate older entries without a
+//        manual cache wipe.
 //
 // Both functions are thread-safe in the sense that wxFileConfig is
 // process-singleton-friendly; they may be called from the worker

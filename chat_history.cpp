@@ -22,9 +22,13 @@
 #include <sstream>
 #include <fstream>
 #include <algorithm>
+#include <cctype>
+#include <cstring>
+#include <utility>
 
-// File format version: 3 adds per-message "attachments" array
-static const int CONVERSATION_FORMAT_VERSION = 4;
+// File format version: 9 adds durable awaiting-user prompt/reply checkpoint
+// evidence for resumed waiting goals.
+static const int CONVERSATION_FORMAT_VERSION = 9;
 
 // Forward declaration — defined further down with the other workflow
 // helpers.  Hoisted here so methods earlier in the file (notably
@@ -33,6 +37,82 @@ static const int CONVERSATION_FORMAT_VERSION = 4;
 static std::string JoinWorkflowPath(const std::string& a, const std::string& b);
 
 namespace {
+
+std::string PersistedGoalStatus(GoalStatus status)
+{
+    switch (status) {
+    case GoalStatus::None:          return "none";
+    case GoalStatus::Active:        return "active";
+    case GoalStatus::Paused:        return "paused";
+    case GoalStatus::AwaitingUser:  return "awaiting_user";
+    case GoalStatus::Completed:     return "completed";
+    case GoalStatus::Cancelled:     return "cancelled";
+    case GoalStatus::Failed:        return "failed";
+    case GoalStatus::BudgetReached: return "budget_reached";
+    }
+    return "none";
+}
+
+GoalStatus GoalStatusFromPersisted(const std::string& status)
+{
+    if (status == "active")         return GoalStatus::Active;
+    if (status == "paused")         return GoalStatus::Paused;
+    if (status == "awaiting_user" ||
+        status == "awaiting user")  return GoalStatus::AwaitingUser;
+    if (status == "completed")      return GoalStatus::Completed;
+    if (status == "cancelled")      return GoalStatus::Cancelled;
+    if (status == "failed")         return GoalStatus::Failed;
+    if (status == "budget_reached" ||
+        status == "budget reached") return GoalStatus::BudgetReached;
+    return GoalStatus::None;
+}
+
+std::string PersistedGoalContractStatus(GoalContractStatus status)
+{
+    switch (status) {
+    case GoalContractStatus::None:     return "none";
+    case GoalContractStatus::Drafting: return "drafting";
+    case GoalContractStatus::Ready:    return "ready";
+    case GoalContractStatus::Failed:   return "failed";
+    }
+    return "none";
+}
+
+GoalContractStatus GoalContractStatusFromPersisted(const std::string& status)
+{
+    if (status == "drafting") return GoalContractStatus::Drafting;
+    if (status == "ready")    return GoalContractStatus::Ready;
+    if (status == "failed")   return GoalContractStatus::Failed;
+    return GoalContractStatus::None;
+}
+
+Poco::JSON::Array::Ptr StringVectorToJsonArray(const std::vector<std::string>& items)
+{
+    Poco::JSON::Array::Ptr arr = new Poco::JSON::Array;
+    for (const auto& item : items)
+        arr->add(item);
+    return arr;
+}
+
+std::vector<std::string> JsonArrayToStringVector(const Poco::JSON::Array::Ptr& arr)
+{
+    std::vector<std::string> out;
+    if (!arr) return out;
+
+    out.reserve(arr->size());
+    for (size_t i = 0; i < arr->size(); ++i) {
+        out.push_back(arr->get(i).convert<std::string>());
+    }
+    return out;
+}
+
+int JsonIntOrDefault(const Poco::JSON::Object::Ptr& obj,
+                     const std::string& key,
+                     int fallback = 0)
+{
+    if (!obj || !obj->has(key)) return fallback;
+    return obj->getValue<int>(key);
+}
 
 // ─── Tool-result compaction helpers ──────────────────────────────
 //
@@ -299,6 +379,7 @@ void ChatHistory::Clear()
 {
     m_messages.clear();
     m_streamBuffer.clear();
+    m_streamBufferDirty = 0;
     m_filePath.clear();
     m_title.clear();
     m_createdAt.clear();
@@ -308,6 +389,7 @@ void ChatHistory::Clear()
     m_projectId.clear();
     m_projectName.clear();
     m_projectRoot.clear();
+    m_goalState.Reset();
     m_chatApprovedTools.clear();
     m_chatApprovalTrustEnabled = false;
     m_dirty = false;
@@ -333,6 +415,7 @@ bool ChatHistory::HasPersistableContent() const
     // metadata clears persist too.
     return !m_messages.empty()
         || HasProject()
+        || m_goalState.HasGoal()
         || !m_toolCwd.empty()
         || m_toolTimeoutMs != 0
         || HasFilePath();
@@ -346,8 +429,13 @@ std::string ChatHistory::BuildChatRequestJson(const std::string& model, bool str
                                                const std::string& systemPrompt,
                                                int contextTokens,
                                                const std::string& toolsArrayJson,
-                                               bool nativeProtocol) const
+                                               bool nativeProtocol)
 {
+    // Make sure any in-flight streamed content is reflected in the JSON
+    // objects before we build the wire request.  AppendToLastAssistantMessage
+    // amortizes the sync; this is the read-side counterpart.
+    FlushStreamBuffer();
+
     // ── Phase 3c-i: pre-parse the tools array once ──────────────
     // The caller passes an already-stringified JSON array (from
     // BuildToolsArrayJson).  We parse it here so it nests under
@@ -495,6 +583,14 @@ std::string ChatHistory::BuildChatRequestJson(const std::string& model, bool str
 
     std::string body = stringifyWire();
 
+    // Mutation tracker for the elision and sanitizer phases below.
+    // Each phase mutates `wire` in place; `body` is only re-stringified
+    // once at the end if anything actually changed.  This replaces the
+    // previous pattern of re-stringifying after every elision (O(n²)
+    // bytes worst case) plus an unconditional re-stringify at the end
+    // of the sanitizer (wasted on the common no-orphan path).
+    bool wireDirty = false;
+
     if (contextTokens > 0) {
         const size_t budget = (size_t)((double)contextTokens
                                        * kBytesPerToken * kBudgetFraction);
@@ -508,25 +604,40 @@ std::string ChatHistory::BuildChatRequestJson(const std::string& model, bool str
             // than the preserve count, the first (total - preserve)
             // are candidates; we stop elision early if we get under
             // budget before exhausting candidates.
-            size_t candidatesRemaining = (totalToolResults > kMinPreservedResults)
-                ? (totalToolResults - kMinPreservedResults)
-                : 0;
-            size_t toolResultsSeen = 0;
+            const size_t maxCandidates =
+                (totalToolResults > kMinPreservedResults)
+                    ? (totalToolResults - kMinPreservedResults)
+                    : 0;
 
-            for (size_t i = 0; i < wire.size() && candidatesRemaining > 0; ++i) {
+            // Track an *estimated* body size with a running raw-content
+            // delta instead of re-stringifying the wire after each
+            // elision.  This is always a conservative over-estimate of
+            // the actual JSON-escaped size after elision: the elided
+            // content typically contains \n / quotes / control chars
+            // (each costing 1+ extra byte once JSON-escaped on the
+            // wire), while the marker we substitute is plain ASCII
+            // (~1:1 escape ratio).  So actual_body <= estimated_body,
+            // and stopping when estimated <= budget guarantees the real
+            // body is also <= budget.  We may elide one extra candidate
+            // versus the old per-iteration measurement, never under.
+            size_t estimatedBodySize = body.size();
+            size_t toolResultsSeen   = 0;
+
+            for (size_t i = 0; i < wire.size(); ++i) {
                 if (!wire[i].isToolResult) continue;
                 ++toolResultsSeen;
-                // Skip any we're preserving (the last kMinPreservedResults).
-                if (toolResultsSeen > (totalToolResults - kMinPreservedResults)) break;
+                if (toolResultsSeen > maxCandidates) break;
 
+                const size_t oldSize = wire[i].content.size();
                 wire[i].content = ElideToolResultBody(wire[i].content);
-                --candidatesRemaining;
+                const size_t newSize = wire[i].content.size();
 
-                // Rebuild + re-measure.  This is O(n² bytes) in the
-                // worst case but n is small (~20 tool results in a
-                // long chain) and the rebuild is pure string work.
-                body = stringifyWire();
-                if (body.size() <= budget) break;
+                if (oldSize > newSize) {
+                    estimatedBodySize -= (oldSize - newSize);
+                }
+                wireDirty = true;
+
+                if (estimatedBodySize <= budget) break;
             }
         }
     }
@@ -555,6 +666,7 @@ std::string ChatHistory::BuildChatRequestJson(const std::string& model, bool str
             // strip it.  The assistant content, if any, remains as prose.
             if (expected.empty()) {
                 wire[i].toolCalls.reset();
+                wireDirty = true;
                 continue;
             }
 
@@ -593,6 +705,7 @@ std::string ChatHistory::BuildChatRequestJson(const std::string& model, bool str
                 // any now-orphaned user.tool_call_id sidecars so those
                 // messages fall back to ordinary user-visible tool blocks.
                 wire[i].toolCalls.reset();
+                wireDirty = true;
                 continue;
             }
 
@@ -610,6 +723,7 @@ std::string ChatHistory::BuildChatRequestJson(const std::string& model, bool str
             if (w.role == "user" && !w.toolCallId.empty() &&
                 !ContainsString(validToolReplyIds, w.toolCallId)) {
                 w.toolCallId.clear();
+                wireDirty = true;
             }
         }
 
@@ -618,6 +732,7 @@ std::string ChatHistory::BuildChatRequestJson(const std::string& model, bool str
         // Drop it from the wire request; otherwise llama-server receives
         // an empty assistant turn that adds no value and can confuse the
         // transcript around tool results.
+        const size_t preEraseSize = wire.size();
         wire.erase(
             std::remove_if(wire.begin(), wire.end(), [](const WireMsg& w) {
                 return w.role == "assistant" &&
@@ -625,9 +740,16 @@ std::string ChatHistory::BuildChatRequestJson(const std::string& model, bool str
                        !w.toolCalls;
             }),
             wire.end());
+        if (wire.size() != preEraseSize) {
+            wireDirty = true;
+        }
+    }
 
-        // Re-stringify after sanitizing so the returned body reflects
-        // the cleaned wire list.
+    // Single re-stringify at the end if either phase actually mutated
+    // the wire.  In the common short-conversation case (no elision
+    // needed, sanitizer found nothing to fix), this is skipped and the
+    // initial stringify above is the only JSON serialization performed.
+    if (wireDirty) {
         body = stringifyWire();
     }
 
@@ -641,6 +763,7 @@ std::string ChatHistory::BuildChatRequestJson(const std::string& model, bool str
 void ChatHistory::AddAssistantPlaceholder(const std::string& model)
 {
     m_streamBuffer.clear();
+    m_streamBufferDirty = 0;
     AddAssistantMessage("", model);
 }
 
@@ -649,11 +772,38 @@ void ChatHistory::AppendToLastAssistantMessage(const std::string& delta)
     if (delta.empty()) return;
 
     if (!m_messages.empty() && IsLastMessageRole("assistant")) {
-        // Accumulate in the buffer (amortized O(1) per delta)
-        // and sync to the JSON object so auto-save captures partial content.
+        // Buffer-only path.  We deliberately avoid copying the full
+        // m_streamBuffer into the JSON object on every delta:
+        // Poco::JSON::Object::set("content", value) takes the value by
+        // copy, so per-delta sync makes the streaming cost O(n²) in body
+        // bytes — measurable as a typewriter that gets slower as the
+        // assistant response grows.
+        //
+        // Instead, accumulate in m_streamBuffer (amortized O(1) on
+        // std::string append) and only push into the JSON object when
+        // enough bytes have piled up to make the copy worth it, or when
+        // a reader (BuildChatRequestJson, SaveToFile,
+        // UpdateLastAssistantMessage on completion) explicitly demands
+        // it via FlushStreamBuffer().
+        //
+        // 4 KiB is small enough that crashes / SIGTERM / OnClose
+        // mid-stream lose at most ~4 KiB of buffered output via
+        // auto-save (which also calls FlushStreamBuffer first), and
+        // large enough to drop the per-delta cost by ~3 orders of
+        // magnitude on typical token deltas.  This is also why we keep
+        // a periodic sync rather than going purely lazy: even though
+        // every reader currently flushes first, the periodic sync
+        // limits the worst-case data loss window if a future code path
+        // ever forgets to flush before reading m_messages directly.
         m_streamBuffer += delta;
-        m_messages.back()->set("content", m_streamBuffer);
+        m_streamBufferDirty += delta.size();
         m_dirty = true;
+
+        constexpr std::size_t kStreamSyncThresholdBytes = 4 * 1024;
+        if (m_streamBufferDirty >= kStreamSyncThresholdBytes) {
+            m_messages.back()->set("content", m_streamBuffer);
+            m_streamBufferDirty = 0;
+        }
     }
 }
 
@@ -663,7 +813,11 @@ void ChatHistory::UpdateLastAssistantMessage(const std::string& content)
         m_messages.back()->set("content", content);
         m_dirty = true;
     }
+    // Replacing content makes any buffered streaming bytes obsolete.
+    // Clear them so subsequent FlushStreamBuffer() calls don't overwrite
+    // the explicit content with a stale buffer snapshot.
     m_streamBuffer.clear();
+    m_streamBufferDirty = 0;
 }
 
 void ChatHistory::RemoveLastAssistantMessage()
@@ -672,14 +826,61 @@ void ChatHistory::RemoveLastAssistantMessage()
         m_messages.pop_back();
         m_dirty = true;
     }
+    // Defensive: if the removed assistant message was an in-flight
+    // streaming target, the buffer carried its content and would
+    // otherwise leak forward into the next assistant message added to
+    // the history.  Belt and braces — current callers always go through
+    // UpdateLastAssistantMessage("") first, but a future caller might
+    // not.
+    m_streamBuffer.clear();
+    m_streamBufferDirty = 0;
 }
 
 bool ChatHistory::HasAssistantPlaceholder() const
 {
     if (!m_messages.empty() && IsLastMessageRole("assistant")) {
-        return m_messages.back()->getValue<std::string>("content").empty();
+        const auto& last = m_messages.back();
+
+        // Native function-calling turns can be a valid assistant message with
+        // empty visible content but a tool_calls sidecar.  Treating that as a
+        // placeholder would let Stop/cancel cleanup remove the assistant call
+        // and orphan the following tool result in saved/native transcripts.
+        if (last->has("tool_calls")) return false;
+
+        // Consult the streaming buffer first.  During an active stream,
+        // the JSON "content" field can lag behind the buffer by up to
+        // kStreamSyncThresholdBytes (see AppendToLastAssistantMessage).
+        // A non-empty buffer means real content has arrived even if it
+        // has not been synced into the JSON object yet, so this is
+        // *not* a placeholder.
+        //
+        // This matters for the Stop button path in MyFrame: it calls
+        // HasAssistantPlaceholder() and removes the message if true.
+        // Without consulting the buffer, an early Stop during a long
+        // stream could drop the partial response.
+        if (!m_streamBuffer.empty()) return false;
+        return last->getValue<std::string>("content").empty();
     }
     return false;
+}
+
+void ChatHistory::FlushStreamBuffer()
+{
+    if (m_streamBufferDirty == 0) return;
+
+    // The buffer can only meaningfully attach to a trailing assistant
+    // message.  If the last message is not an assistant message (e.g. a
+    // tool result was just appended after the streaming reply), the
+    // buffer's content has already been committed to the JSON object on
+    // the prior assistant turn and the dirty counter just needs to be
+    // reset to avoid an out-of-band write to a non-assistant message.
+    if (m_messages.empty() || !IsLastMessageRole("assistant")) {
+        m_streamBufferDirty = 0;
+        return;
+    }
+
+    m_messages.back()->set("content", m_streamBuffer);
+    m_streamBufferDirty = 0;
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -721,6 +922,12 @@ std::string ChatHistory::GetLastAssistantMessage() const
 {
     for (auto it = m_messages.rbegin(); it != m_messages.rend(); ++it) {
         if ((*it)->getValue<std::string>("role") == "assistant") {
+            // If the latest assistant response is actively streaming, the
+            // JSON object may intentionally lag behind m_streamBuffer.  Return
+            // the buffer so callers do not see stale/truncated assistant text.
+            if (it == m_messages.rbegin() && !m_streamBuffer.empty()) {
+                return m_streamBuffer;
+            }
             return (*it)->getValue<std::string>("content");
         }
     }
@@ -745,6 +952,11 @@ bool ChatHistory::SaveToFile(const std::string& filePath, const std::vector<std:
     if (savePath.empty()) return false;
     if (!HasPersistableContent()) return false;
 
+    // Make sure any buffered streaming bytes land on the JSON object
+    // before we serialize.  Auto-save can fire mid-stream (Stop button,
+    // OnClose); without this, partial assistant content would be lost.
+    FlushStreamBuffer();
+
     try {
         // Set timestamps
         if (m_createdAt.empty()) {
@@ -752,9 +964,20 @@ bool ChatHistory::SaveToFile(const std::string& filePath, const std::vector<std:
         }
         m_updatedAt = CurrentTimestamp();
 
-        // Auto-generate title if empty
-        if (m_title.empty()) {
-            m_title = GenerateTitle();
+        // Auto-generate a title once useful user content exists.  Project
+        // attachment can persist a metadata-only conversation before the
+        // user types anything; that first save used to lock the sidebar at
+        // "Untitled conversation" forever because later saves only checked
+        // for an empty title.  Treat the default placeholder as replaceable
+        // until a real generated title is available.  Non-placeholder titles
+        // are left alone so future manual rename support is respected.
+        {
+            const std::string generatedTitle = GenerateTitle();
+            if (m_title.empty() ||
+                (m_title == "Untitled conversation" &&
+                 generatedTitle != "Untitled conversation")) {
+                m_title = generatedTitle;
+            }
         }
 
         // Build the JSON document
@@ -783,6 +1006,56 @@ bool ChatHistory::SaveToFile(const std::string& filePath, const std::vector<std:
             root->set("project_id", m_projectId);
             root->set("project_name", m_projectName);
             root->set("project_root", m_projectRoot);
+        }
+
+        // Durable goal state (Goals Phase 5).  The runtime-only
+        // explicitlyCleared tombstone is intentionally not persisted.
+        if (m_goalState.HasGoal()) {
+            Poco::JSON::Object::Ptr goalObj = new Poco::JSON::Object;
+            goalObj->set("status", PersistedGoalStatus(m_goalState.status));
+            goalObj->set("objective", m_goalState.objective);
+            goalObj->set("turns_used", m_goalState.turnsUsed);
+            goalObj->set("verifier_passes", m_goalState.verifierPasses);
+            goalObj->set("verifier_failures", m_goalState.verifierFailures);
+            if (!m_goalState.lastVerifierReason.empty()) {
+                goalObj->set("last_verifier_reason", m_goalState.lastVerifierReason);
+            }
+            if (!m_goalState.lastInterruptionReason.empty()) {
+                goalObj->set("last_interruption_reason", m_goalState.lastInterruptionReason);
+            }
+            if (!m_goalState.awaitingUserReason.empty()) {
+                goalObj->set("awaiting_user_reason", m_goalState.awaitingUserReason);
+            }
+            if (!m_goalState.awaitingUserPromptEvidence.empty()) {
+                goalObj->set("awaiting_user_prompt_evidence", m_goalState.awaitingUserPromptEvidence);
+            }
+            if (!m_goalState.awaitingUserReplyEvidence.empty()) {
+                goalObj->set("awaiting_user_reply_evidence", m_goalState.awaitingUserReplyEvidence);
+            }
+            if (!m_goalState.structuredAgentEvidence.empty()) {
+                goalObj->set(
+                    "structured_agent_evidence",
+                    StringVectorToJsonArray(m_goalState.structuredAgentEvidence));
+            }
+
+            const GoalContract& contract = m_goalState.contract;
+            if (contract.status != GoalContractStatus::None ||
+                !contract.successCriteria.empty() ||
+                !contract.constraints.empty() ||
+                !contract.evidenceChecks.empty() ||
+                !contract.lastBuilderReason.empty()) {
+                Poco::JSON::Object::Ptr contractObj = new Poco::JSON::Object;
+                contractObj->set("status", PersistedGoalContractStatus(contract.status));
+                contractObj->set("success_criteria", StringVectorToJsonArray(contract.successCriteria));
+                contractObj->set("constraints", StringVectorToJsonArray(contract.constraints));
+                contractObj->set("evidence_checks", StringVectorToJsonArray(contract.evidenceChecks));
+                if (!contract.lastBuilderReason.empty()) {
+                    contractObj->set("last_builder_reason", contract.lastBuilderReason);
+                }
+                goalObj->set("contract", contractObj);
+            }
+
+            root->set("goal", goalObj);
         }
 
         // Write models array (v2 format)
@@ -949,6 +1222,11 @@ bool ChatHistory::SaveToFile(const std::string& filePath, const std::string& mod
 
 bool ChatHistory::LoadFromFile(const std::string& filePath, std::vector<std::string>& outModels)
 {
+    // Make failure deterministic for callers that reuse an output vector.
+    // A missing/corrupt file should not leave stale model paths from a
+    // previous successful load in outModels.
+    outModels.clear();
+
     try {
         std::ifstream file(path_safety::Utf8ToWide(filePath));
         if (!file.is_open()) return false;
@@ -963,11 +1241,12 @@ bool ChatHistory::LoadFromFile(const std::string& filePath, std::vector<std::str
         auto result = parser.parse(content);
         auto root = result.extract<Poco::JSON::Object::Ptr>();
 
-        // Per-chat approval choices are intentionally in-memory only.
-        // If this ChatHistory instance is reused for a load, do not
-        // carry approvals from the previous conversation.
+        // Per-chat approval choices remain intentionally in-memory only.
+        // Goal state is durable as of Goals Phase 5, but reset first so a
+        // load without a "goal" object cannot carry state from the prior chat.
         m_chatApprovedTools.clear();
         m_chatApprovalTrustEnabled = false;
+        m_goalState.Reset();
 
         // Read metadata
         if (root->has("title")) {
@@ -1006,8 +1285,88 @@ bool ChatHistory::LoadFromFile(const std::string& filePath, std::vector<std::str
             m_projectRoot = root->getValue<std::string>("project_root");
         }
 
+        // Durable goal state (Goals Phase 5).  Older conversations simply
+        // omit this block and load with no active goal.
+        if (root->has("goal")) {
+            Poco::JSON::Object::Ptr goalObj = root->getObject("goal");
+            if (goalObj) {
+                const std::string objective = goalObj->has("objective")
+                    ? goalObj->getValue<std::string>("objective")
+                    : std::string();
+                const std::string statusText = goalObj->has("status")
+                    ? goalObj->getValue<std::string>("status")
+                    : std::string("none");
+                const GoalStatus loadedStatus = GoalStatusFromPersisted(statusText);
+
+                if (!objective.empty() && loadedStatus != GoalStatus::None) {
+                    m_goalState.status = loadedStatus;
+                    m_goalState.objective = objective;
+                    m_goalState.turnsUsed = JsonIntOrDefault(goalObj, "turns_used", 0);
+                    m_goalState.verifierPasses = JsonIntOrDefault(goalObj, "verifier_passes", 0);
+                    m_goalState.verifierFailures = JsonIntOrDefault(goalObj, "verifier_failures", 0);
+                    m_goalState.lastVerifierReason = goalObj->has("last_verifier_reason")
+                        ? goalObj->getValue<std::string>("last_verifier_reason")
+                        : std::string();
+                    m_goalState.lastInterruptionReason = goalObj->has("last_interruption_reason")
+                        ? goalObj->getValue<std::string>("last_interruption_reason")
+                        : std::string();
+                    m_goalState.awaitingUserReason = goalObj->has("awaiting_user_reason")
+                        ? goalObj->getValue<std::string>("awaiting_user_reason")
+                        : std::string();
+                    m_goalState.awaitingUserPromptEvidence = goalObj->has("awaiting_user_prompt_evidence")
+                        ? goalObj->getValue<std::string>("awaiting_user_prompt_evidence")
+                        : std::string();
+                    m_goalState.awaitingUserReplyEvidence = goalObj->has("awaiting_user_reply_evidence")
+                        ? goalObj->getValue<std::string>("awaiting_user_reply_evidence")
+                        : std::string();
+                    m_goalState.structuredAgentEvidence =
+                        goalObj->has("structured_agent_evidence")
+                            ? JsonArrayToStringVector(goalObj->getArray("structured_agent_evidence"))
+                            : std::vector<std::string>{};
+                    m_goalState.TrimStructuredAgentEvidenceToCap();
+                    m_goalState.explicitlyCleared = false;
+
+                    if (goalObj->has("contract")) {
+                        Poco::JSON::Object::Ptr contractObj = goalObj->getObject("contract");
+                        if (contractObj) {
+                            GoalContract& contract = m_goalState.contract;
+                            const std::string contractStatusText = contractObj->has("status")
+                                ? contractObj->getValue<std::string>("status")
+                                : std::string("none");
+                            contract.status = GoalContractStatusFromPersisted(contractStatusText);
+                            contract.successCriteria = contractObj->has("success_criteria")
+                                ? JsonArrayToStringVector(contractObj->getArray("success_criteria"))
+                                : std::vector<std::string>{};
+                            contract.constraints = contractObj->has("constraints")
+                                ? JsonArrayToStringVector(contractObj->getArray("constraints"))
+                                : std::vector<std::string>{};
+                            contract.evidenceChecks = contractObj->has("evidence_checks")
+                                ? JsonArrayToStringVector(contractObj->getArray("evidence_checks"))
+                                : std::vector<std::string>{};
+                            contract.lastBuilderReason = contractObj->has("last_builder_reason")
+                                ? contractObj->getValue<std::string>("last_builder_reason")
+                                : std::string();
+
+                            // A hidden contract-builder turn cannot resume after an app
+                            // restart. Convert an interrupted draft into objective-only
+                            // verification rather than leaving /goal status stuck at
+                            // "drafting" forever.
+                            if (contract.status == GoalContractStatus::Drafting) {
+                                contract.MarkFailed(
+                                    "Contract drafting was interrupted before the conversation was reloaded.");
+                            }
+                            else if (contract.status == GoalContractStatus::Ready &&
+                                     contract.successCriteria.empty()) {
+                                contract.MarkFailed(
+                                    "Saved contract was missing success criteria and was restored as objective-only.");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Read models — prefer v2 "models" array, fall back to v1 "model" string
-        outModels.clear();
         if (root->has("models")) {
             auto arr = root->getArray("models");
             for (size_t i = 0; i < arr->size(); ++i) {
@@ -1020,6 +1379,11 @@ bool ChatHistory::LoadFromFile(const std::string& filePath, std::vector<std::str
 
         // Read messages (with optional per-message "model" field)
         m_messages.clear();
+        // Loading a conversation always puts the history into a clean
+        // state.  An unflushed streaming buffer from a prior session
+        // would otherwise leak into the next assistant message added.
+        m_streamBuffer.clear();
+        m_streamBufferDirty = 0;
         if (root->has("messages")) {
             auto messagesArray = root->getArray("messages");
             for (size_t i = 0; i < messagesArray->size(); ++i) {
@@ -1073,25 +1437,190 @@ bool ChatHistory::LoadFromFile(const std::string& filePath, std::string& outMode
     return ok;
 }
 
+namespace {
+
+bool TitleIsIdChar(char c)
+{
+    return std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '-';
+}
+
+std::string TitleTrim(std::string s)
+{
+    auto notSpace = [](unsigned char c) { return !std::isspace(c); };
+    s.erase(s.begin(), std::find_if(s.begin(), s.end(), notSpace));
+    s.erase(std::find_if(s.rbegin(), s.rend(), notSpace).base(), s.end());
+    return s;
+}
+
+std::string TitleLower(std::string s)
+{
+    std::transform(s.begin(), s.end(), s.begin(),
+        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return s;
+}
+
+std::string TitleCollapseWhitespace(std::string s)
+{
+    for (auto& c : s) {
+        if (c == '\n' || c == '\r' || c == '\t') c = ' ';
+    }
+
+    std::string out;
+    out.reserve(s.size());
+    bool lastWasSpace = false;
+    for (unsigned char ch : s) {
+        if (std::isspace(ch)) {
+            if (!lastWasSpace) out.push_back(' ');
+            lastWasSpace = true;
+        }
+        else {
+            out.push_back(static_cast<char>(ch));
+            lastWasSpace = false;
+        }
+    }
+    return TitleTrim(out);
+}
+
+std::string TitleStripOuterQuotes(std::string s)
+{
+    s = TitleTrim(std::move(s));
+    while (s.size() >= 2) {
+        char first = s.front();
+        char last  = s.back();
+        if ((first == '"' && last == '"') ||
+            (first == '\'' && last == '\'')) {
+            s = TitleTrim(s.substr(1, s.size() - 2));
+        }
+        else {
+            break;
+        }
+    }
+    return s;
+}
+
+std::string TitleStripGreeting(std::string s)
+{
+    std::string lower = TitleLower(s);
+    const char* greetings[] = {
+        "hello ", "hello. ", "hello, ", "hi ", "hi. ", "hi, ", "hey ", "hey. ", "hey, "
+    };
+
+    for (const char* prefix : greetings) {
+        const size_t n = std::strlen(prefix);
+        if (lower.compare(0, n, prefix) == 0 && s.size() > n + 4) {
+            return TitleTrim(s.substr(n));
+        }
+    }
+    return s;
+}
+
+std::string TitleReadIdAfter(const std::string& text, size_t start)
+{
+    while (start < text.size() && (text[start] == '/' || text[start] == '=')) {
+        ++start;
+    }
+
+    std::string id;
+    while (start < text.size() && TitleIsIdChar(text[start]) && id.size() < 11) {
+        id.push_back(text[start]);
+        ++start;
+    }
+
+    return id.size() == 11 ? id : std::string();
+}
+
+std::string TitleExtractYouTubeId(const std::string& content)
+{
+    const std::string lower = TitleLower(content);
+
+    size_t pos = lower.find("youtu.be/");
+    if (pos != std::string::npos) {
+        std::string id = TitleReadIdAfter(content, pos + 8);
+        if (!id.empty()) return id;
+    }
+
+    pos = lower.find("youtube.com/watch");
+    if (pos != std::string::npos) {
+        size_t v = lower.find("v=", pos);
+        if (v != std::string::npos) {
+            std::string id = TitleReadIdAfter(content, v + 2);
+            if (!id.empty()) return id;
+        }
+    }
+
+    pos = lower.find("youtube.com/shorts/");
+    if (pos != std::string::npos) {
+        std::string id = TitleReadIdAfter(content, pos + 19);
+        if (!id.empty()) return id;
+    }
+
+    pos = lower.find("youtube.com/embed/");
+    if (pos != std::string::npos) {
+        std::string id = TitleReadIdAfter(content, pos + 18);
+        if (!id.empty()) return id;
+    }
+
+    return {};
+}
+
+std::string TitleMakeFromYouTube(const std::string& content,
+                                 const std::string& videoId)
+{
+    const std::string lower = TitleLower(content);
+
+    if (lower.find("transcript") != std::string::npos ||
+        lower.find("markdown")   != std::string::npos ||
+        lower.find("text file")  != std::string::npos) {
+        return "YouTube transcript " + videoId;
+    }
+
+    if (lower.find("summar") != std::string::npos) {
+        return "YouTube summary " + videoId;
+    }
+
+    return "YouTube video " + videoId;
+}
+
+std::string TitleTruncate(std::string s, size_t maxLen = 60)
+{
+    s = TitleCollapseWhitespace(std::move(s));
+    if (s.size() > maxLen) {
+        s = s.substr(0, maxLen - 3) + "...";
+    }
+    return s.empty() ? "Untitled conversation" : s;
+}
+
+} // namespace
+
 std::string ChatHistory::GenerateTitle() const
 {
-    // Use the first user message, truncated to ~60 chars
+    // Use the first real user message.  Project-attached chats can be
+    // saved before the first message, so SaveToFile may call this before
+    // any usable content exists; in that case keep the placeholder.
     for (const auto& msg : m_messages) {
-        if (msg->getValue<std::string>("role") == "user") {
-            std::string content = msg->getValue<std::string>("content");
-            if (content.empty()) continue;
-
-            // Strip newlines
-            for (auto& c : content) {
-                if (c == '\n' || c == '\r') c = ' ';
-            }
-
-            // Truncate
-            if (content.size() > 60) {
-                content = content.substr(0, 57) + "...";
-            }
-            return content;
+        if (msg->getValue<std::string>("role") != "user") {
+            continue;
         }
+
+        std::string content = msg->getValue<std::string>("content");
+        content = TitleStripGreeting(TitleStripOuterQuotes(
+            TitleCollapseWhitespace(content)));
+        if (content.empty()) continue;
+
+        const std::string youtubeId = TitleExtractYouTubeId(content);
+        if (!youtubeId.empty()) {
+            return TitleMakeFromYouTube(content, youtubeId);
+        }
+
+        const std::string lower = TitleLower(content);
+        if (lower.find("project.md") != std::string::npos) {
+            return "Update PROJECT.md";
+        }
+        if (lower.find("requirements.txt") != std::string::npos) {
+            return "Update project requirements";
+        }
+
+        return TitleTruncate(content);
     }
     return "Untitled conversation";
 }
@@ -1273,9 +1802,31 @@ std::string ChatHistory::FormatToolBlockAsUserMessage(
     size_t fenceLen = std::max<size_t>(3, n + 1);
     const std::string fence(fenceLen, '`');
 
+    auto lowerAscii = [](std::string v) {
+        for (char& c : v) c = (char)std::tolower((unsigned char)c);
+        return v;
+    };
+    bool failedTool = !errorBody.empty();
+    for (const std::string& chip : statusChips) {
+        std::string c = lowerAscii(chip);
+        if (c == "failed" || c == "blocked" || c == "error" ||
+            c == "missing" || c == "too large" || c == "timed out" ||
+            c == "cancelled" || c == "syntax error") {
+            failedTool = true;
+        }
+        if (c.rfind("exit ", 0) == 0 && c != "exit 0") {
+            failedTool = true;
+        }
+    }
+
     std::ostringstream ss;
     ss << "[tool: " << toolTag << "]\n"
        << "> " << commandEcho << "\n";
+
+    if (failedTool) {
+        ss << "\n[tool outcome]\n"
+           << "TOOL FAILED OR DID NOT COMPLETE SUCCESSFULLY. Do not claim success, do not invent generated files, and do not summarize stale output. Fix the problem, retry only with a corrected tool call, or explain the failure to the user.\n";
+    }
 
     // Primary body — monospace fenced block with optional language hint.
     if (!body.empty()) {

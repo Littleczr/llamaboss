@@ -7,6 +7,7 @@
 
 #include <wx/wx.h>
 #include <wx/richtext/richtextctrl.h>
+#include <wx/caret.h>
 #include <algorithm>
 
 class ChatDisplayCtrl : public wxRichTextCtrl {
@@ -22,11 +23,23 @@ public:
         , m_scrollIntensity(0)
         , m_inAutoScroll(false)
     {
+        Bind(wxEVT_SET_FOCUS, &ChatDisplayCtrl::OnFocusGained, this);
+        Bind(wxEVT_LEFT_DOWN, &ChatDisplayCtrl::OnMouseDown, this);
         Bind(wxEVT_MOTION, &ChatDisplayCtrl::OnDragMotion, this);
         Bind(wxEVT_LEFT_UP, &ChatDisplayCtrl::OnDragEnd, this);
         Bind(wxEVT_MOUSE_CAPTURE_LOST, &ChatDisplayCtrl::OnCaptureLost, this);
         Bind(wxEVT_TIMER, &ChatDisplayCtrl::OnAutoScrollTimer, this,
             m_autoScrollTimer.GetId());
+
+        // The chat transcript should behave like a read-only document, not an
+        // editor.  Keep selection/clicking, but do not show a blinking caret.
+        CallAfter([this]() { SuppressCaret(); });
+    }
+
+    void SuppressCaret() {
+        if (wxCaret* caret = GetCaret()) {
+            caret->Hide();
+        }
     }
 
 private:
@@ -34,6 +47,20 @@ private:
     int m_scrollDirection;    // -1 = up, +1 = down, 0 = idle
     int m_scrollIntensity;    // lines per tick, scales with distance from edge
     bool m_inAutoScroll;      // guard against re-entry from synthetic events
+
+    void SuppressCaretSoon() {
+        CallAfter([this]() { SuppressCaret(); });
+    }
+
+    void OnFocusGained(wxFocusEvent& evt) {
+        evt.Skip();
+        SuppressCaretSoon();
+    }
+
+    void OnMouseDown(wxMouseEvent& evt) {
+        evt.Skip();
+        SuppressCaretSoon();
+    }
 
     void OnDragMotion(wxMouseEvent& evt) {
         evt.Skip();  // always let base class handle selection
@@ -67,6 +94,7 @@ private:
     void OnDragEnd(wxMouseEvent& evt) {
         StopAutoScroll();
         evt.Skip();
+        SuppressCaretSoon();
     }
 
     void OnCaptureLost(wxMouseCaptureLostEvent&) {
@@ -88,6 +116,7 @@ private:
         fake.SetEventObject(this);
         HandleWindowEvent(fake);
         m_inAutoScroll = false;
+        SuppressCaretSoon();
     }
 
     void StopAutoScroll() {

@@ -35,6 +35,8 @@
 wxDECLARE_EVENT(wxEVT_PYTHON_COMPLETE, wxCommandEvent);
 wxDECLARE_EVENT(wxEVT_PYTHON_ERROR,    wxCommandEvent);
 
+class SecretsStore;
+
 struct PythonRunResult {
     std::string toolName;          // protocol tool name, e.g. python_health
     std::string helperName;        // built-in helper id, e.g. python_health
@@ -70,6 +72,14 @@ public:
     PythonRunner(wxEvtHandler* eventHandler,
                  std::weak_ptr<std::atomic<bool>> aliveToken);
     ~PythonRunner();
+
+    // Wire the AppState SecretsStore into the runner so
+    // python_run_script subprocesses get the configured Connections
+    // injected as environment variables.  Non-owning pointer; the
+    // store outlives the runner because both are owned by AppState
+    // / MyFrame.  Pass nullptr to disable injection (helpers like
+    // python_health never see secrets anyway).
+    void SetSecretsStore(SecretsStore* store) { m_secretsStore = store; }
 
     // Starts the fixed python_health helper.  `cwd` is the working
     // directory for the helper process; empty falls back to the
@@ -121,6 +131,15 @@ public:
     bool StartXlsxReport(const std::string& pathArg,
                          const std::string& cwd,
                          unsigned long      timeoutMs = kDefaultTimeoutMs);
+
+    // Starts the fixed xlsx_create_workbook helper.  It accepts a
+    // JSON workbook spec as data, never as executable code, and writes
+    // one .xlsx workbook to the conversation Spreadsheets lane.  This
+    // covers safe creation of custom formatted workbooks from structured
+    // rows without generating and running arbitrary Python scripts.
+    bool StartXlsxCreateWorkbook(const std::string& jsonSpecArg,
+                                 const std::string& cwd,
+                                 unsigned long      timeoutMs = kDefaultTimeoutMs);
 
     // Starts the fixed pdf_extract_text helper.  It reads one text-based
     // .pdf file inside `cwd` and writes extracted text as Markdown to
@@ -189,13 +208,17 @@ public:
                               unsigned long      timeoutMs = 30000,
                               const std::string& activeProjectRoot = std::string());
 
-    // Installs one allowlisted Python package into the user's Python
+    // Installs one Python package from PyPI into the user's Python
     // user-site with `py -3 -m pip install --user <package>` (falling
     // back to python/python3 launchers if needed).  This is a deliberate
     // approval-gated environment mutation, not a general shell escape:
-    // the package name is normalized against a fixed allowlist and no
-    // version specifiers, paths, requirements files, extra pip flags, or
-    // arbitrary command-line arguments are accepted.
+    // the package name is normalized to a simple PyPI form and rejected
+    // unless it consists only of [a-z0-9.-] starting with a letter or
+    // digit.  No version specifiers, paths, URLs, requirements files,
+    // extras, pip flags, or arbitrary command-line arguments are
+    // accepted.  Every install renders its own per-package approval
+    // card showing the exact name pip will see, even when one-approval
+    // mode is on for the chat.
     bool StartPythonInstallPackage(const std::string& packageArg,
                                    const std::string& cwd,
                                    unsigned long      timeoutMs = 300000);
@@ -207,8 +230,40 @@ public:
     }
 
 private:
+    // Shared startup path for every public Start* helper.  The Start*
+    // wrappers used to inline a byte-identical block: check IsRunning,
+    // flip cancel/running flags, construct a PythonWorkerThread with
+    // the per-tool helperName and helperArg, Run() it, and on
+    // wxTHREAD_NO_ERROR failure post a wxEVT_PYTHON_ERROR through the
+    // alive-token guard.  Centralizing it here means any future change
+    // to that contract (alive-token semantics, error event payload,
+    // observability hooks) is a one-line edit instead of a sweep
+    // across 13 call sites.
+    //
+    // defaultTimeoutMs preserves the two existing per-tool fallbacks
+    // (python_run_script -> 30s, python_install_package -> 300s) that
+    // need to override the worker's own kDefaultTimeoutMs without
+    // committing every helper to a non-zero default.  Pass 0 (the
+    // default) to let PythonWorkerThread fall back to kDefaultTimeoutMs
+    // when the caller's timeoutMs is 0.
+    //
+    // activeProjectRoot is a passthrough used only by python_run_script
+    // so the worker can resolve scripts under a project's Workflows
+    // lane in addition to the chat Scripts lane.
+    bool StartWorker(const std::string& helperName,
+                     const std::string& helperArg,
+                     const std::string& cwd,
+                     unsigned long      timeoutMs,
+                     unsigned long      defaultTimeoutMs   = 0,
+                     const std::string& activeProjectRoot  = std::string());
+
     wxEvtHandler*                      m_eventHandler;
     std::weak_ptr<std::atomic<bool>>   m_aliveToken;
     std::shared_ptr<std::atomic<bool>> m_cancelFlag;
     std::shared_ptr<std::atomic<bool>> m_isRunning;
+
+    // Non-owning.  Set by MyFrame after construction via
+    // SetSecretsStore(); nullptr until then, which is safe — every
+    // env-injection site checks first.
+    SecretsStore* m_secretsStore = nullptr;
 };

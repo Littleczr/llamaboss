@@ -207,11 +207,25 @@ unsigned long long FileSizeBytes(const std::string& path)
 }
 
 bool IsWorkflowDocFileName(const std::string& fileName);
+bool FileOrDirExists(const std::string& path);
 std::string NormalizeExistingPathForCompare(const std::string& path);
 
 // Scope-agnostic enumerators.  These power ListProjectWorkflows /
 // ListProjectWorkflowScripts and the global-scope counterparts, which
 // differ only in which directory they walk.
+// Phase 2 layout: each skill / workflow is a subfolder containing a
+// SKILL.md file (plus optional .py scripts and other supporting files).
+// This helper walks the subfolders of `workflowsDir` and returns one
+// ProjectWorkflowInfo per folder that has a SKILL.md inside.
+//
+// The display `name` stays in the legacy `<stem>.workflow.md` shape so
+// ResolveWorkflowInList's fuzzy matching (which checks full name, the
+// .workflow.md-stripped stem, and the .ext-stripped stem) keeps working
+// without changes.  The on-disk `path` points at the real SKILL.md so
+// callers that read or open the file land in the right place.
+//
+// Idempotent against a transitional state where the folder exists but
+// SKILL.md is missing -- such folders are silently skipped.
 std::vector<ProjectWorkflowInfo> ListWorkflowsInDir(const std::string& workflowsDir,
                                                     std::size_t maxItems)
 {
@@ -223,18 +237,20 @@ std::vector<ProjectWorkflowInfo> ListWorkflowsInDir(const std::string& workflows
     if (!dir.IsOpened()) return workflows;
 
     wxString name;
-    bool cont = dir.GetFirst(&name, wxEmptyString, wxDIR_FILES);
+    bool cont = dir.GetFirst(&name, wxEmptyString, wxDIR_DIRS);
     while (cont) {
-        const std::string fileName = std::string(name.ToUTF8().data());
-        const std::string lowerName = LowerAscii(fileName);
-        const bool isWorkflowDoc = IsWorkflowDocFileName(lowerName);
+        const std::string folderName = std::string(name.ToUTF8().data());
+        const std::string folderPath = JoinProjectPath(workflowsDir, folderName);
+        const std::string skillMdPath = JoinProjectPath(folderPath, "SKILL.md");
 
-        if (isWorkflowDoc) {
-            const std::string path = JoinProjectPath(workflowsDir, fileName);
+        if (FileOrDirExists(skillMdPath)) {
             ProjectWorkflowInfo info;
-            info.name = fileName;
-            info.path = path;
-            info.sizeBytes = FileSizeBytes(path);
+            // Synthetic "<stem>.workflow.md" display name keeps the
+            // fuzzy resolver working with no changes -- it already
+            // strips the .workflow.md suffix when matching.
+            info.name = folderName + ".workflow.md";
+            info.path = skillMdPath;
+            info.sizeBytes = FileSizeBytes(skillMdPath);
             workflows.push_back(info);
         }
 
@@ -249,6 +265,14 @@ std::vector<ProjectWorkflowInfo> ListWorkflowsInDir(const std::string& workflows
     return workflows;
 }
 
+// Phase 2 layout: helper .py scripts live INSIDE each skill folder,
+// alongside SKILL.md.  This helper iterates skill folders and reports
+// every .py file found within them.  The display `name` is the bare
+// filename ("skill_test.py"), matching the legacy contract so the
+// fuzzy resolver doesn't need updating.  Path collisions across
+// different skill folders are tolerated -- the resolver flags them
+// as ambiguous; in practice a skill author should keep script names
+// unique enough to be self-identifying.
 std::vector<ProjectWorkflowScriptInfo> ListWorkflowScriptsInDir(const std::string& workflowsDir,
                                                                 std::size_t maxItems)
 {
@@ -259,19 +283,38 @@ std::vector<ProjectWorkflowScriptInfo> ListWorkflowScriptsInDir(const std::strin
     wxDir dir(wxString::FromUTF8(workflowsDir));
     if (!dir.IsOpened()) return scripts;
 
-    wxString name;
-    bool cont = dir.GetFirst(&name, wxEmptyString, wxDIR_FILES);
+    wxString folderName;
+    bool cont = dir.GetFirst(&folderName, wxEmptyString, wxDIR_DIRS);
     while (cont) {
-        const std::string fileName = std::string(name.ToUTF8().data());
-        if (HasLowerSuffix(fileName, ".py")) {
-            const std::string path = JoinProjectPath(workflowsDir, fileName);
-            ProjectWorkflowScriptInfo info;
-            info.name = fileName;
-            info.path = path;
-            info.sizeBytes = FileSizeBytes(path);
-            scripts.push_back(info);
+        const std::string folderUtf8 = std::string(folderName.ToUTF8().data());
+        const std::string folderPath = JoinProjectPath(workflowsDir, folderUtf8);
+
+        // Skip subfolders that aren't proper skills (no SKILL.md).
+        const std::string skillMdPath = JoinProjectPath(folderPath, "SKILL.md");
+        if (!FileOrDirExists(skillMdPath)) {
+            cont = dir.GetNext(&folderName);
+            continue;
         }
-        cont = dir.GetNext(&name);
+
+        wxDir inner(wxString::FromUTF8(folderPath));
+        if (inner.IsOpened()) {
+            wxString fileName;
+            bool innerCont = inner.GetFirst(&fileName, wxEmptyString, wxDIR_FILES);
+            while (innerCont) {
+                const std::string fileUtf8 = std::string(fileName.ToUTF8().data());
+                if (HasLowerSuffix(fileUtf8, ".py")) {
+                    const std::string path = JoinProjectPath(folderPath, fileUtf8);
+                    ProjectWorkflowScriptInfo info;
+                    info.name = fileUtf8;
+                    info.path = path;
+                    info.sizeBytes = FileSizeBytes(path);
+                    scripts.push_back(info);
+                }
+                innerCont = inner.GetNext(&fileName);
+            }
+        }
+
+        cont = dir.GetNext(&folderName);
     }
 
     std::sort(scripts.begin(), scripts.end(), [](const ProjectWorkflowScriptInfo& a, const ProjectWorkflowScriptInfo& b) {
@@ -282,6 +325,11 @@ std::vector<ProjectWorkflowScriptInfo> ListWorkflowScriptsInDir(const std::strin
     return scripts;
 }
 
+// LegacyGlobalWorkflowsDir: the function name intentionally keeps the
+// historical "GlobalWorkflows" wording because the folder it returns is
+// literally named "Workflows" on disk in pre-Skills installs. Used only
+// by MoveLegacySkillFilesIfNeeded() during one-time migration into the
+// new LlamaBoss\Skills root. Do not rename this.
 std::string LegacyGlobalWorkflowsDir()
 {
     // Pre-Skills builds stored global reusable workflow files directly in
@@ -304,17 +352,22 @@ std::string UniqueWorkflowStem(const std::string& dir,
                                const std::string& baseName,
                                bool createPythonScript)
 {
+    // Phase 2 layout: each skill lives in its own folder, so the
+    // collision check is "does <dir>/<stem>/ already exist?" rather
+    // than the old "does <dir>/<stem>.workflow.md already exist?".
+    // The createPythonScript flag is still respected -- the python
+    // script lives INSIDE the skill folder, so if the folder name
+    // is free, the script slot inside it is too.
     for (int i = 1; i < 10000; ++i) {
         std::ostringstream stem;
         stem << baseName;
         if (i > 1) stem << " (" << i << ")";
 
         const std::string candidateStem = stem.str();
-        const std::string workflowPath = JoinProjectPath(dir, candidateStem + ".workflow.md");
-        const std::string scriptPath = JoinProjectPath(dir, candidateStem + ".py");
+        const std::string folderPath = JoinProjectPath(dir, candidateStem);
 
-        if (!FileOrDirExists(workflowPath) &&
-            (!createPythonScript || !FileOrDirExists(scriptPath))) {
+        if (!FileOrDirExists(folderPath)) {
+            (void)createPythonScript;  // intentionally unused -- see comment above
             return candidateStem;
         }
     }
@@ -347,6 +400,96 @@ void MoveLegacySkillFilesIfNeeded(const std::string& skillsDir)
             }
         }
         cont = dir.GetNext(&name);
+    }
+}
+
+// One-time (idempotent) migration from the Phase 1 flat layout to
+// the Phase 2 folder-per-skill layout.  For every "<stem>.workflow.md"
+// file at the top of `workflowsDir`, this:
+//
+//   1. Creates "<workflowsDir>/<stem>/" if it doesn't already exist
+//   2. Renames "<workflowsDir>/<stem>.workflow.md"
+//                 -> "<workflowsDir>/<stem>/SKILL.md"
+//   3. If "<workflowsDir>/<stem>.py" exists, renames it
+//                 -> "<workflowsDir>/<stem>/<stem>.py"
+//
+// Conservative: only matched .workflow.md (with optional same-stem .py)
+// are migrated.  Orphan .py files at the top level are left alone --
+// users may keep loose helper scripts there for their own purposes.
+// If the destination folder already exists with content (mid-migration
+// crash, manual move, etc.), this leaves it untouched and moves on so
+// the user can resolve manually.
+void MigrateFlatWorkflowsToFolders(const std::string& workflowsDir)
+{
+    if (workflowsDir.empty()) return;
+    if (!wxDirExists(wxString::FromUTF8(workflowsDir))) return;
+
+    // Collect names first so we don't trip wxDir's iterator with
+    // renames while we walk.
+    std::vector<std::string> flatWorkflowDocs;
+    {
+        wxDir scan(wxString::FromUTF8(workflowsDir));
+        if (!scan.IsOpened()) return;
+        wxString fname;
+        bool cont = scan.GetFirst(&fname, wxEmptyString, wxDIR_FILES);
+        while (cont) {
+            const std::string name = std::string(fname.ToUTF8().data());
+            if (IsWorkflowDocFileName(LowerAscii(name))) {
+                flatWorkflowDocs.push_back(name);
+            }
+            cont = scan.GetNext(&fname);
+        }
+    }
+
+    for (const std::string& docFileName : flatWorkflowDocs) {
+        // Stem = filename minus the ".workflow.md" suffix.  Case-
+        // insensitive strip matches IsWorkflowDocFileName's intent.
+        std::string stem = docFileName;
+        const std::string suffix = ".workflow.md";
+        if (stem.size() > suffix.size()) {
+            std::string tail = LowerAscii(stem.substr(stem.size() - suffix.size()));
+            if (tail == suffix) {
+                stem.resize(stem.size() - suffix.size());
+            }
+        }
+        if (stem.empty()) continue;
+
+        const std::string srcDoc    = JoinProjectPath(workflowsDir, docFileName);
+        const std::string srcScript = JoinProjectPath(workflowsDir, stem + ".py");
+        const std::string folder    = JoinProjectPath(workflowsDir, stem);
+        const std::string dstDoc    = JoinProjectPath(folder, "SKILL.md");
+        const std::string dstScript = JoinProjectPath(folder, stem + ".py");
+
+        // Skip if a folder already exists -- treat as already
+        // migrated (or user-managed; don't clobber).
+        if (FileOrDirExists(folder)) continue;
+
+        if (!wxFileName::Mkdir(wxString::FromUTF8(folder),
+                               wxS_DIR_DEFAULT, wxPATH_MKDIR_FULL)) {
+            continue;  // best-effort -- skip this one, try next
+        }
+
+        // Move the .workflow.md (now becomes SKILL.md inside the folder).
+        // wxRenameFile with overwrite=false fails if destination
+        // exists, but we just created the folder so SKILL.md can't
+        // be there yet.
+        if (!wxRenameFile(wxString::FromUTF8(srcDoc),
+                          wxString::FromUTF8(dstDoc), false)) {
+            // Couldn't move; roll back the empty folder we just made
+            // so the next launch will retry instead of seeing the
+            // folder and skipping (per the "Skip if folder exists"
+            // guard above).
+            wxFileName::Rmdir(wxString::FromUTF8(folder));
+            continue;
+        }
+
+        // Move the matching .py if present.  Failure is non-fatal:
+        // the SKILL.md already migrated, the user can re-create the
+        // script or move it manually.
+        if (FileOrDirExists(srcScript)) {
+            wxRenameFile(wxString::FromUTF8(srcScript),
+                         wxString::FromUTF8(dstScript), false);
+        }
     }
 }
 
@@ -421,20 +564,27 @@ bool ProjectManager::EnsureProjectsRoot()
     return ok || wxDirExists(wxString::FromUTF8(dir));
 }
 
-std::string ProjectManager::GetGlobalWorkflowsDir()
+std::string ProjectManager::GetSkillsDir()
 {
-    // User-facing name: Skills.  The existing API names stay as
-    // GlobalWorkflow internally to keep the patch small and compatible.
+    // Returns %USERPROFILE%\LlamaBoss\Skills with the same home/documents
+    // fallbacks used by GetProjectsDir(). A handful of private helpers in
+    // this file still use the generic "Workflow" name because they are
+    // reused for both Skills and per-project workflows.
     return JoinProjectPath(LlamaBossUserRootDirForProjects(), "Skills");
 }
 
-bool ProjectManager::EnsureGlobalWorkflowsRoot()
+bool ProjectManager::EnsureSkillsRoot()
 {
-    std::string dir = GetGlobalWorkflowsDir();
+    std::string dir = GetSkillsDir();
     bool ok = wxFileName::Mkdir(wxString::FromUTF8(dir), wxS_DIR_DEFAULT, wxPATH_MKDIR_FULL);
     const bool exists = ok || wxDirExists(wxString::FromUTF8(dir));
     if (exists) {
+        // Order matters: pull files in from the legacy Workflows/
+        // root first (pre-Skills builds), THEN run the flat ->
+        // folder migrator so anything that lands here gets wrapped
+        // into Phase 2's folder-per-skill layout in the same launch.
         MoveLegacySkillFilesIfNeeded(dir);
+        MigrateFlatWorkflowsToFolders(dir);
     }
     return exists;
 }
@@ -565,7 +715,7 @@ bool ProjectManager::CreateProject(const std::string& name,
        << "## Outputs\n\n"
        << "Project outputs can be saved in `Outputs/` later. Conversation-generated artifacts still save to chat workflow folders unless a workflow says otherwise.\n\n"
        << "## Workflows\n\n"
-       << "Reusable project workflows live in `Workflows/` as Markdown `.workflow.md` files. A workflow is a repeatable instruction plan; tools and approvals still work normally.\n\n"
+       << "Reusable project workflows live in `Workflows/` as folders that contain a `SKILL.md` instruction file, with optional helper scripts or supporting files alongside it. A workflow is a repeatable instruction plan; tools and approvals still work normally.\n\n"
        << "## Notes\n\n"
        << "Durable project notes can live in `Notes/` in a later phase.\n";
 
@@ -800,13 +950,29 @@ bool CreateWorkflowInternal(const std::string& workflowsDir,
     if (baseName.empty()) baseName = "workflow";
 
     const std::string uniqueStem = UniqueWorkflowStem(workflowsDir, baseName, createPythonScript);
-    const std::string workflowPath = JoinProjectPath(workflowsDir, uniqueStem + ".workflow.md");
+
+    // Phase 2 layout: skill / workflow lives in its own folder.
+    //     <workflowsDir>/<uniqueStem>/SKILL.md
+    //     <workflowsDir>/<uniqueStem>/<uniqueStem>.py   (optional)
+    // Folder gets created here; SKILL.md and the script are written
+    // into it below.
+    const std::string skillFolder = JoinProjectPath(workflowsDir, uniqueStem);
+    if (!wxFileName::Mkdir(wxString::FromUTF8(skillFolder),
+                           wxS_DIR_DEFAULT, wxPATH_MKDIR_FULL)
+        && !wxDirExists(wxString::FromUTF8(skillFolder))) {
+        outError = isGlobal
+            ? std::string("Could not create the Skill folder.")
+            : std::string("Could not create the workflow folder.");
+        return false;
+    }
+
+    const std::string workflowPath = JoinProjectPath(skillFolder, "SKILL.md");
 
     std::string scriptName;
     std::string scriptPath;
     if (createPythonScript) {
         scriptName = uniqueStem + ".py";
-        scriptPath = JoinProjectPath(workflowsDir, scriptName);
+        scriptPath = JoinProjectPath(skillFolder, scriptName);
     }
 
     std::ostringstream md;
@@ -816,7 +982,7 @@ bool CreateWorkflowInternal(const std::string& workflowsDir,
               "conversations whether or not a project is attached. When the user asks to run or "
               "use this Skill, LlamaBoss should read this file first, then follow the steps "
               "using normal tools/approval rules. If a project is attached and that project has a "
-              "Skill file with the same name, the project workflow takes precedence.\n\n";
+              "project workflow with the same name, the project workflow takes precedence.\n\n";
     } else {
         md << "This file is a reusable project workflow. When the user asks to run or use this workflow, "
               "LlamaBoss should read this file first, then follow the steps using the active project context, "
@@ -825,9 +991,6 @@ bool CreateWorkflowInternal(const std::string& workflowsDir,
     md << "## Trigger Phrases\n\n"
        << "- Run the " << trimmedName << (isGlobal ? " skill\n" : " workflow\n")
        << "- Use the " << trimmedName << (isGlobal ? " skill\n" : " workflow\n");
-    if (isGlobal) {
-        md << "- Run the " << trimmedName << " workflow\n";
-    }
     md << "\n## Inputs to Ask For\n\n"
        << "- List the details this " << (isGlobal ? "Skill" : "workflow") << " needs from the user.\n\n"
        << "## Steps\n\n";
@@ -849,7 +1012,9 @@ bool CreateWorkflowInternal(const std::string& workflowsDir,
     }
 
     md << "## Output Expectations\n\n"
-       << "- Describe the final artifact or answer this workflow should produce.\n\n";
+       << "- Describe the final artifact or answer this "
+       << (isGlobal ? "Skill" : "workflow")
+       << " should produce.\n\n";
 
     if (createPythonScript) {
         md << "## Optional Python Script\n\n"
@@ -873,7 +1038,9 @@ bool CreateWorkflowInternal(const std::string& workflowsDir,
     }
 
     if (!WriteUtf8File(workflowPath, md.str())) {
-        outError = "Could not write workflow file.";
+        outError = isGlobal
+            ? std::string("Could not write Skill file.")
+            : std::string("Could not write workflow file.");
         return false;
     }
 
@@ -884,20 +1051,37 @@ bool CreateWorkflowInternal(const std::string& workflowsDir,
            << ".\n\n";
         if (isGlobal) {
             py << "LlamaBoss runs Skill helper scripts from the current conversation workspace.\n"
-               << "This script can infer its Skills folder from its own file location.\n";
+               << "This script can infer its Skill folder, the global Skills root, and the\n"
+               << "LlamaBoss user root from its own file location.\n";
         } else {
             py << "LlamaBoss runs project workflow scripts from the current conversation workspace.\n"
-               << "This script can infer its project folders from its own file location.\n";
+               << "This script can infer its workflow folder, the project Workflows root, and\n"
+               << "the project root from its own file location.\n";
         }
-        py << "Edit this file to implement the repeatable workflow action.\n\"\"\"\n\n"
+        py << "Edit this file to implement the repeatable "
+           << (isGlobal ? "Skill" : "workflow")
+           << " action.\n\"\"\"\n\n"
            << "from pathlib import Path\n\n"
-           << "SCRIPT_PATH = Path(__file__).resolve()\n"
-           << "WORKFLOWS_DIR = SCRIPT_PATH.parent\n";
+           << "SCRIPT_PATH = Path(__file__).resolve()\n";
         if (isGlobal) {
-            py << "LLAMABOSS_USER_ROOT = WORKFLOWS_DIR.parent\n"
+            // Folder-per-skill layout:
+            //   <user>/LlamaBoss/Skills/<skill>/<script>.py
+            // .parent ->  the <skill>/ folder
+            // .parent.parent ->  the Skills/ root
+            // .parent.parent.parent -> the LlamaBoss/ user root
+            py << "SKILL_DIR = SCRIPT_PATH.parent\n"
+               << "SKILLS_ROOT = SKILL_DIR.parent\n"
+               << "LLAMABOSS_USER_ROOT = SKILLS_ROOT.parent\n"
                << "PROJECTS_ROOT = LLAMABOSS_USER_ROOT / \"Projects\"\n";
         } else {
-            py << "PROJECT_ROOT = WORKFLOWS_DIR.parent\n"
+            // Project folder-per-skill layout:
+            //   <project>/Workflows/<workflow>/<script>.py
+            // .parent -> the <workflow>/ folder
+            // .parent.parent -> the project's Workflows/ folder
+            // .parent.parent.parent -> the project root
+            py << "WORKFLOW_DIR = SCRIPT_PATH.parent\n"
+               << "WORKFLOWS_ROOT = WORKFLOW_DIR.parent\n"
+               << "PROJECT_ROOT = WORKFLOWS_ROOT.parent\n"
                << "SOURCES_DIR = PROJECT_ROOT / \"Sources\"\n"
                << "TEMPLATES_DIR = PROJECT_ROOT / \"Templates\"\n"
                << "OUTPUTS_DIR = PROJECT_ROOT / \"Outputs\"\n";
@@ -906,10 +1090,12 @@ bool CreateWorkflowInternal(const std::string& workflowsDir,
            << "def main() -> None:\n"
            << "    print(\"Workflow helper script placeholder\")\n";
         if (isGlobal) {
-            py << "    print(f\"Skills folder: {WORKFLOWS_DIR}\")\n"
+            py << "    print(f\"Skill folder: {SKILL_DIR}\")\n"
+               << "    print(f\"Skills root: {SKILLS_ROOT}\")\n"
                << "    print(f\"LlamaBoss user root: {LLAMABOSS_USER_ROOT}\")\n";
         } else {
-            py << "    print(f\"Project root: {PROJECT_ROOT}\")\n"
+            py << "    print(f\"Workflow folder: {WORKFLOW_DIR}\")\n"
+               << "    print(f\"Project root: {PROJECT_ROOT}\")\n"
                << "    print(f\"Sources folder: {SOURCES_DIR}\")\n"
                << "    print(f\"Templates folder: {TEMPLATES_DIR}\")\n"
                << "    print(f\"Outputs folder: {OUTPUTS_DIR}\")\n";
@@ -933,7 +1119,11 @@ bool CreateWorkflowInternal(const std::string& workflowsDir,
     }
 
     wxFileName fn(wxString::FromUTF8(workflowPath));
-    outWorkflow.name = std::string(fn.GetFullName().ToUTF8().data());
+    // Display name keeps the legacy "<stem>.workflow.md" shape so
+    // ResolveWorkflowInList's fuzzy match (which strips .workflow.md
+    // and .ext) keeps working without changes -- and so every skill
+    // doesn't collapse to the literal "SKILL.md" name.
+    outWorkflow.name = uniqueStem + ".workflow.md";
     outWorkflow.path = workflowPath;
     outWorkflow.sizeBytes = FileSizeBytes(workflowPath);
     return true;
@@ -954,6 +1144,13 @@ bool CreateProjectWorkflowInternal(const std::string& rootPath,
         outWorkflow = ProjectWorkflowInfo{};
         return false;
     }
+
+    // Migrate any flat <stem>.workflow.md / <stem>.py pairs in this
+    // project's Workflows/ to folders before we create a new one.
+    // Keeps the directory shape consistent and avoids the new skill
+    // being created in a folder while older siblings stay flat.
+    MigrateFlatWorkflowsToFolders(ProjectManager::ProjectWorkflowsPath(rootPath));
+
     return CreateWorkflowInternal(ProjectManager::ProjectWorkflowsPath(rootPath),
                                   /*isGlobal=*/false,
                                   workflowName,
@@ -1097,6 +1294,11 @@ bool ProjectManager::CreateProjectWorkflowWithScript(const std::string& rootPath
 std::vector<ProjectWorkflowInfo> ProjectManager::ListProjectWorkflows(const std::string& rootPath,
                                                                       std::size_t maxItems)
 {
+    // Idempotent: migrates any flat workflows in this project's
+    // Workflows/ to the folder-per-skill layout before listing.
+    // No-op if there's nothing flat to migrate, so the cost is one
+    // directory scan per call.
+    MigrateFlatWorkflowsToFolders(ProjectWorkflowsPath(rootPath));
     return ListWorkflowsInDir(ProjectWorkflowsPath(rootPath), maxItems);
 }
 
@@ -1133,6 +1335,11 @@ bool ProjectManager::ResolveProjectWorkflow(const std::string& rootPath,
 std::vector<ProjectWorkflowScriptInfo> ProjectManager::ListProjectWorkflowScripts(const std::string& rootPath,
                                                                                   std::size_t maxItems)
 {
+    // Same idempotent migration as ListProjectWorkflows -- ensures
+    // any flat <stem>.py / <stem>.workflow.md pairs get wrapped
+    // into <stem>/ folders before we try to enumerate scripts
+    // (which now only looks inside skill folders).
+    MigrateFlatWorkflowsToFolders(ProjectWorkflowsPath(rootPath));
     return ListWorkflowScriptsInDir(ProjectWorkflowsPath(rootPath), maxItems);
 }
 
@@ -1177,65 +1384,69 @@ bool ProjectManager::ResolveProjectWorkflowScript(const std::string& rootPath,
 }
 
 // ── Skills public API ─────────────────────────────────────────────
-// User-facing Skills are the global reusable lane.  Internally this
-// still uses the existing GlobalWorkflow function names to keep the
-// patch small, but files now live under %USERPROFILE%\LlamaBoss\Skills.
+// User-facing Skills are the global reusable lane and live under
+// %USERPROFILE%\LlamaBoss\Skills.  The internal helpers used below
+// (CreateWorkflowInternal, ListWorkflowsInDir, etc.) keep the generic
+// "Workflow" name on purpose: they are shared with the per-project
+// workflow lane.  The shared on-disk structs (ProjectWorkflowInfo /
+// ProjectWorkflowScriptInfo) are aliased to SkillInfo / SkillScriptInfo
+// in project_manager.h -- prefer the Skill aliases at new call sites.
 
-bool ProjectManager::CreateGlobalWorkflow(const std::string& workflowName,
-                                          ProjectWorkflowInfo& outWorkflow,
-                                          std::string& outError)
+bool ProjectManager::CreateSkill(const std::string& skillName,
+                                 SkillInfo& outSkill,
+                                 std::string& outError)
 {
-    if (!EnsureGlobalWorkflowsRoot()) {
+    if (!EnsureSkillsRoot()) {
         outError = "Could not create the LlamaBoss Skills folder.";
-        outWorkflow = ProjectWorkflowInfo{};
+        outSkill = SkillInfo{};
         return false;
     }
-    return CreateWorkflowInternal(GetGlobalWorkflowsDir(),
+    return CreateWorkflowInternal(GetSkillsDir(),
                                   /*isGlobal=*/true,
-                                  workflowName,
+                                  skillName,
                                   /*createPythonScript=*/false,
-                                  outWorkflow,
+                                  outSkill,
                                   nullptr,
                                   outError);
 }
 
-bool ProjectManager::CreateGlobalWorkflowWithScript(const std::string& workflowName,
-                                                    ProjectWorkflowInfo& outWorkflow,
-                                                    ProjectWorkflowScriptInfo& outScript,
-                                                    std::string& outError)
+bool ProjectManager::CreateSkillWithScript(const std::string& skillName,
+                                           SkillInfo& outSkill,
+                                           SkillScriptInfo& outScript,
+                                           std::string& outError)
 {
-    if (!EnsureGlobalWorkflowsRoot()) {
+    if (!EnsureSkillsRoot()) {
         outError = "Could not create the LlamaBoss Skills folder.";
-        outWorkflow = ProjectWorkflowInfo{};
-        outScript = ProjectWorkflowScriptInfo{};
+        outSkill = SkillInfo{};
+        outScript = SkillScriptInfo{};
         return false;
     }
-    return CreateWorkflowInternal(GetGlobalWorkflowsDir(),
+    return CreateWorkflowInternal(GetSkillsDir(),
                                   /*isGlobal=*/true,
-                                  workflowName,
+                                  skillName,
                                   /*createPythonScript=*/true,
-                                  outWorkflow,
+                                  outSkill,
                                   &outScript,
                                   outError);
 }
 
-std::vector<ProjectWorkflowInfo> ProjectManager::ListGlobalWorkflows(std::size_t maxItems)
+std::vector<SkillInfo> ProjectManager::ListSkills(std::size_t maxItems)
 {
-    EnsureGlobalWorkflowsRoot();
-    return ListWorkflowsInDir(GetGlobalWorkflowsDir(), maxItems);
+    EnsureSkillsRoot();
+    return ListWorkflowsInDir(GetSkillsDir(), maxItems);
 }
 
-std::vector<ProjectWorkflowScriptInfo> ProjectManager::ListGlobalWorkflowScripts(std::size_t maxItems)
+std::vector<SkillScriptInfo> ProjectManager::ListSkillScripts(std::size_t maxItems)
 {
-    EnsureGlobalWorkflowsRoot();
-    return ListWorkflowScriptsInDir(GetGlobalWorkflowsDir(), maxItems);
+    EnsureSkillsRoot();
+    return ListWorkflowScriptsInDir(GetSkillsDir(), maxItems);
 }
 
-bool ProjectManager::ResolveGlobalWorkflow(const std::string& requested,
-                                           ProjectWorkflowInfo& outWorkflow,
-                                           std::string& outError)
+bool ProjectManager::ResolveSkill(const std::string& requested,
+                                  SkillInfo& outSkill,
+                                  std::string& outError)
 {
-    outWorkflow = ProjectWorkflowInfo{};
+    outSkill = SkillInfo{};
     outError.clear();
 
     std::string query = StripWorkflowsPrefix(requested);
@@ -1250,20 +1461,20 @@ bool ProjectManager::ResolveGlobalWorkflow(const std::string& requested,
         return false;
     }
 
-    const auto workflows = ListGlobalWorkflows(0);
-    if (workflows.empty()) {
+    const auto skills = ListSkills(0);
+    if (skills.empty()) {
         outError = "There are no Skill files in LlamaBoss\\Skills.";
         return false;
     }
 
-    return ResolveWorkflowInList(workflows, query, "Skill", outWorkflow, outError);
+    return ResolveWorkflowInList(skills, query, "Skill", outSkill, outError);
 }
 
-bool ProjectManager::ResolveGlobalWorkflowScript(const std::string& requested,
-                                                 ProjectWorkflowScriptInfo& outScript,
-                                                 std::string& outError)
+bool ProjectManager::ResolveSkillScript(const std::string& requested,
+                                        SkillScriptInfo& outScript,
+                                        std::string& outError)
 {
-    outScript = ProjectWorkflowScriptInfo{};
+    outScript = SkillScriptInfo{};
     outError.clear();
 
     std::string query = StripWorkflowScriptPrefix(requested);
@@ -1289,7 +1500,7 @@ bool ProjectManager::ResolveGlobalWorkflowScript(const std::string& requested,
         return false;
     }
 
-    const auto scripts = ListGlobalWorkflowScripts(0);
+    const auto scripts = ListSkillScripts(0);
     if (scripts.empty()) {
         outError = "There are no Python Skill scripts in LlamaBoss\\Skills.";
         return false;

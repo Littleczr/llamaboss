@@ -35,4 +35,15 @@ struct ToolBlock {
     // (e.g. /write hello.cpp). ChatDisplay presents these via the
     // same PresentFile() path used for model-generated code blocks.
     std::vector<PresentedFile> presentedFiles;
+
+    // When true, ChatDisplay renders an inline button row
+    // "[ Allow Once ]   [ Allow Always ]   [ Deny ]" beneath the
+    // [show details] affordance.  Clicks dispatch through
+    // ChatDisplay::SetApprovalCallback back to the frame, which routes
+    // to HandleApprovalCommand with the appropriate (approve,
+    // rememberForChat) pair.  Set by OnAgentApprovalRequired and the
+    // slash-command approval gate; left false for normal tool result
+    // rendering.  The typed fallback in TryHandlePendingApprovalInput
+    // remains as a keyboard safety net.
+    bool requiresApproval = false;
 };

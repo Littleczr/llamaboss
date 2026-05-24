@@ -4,6 +4,7 @@
 // All listed models are sourced from bartowski — no HF account required.
 
 #include <wx/wx.h>
+#include <wx/button.h>
 #include <wx/gauge.h>
 #include <wx/scrolwin.h>
 #include <wx/thread.h>
@@ -88,6 +89,14 @@ private:
 };
 
 // ── Per-row UI handles ────────────────────────────────────────────
+//
+// row.actionBtn is a plain wxButton whose label and colour are swapped
+// in place by SetRowDownloading / SetRowComplete / SetRowError /
+// OnCancelClicked to reflect the download lifecycle:
+//   idle      → "Download" (accent fill)
+//   active    → "Cancel"   (red fill, destructive)
+//   complete  → "✓ Downloaded" (flat muted, disabled)
+//   error     → "Retry"    (accent fill)
 struct ModelRow
 {
     wxPanel*      rowPanel    = nullptr;

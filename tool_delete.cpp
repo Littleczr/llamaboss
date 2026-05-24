@@ -2,7 +2,7 @@
 
 #include "tool_delete.h"
 #include "tool_path.h"
-#include "tool_path_safety.h"   // IsUnderCwd, NormalizeForCompare, Basename
+#include "tool_path_safety.h"   // IsUnderAllowedWriteRoot, SamePath, Basename
 #include "tool_open.h"          // ClassifyForOpen, FileRisk
 #include "path_safety.h"
 
@@ -136,7 +136,7 @@ DeleteResult DeleteEntry(const std::string& pathIn,
         return r;
     }
 
-    std::string resolved = ResolveToolPath(requested, ctx.cwd);
+    std::string resolved = tool_path_safety::ResolveProjectAwareToolPath(requested, ctx.cwd, ctx.activeProjectRoot);
     if (resolved.empty()) {
         r.chips.push_back("failed");
         r.errorBody = "Could not resolve path: " + requested;
@@ -145,11 +145,11 @@ DeleteResult DeleteEntry(const std::string& pathIn,
     }
 
     // ── Containment ──────────────────────────────────────────────
-    if (!tool_path_safety::IsUnderCwd(resolved, ctx.cwd)) {
+    if (!tool_path_safety::IsUnderAllowedWriteRoot(resolved, ctx.cwd, ctx.activeProjectRoot, ctx.skillsRoot)) {
         r.chips.push_back("blocked");
-        r.errorBody = "Refuses to delete outside the working "
-                      "directory.\n  resolved: " + resolved +
-                      "\n  cwd:      " + ctx.cwd;
+        r.errorBody = "Refuses to delete outside the allowed write roots."
+                      "\n  resolved: " + resolved +
+                      tool_path_safety::AllowedWriteRootsDiagnostic(ctx.cwd, ctx.activeProjectRoot, ctx.skillsRoot);
         r.chips.push_back(ElapsedChip(t0));
         return r;
     }
@@ -160,12 +160,17 @@ DeleteResult DeleteEntry(const std::string& pathIn,
     // kind of thing nobody wants to happen by accident.  Force the
     // user to leave first.
     {
-        std::string a = tool_path_safety::NormalizeForCompare(resolved);
-        std::string b = tool_path_safety::NormalizeForCompare(ctx.cwd);
-        while (b.size() > 3 && b.back() == '\\') b.pop_back();
-        if (a == b) {
+        if (tool_path_safety::SamePath(resolved, ctx.cwd)) {
             r.chips.push_back("blocked");
             r.errorBody = "Refuses to delete the working directory "
+                          "itself: " + resolved;
+            r.chips.push_back(ElapsedChip(t0));
+            return r;
+        }
+        if (!ctx.activeProjectRoot.empty() &&
+            tool_path_safety::SamePath(resolved, ctx.activeProjectRoot)) {
+            r.chips.push_back("blocked");
+            r.errorBody = "Refuses to delete the active project root "
                           "itself: " + resolved;
             r.chips.push_back(ElapsedChip(t0));
             return r;

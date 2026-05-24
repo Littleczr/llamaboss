@@ -1,4 +1,4 @@
-﻿// model_manager.cpp
+// model_manager.cpp
 //
 // Filesystem-based model manager for LlamaBoss.
 // Lists .gguf files from %LOCALAPPDATA%\LlamaBoss\models\
@@ -14,6 +14,57 @@
 
 #include <sstream>
 #include <iomanip>
+
+// ─────────────────────────────────────────────────────────────────
+//  Button helpers (file-local)
+// ─────────────────────────────────────────────────────────────────
+//
+// Same Telegram-style recipe used across the dialog family:
+// wxButton + wxBORDER_NONE + semibold 10pt + theme palette painted
+// in place. This dialog applies its theme at the end of
+// CreateControls() so the helpers paint the colours directly.
+//
+//   MakeAccentButton — t.accentButton fill, white label
+//   MakeFlatButton   — borderless, dialog-surface fill, muted text
+//
+// No destructive button helper is needed here — Delete lives on the
+// list (Del key + right-click context menu), not in the action row.
+//
+namespace {
+
+wxButton* MakeAccentButton(wxWindow* parent, wxWindowID id,
+                           const wxString& label, const ThemeData& t,
+                           int height = 32)
+{
+    auto* btn = new wxButton(parent, id, label,
+                             wxDefaultPosition, wxSize(-1, height),
+                             wxBORDER_NONE);
+    wxFont bf = btn->GetFont();
+    bf.SetPointSize(10);
+    bf.SetWeight(wxFONTWEIGHT_SEMIBOLD);
+    btn->SetFont(bf);
+    btn->SetBackgroundColour(t.accentButton);
+    btn->SetForegroundColour(t.accentButtonText);
+    return btn;
+}
+
+wxButton* MakeFlatButton(wxWindow* parent, wxWindowID id,
+                         const wxString& label, const ThemeData& t,
+                         int height = 32)
+{
+    auto* btn = new wxButton(parent, id, label,
+                             wxDefaultPosition, wxSize(-1, height),
+                             wxBORDER_NONE);
+    wxFont bf = btn->GetFont();
+    bf.SetPointSize(10);
+    bf.SetWeight(wxFONTWEIGHT_SEMIBOLD);
+    btn->SetFont(bf);
+    btn->SetBackgroundColour(t.bgDialogSurface);
+    btn->SetForegroundColour(t.textMuted);
+    return btn;
+}
+
+}  // namespace
 
 // ── Helper: human-readable size ───────────────────────────────────
 static std::string FormatSize(wxULongLong bytes)
@@ -38,17 +89,22 @@ enum {
 };
 
 wxBEGIN_EVENT_TABLE(ModelManagerDialog, wxDialog)
-    EVT_BUTTON(ID_MM_DELETE,     ModelManagerDialog::OnDeleteClicked)
     EVT_BUTTON(ID_MM_REFRESH,    ModelManagerDialog::OnRefreshClicked)
     EVT_BUTTON(ID_MM_OPENFOLDER, ModelManagerDialog::OnOpenFolderClicked)
     EVT_BUTTON(wxID_CLOSE,       ModelManagerDialog::OnClose)
 wxEND_EVENT_TABLE()
 
 ModelManagerDialog::ModelManagerDialog(wxWindow* parent, const ThemeData* theme)
-    : wxDialog(parent, wxID_ANY, "Manage Models", wxDefaultPosition, wxSize(600, 440),
+    : wxDialog(parent, wxID_ANY, "Manage Models", wxDefaultPosition, wxSize(640, 480),
                wxDEFAULT_DIALOG_STYLE | wxRESIZE_BORDER)
     , m_theme(theme)
 {
+    // Bump dialog default font to match the rest of the dialog family.
+    wxFont f = GetFont();
+    f.SetPointSize(11);
+    f.SetWeight(wxFONTWEIGHT_NORMAL);
+    SetFont(f);
+
     CreateControls();
     RefreshModelList();
 
@@ -60,114 +116,144 @@ ModelManagerDialog::ModelManagerDialog(wxWindow* parent, const ThemeData* theme)
 
 void ModelManagerDialog::CreateControls()
 {
+    // Fallback theme — used when m_theme is null. Keeps the helpers
+    // honest in the degenerate case (no theme passed in).
+    const ThemeData fallback = ThemeManager::GetDarkTheme();
+    const ThemeData& t = m_theme ? *m_theme : fallback;
+
     auto* rootSizer = new wxBoxSizer(wxVERTICAL);
 
     // Body panel gives us consistent padding around everything
     auto* body = new wxPanel(this, wxID_ANY);
+    body->SetBackgroundColour(t.bgDialogSurface);
     auto* bodySizer = new wxBoxSizer(wxVERTICAL);
 
     // ── Header: muted folder path line ──────────────────────────
     auto* headerLabel = new wxStaticText(body, wxID_ANY,
         "Models folder: " + ServerManager::GetModelsDir());
     wxFont hf = headerLabel->GetFont();
-    hf.SetPointSize(9);
+    hf.SetPointSize(10);
     headerLabel->SetFont(hf);
-    bodySizer->Add(headerLabel, 0, wxBOTTOM, 10);
+    headerLabel->SetForegroundColour(t.textMuted);
+    bodySizer->Add(headerLabel, 0, wxBOTTOM, 12);
 
     // ── Model list ──────────────────────────────────────────────
-    m_modelList = new wxListCtrl(body, wxID_ANY, wxDefaultPosition, wxSize(-1, 240),
+    m_modelList = new wxListCtrl(body, wxID_ANY, wxDefaultPosition, wxSize(-1, 260),
                                  wxLC_REPORT | wxLC_SINGLE_SEL | wxBORDER_NONE);
-    m_modelList->AppendColumn("Model", wxLIST_FORMAT_LEFT,  360);
+    m_modelList->AppendColumn("Model", wxLIST_FORMAT_LEFT,  380);
     m_modelList->AppendColumn("Size",  wxLIST_FORMAT_RIGHT, 100);
-    bodySizer->Add(m_modelList, 1, wxEXPAND | wxBOTTOM, 10);
+    m_modelList->SetBackgroundColour(t.bgInputField);
+    m_modelList->SetForegroundColour(t.textPrimary);
+    bodySizer->Add(m_modelList, 1, wxEXPAND | wxBOTTOM, 12);
 
-    // ── Action row: Delete (destructive), Refresh (neutral), Open (neutral) ──
+    // ── Action row: Refresh (accent left), Open folder (accent right) ──
+    //  Delete is deliberately NOT in this row. It lives on the list
+    //  itself — Del key while a row is selected, or right-click for a
+    //  context menu. Same pattern as ProjectAttachDialog. The italic
+    //  hint between the two action buttons tells the user where to
+    //  find it. Keeps the destructive action accessible without
+    //  letting a red button visually dominate the dialog.
     auto* actionSizer = new wxBoxSizer(wxHORIZONTAL);
-    m_deleteButton  = new wxButton(body, ID_MM_DELETE, "Delete Selected",
-        wxDefaultPosition, wxSize(-1, 30), wxBORDER_NONE);
-    m_refreshButton = new wxButton(body, ID_MM_REFRESH, "Refresh",
-        wxDefaultPosition, wxSize(-1, 30), wxBORDER_NONE);
-    auto* openBtn   = new wxButton(body, ID_MM_OPENFOLDER, "Open Folder",
-        wxDefaultPosition, wxSize(-1, 30), wxBORDER_NONE);
+    m_refreshButton = MakeAccentButton(body, ID_MM_REFRESH, "Refresh", t);
+    auto* openBtn   = MakeAccentButton(body, ID_MM_OPENFOLDER, "Open folder", t);
 
-    wxFont btnFont = m_deleteButton->GetFont();
-    btnFont.SetPointSize(9);
-    m_deleteButton->SetFont(btnFont);
-    m_refreshButton->SetFont(btnFont);
-    openBtn->SetFont(btnFont);
+    auto* deleteHint = new wxStaticText(body, wxID_ANY,
+        "Press Del or right-click to delete");
+    {
+        wxFont hf = deleteHint->GetFont();
+        hf.SetPointSize(10);
+        hf.SetStyle(wxFONTSTYLE_ITALIC);
+        deleteHint->SetFont(hf);
+        deleteHint->SetForegroundColour(t.textMuted);
+    }
 
-    actionSizer->Add(m_deleteButton, 0, wxRIGHT, 6);
-    actionSizer->Add(m_refreshButton, 0, wxRIGHT, 6);
+    actionSizer->Add(m_refreshButton, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 14);
+    actionSizer->Add(deleteHint,      0, wxALIGN_CENTER_VERTICAL);
     actionSizer->AddStretchSpacer();
-    actionSizer->Add(openBtn, 0);
+    actionSizer->Add(openBtn,         0, wxALIGN_CENTER_VERTICAL);
     bodySizer->Add(actionSizer, 0, wxEXPAND | wxBOTTOM, 10);
 
     // ── Status line ──────────────────────────────────────────────
     m_statusText = new wxStaticText(body, wxID_ANY, "");
     wxFont sf = m_statusText->GetFont();
-    sf.SetPointSize(9);
+    sf.SetPointSize(10);
     m_statusText->SetFont(sf);
+    m_statusText->SetForegroundColour(t.textMuted);
     bodySizer->Add(m_statusText, 0, wxBOTTOM, 4);
 
     // ── Hint ─────────────────────────────────────────────────────
     auto* hintText = new wxStaticText(body, wxID_ANY,
         "To add models, download .gguf files and place them in the models folder.");
     wxFont hint = hintText->GetFont();
-    hint.SetPointSize(9);
+    hint.SetPointSize(10);
     hint.SetStyle(wxFONTSTYLE_ITALIC);
     hintText->SetFont(hint);
+    hintText->SetForegroundColour(t.textMuted);
     bodySizer->Add(hintText, 0, wxBOTTOM, 4);
 
     body->SetSizer(bodySizer);
     rootSizer->Add(body, 1, wxEXPAND | wxALL, 18);
 
-    // ── Footer: Close button ─────────────────────────────────────
+    // ── Footer: flat Close button ────────────────────────────────
     auto* footer = new wxPanel(this, wxID_ANY);
+    footer->SetBackgroundColour(t.bgDialogSurface);
     auto* footSizer = new wxBoxSizer(wxHORIZONTAL);
     footSizer->AddStretchSpacer();
-    auto* closeBtn = new wxButton(footer, wxID_CLOSE, "Close",
-        wxDefaultPosition, wxSize(90, 32), wxBORDER_NONE);
-    wxFont cbf = closeBtn->GetFont();
-    cbf.SetPointSize(9);
-    cbf.SetWeight(wxFONTWEIGHT_SEMIBOLD);
-    closeBtn->SetFont(cbf);
-    footSizer->Add(closeBtn, 0);
+    auto* closeBtn = MakeFlatButton(footer, wxID_CLOSE, "Close", t);
+    footSizer->Add(closeBtn, 0, wxALIGN_CENTER_VERTICAL);
     footer->SetSizer(footSizer);
     rootSizer->Add(footer, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 18);
 
     SetSizer(rootSizer);
-    closeBtn->SetDefault();
 
     // ═════════════════════════════════════════════════════════════
-    //  Apply theme
+    //  Final theming pass
     // ═════════════════════════════════════════════════════════════
+    //
+    // Buttons already carry their accent/destructive/flat palette from
+    // the helpers above. We just need to set the dialog surface and let
+    // the recursive helper colour static labels — but we DON'T let it
+    // tint our buttons (it would overwrite the helper-applied colours),
+    // so we re-paint them afterwards.
     if (m_theme) {
-        const ThemeData& t = *m_theme;
+        SetBackgroundColour(t.bgDialogSurface);
 
-        SetBackgroundColour(t.bgMain);
-        body->SetBackgroundColour(t.bgMain);
-        footer->SetBackgroundColour(t.bgMain);
-
-        // Recursively paint labels + neutral buttons
+        // ApplyDialogThemeRecursive will paint every wxButton it finds
+        // with t.bgInputField — re-tint our two accent buttons and the
+        // flat close button afterwards.
         ApplyDialogThemeRecursive(this, t.textPrimary, t.bgInputField, t.textPrimary);
 
-        // Header + hint + status = muted text
+        m_refreshButton->SetBackgroundColour(t.accentButton);
+        m_refreshButton->SetForegroundColour(t.accentButtonText);
+        openBtn->SetBackgroundColour(t.accentButton);
+        openBtn->SetForegroundColour(t.accentButtonText);
+        closeBtn->SetBackgroundColour(t.bgDialogSurface);
+        closeBtn->SetForegroundColour(t.textMuted);
+
+        // Status + hint + header should remain muted (the recursive
+        // helper painted them with textPrimary).
         headerLabel->SetForegroundColour(t.textMuted);
         m_statusText->SetForegroundColour(t.textMuted);
         hintText->SetForegroundColour(t.textMuted);
+        deleteHint->SetForegroundColour(t.textMuted);
 
-        // List control — input-field surface with primary text
         m_modelList->SetBackgroundColour(t.bgInputField);
         m_modelList->SetForegroundColour(t.textPrimary);
 
-        // Delete button is destructive — stopButton red
-        m_deleteButton->SetBackgroundColour(t.stopButton);
-        m_deleteButton->SetForegroundColour(t.stopButtonText);
-
-        // Close button is the primary footer action — accent blue
-        closeBtn->SetBackgroundColour(t.accentButton);
-        closeBtn->SetForegroundColour(t.accentButtonText);
+        Refresh();
     }
+
+    // ── Del key + right-click → delete ──────────────────────────
+    // Same idiom as ProjectAttachDialog. Dialog-level CHAR_HOOK catches
+    // Del everywhere and routes to OnDeleteClicked when a row is
+    // selected; other keys skip through so wxDialog defaults still work.
+    // wxEVT_CONTEXT_MENU on the list pops a one-item menu using
+    // ID_MM_DELETE, which we bind to OnDeleteClicked via wxEVT_MENU.
+    Bind(wxEVT_CHAR_HOOK, &ModelManagerDialog::OnCharHook, this);
+    m_modelList->Bind(wxEVT_CONTEXT_MENU,
+                      &ModelManagerDialog::OnContextMenu, this);
+    Bind(wxEVT_MENU,
+         &ModelManagerDialog::OnDeleteClicked, this, ID_MM_DELETE);
 }
 
 void ModelManagerDialog::RefreshModelList()
@@ -197,6 +283,40 @@ void ModelManagerDialog::RefreshModelList()
 }
 
 // ── Event handlers ───────────────────────────────────────────────
+
+void ModelManagerDialog::OnContextMenu(wxContextMenuEvent&)
+{
+    // Right-click on the list. Only show the menu when there's a row
+    // selected to act on — otherwise the user is clicking empty space
+    // and the menu would be a dead end.
+    if (!m_modelList) return;
+    if (m_modelPaths.empty()) return;
+    long sel = m_modelList->GetNextItem(-1, wxLIST_NEXT_ALL, wxLIST_STATE_SELECTED);
+    if (sel < 0) return;
+
+    wxMenu menu;
+    menu.Append(ID_MM_DELETE, "Delete model");
+    PopupMenu(&menu);
+}
+
+void ModelManagerDialog::OnCharHook(wxKeyEvent& event)
+{
+    // Del on a selected row triggers delete. Every other key skips
+    // through so wxDialog's built-in routing (Esc, Tab, arrows) still
+    // works as expected.
+    if (event.GetKeyCode() == WXK_DELETE) {
+        if (m_modelList && !m_modelPaths.empty()) {
+            long sel = m_modelList->GetNextItem(-1, wxLIST_NEXT_ALL,
+                                                wxLIST_STATE_SELECTED);
+            if (sel >= 0) {
+                wxCommandEvent dummy;
+                OnDeleteClicked(dummy);
+                return;   // handled
+            }
+        }
+    }
+    event.Skip();
+}
 
 void ModelManagerDialog::OnDeleteClicked(wxCommandEvent&)
 {

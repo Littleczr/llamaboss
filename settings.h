@@ -14,10 +14,17 @@
 // Forward declarations
 struct ThemeData;
 class TickSlider;
+class SecretsStore;
 
 // ── Settings dialog ──────────────────────────────────────────────
 // Lets the user pick the model, context length, theme, and chat font.
 // Model selection scans the filesystem for .gguf files (no Ollama API).
+//
+// All committal buttons are plain wxButtons styled like the chat Send
+// button (t.accentButton fill, t.accentButtonText label). Cancel is a
+// flat borderless wxButton with muted text. See settings.cpp for the
+// rationale — short version is: this dialog wears Telegram clothes,
+// not terminal clothes.
 class SettingsDialog : public wxDialog
 {
 public:
@@ -27,7 +34,8 @@ public:
                    int currentCtxSize,
                    int currentFontSize,
                    bool currentAgentDefaultOn,
-                   const ThemeData& theme);
+                   const ThemeData& theme,
+                   SecretsStore* secretsStore = nullptr);
     ~SettingsDialog();
 
     // Selected values (use these after ShowModal() returns wxID_OK)
@@ -53,31 +61,56 @@ private:
     void OnDownloadModels(wxCommandEvent& event);
     void OnChangeFolder(wxCommandEvent& event);
     void OnResetFolder(wxCommandEvent& event);
+    void OnManageConnections(wxCommandEvent& event);
 
     void CreateControls();
     void PopulateModelList();
     void UpdateFolderUi();        // Refreshes Location row from GetModelsDir()
+    void UpdateConnectionsLabel();// Refreshes "N connections configured" hint
     void ApplyTheme();
 
-    // Helpers for consistent styling of custom buttons
-    wxButton* MakeNeutralButton(wxWindow* parent, const wxString& label);
-    wxButton* MakePrimaryButton(wxWindow* parent, const wxString& label);
-    wxPanel*  MakeSectionDivider(wxWindow* parent);
+    // Helpers for consistent styling of section headers / dividers
+    wxPanel*      MakeSectionDivider(wxWindow* parent);
     wxStaticText* MakeSectionHeader(wxWindow* parent, const wxString& text);
 
+    // Creates a Send-style accent button and registers it in m_accentBtns
+    // so ApplyTheme() can re-tint it after the neutral cascade. Height
+    // defaults to 32 (action-row / footer); pass 26 for inline buttons
+    // that sit next to text labels.
+    wxButton*     MakeAccentButton(wxWindow* parent,
+                                   wxWindowID id,
+                                   const wxString& label,
+                                   int height = 32);
+
     // UI widgets
-    wxComboBox*   m_modelComboBox = nullptr;
-    wxStaticText* m_statusText    = nullptr;
-    wxStaticText* m_locationPath  = nullptr;   // Shows active models folder
-    wxStaticText* m_defaultPathRow = nullptr;  // "Default: ..." hint, shown only when override active
-    wxButton*     m_changeBtn     = nullptr;
-    wxButton*     m_resetBtn      = nullptr;   // Hidden in casual mode
-    wxComboBox*   m_themeComboBox = nullptr;
-    TickSlider*   m_ctxSlider     = nullptr;
-    TickSlider*   m_fontSlider    = nullptr;
+    wxComboBox*   m_modelComboBox  = nullptr;
+    wxStaticText* m_statusText     = nullptr;
+    wxStaticText* m_locationPath   = nullptr;   // Shows active models folder
+    wxStaticText* m_defaultPathRow = nullptr;   // "Default: ..." hint, shown only when override active
+    wxButton*     m_changeBtn      = nullptr;
+    wxButton*     m_resetBtn       = nullptr;   // Hidden in casual mode
+    wxComboBox*   m_themeComboBox  = nullptr;
+    TickSlider*   m_ctxSlider      = nullptr;
+    TickSlider*   m_fontSlider     = nullptr;
     wxCheckBox*   m_agentDefaultCheckBox = nullptr;
-    wxButton*     m_okBtn         = nullptr;
-    wxButton*     m_cancelBtn     = nullptr;
+    wxButton*     m_okBtn          = nullptr;
+    wxButton*     m_cancelBtn      = nullptr;
+
+    // Connections section — opens ConnectionsDialog on click.
+    wxStaticText* m_connectionsLabel = nullptr;
+    wxButton*     m_manageConnBtn    = nullptr;
+    SecretsStore* m_secretsStore     = nullptr;   // non-owning
+
+    // Every button that gets the solid accent fill in ApplyTheme().
+    // Populated by MakeAccentButton() as buttons are constructed.
+    // Cancel deliberately stays out of this list — it's the flat one.
+    std::vector<wxButton*> m_accentBtns;
+
+    // Every section gap band (the thick darker strip between sections).
+    // Populated by MakeSectionDivider() and repainted with t.bgMain in
+    // ApplyTheme() so they read as slots behind the dialog surface
+    // rather than borders inside it — Telegram's section-band trick.
+    std::vector<wxPanel*> m_dividers;
 
     // Model list: display name → full path mapping
     std::vector<std::string> m_modelPaths;   // parallel to combobox items

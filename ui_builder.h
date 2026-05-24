@@ -17,7 +17,9 @@ struct TopBarWidgets {
     wxPanel*       toolbarPanel;
     wxStaticText*  titleLabel;
     wxPanel*       modelPill;
+    wxStaticText*  modelPillLeftBracket;   // "[" — recolored on hover
     wxStaticText*  modelLabel;
+    wxStaticText*  modelPillRightBracket;  // "]" — recolored on hover
     StatusDot*     statusDot;
     wxStaticText*  protocolChip;  // Phase 3b: "native" / "xml" / hidden
     wxButton*      sidebarToggle;

@@ -9,6 +9,8 @@
 #include <Poco/JSON/Object.h>
 
 #include "attachment_manager.h"  // for AttachmentInfo
+#include "tool_invocation.h"     // for tool_names::kPythonInstallPackage
+#include "goal_state.h"          // Goals Phase 1: per-conversation in-memory goal state
 
 // Chat history management class with file persistence
 class ChatHistory
@@ -91,11 +93,18 @@ public:
     // referencing that id.  Dangling tool_calls (an assistant call
     // without a matching tool reply remaining after elision) are
     // dropped to satisfy llama-server's strict request validation.
+    //
+    // Not const because the builder must flush the in-memory streaming
+    // buffer onto the JSON object before serialization.
+    // Poco::SharedPtr propagates const through operator-> (a const
+    // SharedPtr yields a const T*), which makes Object::set()
+    // uncallable from a const path even though the vector member
+    // wouldn't have to be mutated.
     std::string BuildChatRequestJson(const std::string& model, bool stream = true,
                                      const std::string& systemPrompt = "",
                                      int contextTokens = 0,
                                      const std::string& toolsArrayJson = "",
-                                     bool nativeProtocol = false) const;
+                                     bool nativeProtocol = false);
 
     // ── Streaming support methods ─────────────────────────────────
     void AddAssistantPlaceholder(const std::string& model = "");
@@ -201,10 +210,24 @@ public:
     // enabled, subsequent approval-required tools skip the approval
     // card until the conversation is cleared or reloaded.
     //
+    // Exception: python_install_package is intentionally excluded from
+    // the chat-wide trust flag.  Each install names a distinct package
+    // that touches the user's Python environment, so it always renders
+    // its own approval card with the exact package name even when
+    // one-approval mode is on.  An explicit "approve once" of an
+    // install request still individually remembers that single tool
+    // name (via RememberToolApproval), but installs cannot be
+    // wholesale-approved for the rest of the chat.
+    //
     // This is intentionally in-memory only.  It is not persisted with
     // the conversation file, so reopening an older conversation starts
     // with a clean trust state.
     bool IsToolChatApproved(const std::string& name) const {
+        if (name == tool_names::kPythonInstallPackage) {
+            // Per-package review is the safety boundary now that the
+            // package allowlist has been retired.  Never bypass.
+            return false;
+        }
         return m_chatApprovalTrustEnabled ||
                (!name.empty() && m_chatApprovedTools.count(name) > 0);
     }
@@ -220,6 +243,113 @@ public:
     void ClearChatApprovedTools() {
         m_chatApprovedTools.clear();
         m_chatApprovalTrustEnabled = false;
+    }
+
+    // ── Goals Phase 12: durable mission state + awaiting-user pauses ──
+    // Goal state saves with the conversation JSON: objective, status,
+    // verifier bookkeeping, continuation budget state, drafted verification
+    // contract, and compact structured AgentEvent evidence.  The
+    // explicitly-cleared anti-ghosting tombstone remains runtime-only and is
+    // intentionally not persisted.
+    bool HasGoal() const { return m_goalState.HasGoal(); }
+    bool HasActiveGoal() const { return m_goalState.IsActive(); }
+    bool HasPausedGoal() const { return m_goalState.IsPaused(); }
+    bool HasAwaitingUserGoal() const { return m_goalState.IsAwaitingUser(); }
+    bool HasCompletedGoal() const { return m_goalState.IsCompleted(); }
+    bool HasBudgetReachedGoal() const { return m_goalState.IsBudgetReached(); }
+    bool GoalContractReady() const { return m_goalState.contract.IsReady(); }
+    bool GoalContractDrafting() const { return m_goalState.contract.IsDrafting(); }
+    const GoalState& GetGoalState() const { return m_goalState; }
+
+    void StartGoal(const std::string& objective) {
+        m_goalState.Start(objective);
+        m_dirty = true;
+    }
+    bool PauseGoal() {
+        if (!m_goalState.HasGoal() || m_goalState.IsPaused()) return false;
+        m_goalState.Pause();
+        m_dirty = true;
+        return true;
+    }
+    bool ResumeGoal() {
+        if (!m_goalState.HasGoal() || m_goalState.IsActive()) return false;
+        m_goalState.Resume();
+        m_dirty = true;
+        return true;
+    }
+    void ClearGoal() {
+        if (!m_goalState.HasGoal()) return;
+        m_goalState.Clear();
+        m_dirty = true;
+    }
+
+    void BeginGoalContractDrafting() {
+        if (!m_goalState.HasGoal()) return;
+        m_goalState.BeginContractDrafting();
+        m_dirty = true;
+    }
+    void SetGoalContractReady(const std::vector<std::string>& successCriteria,
+                              const std::vector<std::string>& constraints,
+                              const std::vector<std::string>& evidenceChecks,
+                              const std::string& builderReason) {
+        m_goalState.SetContractReady(successCriteria, constraints, evidenceChecks, builderReason);
+        m_dirty = true;
+    }
+    void MarkGoalContractFailed(const std::string& reason) {
+        m_goalState.MarkContractFailed(reason);
+        m_dirty = true;
+    }
+
+    void AppendGoalStructuredAgentEvidence(const std::string& chunk) {
+        if (!m_goalState.HasGoal()) return;
+        m_goalState.AppendStructuredAgentEvidence(chunk);
+        m_dirty = true;
+    }
+    const std::vector<std::string>& GetGoalStructuredAgentEvidence() const {
+        return m_goalState.structuredAgentEvidence;
+    }
+
+    void NoteGoalTurnInterrupted(const std::string& reason) {
+        if (!m_goalState.HasGoal()) return;
+        m_goalState.MarkInterrupted(reason);
+        m_dirty = true;
+    }
+
+    void MarkGoalAwaitingUser(const std::string& reason,
+                              const std::string& promptEvidence) {
+        m_goalState.MarkAwaitingUser(reason, promptEvidence);
+        m_dirty = true;
+    }
+
+    void RecordGoalAwaitingUserReply(const std::string& replyEvidence) {
+        if (!m_goalState.IsAwaitingUser()) return;
+        m_goalState.RecordAwaitingUserReply(replyEvidence);
+        m_dirty = true;
+    }
+
+    void NoteGoalVerifierContinue(const std::string& reason) {
+        m_goalState.MarkVerifierContinue(reason);
+        m_dirty = true;
+    }
+    void NoteGoalVerifierUnclear(const std::string& reason) {
+        m_goalState.MarkVerifierUnclear(reason);
+        m_dirty = true;
+    }
+    void MarkGoalVerifiedComplete(const std::string& reason) {
+        m_goalState.MarkVerifiedComplete(reason);
+        m_dirty = true;
+    }
+    bool CanGoalAutoContinue(int maxContinuations) const {
+        return m_goalState.CanAutoContinue(maxContinuations);
+    }
+    void ConsumeGoalAutoContinuation() {
+        if (!m_goalState.IsActive()) return;
+        m_goalState.ConsumeAutoContinuation();
+        m_dirty = true;
+    }
+    void MarkGoalBudgetReached(const std::string& reason) {
+        m_goalState.MarkBudgetReached(reason);
+        m_dirty = true;
     }
 
     // Generate a title from the first user message
@@ -318,10 +448,32 @@ private:
     bool m_chatApprovalTrustEnabled = false;
     std::unordered_set<std::string> m_chatApprovedTools;
 
+    // Goals Phase 1 state is also in-memory only.  Keeping it on
+    // ChatHistory rather than MyFrame prevents one chat's goal from leaking
+    // into another chat when the conversation controller swaps histories.
+    GoalState m_goalState;
+
     // Streaming accumulation buffer — avoids O(n²) string concatenation
     // in AppendToLastAssistantMessage by accumulating here instead of
     // repeatedly reading/writing the Poco JSON object per delta.
+    //
+    // The Poco JSON object's "content" field is the source of truth on disk
+    // and on the wire; m_streamBuffer is the source of truth in memory while
+    // a response is streaming.  The two are reconciled lazily by
+    // FlushStreamBuffer() — called automatically before any reader (Save,
+    // BuildChatRequestJson) and on stream completion via
+    // UpdateLastAssistantMessage().  Per-delta sync used to be unconditional
+    // and made streaming O(n²) in body bytes; now we sync only after enough
+    // bytes have accumulated to amortize the cost.
+    //
+    // m_streamBufferDirty is the byte count buffered since the last sync to
+    // the JSON object.  It only ticks under non-const flush paths, so it
+    // does not need to be mutable; FlushStreamBuffer() is non-const because
+    // Poco::SharedPtr propagates const through operator-> (a const
+    // SharedPtr yields a const T*), preventing Object::set() from a const
+    // member.  See FlushStreamBuffer() for the matching rationale.
     std::string m_streamBuffer;
+    std::size_t m_streamBufferDirty = 0;
 
     // Helper methods
     Poco::JSON::Object::Ptr CreateMessage(const std::string& role,
@@ -329,5 +481,17 @@ private:
                                           const std::string& model = "");
     bool IsLastMessageRole(const std::string& role) const;
     static std::string CurrentTimestamp();
+
+    // Sync the in-memory streaming buffer onto the last assistant message's
+    // JSON "content" field.  No-op if the buffer is clean or the last
+    // message is not an assistant message.  See m_streamBuffer comment for
+    // the full lifetime / consistency contract.
+    //
+    // Not const: Poco::SharedPtr's operator->() const returns a const T*,
+    // so calling Object::set() through m_messages.back() requires non-const
+    // access even though the vector itself is not modified.  Callers that
+    // need to flush from an otherwise-const reader path should drop const
+    // on themselves rather than reach for const_cast here.
+    void FlushStreamBuffer();
 };
 

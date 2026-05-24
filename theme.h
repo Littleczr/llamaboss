@@ -7,6 +7,7 @@
 
 #include <wx/colour.h>
 #include <string>
+#include <vector>
 
 // ═══════════════════════════════════════════════════════════════════
 //  ThemeData — every color the application uses, in one place
@@ -22,6 +23,8 @@ struct ThemeData
     wxColour bgSidebar;         // Sidebar panel background
     wxColour bgInputField;      // Text input field background
     wxColour bgInputArea;       // Container around the input row
+    wxColour bgDialogSurface;   // Raised modal/dialog surface background
+    wxColour modalScrim;        // Tint used for translucent modal dimming overlays
 
     // ── Text colors ──────────────────────────────────────────────
     wxColour textPrimary;       // Primary text (titles, input text)
@@ -68,20 +71,61 @@ class ThemeManager
 public:
     ThemeManager();
 
-    // Get preset theme definitions
+    // ── Preset theme definitions ─────────────────────────────────
+    //
+    // Original two themes. "Dark" is the canonical Telegram-inspired
+    // LlamaBoss palette; "Light" is the matching clean light variant.
     static ThemeData GetDarkTheme();
     static ThemeData GetLightTheme();
+
+    // ── Designer-curated themes ──────────────────────────────────
+    //
+    // These map well-known published palettes to LlamaBoss's ThemeData
+    // slots. Each function comments the design choices made — for example,
+    // Nord publishes colors in named groups (Frost, Aurora, etc.), so the
+    // mapping reads like "frost → accent, aurora red → stopButton".
+    // Where a published palette doesn't have an obvious muted-text color,
+    // the function lifts the comment color or picks a custom mid-tone so
+    // UI labels remain readable on the surface.
+    static ThemeData GetAyuMirageTheme();         // ayu-theme/ayu-colors (mirage variant)
+    static ThemeData GetCobalt2Theme();           // Wes Bos Cobalt2
+    static ThemeData GetDraculaTheme();           // draculatheme.com
+    static ThemeData GetNordTheme();              // arcticicestudio/nord
+    static ThemeData GetNordLightTheme();         // arcticicestudio/nord (bright Snow Storm variant)
+    static ThemeData GetOneDarkTheme();           // Atom One Dark-inspired
+    static ThemeData GetTokyoNightTheme();        // enkia/tokyo-night (storm variant)
+    static ThemeData GetRosePineMoonTheme();      // rosepinetheme.com (moon)
+    static ThemeData GetRosePineDawnTheme();      // rosepinetheme.com (dawn)
 
     // Active theme management
     void SetActiveTheme(const std::string& themeName);
     const ThemeData& GetActiveTheme() const { return m_activeTheme; }
     std::string GetActiveThemeName() const { return m_activeTheme.name; }
 
-    // Convenience: get a theme by name ("dark", "light", or "system")
+    // Convenience: get a theme by name. Recognized values:
+    //   "dark", "light", "system",
+    //   "ayu-mirage", "cobalt2", "dracula",
+    //   "nord", "nord-light", "one-dark",
+    //   "tokyo-night", "rose-pine-moon", "rose-pine-dawn".
+    // Unknown values fall back to the dark theme.
     static ThemeData GetThemeByName(const std::string& name);
 
     // Detect Windows dark/light preference from registry
     static std::string DetectSystemTheme();
+
+    // ── Settings dropdown support ────────────────────────────────
+    //
+    // Pairs every selectable theme with its display name, in the
+    // order they should appear in the Settings dropdown. Originals
+    // (Dark / Light / System) lead; designer-curated themes follow
+    // alphabetically. Adding a new theme is a one-line entry here
+    // plus a Get<Name>Theme() above — no Settings code touches.
+    struct ThemeChoice
+    {
+        std::string internalName;   // Persisted form, e.g. "tokyo-night"
+        std::string displayName;    // Shown in the dropdown, e.g. "Tokyo Night"
+    };
+    static const std::vector<ThemeChoice>& GetThemeChoices();
 
 private:
     ThemeData m_activeTheme;

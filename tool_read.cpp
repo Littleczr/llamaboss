@@ -2,6 +2,7 @@
 
 #include "tool_read.h"
 #include "tool_path.h"
+#include "tool_path_safety.h"
 #include "path_safety.h"
 
 #include <algorithm>
@@ -192,7 +193,7 @@ ReadResult ReadFile(const std::string& inputPath, const ToolContext& ctx)
     auto t0 = std::chrono::steady_clock::now();
 
     // ── Path resolution ──────────────────────────────────────────
-    std::string resolved = ResolveToolPath(inputPath, ctx.cwd);
+    std::string resolved = tool_path_safety::ResolveProjectAwareToolPath(inputPath, ctx.cwd, ctx.activeProjectRoot);
     if (resolved.empty()) {
         r.chips.push_back("failed");
         r.errorBody = "Could not resolve path: " + inputPath;
@@ -295,6 +296,119 @@ ReadResult ReadFile(const std::string& inputPath, const ToolContext& ctx)
                       (truncated ? " shown lines" : " lines"));
     if (truncated) r.chips.push_back("truncated");
     r.body     = std::move(content);
+    r.bodyLang = InferBodyLang(resolved);
+    r.chips.push_back(ElapsedChip(t0));
+    return r;
+}
+
+
+ReadResult ReadFileHead(const std::string& inputPath,
+                        const ToolContext& ctx,
+                        size_t maxLines)
+{
+    ReadResult r;
+    auto t0 = std::chrono::steady_clock::now();
+
+    if (maxLines == 0) maxLines = 40;
+    if (maxLines > 500) maxLines = 500;
+
+    std::string resolved = tool_path_safety::ResolveProjectAwareToolPath(inputPath, ctx.cwd, ctx.activeProjectRoot);
+    if (resolved.empty()) {
+        r.chips.push_back("failed");
+        r.errorBody = "Could not resolve path: " + inputPath;
+        r.chips.push_back(ElapsedChip(t0));
+        return r;
+    }
+
+    if (!IsFile(resolved)) {
+        r.chips.push_back("failed");
+        if (IsDirectory(resolved)) {
+            r.errorBody = "Not a file (is a directory): " + resolved;
+        } else {
+            r.errorBody = "File not found: " + resolved;
+        }
+        r.chips.push_back(ElapsedChip(t0));
+        return r;
+    }
+
+    std::ifstream f(path_safety::Utf8ToWide(resolved), std::ios::binary | std::ios::ate);
+    if (!f.is_open()) {
+        r.chips.push_back("failed");
+        r.errorBody = "Could not open file: " + resolved;
+        r.chips.push_back(ElapsedChip(t0));
+        return r;
+    }
+
+    std::streamsize fileSize = f.tellg();
+    if (fileSize < 0) {
+        r.chips.push_back("failed");
+        r.errorBody = "Could not determine file size: " + resolved;
+        r.chips.push_back(ElapsedChip(t0));
+        return r;
+    }
+
+    const size_t totalBytes = (size_t)fileSize;
+    if (totalBytes > kReadRefuseAbove) {
+        r.chips.push_back(HumanBytes(totalBytes));
+        r.chips.push_back("too large");
+        r.errorBody = "File too large to preview: " + HumanBytes(totalBytes)
+                      + " (max " + HumanBytes(kReadRefuseAbove) + ")";
+        r.chips.push_back(ElapsedChip(t0));
+        return r;
+    }
+
+    const size_t previewCap = 128 * 1024;
+    const size_t toRead = std::min(totalBytes, previewCap);
+    f.seekg(0, std::ios::beg);
+    std::string content(toRead, '\0');
+    if (toRead > 0) {
+        f.read(&content[0], (std::streamsize)toRead);
+        if (f.gcount() < (std::streamsize)toRead) {
+            content.resize((size_t)f.gcount());
+        }
+    }
+
+    if (IsBinary(content.data(), content.size())) {
+        r.chips.push_back(HumanBytes(totalBytes));
+        r.chips.push_back("binary");
+        r.chips.push_back("hex preview");
+        r.body = HexPreview(content);
+        r.chips.push_back(ElapsedChip(t0));
+        return r;
+    }
+
+    std::string out;
+    out.reserve(std::min(content.size(), (size_t)32 * 1024));
+    size_t lines = 0;
+    size_t pos = 0;
+    bool truncatedByLines = false;
+    while (pos < content.size() && lines < maxLines) {
+        size_t nl = content.find('\n', pos);
+        if (nl == std::string::npos) {
+            out.append(content.substr(pos));
+            pos = content.size();
+            ++lines;
+            break;
+        }
+        out.append(content.data() + pos, nl - pos + 1);
+        pos = nl + 1;
+        ++lines;
+    }
+    if (pos < content.size() || toRead < totalBytes) {
+        truncatedByLines = true;
+        if (!out.empty() && out.back() != '\n') out += '\n';
+        std::ostringstream marker;
+        marker << "\n[... preview: showing first " << lines
+               << " line(s) of " << HumanBytes(totalBytes)
+               << " file ...]\n";
+        out += marker.str();
+    }
+
+    r.chips.push_back(HumanBytes(totalBytes));
+    r.chips.push_back(std::to_string(lines) + " shown lines");
+    r.chips.push_back("preview");
+    if (truncatedByLines) r.chips.push_back("truncated");
+    r.body = std::move(out);
     r.bodyLang = InferBodyLang(resolved);
     r.chips.push_back(ElapsedChip(t0));
     return r;

@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 #include <memory>
+#include <functional>
 
 #include "presented_file.h"
 #include "tool_block.h"
@@ -60,6 +61,34 @@ public:
     // is still appending text.  This prevents wxRichTextCtrl range mutation
     // from corrupting live tool output. File actions stay clickable.
     void SetToolBlockInteractionEnabled(bool enabled);
+
+    // ── Approval buttons (Phase 6 UX) ────────────────────────────
+    // When a ToolBlock with requiresApproval=true is rendered,
+    // DisplayToolBlock writes a clickable button row beneath
+    // [show details]:
+    //
+    //   [ Allow Once ]   [ Allow Always ]   [ Deny ]
+    //
+    // Each label is a separately-registered click region styled the
+    // same as the [show details] affordance (italic Consolas, soft
+    // blue).  Clicks dispatch through the registered callback to the
+    // frame, which routes to HandleApprovalCommand using the existing
+    // chat-scoped approval semantics:
+    //
+    //   Once   -> HandleApprovalCommand(true,  /*rememberForChat=*/false)
+    //   Always -> HandleApprovalCommand(true,  /*rememberForChat=*/true)
+    //   Deny   -> HandleApprovalCommand(false)
+    //
+    // ClearApprovalButtons removes the visual row.  The frame calls it
+    // when an approval is resolved via the typed-command fallback in
+    // TryHandlePendingApprovalInput, so the row vanishes regardless of
+    // which path resolved it.  HandleApprovalButtonClick also calls it
+    // before invoking the callback, so a click resolves itself
+    // visually before the new tool output (or denial system message)
+    // starts streaming.
+    enum class ApprovalChoice { Once, Always, Deny };
+    void SetApprovalCallback(std::function<void(ApprovalChoice)> callback);
+    void ClearApprovalButtons();
 
     void DisplayAssistantPrefix(const std::string& modelName);
     void DisplayAssistantPrefix(const std::string& modelName, const wxColour& accentColor);
@@ -204,6 +233,27 @@ private:
 
     int  HitTestToolBlockAffordance(long pos) const;  // -1 if no hit
     void HandleToolBlockAffordanceClick(size_t idx);
+
+    // ── Approval button registry ─────────────────────────────────
+    // Parallel to m_fileChips / m_toolBlocks.  At most three entries
+    // (Once/Always/Deny) populated by DisplayToolBlock when the block
+    // has requiresApproval=true; cleared by ClearApprovalButtons (called
+    // either directly by HandleApprovalButtonClick or by the frame from
+    // the typed-command fallback path).  m_approvalRowStart/End track
+    // the full row bounds — including the trailing newline — so the
+    // entire row can be removed as one Remove() call.
+    struct ApprovalButtonRegion {
+        long startPos;
+        long endPos;
+        ApprovalChoice choice;
+    };
+    std::vector<ApprovalButtonRegion> m_approvalButtons;
+    long m_approvalRowStart = -1;
+    long m_approvalRowEnd   = -1;
+    std::function<void(ApprovalChoice)> m_approvalCallback;
+
+    int  HitTestApprovalButton(long pos) const;       // -1 if no hit
+    void HandleApprovalButtonClick(size_t idx);
 
     // Auto-expand classifier for Phase C.  Returns true if the block
     // looks like a failure (non-empty errorBody, or any chip indicating

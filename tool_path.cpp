@@ -2,7 +2,9 @@
 
 #include "tool_path.h"
 
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
 #include <windows.h>
 
 namespace {
@@ -54,17 +56,52 @@ std::string StripMatchingQuotes(std::string s)
     return s;
 }
 
-// Accepts classic drive-letter absolutes ("C:\...") and UNC roots
-// ("\\server\share").  Everything else is treated as relative so it
-// gets resolved against the supplied cwd.
+bool IsPathSeparator(wchar_t ch)
+{
+    return ch == L'\\' || ch == L'/';
+}
+
+bool IsDriveAbsolutePath(const std::wstring& p)
+{
+    return p.size() >= 3 &&
+           iswalpha(p[0]) &&
+           p[1] == L':' &&
+           IsPathSeparator(p[2]);
+}
+
+bool IsDriveRelativePath(const std::wstring& p)
+{
+    return p.size() >= 2 &&
+           iswalpha(p[0]) &&
+           p[1] == L':' &&
+           (p.size() == 2 || !IsPathSeparator(p[2]));
+}
+
+bool IsUncLikePath(const std::wstring& p)
+{
+    return p.size() >= 2 && IsPathSeparator(p[0]) && IsPathSeparator(p[1]);
+}
+
+bool IsRootRelativePath(const std::wstring& p)
+{
+    return p.size() >= 1 && IsPathSeparator(p[0]) && !IsUncLikePath(p);
+}
+
+// Accepts classic drive-letter absolutes ("C:\..."), UNC roots
+// ("\\server\share"), and Win32 device paths ("\\?\C:\...").
+// Root-relative paths ("\foo") are not absolute because they need a
+// drive prefix from cwd before canonicalization.
 bool IsAbsolutePath(const std::wstring& p)
 {
-    if (p.size() >= 3 && iswalpha(p[0]) && p[1] == L':' &&
-        (p[2] == L'\\' || p[2] == L'/'))
-        return true;
-    if (p.size() >= 2 && p[0] == L'\\' && p[1] == L'\\')
-        return true;
-    return false;
+    return IsDriveAbsolutePath(p) || IsUncLikePath(p);
+}
+
+std::wstring DrivePrefixFromAbsoluteCwd(const std::wstring& cwd)
+{
+    if (IsDriveAbsolutePath(cwd)) {
+        return cwd.substr(0, 2); // "C:"
+    }
+    return L"";
 }
 
 } // anonymous namespace
@@ -77,6 +114,7 @@ std::string ResolveToolPath(const std::string& input,
 
     std::wstring wInput = Utf8ToWide(normalized);
     std::wstring wCwd   = Utf8ToWide(cwd);
+    if (wInput.empty()) return "";
 
     // ── Step 1: expand %VAR% environment variables.
     // ExpandEnvironmentStringsW returns required buffer size (including
@@ -96,8 +134,27 @@ std::string ResolveToolPath(const std::string& input,
         }
     }
 
-    // ── Step 2: prepend cwd if the path is relative.
-    if (!IsAbsolutePath(wInput) && !wCwd.empty()) {
+    if (wInput.empty()) return "";
+
+    // ── Step 2: make relative/rooted shapes deterministic.
+    //
+    // Windows has two ambiguous path forms:
+    //   * "\foo" / "/foo" is rooted on the current drive.
+    //   * "C:foo" is relative to the process's hidden per-drive cwd.
+    //
+    // The first should resolve against the supplied cwd's drive, not the
+    // LlamaBoss process cwd. The second is too surprising for tool paths, so
+    // fail closed instead of letting GetFullPathNameW consult process state.
+    if (IsDriveRelativePath(wInput)) {
+        return "";
+    }
+
+    if (IsRootRelativePath(wInput)) {
+        std::wstring drive = DrivePrefixFromAbsoluteCwd(wCwd);
+        if (drive.empty()) return "";
+        wInput = drive + wInput;
+    }
+    else if (!IsAbsolutePath(wInput) && !wCwd.empty()) {
         wchar_t last = wCwd.back();
         if (last != L'\\' && last != L'/')
             wCwd.push_back(L'\\');
@@ -105,8 +162,8 @@ std::string ResolveToolPath(const std::string& input,
     }
 
     // ── Step 3: canonicalize (normalize `.` and `..`, unify separators
-    // to `\`, resolve drive-relative paths).  GetFullPathNameW with a
-    // zero-length buffer returns the required size in chars including NUL.
+    // to `\`).  GetFullPathNameW with a zero-length buffer returns the
+    // required size in chars including NUL.
     DWORD bufLen = ::GetFullPathNameW(wInput.c_str(), 0, nullptr, nullptr);
     if (bufLen == 0) return "";
 
@@ -122,6 +179,7 @@ std::string ResolveToolPath(const std::string& input,
 bool IsDirectory(const std::string& absPath)
 {
     std::wstring w = Utf8ToWide(absPath);
+    if (w.empty()) return false;
     DWORD attrs = ::GetFileAttributesW(w.c_str());
     if (attrs == INVALID_FILE_ATTRIBUTES) return false;
     return (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
@@ -130,6 +188,7 @@ bool IsDirectory(const std::string& absPath)
 bool IsFile(const std::string& absPath)
 {
     std::wstring w = Utf8ToWide(absPath);
+    if (w.empty()) return false;
     DWORD attrs = ::GetFileAttributesW(w.c_str());
     if (attrs == INVALID_FILE_ATTRIBUTES) return false;
     return (attrs & FILE_ATTRIBUTE_DIRECTORY) == 0;

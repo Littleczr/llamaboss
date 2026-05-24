@@ -17,6 +17,7 @@
 
 #include "agent_controller.h"
 #include "python_runner.h"
+#include "python_arg_policy.h"
 
 #include "app_state.h"
 #include "chat_history.h"
@@ -211,30 +212,10 @@ std::string AgentTrimPackageToken(std::string s)
     return s.substr(a, b - a + 1);
 }
 
-bool AgentPackageIsAllowed(const std::string& packageName)
-{
-    static const char* kAllowed[] = {
-        "python-docx", "openpyxl", "pymupdf", "pypdf", "pypdfium2",
-        "pandas", "pillow", "reportlab", "matplotlib", "python-pptx",
-        "xlsxwriter", "beautifulsoup4", "lxml"
-    };
-    for (const char* allowed : kAllowed) {
-        if (packageName == allowed) return true;
-    }
-    return false;
-}
-
-std::string AgentNormalizeMissingPackageName(const std::string& raw)
+std::string AgentNormalizePackageTokenForDisplay(const std::string& raw)
 {
     std::string p = AgentLowerAscii(AgentTrimPackageToken(raw));
     std::replace(p.begin(), p.end(), '_', '-');
-
-    if (p == "docx") p = "python-docx";
-    else if (p == "fitz") p = "pymupdf";
-    else if (p == "pil") p = "pillow";
-    else if (p == "pptx") p = "python-pptx";
-    else if (p == "bs4") p = "beautifulsoup4";
-
     return p;
 }
 
@@ -273,11 +254,11 @@ bool AgentFindMissingPythonPackage(const std::string& stdoutText,
                                 const std::string& stderrText,
                                 std::string&       importNameOut,
                                 std::string&       packageNameOut,
-                                bool&              allowlistedOut)
+                                bool&              installableOut)
 {
     importNameOut.clear();
     packageNameOut.clear();
-    allowlistedOut = false;
+    installableOut = false;
 
     const std::string text = stderrText + "\n" + stdoutText;
     const std::string lower = AgentLowerAscii(text);
@@ -303,8 +284,19 @@ bool AgentFindMissingPythonPackage(const std::string& stdoutText,
     if (candidate.empty()) return false;
 
     importNameOut = candidate;
-    packageNameOut = AgentNormalizeMissingPackageName(candidate);
-    allowlistedOut = AgentPackageIsAllowed(packageNameOut);
+
+    std::string normalizedPackage;
+    std::string normalizeError;
+    installableOut = python_arg_policy::NormalizeAllowedPythonPackage(
+        candidate, normalizedPackage, normalizeError);
+
+    // For installable packages, use the exact shared normalized name that
+    // python_install_package will accept.  For unsupported tokens, keep a
+    // simple lowercase display value so the recovery message remains useful
+    // without duplicating the install policy.
+    packageNameOut = installableOut
+        ? normalizedPackage
+        : AgentNormalizePackageTokenForDisplay(candidate);
     return true;
 }
 
@@ -315,30 +307,34 @@ void ApplyAgentMissingPythonPackageRecovery(ToolInvocationResult& r,
 
     std::string importName;
     std::string packageName;
-    bool allowlisted = false;
+    bool installable = false;
     if (!AgentFindMissingPythonPackage(py.stdoutText,
                                     py.stderrText,
                                     importName,
                                     packageName,
-                                    allowlisted)) {
+                                    installable)) {
         return;
     }
 
     r.iconUtf8 = "\xF0\x9F\x93\xA6"; // 📦
-    r.toolName = allowlisted ? std::string("Missing Python Package")
+    r.toolName = installable ? std::string("Missing Python Package")
                              : std::string("Unsupported Python Package");
 
     std::ostringstream body;
-    if (allowlisted) {
-        body << "Python needs the allowlisted package `" << packageName
+    if (installable) {
+        body << "Python needs the package `" << packageName
              << "` before this step can continue.\n\n"
              << "Suggested next step for LlamaBoss: use `python_install_package "
              << packageName << "`, then retry the failed step once.\n\n"
-             << "No package was installed yet.";
+             << "No package was installed yet. The user will see an approval "
+                "card with the exact package name before pip runs.";
     } else {
         body << "Python tried to import `" << importName
-             << "`, but that package is not on the current LlamaBoss install allowlist.\n\n"
-             << "For safety, LlamaBoss will not install it automatically. The script may need to be rewritten using the standard library or an allowlisted package.";
+             << "`, but the inferred package name `" << packageName
+             << "` is not a simple PyPI name LlamaBoss can install through "
+                "python_install_package.\n\n"
+             << "The script may need to be rewritten using the standard "
+                "library, or the user can install the dependency manually.";
     }
 
     if (!r.body.empty()) {
@@ -512,6 +508,69 @@ AgentEventType ClassifyToolOutputEvent(const ToolInvocationResult& r)
     return AgentEventType::ToolOutput;
 }
 
+bool HasChip(const ToolInvocationResult& r, const std::string& chip)
+{
+    return std::find(r.chips.begin(), r.chips.end(), chip) != r.chips.end();
+}
+
+bool IsAgentPythonAsyncToolName(const std::string& name)
+{
+    return name == tool_names::kPythonHealth ||
+           name == tool_names::kCsvInspect ||
+           name == tool_names::kCsvReport ||
+           name == tool_names::kCsvToXlsx ||
+           name == tool_names::kXlsxInspect ||
+           name == tool_names::kXlsxReport ||
+           name == tool_names::kXlsxCreateWorkbook ||
+           name == tool_names::kPdfExtractText ||
+           name == tool_names::kPdfInspectForm ||
+           name == tool_names::kPdfFillForm ||
+           name == tool_names::kDocxExtractText ||
+           name == tool_names::kDocxInspect ||
+           name == tool_names::kPythonRunScript ||
+           name == tool_names::kPythonInstallPackage;
+}
+
+// Standalone file/artifact requests usually end immediately after write or
+// overwrite_file succeeds. Without this deterministic stop, small local models
+// often ask for the same write again; write then reports "exists", the model
+// switches to overwrite_file, and the loop keeps replacing the same artifact.
+//
+// Keep this scoped to conversations with no active project attached so project
+// workflows can still do multi-step flows such as overwriting Inputs\*.txt and
+// then running a workflow script. Project chats can still terminate normally
+// when the model emits final prose after the write result.
+bool ShouldStopAfterStandaloneWriteArtifact(const ToolInvocation& inv,
+                                            const ToolInvocationResult& r,
+                                            const ToolContext& ctx)
+{
+    if (inv.name != tool_names::kWrite &&
+        inv.name != tool_names::kOverwriteFile) {
+        return false;
+    }
+
+    if (!ctx.activeProjectRoot.empty()) return false;
+    if (!r.errorBody.empty()) return false;
+    if (r.presentedFiles.empty()) return false;
+
+    return HasChip(r, "created") || HasChip(r, "overwritten");
+}
+
+std::string StandaloneWriteCompletionMessage(const ToolInvocation& inv,
+                                             const ToolInvocationResult& r)
+{
+    std::string name = r.presentedFiles.empty()
+        ? std::string("the file")
+        : r.presentedFiles.front().displayName;
+
+    if (name.empty()) name = "the file";
+
+    if (inv.name == tool_names::kOverwriteFile)
+        return "I have updated " + name + ".";
+
+    return "I have created " + name + ".";
+}
+
 } // namespace
 
 // ═══════════════════════════════════════════════════════════════════
@@ -549,6 +608,7 @@ void AgentController::Begin()
     m_pendingApprovalContext    = ToolContext{};
     m_currentToolCallId.clear();
     m_recentToolSignatures.clear();
+    m_pendingSoftHint.clear();
     // Note: m_oneShotApprovedScriptRun is intentionally NOT cleared here.
     // It survives a Normal EndLoop (model paused with "Want me to run it?"
     // prose and ended the turn) so the user's natural "yes" reply lands
@@ -579,18 +639,8 @@ void AgentController::Cancel()
         else if (m_pendingAsyncInvocation.name == tool_names::kPowerShell && m_cmdExec) {
             m_cmdExec->Cancel();
         }
-        else if ((m_pendingAsyncInvocation.name == tool_names::kPythonHealth ||
-                  m_pendingAsyncInvocation.name == tool_names::kCsvInspect ||
-                  m_pendingAsyncInvocation.name == tool_names::kCsvReport ||
-                  m_pendingAsyncInvocation.name == tool_names::kXlsxInspect ||
-                  m_pendingAsyncInvocation.name == tool_names::kXlsxReport ||
-                  m_pendingAsyncInvocation.name == tool_names::kPdfExtractText ||
-                  m_pendingAsyncInvocation.name == tool_names::kPdfInspectForm ||
-                  m_pendingAsyncInvocation.name == tool_names::kPdfFillForm ||
-                  m_pendingAsyncInvocation.name == tool_names::kDocxExtractText ||
-                  m_pendingAsyncInvocation.name == tool_names::kDocxInspect ||
-                  m_pendingAsyncInvocation.name == tool_names::kPythonRunScript ||
-                  m_pendingAsyncInvocation.name == tool_names::kPythonInstallPackage) && m_pythonRunner) {
+        else if (IsAgentPythonAsyncToolName(m_pendingAsyncInvocation.name) &&
+                 m_pythonRunner) {
             m_pythonRunner->Cancel();
         }
     }
@@ -607,6 +657,7 @@ void AgentController::EndLoop(AgentEndReason     reason,
     m_pendingApprovalContext    = ToolContext{};
     m_currentToolCallId.clear();
     m_recentToolSignatures.clear();
+    m_pendingSoftHint.clear();
     // Bundled-approval bypass survives a Normal exit (model paused with
     // "Want me to run it?" prose).  Abnormal exits — user cancelled,
     // loop guard tripped, malformed cap, iteration cap, send/stream
@@ -778,7 +829,7 @@ std::string AgentController::BuildRequestBody()
     bool native = false;
     if (m_cb.getActiveProtocol &&
         m_cb.getActiveProtocol() == ToolProtocol::Native) {
-        tools = BuildToolsArrayJson(GetGlobalRouter());
+        tools = GetCachedToolsArrayJson();
         native = true;
     }
 
@@ -922,6 +973,22 @@ bool AgentController::DispatchAndContinue(const ToolInvocation& inv)
     }
     RecordToolSignature(signature);
 
+    // Phase 7b: soft-hint nudge.  When the model is one repeat away
+    // from tripping the loop guard, stash a notice that
+    // FeedResultAndIterate will append to the upcoming tool result
+    // body.  That gives the model one chance to break the pattern
+    // before the hard stop on the next iteration.  The repeatCount
+    // >= 2 floor protects against someone lowering the kill threshold
+    // to 2, which would otherwise fire on every first call.
+    if (repeatCount == kLoopGuardRepeatThreshold - 1 && repeatCount >= 2) {
+        m_pendingSoftHint =
+            "\n\n[notice] You just repeated this exact tool call. One more "
+            "identical call will trip the loop guard and stop the agent. "
+            "Try a different approach: call notes_read if a saved path may "
+            "exist, ask the user where the file lives, or use a different "
+            "tool. Do NOT repeat this exact call.";
+    }
+
     ToolContext ctx = m_cb.buildToolContext ? m_cb.buildToolContext()
                                               : ToolContext{};
 
@@ -995,6 +1062,19 @@ bool AgentController::DispatchApprovedAndContinue(const ToolInvocation& inv,
                 if (!finalName.empty())
                     m_oneShotApprovedScriptRun.push_back(finalName);
             }
+
+            if (ShouldStopAfterStandaloneWriteArtifact(inv, out.result, ctx)) {
+                EmitAndStoreTerminalToolResult(out.result, false);
+
+                if (m_sink) {
+                    m_sink->OnAgentEvent(AgentEvent::TurnComplete(
+                        StandaloneWriteCompletionMessage(inv, out.result)));
+                }
+
+                EndLoop(AgentEndReason::Normal, "");
+                return true;
+            }
+
             FeedResultAndIterate(out.result);
             return true;
 
@@ -1026,6 +1106,14 @@ void AgentController::FeedResultAndIterate(const ToolInvocationResult& rIn)
 {
     ToolInvocationResult r = rIn;
     InlineSmallPdfExtractedMarkdown(r);
+
+    // Phase 7b: consume pending soft-hint set at dispatch.  Appended
+    // to body so the notice surfaces in both the model-facing tool
+    // message and the on-screen tool block, then cleared (one-shot).
+    if (!m_pendingSoftHint.empty()) {
+        r.body += m_pendingSoftHint;
+        m_pendingSoftHint.clear();
+    }
 
     // Phase 5: emit a ToolBlock event instead of pushing directly
     // to ChatDisplay.  MyFrame's sink implementation forwards to
@@ -1161,10 +1249,33 @@ bool AgentController::HandleAssistantComplete(const std::string& fullResponse,
             return cont;
         }
 
-        // Model emitted toolCallsJson but parser produced nothing —
-        // malformed structured output.  Fall through to XML parse
-        // attempt as a safety net (shouldn't happen with conformant
-        // servers, but the fallback costs us nothing).
+        // Model emitted structured toolCallsJson but none of the entries
+        // could be projected into a ToolInvocation.  Treat this like a
+        // malformed tool call and feed the error back once; silently ending
+        // the loop here makes native-tool regressions look like the assistant
+        // simply ignored its own call.
+        ToolInvocation bad;
+        bad.valid         = false;
+        bad.rawBlock      = "[native tool_call] " + toolCallsJson;
+        bad.invalidReason = "Native tool call payload could not be parsed.";
+        bool cont = DispatchAndContinue(bad);
+        return cont;
+    }
+
+    // Phase 7c: when native protocol is active and the model emitted
+    // NO toolCallsJson at all, the response is the model's final
+    // prose answer with no tool call.  Do NOT fall through to XML
+    // parsing of fullResponse -- prose can legitimately contain
+    // <tool_call> as plain text (e.g. when the model is explaining
+    // its own tool-call protocol, citing docs, or quoting source
+    // code that mentions <tool_call> blocks), and the XML parser
+    // would synthesize a spurious malformed-invocation error.
+    // Observed with Qwen3.6 (~every turn) and Gemma 26B (code-review
+    // answers that describe the XML protocol).  Native function-call
+    // is authoritative when active; empty == final answer, end loop.
+    if (nativeActive && toolCallsJson.empty()) {
+        EndLoop(AgentEndReason::Normal, "");
+        return false;
     }
 
     // ── XML protocol path (Phase 1/2/3a/3b/3c-i unchanged) ──────
@@ -1355,7 +1466,7 @@ std::string AgentController::ProjectStructuredArgs(
     // engage this branch if `path` is present; otherwise we fall
     // through so a model still emitting the old {args} shape gets
     // handled as a backward-compat case.
-    if (toolName == tool_names::kWrite && obj->has("path")) {
+    if ((toolName == tool_names::kWrite || toolName == tool_names::kOverwriteFile) && obj->has("path")) {
         std::string path    = getStr("path");
         std::string content = getStr("content");
         if (!path.empty()) {
@@ -1378,6 +1489,19 @@ std::string AgentController::ProjectStructuredArgs(
         if (!path.empty()) {
             return path + "\n<<<OLD>>>\n" + oldS +
                    "\n<<<NEW>>>\n" + newS;
+        }
+    }
+
+    // ── read_head: {path, lines} → "<lines>\n<path>" ─────────
+    if (toolName == tool_names::kReadHead && obj->has("path")) {
+        std::string path = getStr("path");
+        std::string lines;
+        if (obj->has("lines")) {
+            try { lines = std::to_string(obj->getValue<int>("lines")); }
+            catch (...) { lines.clear(); }
+        }
+        if (!path.empty()) {
+            return (lines.empty() ? std::string("40") : lines) + "\n" + path;
         }
     }
 
@@ -1531,18 +1655,7 @@ bool AgentController::HandlePythonComplete(const PythonRunResult& pythonResult)
 {
     if (!m_active || !m_awaitingAsyncResult) return false;
 
-    if (m_pendingAsyncInvocation.name != tool_names::kPythonHealth &&
-        m_pendingAsyncInvocation.name != tool_names::kCsvInspect &&
-        m_pendingAsyncInvocation.name != tool_names::kCsvReport &&
-        m_pendingAsyncInvocation.name != tool_names::kXlsxInspect &&
-        m_pendingAsyncInvocation.name != tool_names::kXlsxReport &&
-        m_pendingAsyncInvocation.name != tool_names::kPdfExtractText &&
-        m_pendingAsyncInvocation.name != tool_names::kPdfInspectForm &&
-        m_pendingAsyncInvocation.name != tool_names::kPdfFillForm &&
-        m_pendingAsyncInvocation.name != tool_names::kDocxExtractText &&
-        m_pendingAsyncInvocation.name != tool_names::kDocxInspect &&
-        m_pendingAsyncInvocation.name != tool_names::kPythonRunScript &&
-        m_pendingAsyncInvocation.name != tool_names::kPythonInstallPackage)
+    if (!IsAgentPythonAsyncToolName(m_pendingAsyncInvocation.name))
         return false;
 
     m_awaitingAsyncResult = false;
@@ -1572,8 +1685,10 @@ bool AgentController::HandlePythonComplete(const PythonRunResult& pythonResult)
 
     const bool isInspect = (inv.name == tool_names::kCsvInspect);
     const bool isReport  = (inv.name == tool_names::kCsvReport);
+    const bool isCsvToXlsx = (inv.name == tool_names::kCsvToXlsx);
     const bool isXlsxIns = (inv.name == tool_names::kXlsxInspect);
     const bool isXlsxRep = (inv.name == tool_names::kXlsxReport);
+    const bool isXlsxCreate = (inv.name == tool_names::kXlsxCreateWorkbook);
     const bool isPdf     = (inv.name == tool_names::kPdfExtractText);
     const bool isPdfInspect = (inv.name == tool_names::kPdfInspectForm);
     const bool isPdfFill = (inv.name == tool_names::kPdfFillForm);
@@ -1587,7 +1702,7 @@ bool AgentController::HandlePythonComplete(const PythonRunResult& pythonResult)
     r.invocationRaw = inv.rawBlock;
     r.iconUtf8      = (isPdf || isPdfInspect || isPdfFill ||
                        isDocx || isDocxIns)        ? std::string("\xF0\x9F\x93\x84")  // 📄
-                    : isXlsxRep ? std::string("\xF0\x9F\x93\x97")      // 📗
+                    : (isXlsxRep || isXlsxCreate || isCsvToXlsx) ? std::string("\xF0\x9F\x93\x97")      // 📗
                     : isReport ? std::string("\xF0\x9F\x93\x9D")       // 📝
                     : (isInspect || isXlsxIns) ? std::string("\xF0\x9F\x93\x8A") // 📊
                                 : std::string("\xF0\x9F\x90\x8D");     // 🐍
@@ -1598,6 +1713,8 @@ bool AgentController::HandlePythonComplete(const PythonRunResult& pythonResult)
                     : isPdfFill ? std::string("PDF Fill Form")
                     : isDocx ? std::string("DOCX Extract Text")
                     : isDocxIns ? std::string("DOCX Inspect")
+                    : isXlsxCreate ? std::string("Create Workbook")
+                    : isCsvToXlsx ? std::string("CSV to XLSX")
                     : isXlsxRep ? std::string("XLSX Report")
                     : isXlsxIns ? std::string("XLSX Inspect")
                     : isReport ? std::string("CSV Report")
@@ -1611,6 +1728,8 @@ bool AgentController::HandlePythonComplete(const PythonRunResult& pythonResult)
                           : isPdfFill ? std::string("pdf_fill_form")
                           : isDocx ? std::string("docx_extract_text")
                           : isDocxIns ? std::string("docx_inspect")
+                          : isXlsxCreate ? std::string("xlsx_create_workbook")
+                          : isCsvToXlsx ? std::string("csv_to_xlsx")
                           : isXlsxRep ? std::string("xlsx_report")
                           : isXlsxIns ? std::string("xlsx_inspect")
                           : isReport ? std::string("csv_report")
@@ -1635,6 +1754,56 @@ bool AgentController::HandlePythonComplete(const PythonRunResult& pythonResult)
         m_history->AddToolResultMessage(inv.toolCallId, formatted);
 
         EndLoop(AgentEndReason::Cancelled, "Agent stopped by user.");
+        return true;
+    }
+
+    // If workbook creation failed after the fixed helper had a chance to
+    // validate/repair the spec, stop the turn instead of feeding the same
+    // failing tool result back into the model. Local models commonly retry
+    // the identical bad JSON, which looks like a loop to the user.
+    if (isXlsxCreate &&
+        pythonResult.exitCode != 0 &&
+        !pythonResult.cancelled &&
+        !pythonResult.timedOut) {
+        EmitAndStoreTerminalToolResult(r, true);
+        EndLoop(AgentEndReason::Normal,
+                "I couldn't create the Excel workbook. Check the tool details above for the exact error.");
+        return true;
+    }
+
+    // Artifact-producing create helpers are complete once the file card is
+    // rendered. Do not feed a successful workbook creation back into the
+    // model for another iteration, because smaller/local models may simply
+    // repeat the same create call and generate duplicate files until the
+    // loop guard stops them.
+    //
+    // Still end with a short deterministic completion message so the turn
+    // feels finished even though we intentionally skip the model's final
+    // prose pass.
+    if (isXlsxCreate &&
+        pythonResult.exitCode == 0 &&
+        !pythonResult.timedOut &&
+        !pythonResult.presentedFiles.empty()) {
+        EmitAndStoreTerminalToolResult(r, false);
+
+        std::string workbookName = pythonResult.presentedFiles.front().displayName;
+
+        std::string completionMessage;
+        if (workbookName.empty()) {
+            completionMessage = "I have created the Excel workbook.";
+        } else {
+            completionMessage = "I have created the " + workbookName + " Excel workbook.";
+        }
+
+        // Render the deterministic completion as a normal assistant reply,
+        // not as a gray/italic system status line.  This keeps successful
+        // xlsx_create_workbook turns visually consistent with CSV/write
+        // completions while still avoiding another model pass that could
+        // repeat the same create call.
+        if (m_sink)
+            m_sink->OnAgentEvent(AgentEvent::TurnComplete(completionMessage));
+
+        EndLoop(AgentEndReason::Normal, "");
         return true;
     }
 

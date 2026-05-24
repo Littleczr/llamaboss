@@ -1,4 +1,4 @@
-﻿// ui_builder.cpp
+// ui_builder.cpp
 #include "ui_builder.h"
 #include "widgets.h"
 #include "chat_input_ctrl.h"
@@ -38,30 +38,46 @@ TopBarWidgets BuildTopBar(wxWindow* parent, wxBoxSizer* mainSizer,
 
     sizer->AddStretchSpacer(1);
 
-    // ── Center: Model pill [dot + model name] (clickable) ──
+    // ── Center: Model pill [ ● model-name · quant ] (clickable) ──
+    // Bracket, status dot, model label, optional protocol chip, and
+    // closing bracket are grouped into one centered clickable model
+    // affordance. The brackets match the [ ... ] command language used
+    // throughout the chrome.
     w.modelPill = new wxPanel(w.toolbarPanel, wxID_ANY);
     w.modelPill->SetBackgroundColour(theme.bgToolbar);
     w.modelPill->SetCursor(wxCURSOR_HAND);
     auto* pillSizer = new wxBoxSizer(wxHORIZONTAL);
 
+    // Monospace font for the model label so the top bar keeps the
+    // same terminal-like visual language as the status strip below.
+    wxFont pillMonoFont(12, wxFONTFAMILY_TELETYPE, wxFONTSTYLE_NORMAL,
+                        wxFONTWEIGHT_NORMAL, false, "Consolas");
+
+    // Opening bracket of the [ ... ] affordance, matching the bracket
+    // language used elsewhere in the chrome ([ + attach ], [ /goal ]).
+    // Muted at rest; LlamaBoss.cpp recolors it to the interactive accent
+    // on hover and binds it to the same click handler as the dot/label.
+    w.modelPillLeftBracket = new wxStaticText(w.modelPill, wxID_ANY, "[");
+    w.modelPillLeftBracket->SetForegroundColour(theme.textMuted);
+    w.modelPillLeftBracket->SetCursor(wxCURSOR_HAND);
+    w.modelPillLeftBracket->SetFont(pillMonoFont);
+    pillSizer->Add(w.modelPillLeftBracket, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 6);
+
     w.statusDot = new StatusDot(w.modelPill, 10);
     w.statusDot->SetCursor(wxCURSOR_HAND);
-    pillSizer->Add(w.statusDot, 0, wxALIGN_CENTER_VERTICAL | wxLEFT, 10);
+    pillSizer->Add(w.statusDot, 0, wxALIGN_CENTER_VERTICAL);
 
     w.modelLabel = new wxStaticText(
         w.modelPill,
         wxID_ANY,
         "loading...",
         wxDefaultPosition,
-        wxSize(360, -1),
-        wxST_ELLIPSIZE_MIDDLE
+        wxSize(96, -1),
+        wxST_ELLIPSIZE_MIDDLE | wxST_NO_AUTORESIZE
     );
     w.modelLabel->SetForegroundColour(theme.textPrimary);
     w.modelLabel->SetCursor(wxCURSOR_HAND);
-    wxFont modelFont = w.modelLabel->GetFont();
-    modelFont.SetPointSize(13);
-    modelFont.SetWeight(wxFONTWEIGHT_BOLD);
-    w.modelLabel->SetFont(modelFont);
+    w.modelLabel->SetFont(pillMonoFont);
     pillSizer->Add(w.modelLabel, 0, wxALIGN_CENTER_VERTICAL | wxLEFT, 6);
 
     // ── Protocol chip (Phase 3b) ──
@@ -93,7 +109,14 @@ TopBarWidgets BuildTopBar(wxWindow* parent, wxBoxSizer* mainSizer,
     w.protocolChip->Hide();
     pillSizer->Add(w.protocolChip, 0, wxALIGN_CENTER_VERTICAL | wxLEFT, 8);
 
-    pillSizer->AddSpacer(10);
+    // Closing bracket. Sits after the (often hidden) protocol chip so the
+    // readout reads "[ * model-name . quant ]" normally and
+    // "[ * model-name . quant  native ]" once protocol detection lands.
+    w.modelPillRightBracket = new wxStaticText(w.modelPill, wxID_ANY, "]");
+    w.modelPillRightBracket->SetForegroundColour(theme.textMuted);
+    w.modelPillRightBracket->SetCursor(wxCURSOR_HAND);
+    w.modelPillRightBracket->SetFont(pillMonoFont);
+    pillSizer->Add(w.modelPillRightBracket, 0, wxALIGN_CENTER_VERTICAL | wxLEFT, 6);
 
     w.modelPill->SetSizer(pillSizer);
     sizer->Add(w.modelPill, 0, wxALIGN_CENTER_VERTICAL);

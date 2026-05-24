@@ -10,6 +10,94 @@
 #include "model_downloader.h"   // first-run onboarding
 #include "theme.h"
 
+#include <algorithm>
+#include <cctype>
+#include <vector>
+
+namespace {
+
+// Heuristic: does this token look like a GGUF or torch quantization
+// label (so we can render it as a " · <q>" suffix in the pill)?
+// Catches f16/fp16/bf16/f32/fp32 plus the qN... and iqN... families.
+// False negatives are fine -- worst case we just hyphenate the token
+// in with the rest of the model identity, which is still readable.
+bool LooksLikeQuantization(const std::string& token)
+{
+    if (token.empty() || token.size() > 16) return false;
+
+    std::string lower;
+    lower.reserve(token.size());
+    for (char c : token) {
+        lower.push_back(
+            static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+    }
+
+    if (lower == "f16"  || lower == "fp16" || lower == "bf16" ||
+        lower == "f32"  || lower == "fp32") {
+        return true;
+    }
+
+    auto isDigitCh = [](char c) {
+        return std::isdigit(static_cast<unsigned char>(c)) != 0;
+    };
+
+    // "qN..."  -- q4, q4_0, q4_K_M, q5_K_S, q8_0, etc.
+    if (lower[0] == 'q' && lower.size() >= 2 && isDigitCh(lower[1])) {
+        return true;
+    }
+    // "iqN..." -- iq4_NL, iq3_XXS, etc.
+    if (lower.size() >= 3 && lower[0] == 'i' && lower[1] == 'q' &&
+        isDigitCh(lower[2])) {
+        return true;
+    }
+
+    return false;
+}
+
+// Reformats a friendly display name ("gemma 4 e4b it f16") into the
+// pill form ("gemma-4-e4b-it · f16").  Identity tokens are joined with
+// hyphens; the final token, if it looks like a quantization label, is
+// peeled off and rendered as a "· <q>" suffix.  No quantization match
+// at the tail means everything hyphenates, which is still a readable
+// fallback.  Returns the input unchanged if it doesn't tokenize.
+std::string FormatModelNameForPill(const std::string& displayName)
+{
+    std::vector<std::string> tokens;
+    std::string cur;
+    for (char c : displayName) {
+        if (c == ' ') {
+            if (!cur.empty()) { tokens.push_back(cur); cur.clear(); }
+        } else {
+            cur.push_back(c);
+        }
+    }
+    if (!cur.empty()) tokens.push_back(cur);
+
+    if (tokens.empty())     return displayName;
+    if (tokens.size() == 1) return tokens.front();
+
+    std::string quant;
+    if (LooksLikeQuantization(tokens.back())) {
+        quant = tokens.back();
+        tokens.pop_back();
+    }
+
+    std::string out = tokens.front();
+    for (size_t i = 1; i < tokens.size(); ++i) {
+        out += '-';
+        out += tokens[i];
+    }
+
+    if (!quant.empty()) {
+        out += " \xC2\xB7 ";  // " · "
+        out += quant;
+    }
+
+    return out;
+}
+
+} // namespace
+
 ModelSwitcher::ModelSwitcher(AppState& appState,
                              ServerManager& serverManager,
                              ChatDisplay* chatDisplay,
@@ -255,28 +343,59 @@ void ModelSwitcher::UpdateModelLabel()
 {
     std::string model = m_appState.GetModel();
 
+    // If the stored model looks like a filesystem path (contains a
+    // separator) or a .gguf filename, run it through ModelDisplayName
+    // for a human-friendly short name. Otherwise it's already a bare
+    // model id (e.g. an Ollama tag from the legacy path) — leave it.
     auto shortenModel = [](const std::string& m) -> std::string {
-        if ((m.find('\\') != std::string::npos || m.find('/') != std::string::npos)
-            || (m.size() > 5 && m.substr(m.size() - 5) == ".gguf")) {
+        const bool hasSeparator =
+            m.find('\\') != std::string::npos ||
+            m.find('/')  != std::string::npos;
+        const bool endsWithGguf =
+            m.size() > 5 && m.substr(m.size() - 5) == ".gguf";
+
+        if (hasSeparator || endsWithGguf) {
             return ServerManager::ModelDisplayName(m);
         }
-        size_t slash = m.rfind('/');
-        if (slash != std::string::npos && slash + 1 < m.size())
-            return m.substr(slash + 1);
         return m;
-        };
+    };
 
-    std::string display = shortenModel(model);
+    // Take the friendly display ("gemma 4 e4b it f16") and reformat it
+    // for the pill: "gemma-4-e4b-it · f16".  Hyphens replace the spaces
+    // in the identity tokens, and any trailing quantization-like token
+    // (f16, bf16, q4_K_M, iq4_NL, ...) gets peeled off as a " · <q>"
+    // suffix.  The ▾ caret is no longer appended -- the brackets that
+    // now wrap the pill (added in ui_builder.cpp) carry the affordance.
+    std::string display = FormatModelNameForPill(shortenModel(model));
+    const wxString displayWx = wxString::FromUTF8(display);
 
-    wxString label = wxString::FromUTF8(display) +
-        wxString::FromUTF8(" \xE2\x96\xBE"); // ▾
+    m_modelLabel->SetLabel(displayWx);
 
-    m_modelLabel->SetLabel(label);
+    // Keep the pill compact for short names while still protecting the
+    // toolbar from very long GGUF filenames. The static text is created
+    // with wxST_NO_AUTORESIZE in ui_builder.cpp, so we manually size it
+    // to the measured text width, capped at the old 360px limit where
+    // wxST_ELLIPSIZE_MIDDLE can take over.
+    int textW = 0;
+    int textH = 0;
+    m_modelLabel->GetTextExtent(displayWx, &textW, &textH);
+
+    constexpr int kMinModelLabelWidth = 24;
+    constexpr int kMaxModelLabelWidth = 360;
+    const int labelWidth = std::max(
+        kMinModelLabelWidth,
+        std::min(textW + 2, kMaxModelLabelWidth));
+    const int labelHeight = std::max(textH + 2,
+                                     m_modelLabel->GetBestSize().GetHeight());
+
+    m_modelLabel->SetMinSize(wxSize(labelWidth, labelHeight));
+    m_modelLabel->SetSize(wxSize(labelWidth, labelHeight));
+    m_modelLabel->InvalidateBestSize();
 
     // Full name stays available on hover even if the toolbar ellipsizes it.
-    m_modelLabel->SetToolTip(wxString::FromUTF8(display));
+    m_modelLabel->SetToolTip(displayWx);
     if (auto* parent = m_modelLabel->GetParent()) {
-        parent->SetToolTip(wxString::FromUTF8(display));
+        parent->SetToolTip(displayWx);
         parent->Layout();
 
         if (auto* grandparent = parent->GetParent()) {

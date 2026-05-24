@@ -17,6 +17,9 @@
 
 // Expands %VAR%, resolves relative paths against `cwd`, and
 // canonicalizes (normalizes `.`, `..`, separators) via GetFullPathNameW.
+// Root-relative paths like "\foo" resolve against cwd's drive. Ambiguous
+// drive-relative paths like "C:foo" return empty instead of consulting the
+// process's hidden per-drive cwd.
 // Returns empty on failure.  Inputs and outputs are UTF-8.
 std::string ResolveToolPath(const std::string& input,
                             const std::string& cwd);

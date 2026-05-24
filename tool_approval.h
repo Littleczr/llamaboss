@@ -8,15 +8,19 @@
 // only pauses risky intent so the user can explicitly allow or deny
 // it.  Approval cards are UI-only and are not written to chat history.
 //
-// PowerShell is intentionally not gated here: command_policy.cpp's
-// allowlist remains the hard boundary for shell invocations.
+// PowerShell has a hybrid gate: command_policy.cpp auto-allows
+// clearly read-only commands, rejects malformed commands, and routes
+// broader shell automation into this approval-card layer.
 #pragma once
 
+#include "command_policy.h"
 #include "tool_block.h"
 #include "tool_context.h"
 #include "tool_dispatcher.h"
 #include "tool_invocation.h"
 #include "tool_path.h"
+#include "tool_path_safety.h"
+#include "tool_router.h"     // GetGlobalRouter() for ClassifyTier lookup
 #include "server_manager.h"
 
 #include <algorithm>
@@ -27,8 +31,14 @@
 
 namespace tool_approval {
 
+// Backward-compatibility alias.  RiskTier moved to tool_safety.h (global
+// namespace) so it can live on ToolSpec.safety.tier without circular
+// includes.  This alias keeps any older `tool_approval::RiskTier::*`
+// references compiling without forcing a tree-wide rename.
+using RiskTier = ::RiskTier;
+
 // ═══════════════════════════════════════════════════════════════════
-//  Risk tiering — Phase 3
+//  Risk tiering — Phase 3 (consolidated via ToolSpec.safety.tier)
 // ═══════════════════════════════════════════════════════════════════
 //
 // RequiresApproval used to walk a per-tool if/else ladder where each
@@ -39,63 +49,28 @@ namespace tool_approval {
 // double-prompts: model asks, user says yes, system ALSO renders an
 // approval card asking the same thing.
 //
-// The tier system replaces that ladder.  Each tool is classified once
-// by ClassifyTier; RequiresApproval renders an approval card only for
-// the Dangerous tier.  Safe and Moderate tools rely on:
-//   - in agent mode  : the model's natural-language ask + user's "yes"
+// The tier system replaces that ladder.  Each tool is classified
+// ONCE on its ToolSpec.safety.tier (see tool_safety.h and the
+// BuildBuiltinSpecs registrations in tool_router.cpp).  ClassifyTier
+// is now a one-line lookup against the global router; it exists
+// purely to keep older call sites compiling.  New code should read
+// spec.safety.tier directly.  RequiresApproval renders an approval
+// card only for the Dangerous tier.  Safe and Moderate tools rely
+// on:
+//   - in agent mode  : the model's natural-language ask + user "yes"
 //   - in slash mode  : the user having literally typed the command
 //
-// PowerShell sits outside this system entirely.  Its safety boundary
-// is command_policy.cpp's allowlist, which rejects disallowed commands
-// before the approval gate is ever consulted.
-enum class RiskTier {
-    // Pure read-only or self-bounded helper.  No file modification, no
-    // arbitrary code execution, no network reach.  Examples: read,
-    // ls, grep, pwd, open, csv_inspect, xlsx_inspect, pdf_extract_text,
-    // python_health.
-    Safe,
-
-    // Modifies workspace state (files, directories, generated reports)
-    // but cannot escape the workspace and cannot directly create an
-    // executable artifact.  write blocks risky extensions; edit only
-    // touches existing files; csv_report/xlsx_report write a single
-    // markdown file in the LlamaBoss Documents folder; mkdir creates
-    // an empty directory; python_run_script runs a .py whose source
-    // was already reviewed when python_create_script's approval card
-    // was rendered or that lives as an optional helper in an active
-    // project Workflows folder.
-    Moderate,
-
-    // Irreversible, or carries arbitrary code-execution risk that
-    // benefits from explicit per-invocation review:
-    //   - delete                : removes a file or empty directory; can't undo.
-    //   - python_create_script  : writes a .py the user will then run; the
-    //                             approval card body shows the script source
-    //                             so the user can review before authorizing.
-    Dangerous,
-};
+// PowerShell is conditional: clearly read-only commands stay outside
+// the approval-card path, while broader syntactically usable commands
+// are routed here by command_policy.cpp for explicit review.
+//
+// The RiskTier enum itself now lives in tool_safety.h so the
+// ToolSafetyProfile struct can carry it as a field.
 
 inline RiskTier ClassifyTier(const std::string& toolName)
 {
-    if (toolName == tool_names::kDelete ||
-        toolName == tool_names::kPythonCreateScript ||
-        toolName == tool_names::kPythonInstallPackage) {
-        return RiskTier::Dangerous;
-    }
-
-    if (toolName == tool_names::kWrite              ||
-        toolName == tool_names::kEdit               ||
-        toolName == tool_names::kMkdir              ||
-        toolName == tool_names::kCsvReport          ||
-        toolName == tool_names::kXlsxReport         ||
-        toolName == tool_names::kPythonRunScript) {
-        return RiskTier::Moderate;
-    }
-
-    // Default to Safe for read-only tools and any future unrecognized
-    // tool name.  Unknown tools fail at dispatch time anyway; gating
-    // them here would surface a confusing approval card.
-    return RiskTier::Safe;
+    const ToolSpec* spec = GetGlobalRouter().Find(toolName);
+    return spec ? spec->safety.tier : RiskTier::Safe;
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -138,12 +113,17 @@ inline std::string CommandEcho(const ToolInvocation& inv)
     if (inv.name == tool_names::kCsvReport)
         return Trim(inv.args).empty() ? std::string("/csv_report")
                                       : ("/csv_report " + Trim(inv.args));
+    if (inv.name == tool_names::kCsvToXlsx)
+        return Trim(inv.args).empty() ? std::string("/csv_to_xlsx")
+                                      : ("/csv_to_xlsx " + Trim(inv.args));
     if (inv.name == tool_names::kXlsxInspect)
         return Trim(inv.args).empty() ? std::string("/xlsx_inspect")
                                       : ("/xlsx_inspect " + Trim(inv.args));
     if (inv.name == tool_names::kXlsxReport)
         return Trim(inv.args).empty() ? std::string("/xlsx_report")
                                       : ("/xlsx_report " + Trim(inv.args));
+    if (inv.name == tool_names::kXlsxCreateWorkbook)
+        return "/xlsx_create_workbook";
     if (inv.name == tool_names::kPdfExtractText)
         return Trim(inv.args).empty() ? std::string("/pdf_extract_text")
                                       : ("/pdf_extract_text " + Trim(inv.args));
@@ -158,7 +138,7 @@ inline std::string CommandEcho(const ToolInvocation& inv)
     if (inv.name == tool_names::kPythonInstallPackage)
         return Trim(inv.args).empty() ? std::string("/python_install_package")
                                       : ("/python_install_package " + Trim(inv.args));
-    if (inv.name == tool_names::kWrite || inv.name == tool_names::kEdit) {
+    if (inv.name == tool_names::kWrite || inv.name == tool_names::kOverwriteFile || inv.name == tool_names::kEdit) {
         std::string first = FirstLine(inv.args);
         return first.empty() ? ("/" + inv.name) : ("/" + inv.name + " " + first);
     }
@@ -169,6 +149,7 @@ inline std::string CommandEcho(const ToolInvocation& inv)
 inline std::string ToolDisplayName(const std::string& name)
 {
     if (name == tool_names::kWrite)      return "Write";
+    if (name == tool_names::kOverwriteFile) return "Overwrite File";
     if (name == tool_names::kEdit)       return "Edit";
     if (name == tool_names::kDelete)     return "Delete";
     if (name == tool_names::kMkdir)      return "Mkdir";
@@ -176,13 +157,16 @@ inline std::string ToolDisplayName(const std::string& name)
     if (name == tool_names::kPythonHealth) return "Python Health";
     if (name == tool_names::kCsvInspect) return "CSV Inspect";
     if (name == tool_names::kCsvReport)  return "CSV Report";
+    if (name == tool_names::kCsvToXlsx)  return "CSV to XLSX";
     if (name == tool_names::kXlsxInspect) return "XLSX Inspect";
     if (name == tool_names::kXlsxReport)  return "XLSX Report";
+    if (name == tool_names::kXlsxCreateWorkbook) return "Create Workbook";
     if (name == tool_names::kPdfExtractText) return "PDF Extract Text";
     if (name == tool_names::kPythonCreateScript) return "Python Script";
-    if (name == tool_names::kPythonRunScript) return "Create Files";
+    if (name == tool_names::kPythonRunScript) return "Python Run";
     if (name == tool_names::kPythonInstallPackage) return "Install Python Package";
     if (name == tool_names::kRead)       return "Read";
+    if (name == tool_names::kReadHead)   return "Read Head";
     if (name == tool_names::kLs)         return "List";
     if (name == tool_names::kGrep)       return "Grep";
     if (name == tool_names::kPwd)        return "Pwd";
@@ -193,6 +177,7 @@ inline std::string ToolDisplayName(const std::string& name)
 inline std::string ToolIcon(const std::string& name)
 {
     if (name == tool_names::kWrite)      return "\xF0\x9F\x93\x9D"; // 📝
+    if (name == tool_names::kOverwriteFile) return "\xE2\x99\xBB"; // ♻
     if (name == tool_names::kEdit)       return "\xE2\x9C\x8F";     // ✏
     if (name == tool_names::kDelete)     return "\xF0\x9F\x97\x91"; // 🗑
     if (name == tool_names::kMkdir)      return "\xE2\x9E\x95";     // ➕
@@ -200,12 +185,15 @@ inline std::string ToolIcon(const std::string& name)
     if (name == tool_names::kPythonHealth) return "\xF0\x9F\x90\x8D"; // 🐍
     if (name == tool_names::kCsvInspect) return "\xF0\x9F\x93\x8A";   // 📊
     if (name == tool_names::kCsvReport)  return "\xF0\x9F\x93\x9D";   // 📝
+    if (name == tool_names::kCsvToXlsx)  return "\xF0\x9F\x93\x97";   // 📗
     if (name == tool_names::kXlsxInspect) return "\xF0\x9F\x93\x8A";  // 📊
     if (name == tool_names::kXlsxReport)  return "\xF0\x9F\x93\x97";  // 📗
+    if (name == tool_names::kXlsxCreateWorkbook) return "\xF0\x9F\x93\x97";  // 📗
     if (name == tool_names::kPdfExtractText) return "\xF0\x9F\x93\x84"; // 📄
     if (name == tool_names::kPythonCreateScript) return "\xF0\x9F\x90\x8D"; // 🐍
-    if (name == tool_names::kPythonRunScript) return "\xF0\x9F\x93\xA6"; // 📦
+    if (name == tool_names::kPythonRunScript) return "\xF0\x9F\x90\x8D"; // 🐍
     if (name == tool_names::kPythonInstallPackage) return "\xF0\x9F\x90\x8D"; // 🐍
+    if (name == tool_names::kRead || name == tool_names::kReadHead) return "\xF0\x9F\x93\x84"; // 📄
     return "\xE2\x9A\xA0";                                         // ⚠
 }
 
@@ -275,7 +263,7 @@ inline std::string ResolveTargetForPreview(const std::string& requested,
 {
     std::string trimmed = Trim(requested);
     if (trimmed.empty() || ctx.cwd.empty()) return trimmed;
-    std::string resolved = ResolveToolPath(trimmed, ctx.cwd);
+    std::string resolved = tool_path_safety::ResolveProjectAwareToolPath(trimmed, ctx.cwd, ctx.activeProjectRoot);
     return resolved.empty() ? trimmed : resolved;
 }
 
@@ -409,6 +397,13 @@ inline std::string PreviewForInvocation(const ToolInvocation& inv,
         return p.str();
     }
 
+    if (inv.name == tool_names::kXlsxCreateWorkbook) {
+        targetOut = "LlamaBoss Spreadsheets folder";
+        p << "Output: LlamaBoss Spreadsheets folder\n"
+          << "Runs only the bundled xlsx_create_workbook helper. The helper accepts structured JSON data and creates one .xlsx workbook. It does not accept arbitrary Python code, script paths, external source reads, or arbitrary output paths. Requires the openpyxl Python package.";
+        return p.str();
+    }
+
     if (inv.name == tool_names::kPdfExtractText) {
         targetOut = ResolveTargetForPreview(inv.args, ctx);
         p << "Target PDF file: " << targetOut << "\n"
@@ -423,20 +418,26 @@ inline std::string PreviewForInvocation(const ToolInvocation& inv,
         p << "Package: " << packageName << "\n"
           << "Command: py -3 -m pip install --user --disable-pip-version-check " << packageName << "\n"
           << "Fallback launchers: python -m pip, then python3 -m pip if py -3 is unavailable.\n\n"
-          << "This changes the user's Python environment and may download files from the Python Package Index. "
-          << "The package name must be on LlamaBoss's allowlist; no versions, URLs, requirements files, extras, or pip flags are accepted.";
+          << "This downloads and installs `" << packageName << "` from the Python "
+          << "Package Index into the user's per-user site-packages. It changes the "
+          << "local Python environment and uses the network. The package name is "
+          << "validated as a simple PyPI name -- no versions, URLs, requirements "
+          << "files, extras, or pip flags -- and every install renders this card "
+          << "with the exact name pip will see, even when one-approval mode is on.";
         return p.str();
     }
 
     if (inv.name == tool_names::kPythonCreateScript) {
         std::string filename, content;
         SplitWriteArgs(inv.args, filename, content);
-        targetOut = ScriptPreviewPath(filename);
+        targetOut = ProjectWorkflowScriptPreviewPath(filename, ctx);
         p << "Target Python script: " << targetOut << "\n"
-          << "Output: LlamaBoss Scripts folder\n"
+          << (!ctx.activeProjectRoot.empty()
+                  ? "Output: active project Workflows folder\n"
+                  : "Output: LlamaBoss Scripts folder\n")
           << "Bytes: " << content.size() << "\n"
           << "Lines: " << CountLines(content) << "\n\n"
-          << "Creates a reviewable .py script artifact. If this task needs output, this approval also covers one immediate run of this exact script. Review the source below before approving.\n\n"
+          << "Creates a reviewable .py script artifact. In a project chat, the script is created in that project's Workflows folder; otherwise it is created in the LlamaBoss Scripts folder. If this task needs output, this approval also covers one immediate run of this exact script. Review the source below before approving.\n\n"
           << LimitText(content.empty() ? std::string("[empty script body]") : content);
         return p.str();
     }
@@ -460,6 +461,7 @@ inline std::string ApprovalActionVerb(const ToolInvocation& inv)
     if (inv.name == tool_names::kPythonCreateScript) return "create it";
     if (inv.name == tool_names::kPythonInstallPackage) return "install it";
     if (inv.name == tool_names::kWrite) return "create it";
+    if (inv.name == tool_names::kOverwriteFile) return "overwrite it";
     if (inv.name == tool_names::kMkdir) return "create it";
     if (inv.name == tool_names::kEdit) return "edit it";
     if (inv.name == tool_names::kDelete) return "delete it";
@@ -473,12 +475,49 @@ inline bool RequiresApproval(const ToolInvocation& inv,
     out = ApprovalDecision{};
     if (!inv.valid) return false;
 
+    // ── Conditional PowerShell gate ─────────────────────────────
+    // Read-only allowlisted commands run immediately.  Broader shell
+    // automation is intentionally not blocked; it pauses here so the
+    // user can review and approve the exact command before dispatch.
+    // Malformed/empty commands do not render a card -- DispatchInvocation
+    // will surface the policy rejection back to the model/user.
+    if (inv.name == tool_names::kPowerShell) {
+        PolicyDecision ps = EvaluatePowerShellCommand(inv.args);
+        if (!ps.requiresApproval) {
+            return false;
+        }
+
+        out.required = true;
+        out.reason = "This PowerShell command falls outside the automatic read-only inspection profile and must be reviewed before execution.";
+        if (!ps.reason.empty()) {
+            out.reason += " Policy note: " + ps.reason + ".";
+        }
+        out.preview = PreviewForInvocation(inv, ctx, out.target);
+
+        out.block.iconUtf8     = "\xE2\x9A\xA0"; // ⚠
+        out.block.toolName     = "Approval Required";
+        out.block.statusChips  = { "pending", ToolDisplayName(inv.name) };
+        out.block.commandEcho  = CommandEcho(inv);
+        out.block.bodyLang.clear();
+
+        std::ostringstream body;
+        body << "Approval required: " << ToolDisplayName(inv.name);
+        if (!out.target.empty()) body << " " << out.target;
+        body << "\n\nReason: " << out.reason;
+        if (!out.preview.empty()) body << "\n\n" << out.preview;
+        body << "\n\nApprove options:\n"
+             << "  approve       Continue and trust tools for this chat.\n"
+             << "  approve once  Approve only this action.\n"
+             << "  deny          Cancel.\n"
+             << "Slash forms also work.";
+        out.block.body = body.str();
+        return true;
+    }
+
     if (ClassifyTier(inv.name) != RiskTier::Dangerous) {
         // Safe and Moderate tools never render an approval card.
         // Conversational consent (agent mode) and explicit user
         // invocation (slash mode) carry the trust burden instead.
-        // PowerShell never reaches this path; its allowlist in
-        // command_policy.cpp is the hard boundary.
         return false;
     }
 
@@ -493,7 +532,7 @@ inline bool RequiresApproval(const ToolInvocation& inv,
     }
     else if (inv.name == tool_names::kPythonInstallPackage) {
         out.required = true;
-        out.reason = "This installs one allowlisted Python package into the user's Python user-site using pip. It changes the local Python environment and may use the network, so it requires approval.";
+        out.reason = "This installs one Python package from PyPI into the user's Python user-site using pip. It changes the local Python environment and uses the network, so it requires approval -- and every install renders its own card showing the exact package name, even when one-approval mode is on.";
     }
     else {
         // Defensive default for any future Dangerous-tier addition

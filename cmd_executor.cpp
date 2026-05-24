@@ -28,6 +28,7 @@
 #include <fstream>
 #include <chrono>
 #include <cctype>
+#include "ui_event_post.h"
 #include <mutex>
 #include <sstream>
 #include <string>
@@ -703,12 +704,9 @@ private:
     // is still alive.  We intentionally don't deliver on destruction
     // — the handler would dereference freed UI state.
     void PostCompletion(CmdResult result) {
-        auto alive = m_aliveToken.lock();
-        if (!alive || !alive->load()) return;
-
         auto* ev = new wxCommandEvent(wxEVT_CMD_COMPLETE);
         ev->SetClientObject(new CmdResultClientData(std::move(result)));
-        wxQueueEvent(m_evtHandler, ev);
+        LbQueueEventIfAlive(m_evtHandler, m_aliveToken, ev);
     }
 
     wxEvtHandler*                      m_evtHandler;
@@ -777,12 +775,9 @@ bool CmdExecutor::Start(const std::string& command,
 
         // Surface the failure as a synthetic error event so the UI
         // follows the same completion path as a real failure.
-        auto alive = m_aliveToken.lock();
-        if (alive && alive->load()) {
-            auto* ev = new wxCommandEvent(wxEVT_CMD_ERROR);
-            ev->SetString("Failed to start command worker thread.");
-            wxQueueEvent(m_eventHandler, ev);
-        }
+        auto* ev = new wxCommandEvent(wxEVT_CMD_ERROR);
+        ev->SetString("Failed to start command worker thread.");
+        LbQueueEventIfAlive(m_eventHandler, m_aliveToken, ev);
         return false;
     }
 

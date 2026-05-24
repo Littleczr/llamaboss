@@ -23,6 +23,7 @@
 // to lowercase before matching.
 namespace tool_names {
     constexpr const char* kRead       = "read";
+    constexpr const char* kReadHead   = "read_head";
     constexpr const char* kLs         = "ls";
     constexpr const char* kGrep       = "grep";
     constexpr const char* kPwd        = "pwd";
@@ -33,6 +34,7 @@ namespace tool_names {
     constexpr const char* kCsvToXlsx    = "csv_to_xlsx";
     constexpr const char* kXlsxInspect  = "xlsx_inspect";
     constexpr const char* kXlsxReport   = "xlsx_report";
+    constexpr const char* kXlsxCreateWorkbook = "xlsx_create_workbook";
     constexpr const char* kPdfExtractText = "pdf_extract_text";
     constexpr const char* kPdfInspectForm = "pdf_inspect_form";
     constexpr const char* kPdfFillForm    = "pdf_fill_form";
@@ -43,6 +45,7 @@ namespace tool_names {
     constexpr const char* kPythonInstallPackage = "python_install_package";
     constexpr const char* kOpen       = "open";
     constexpr const char* kWrite      = "write";
+    constexpr const char* kOverwriteFile = "overwrite_file";
     constexpr const char* kMkdir      = "mkdir";
     constexpr const char* kEdit       = "edit";
     constexpr const char* kDelete     = "delete";
@@ -50,6 +53,7 @@ namespace tool_names {
     constexpr const char* kNotesAppend = "notes_append";
     constexpr const char* kProjectNotesRead   = "project_notes_read";
     constexpr const char* kProjectNotesAppend = "project_notes_append";
+    constexpr const char* kWebFetchUrl = "web_fetch_url";
 }
 
 // ─── Single parsed tool call ────────────────────────────────────

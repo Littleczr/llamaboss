@@ -15,6 +15,7 @@
 #include "tool_dispatcher.h"
 #include "tool_router.h"
 
+#include <cassert>
 #include <string>
 
 namespace {
@@ -73,5 +74,26 @@ DispatchOutcome DispatchInvocation(const ToolInvocation& inv,
     deps.cmdExec      = cmdExec;
     deps.pythonRunner = pythonRunner;
 
-    return spec->dispatch(inv, ctx, deps);
+    DispatchOutcome outcome = spec->dispatch(inv, ctx, deps);
+
+    // ─── Debug-only sync/async cross-check ─────────────────────
+    // Catches the coordination bug where a registration declares
+    // safety.isAsync but the dispatch body returns Completed, or
+    // vice versa.  Compiled out of release builds; assert() expands
+    // to a no-op when NDEBUG is defined.
+    //
+    // Invalid status is excluded: an arg-validation failure can
+    // legitimately short-circuit either an async or sync tool to
+    // Completed/Invalid, and we do not want to mask those returns.
+    if (outcome.status == DispatchStatus::Async) {
+        assert(spec->safety.isAsync &&
+               "Tool dispatch returned Async but safety.isAsync is false. "
+               "Either set safety.isAsync = true at registration or return Completed.");
+    } else if (outcome.status == DispatchStatus::Completed) {
+        assert(!spec->safety.isAsync &&
+               "Tool dispatch returned Completed but safety.isAsync is true. "
+               "Either set safety.isAsync = false at registration or return Async.");
+    }
+
+    return outcome;
 }

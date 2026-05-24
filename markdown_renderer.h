@@ -45,6 +45,10 @@ public:
     void ClearCodeBlocks();
     // Returns block index if pos is inside a [Copy] link, or -1
     int HitTestCopyLink(long pos) const;
+    // Changes the clicked code-block affordance from "Copy" to "Copied".
+    // The rendered affordance reserves six monospace cells ("Copy  "), so
+    // this replacement does not shift any later rich-text ranges.
+    bool MarkCopyLinkCopied(size_t blockIndex);
 
     // ── File chip callback ────────────────────────────────────────
     // When a fenced code block closes, the renderer packages it into a
@@ -81,6 +85,20 @@ private:
     // ── Block-level rendering ────────────────────────────────────
     void RenderCompleteLine(const std::string& line, const wxColour& baseColor);
     void RenderCodeBlockLine(const std::string& line);
+
+    // Finalize the currently-open code block (if any).  Pushes the
+    // accumulated content into m_codeBlocks so any Copy link recorded
+    // at fence-open time resolves to its block, then resets the block
+    // state members.  When drawBottomBorder is true, also writes the
+    // closing border (or a trailing newline for no-language fences) —
+    // matches the visuals of a normally-closed fence.
+    //
+    // Called from three places:
+    //   • RenderCompleteLine when a closing ``` arrives (drawBottomBorder=true)
+    //   • Flush()  when a stream ends without a closing fence (true)
+    //   • Reset()  for defense against cancel/error paths        (false)
+    void FinalizeOpenCodeBlock(bool drawBottomBorder);
+
     void RenderHeading(const std::string& text, int level, const wxColour& baseColor);
     void RenderBulletItem(const std::string& text, const wxColour& baseColor,
                           int depth = 0);

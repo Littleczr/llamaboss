@@ -2,16 +2,19 @@
 
 #include "tool_write.h"
 #include "tool_path.h"
-#include "tool_path_safety.h"   // IsUnderCwd, Basename, ParentDir
-#include "tool_staged_write.h"  // StagedTempFile, CreateStagedTempFile
-#include "tool_open.h"          // ClassifyForOpen, FileRisk
+#include "tool_path_safety.h"    // IsUnderAllowedWriteRoot, Basename, ParentDir
+#include "tool_staged_write.h"   // StagedTempFile, CreateStagedTempFile
+#include "tool_open.h"           // ClassifyForOpen, FileRisk
+#include "tool_python_syntax.h"  // tool_python_syntax::CheckFile
 #include "path_safety.h"
 
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <cctype>
 #include <sstream>
 #include <utility>
+#include <vector>
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -101,10 +104,25 @@ void SplitPathAndContent(const std::string& argsBlob,
     }
 }
 
-} // anonymous namespace
 
-WriteResult WriteNewFile(const std::string& argsBlob,
-                         const ToolContext& ctx)
+bool HasPythonExtension(const std::string& absPath)
+{
+    std::string lower = absPath;
+    std::transform(lower.begin(), lower.end(), lower.begin(),
+                   [](unsigned char c){ return static_cast<char>(std::tolower(c)); });
+    return lower.size() >= 3 &&
+           (lower.rfind(".py") == lower.size() - 3 ||
+            (lower.size() >= 4 && lower.rfind(".pyw") == lower.size() - 4));
+}
+
+// Shared implementation behind WriteNewFile / OverwriteFileContent.
+// Lives in the anonymous namespace (internal linkage): only the two
+// public wrappers below call it, and it is not declared in
+// tool_write.h.  Previously it sat just outside the namespace and so
+// leaked an undeclared external symbol.
+WriteResult WriteFileContent(const std::string& argsBlob,
+                             const ToolContext& ctx,
+                             bool overwriteExisting)
 {
     WriteResult r;
     auto t0 = std::chrono::steady_clock::now();
@@ -115,7 +133,9 @@ WriteResult WriteNewFile(const std::string& argsBlob,
 
     if (requestedPath.empty()) {
         r.chips.push_back("failed");
-        r.errorBody = "write requires a path on the first line of <args>.";
+        r.errorBody = overwriteExisting
+            ? "overwrite_file requires a path on the first line of <args>."
+            : "write requires a path on the first line of <args>.";
         r.chips.push_back(ElapsedChip(t0));
         return r;
     }
@@ -138,7 +158,7 @@ WriteResult WriteNewFile(const std::string& argsBlob,
         return r;
     }
 
-    std::string resolved = ResolveToolPath(requestedPath, ctx.cwd);
+    std::string resolved = tool_path_safety::ResolveProjectAwareToolPath(requestedPath, ctx.cwd, ctx.activeProjectRoot);
     if (resolved.empty()) {
         r.chips.push_back("failed");
         r.errorBody = "Could not resolve path: " + requestedPath;
@@ -150,11 +170,11 @@ WriteResult WriteNewFile(const std::string& argsBlob,
     // This is where "../../etc/passwd"-style traversal dies, even
     // though GetFullPathNameW happily resolved it -- the resolved
     // absolute path won't start with ctx.cwd anymore.
-    if (!tool_path_safety::IsUnderCwd(resolved, ctx.cwd)) {
+    if (!tool_path_safety::IsUnderAllowedWriteRoot(resolved, ctx.cwd, ctx.activeProjectRoot, ctx.skillsRoot)) {
         r.chips.push_back("blocked");
-        r.errorBody = "Refuses to write outside the working "
-                      "directory.\n  resolved: " + resolved +
-                      "\n  cwd:      " + ctx.cwd;
+        r.errorBody = "Refuses to write outside the allowed write roots."
+                      "\n  resolved: " + resolved +
+                      tool_path_safety::AllowedWriteRootsDiagnostic(ctx.cwd, ctx.activeProjectRoot, ctx.skillsRoot);
         r.chips.push_back(ElapsedChip(t0));
         return r;
     }
@@ -184,9 +204,9 @@ WriteResult WriteNewFile(const std::string& argsBlob,
     // on what's dangerous.  TextLike and Safe both pass.
     if (ClassifyForOpen(resolved) == FileRisk::Risky) {
         r.chips.push_back("blocked");
-        r.errorBody = "Refuses to create files with executable or "
-                      "scriptable extensions. If the user wants this, "
-                      "they can drop the file in manually.";
+        r.errorBody = overwriteExisting
+            ? "Refuses to overwrite files with executable or scriptable extensions. If the user wants this, they can edit the file manually."
+            : "Refuses to create files with executable or scriptable extensions. If the user wants this, they can drop the file in manually.";
         r.chips.push_back(ElapsedChip(t0));
         return r;
     }
@@ -204,16 +224,20 @@ WriteResult WriteNewFile(const std::string& argsBlob,
         return r;
     }
 
-    // ── Pre-check: target must not exist ─────────────────────────
-    // We're a create-new tool; if the file's already there the
-    // model should call edit (future) or pick a new name.  This
-    // check is duplicated by the no-REPLACE_EXISTING flag on the
-    // final MoveFileEx, which closes the race between check and
-    // rename.
-    if (IsFile(resolved) || IsDirectory(resolved)) {
+    // ── Pre-check: create-new refuses existing targets; overwrite_file
+    // replaces existing regular files but still refuses directories.
+    const bool targetIsFile = IsFile(resolved);
+    const bool targetIsDir  = IsDirectory(resolved);
+    if (!overwriteExisting && (targetIsFile || targetIsDir)) {
         r.chips.push_back("exists");
         r.errorBody = "File or directory already exists: " + resolved +
-                      ".\nUse a different name or edit to modify.";
+                      ".\nUse overwrite_file to replace the whole file, or edit for a small unique text replacement.";
+        r.chips.push_back(ElapsedChip(t0));
+        return r;
+    }
+    if (overwriteExisting && targetIsDir) {
+        r.chips.push_back("blocked");
+        r.errorBody = "Refuses to overwrite a directory: " + resolved;
         r.chips.push_back(ElapsedChip(t0));
         return r;
     }
@@ -221,9 +245,10 @@ WriteResult WriteNewFile(const std::string& argsBlob,
     // ── Atomic-ish write: unique sibling temp then rename ─────────
     // Step 1: create a fresh temp file with CREATE_NEW so we never
     // overwrite a real user-owned "<path>.tmp" file.  Step 2: write
-    // the bytes.  Step 3: MoveFileEx with no REPLACE_EXISTING -- if
-    // someone else created the target during our write, fail cleanly
-    // and leave the unique temp.  No partial real file is ever visible.
+    // the bytes.  Step 3: MoveFileEx -- create-new with no
+    // REPLACE_EXISTING (fail if the target appeared during staging);
+    // overwrite_file with REPLACE_EXISTING (atomically swap the file).
+    // No partial real file is ever visible.
     std::wstring wFinal = path_safety::Utf8ToWide(resolved);
     if (wFinal.empty()) {
         r.chips.push_back("failed");
@@ -290,14 +315,30 @@ WriteResult WriteNewFile(const std::string& argsBlob,
         return r;
     }
 
-    // Atomic rename.  Without MOVEFILE_REPLACE_EXISTING, MoveFileExW
-    // refuses if the destination popped into existence during our
-    // write -- closing the TOCTOU window between the pre-check above
-    // and this rename.
+    if (HasPythonExtension(resolved)) {
+        tool_python_syntax::SyntaxCheckResult syntax =
+            tool_python_syntax::CheckFile(tmpPath);
+        if (!syntax.ok) {
+            ::DeleteFileW(wTmp.c_str());
+            r.chips.push_back("failed");
+            r.chips.push_back("syntax error");
+            r.errorBody = "Python syntax check failed; the file was not " +
+                          std::string(overwriteExisting ? "overwritten" : "created") +
+                          ".\n\n" + syntax.message;
+            r.chips.push_back(ElapsedChip(t0));
+            return r;
+        }
+    }
+
+    // Atomic rename. write refuses if the destination appeared during
+    // staging; overwrite_file atomically replaces an existing regular file.
+    DWORD moveFlags = MOVEFILE_WRITE_THROUGH;
+    if (overwriteExisting) moveFlags |= MOVEFILE_REPLACE_EXISTING;
+
     BOOL movedOK = ::MoveFileExW(
         wTmp.c_str(),
         wFinal.c_str(),
-        MOVEFILE_WRITE_THROUGH);
+        moveFlags);
 
     if (!movedOK) {
         DWORD err = ::GetLastError();
@@ -329,16 +370,30 @@ WriteResult WriteNewFile(const std::string& argsBlob,
     r.sizeBytes   = bytes;
     r.lineCount   = static_cast<int>(lines);
 
-    r.chips.push_back("created");
+    r.chips.push_back(overwriteExisting ? "overwritten" : "created");
     if (bytes == 0) {
         r.chips.push_back("empty");
     } else {
         r.chips.push_back(HumanBytes(bytes));
         r.chips.push_back(std::to_string(lines) + " lines");
     }
-    r.body = "Wrote " + (bytes == 0 ? std::string("empty file")
-                                    : HumanBytes(bytes)) +
+    r.body = std::string(overwriteExisting ? "Overwrote " : "Wrote ") +
+             (bytes == 0 ? std::string("empty file") : HumanBytes(bytes)) +
              " to " + resolved + "\n";
     r.chips.push_back(ElapsedChip(t0));
     return r;
+}
+
+} // anonymous namespace
+
+WriteResult WriteNewFile(const std::string& argsBlob,
+                         const ToolContext& ctx)
+{
+    return WriteFileContent(argsBlob, ctx, false);
+}
+
+WriteResult OverwriteFileContent(const std::string& argsBlob,
+                                 const ToolContext& ctx)
+{
+    return WriteFileContent(argsBlob, ctx, true);
 }

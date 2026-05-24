@@ -32,6 +32,20 @@ MarkdownRenderer::MarkdownRenderer(wxRichTextCtrl* ctrl)
 
 void MarkdownRenderer::Reset()
 {
+    // If a stream ended mid-code-block (cancel, error, or the model
+    // simply stopped without emitting a closing fence), finalize so the
+    // slot referenced by any Copy link recorded at fence-open time
+    // exists in m_codeBlocks.  Without this, the next message's first
+    // code block would land at the orphaned index and the dangling
+    // Copy link would copy *its* content — same chat, different turn.
+    //
+    // We don't draw the bottom border here.  Reset doesn't own the
+    // wxRichTextCtrl write position; the prior turn may still have a
+    // partial-line preview lingering on screen.  Drawing styled text
+    // in that state can land in the wrong place.  Visually leaving the
+    // abandoned block "open" is honest: the model didn't close it.
+    FinalizeOpenCodeBlock(/*drawBottomBorder=*/false);
+
     m_lineBuffer.clear();
     m_inCodeBlock = false;
     m_codeBlockLang.clear();
@@ -62,6 +76,49 @@ int MarkdownRenderer::HitTestCopyLink(long pos) const
             return static_cast<int>(link.blockIndex);
     }
     return -1;
+}
+
+bool MarkdownRenderer::MarkCopyLinkCopied(size_t blockIndex)
+{
+    if (!m_ctrl) return false;
+
+    auto it = std::find_if(m_copyLinks.begin(), m_copyLinks.end(),
+        [blockIndex](const CopyLink& link) { return link.blockIndex == blockIndex; });
+    if (it == m_copyLinks.end()) return false;
+
+    // The header renders "Copy  " as a six-cell affordance.  Replacing that
+    // exact six-character range with "Copied" keeps every later tracked
+    // range stable (copy links, file chips, and tool-block affordances).
+    wxRichTextAttr attr;
+    attr.SetTextColour(m_codeLabelColor);
+    attr.SetFontWeight(wxFONTWEIGHT_NORMAL);
+    attr.SetFontStyle(wxFONTSTYLE_NORMAL);
+    attr.SetFontFaceName("Cascadia Code");
+
+    wxFont currentFont = m_ctrl->GetFont();
+    int baseSize = currentFont.GetPointSize();
+    if (baseSize <= 0) baseSize = 14;
+    attr.SetFontSize(baseSize);
+
+    const long oldInsertionPoint = m_ctrl->GetInsertionPoint();
+
+    m_ctrl->Freeze();
+    m_ctrl->SetInsertionPoint(it->startPos);
+    m_ctrl->Remove(it->startPos, it->endPos);
+    m_ctrl->BeginStyle(attr);
+    m_ctrl->WriteText("Copied");
+    m_ctrl->EndStyle();
+
+    const long lastPos = m_ctrl->GetLastPosition();
+    if (oldInsertionPoint >= 0 && oldInsertionPoint <= lastPos) {
+        m_ctrl->SetInsertionPoint(oldInsertionPoint);
+    }
+    else {
+        m_ctrl->SetInsertionPointEnd();
+    }
+    m_ctrl->Thaw();
+
+    return true;
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -107,7 +164,11 @@ void MarkdownRenderer::ProcessDelta(const std::string& delta, const wxColour& ba
 
 void MarkdownRenderer::Flush(const wxColour& baseColor)
 {
-    if (m_lineBuffer.empty()) return;
+    // Nothing to render and no open code block: nothing to do.  Both
+    // checks matter — a clean stream end with empty buffer can still
+    // leave a fence open if the model never emitted ```, and that block
+    // needs finalizing for Copy link integrity.
+    if (m_lineBuffer.empty() && !m_inCodeBlock) return;
 
     m_ctrl->Freeze();
 
@@ -115,9 +176,17 @@ void MarkdownRenderer::Flush(const wxColour& baseColor)
     // permanently with full markdown formatting.
     RemovePartialLine();
 
-    // Render the final buffered remainder as a complete line
-    RenderCompleteLine(m_lineBuffer, baseColor);
-    m_lineBuffer.clear();
+    // Render the final buffered remainder as a complete line, if any.
+    if (!m_lineBuffer.empty()) {
+        RenderCompleteLine(m_lineBuffer, baseColor);
+        m_lineBuffer.clear();
+    }
+
+    // If the model never emitted a closing fence, give the open block
+    // visual closure (bottom border) and finalize state so any Copy link
+    // recorded at fence-open time resolves to the right content rather
+    // than to a future block in a later message.
+    FinalizeOpenCodeBlock(/*drawBottomBorder=*/true);
 
     m_ctrl->Thaw();
     m_ctrl->ShowPosition(m_ctrl->GetLastPosition());
@@ -163,47 +232,19 @@ void MarkdownRenderer::RenderCompleteLine(const std::string& line, const wxColou
     // ── Code fence? ──────────────────────────────────────────────
     if (IsCodeFence(line)) {
         if (m_inCodeBlock) {
-            // Closing fence — finalize the block and draw the bottom border.
+            // Closing fence — delegate to the shared helper.  Same path
+            // used by Flush() and Reset() when a stream ends without an
+            // explicit close.  The helper pushes m_codeBlocks (so any
+            // Copy link recorded at fence-open time resolves to the
+            // right content) and then draws the bottom border.
             //
-            // Copy link was already written into the header row at the opening
-            // fence; the index recorded there expects m_codeBlocks.size() to be
-            // its slot, so we push now with no intervening modifications.
-            //
-            // File chip (saved-to-disk PresentedFile) is intentionally not written
-            // in v1 — the aesthetic spec calls for no footer, filename, or
-            // line count.  The SetFileCallback infrastructure remains intact and
-            // can be re-invoked here in a future step (e.g., a right-click Save
-            // As menu on the block) without re-wiring anything.
-            if (!m_currentCodeContent.empty() && m_currentCodeContent.back() == '\n')
-                m_currentCodeContent.pop_back();
-            m_codeBlocks.push_back(m_currentCodeContent);
-            m_currentCodeContent.clear();
-
-            // Bottom border:  ╰──…──╯
-            // Only drawn when a header was drawn (i.e. a language was present).
-            // For fences without a language, we just emit a newline so the code
-            // body flows back into regular prose without decorative chrome.
-            if (!m_codeBlockLang.empty()) {
-                constexpr int kBoxWidth   = 72;
-                constexpr int kInnerWidth = kBoxWidth - 2;
-
-                std::string hfill;
-                hfill.reserve(kInnerWidth * 3);
-                for (int i = 0; i < kInnerWidth; ++i) hfill += "\xE2\x94\x80";  // ─
-
-                std::string bottomBorder;
-                bottomBorder += "\xE2\x95\xB0";   // ╰  (U+2570)
-                bottomBorder += hfill;
-                bottomBorder += "\xE2\x95\xAF";   // ╯  (U+256F)
-                bottomBorder += "\n";
-                WriteStyled(bottomBorder, m_codeLabelColor, false, false, true);
-            } else {
-                WriteStyled("\n", m_codeLabelColor);
-            }
-
-            m_inCodeBlock = false;
-            m_codeBlockLang.clear();
-            m_codeBlockFilename.clear();
+            // File chip (saved-to-disk PresentedFile) is intentionally
+            // not written in v1 — the aesthetic spec calls for no
+            // footer, filename, or line count.  The SetFileCallback
+            // infrastructure remains intact and can be re-invoked here
+            // in a future step (e.g., a right-click Save As menu on the
+            // block) without re-wiring anything.
+            FinalizeOpenCodeBlock(/*drawBottomBorder=*/true);
         }
         else {
             // Opening fence — parse language + optional filename from the
@@ -263,7 +304,7 @@ void MarkdownRenderer::RenderCompleteLine(const std::string& line, const wxColou
                 // Header row:  │ </> <n>  <padding>  Copy │
                 //
                 // Cell budget:
-                //   "│ " (2) + "</> " (4) + nameCells + padding + copyCells (4) + " │" (2) = kBoxWidth
+                //   "│ " (2) + "</> " (4) + nameCells + padding + copyCells (6) + " │" (2) = kBoxWidth
                 //
                 // Plain "Copy" — no emoji.  Emoji rendering width varies across
                 // fonts (1 cell in some, 2 in others, proportional in emoji fonts),
@@ -271,7 +312,7 @@ void MarkdownRenderer::RenderCompleteLine(const std::string& line, const wxColou
                 // whole problem and the position itself (top-right of a framed
                 // container) already signals clickability.
                 const int prefixCells = 2 + 4;    // "│ " + "</> "
-                const int copyCells   = 4;        // "Copy" (4)
+                const int copyCells   = 6;        // "Copy  " / "Copied" (6)
                 const int suffixCells = 2;        // " │"
                 const int nameCells   = static_cast<int>(displayName.size());
                 int padding = kBoxWidth - prefixCells - nameCells - copyCells - suffixCells;
@@ -292,7 +333,7 @@ void MarkdownRenderer::RenderCompleteLine(const std::string& line, const wxColou
                 // mapping is stable. If the stream is cut off before close, clicks
                 // on this Copy return an empty string (GetCodeBlock is bounds-checked).
                 long linkStart = m_ctrl->GetLastPosition();
-                WriteStyled("Copy",
+                WriteStyled("Copy  ",
                     m_codeLabelColor, false, false, true);
                 long linkEnd = m_ctrl->GetLastPosition();
                 m_copyLinks.push_back({ linkStart, linkEnd, m_codeBlocks.size() });
@@ -365,7 +406,8 @@ void MarkdownRenderer::RenderCompleteLine(const std::string& line, const wxColou
 void MarkdownRenderer::RenderCodeBlockLine(const std::string& line)
 {
     // Preserve the raw code line for the saved block — the left/right walls
-    // below are chrome, not part of the block's copyable payload.
+    // and any visual wrapping below are chrome, not part of the block's
+    // copyable payload.  Copy still returns the original unwrapped code.
     m_currentCodeContent += line + "\n";
 
     // No-language fences render plain, no frame.
@@ -379,31 +421,147 @@ void MarkdownRenderer::RenderCodeBlockLine(const std::string& line)
     //   ^---^-----------^--^
     //   2   contentCells pad  2   cells = kBoxWidth (72)
     //
-    // contentCells is approximated by byte count — exact for ASCII, a little
-    // off for multi-byte characters (e.g. unicode identifiers or comments in
-    // non-ASCII languages).  Acceptable for v1; LLMs overwhelmingly emit ASCII.
+    // Display wrapping is intentionally visual-only.  A long code line is
+    // rendered as several framed rows so it cannot spill outside the box, but
+    // m_currentCodeContent above keeps the exact original line for Copy.
+    //
+    // Column accounting uses UTF-8 codepoint count rather than raw byte
+    // count.  Exact for ASCII, Latin, Cyrillic, Greek, etc.; CJK glyphs
+    // (which are 2 cells wide in monospace) and combining marks (0 cells)
+    // will be off by ~1 cell each — frame may look slightly narrower or
+    // wider than 72 cells visually for CJK content.  Acceptable for v1;
+    // LLMs overwhelmingly emit ASCII in code.  Proper East Asian Width
+    // handling is a future improvement, not a correctness requirement.
     constexpr int kBoxWidth = 72;
     constexpr int kInterior = kBoxWidth - 4;   // minus "│ " + " │"
-    const int contentCells = static_cast<int>(line.size());
-    const int pad = kInterior - contentCells;
 
-    // Left wall always drawn.
-    WriteStyled("\xE2\x94\x82 ", m_codeLabelColor, false, false, true);  // │ + space
+    // Count UTF-8 codepoints in a byte range.  Continuation bytes match
+    // 10xxxxxx; lead bytes (and ASCII) do not.  One non-continuation
+    // byte per codepoint is the invariant of well-formed UTF-8.
+    auto codepointCount = [](const std::string& s) -> int {
+        int n = 0;
+        for (char c : s) {
+            if ((static_cast<unsigned char>(c) & 0xC0) != 0x80) ++n;
+        }
+        return n;
+    };
 
-    // Code content in syntax-highlight color.
-    WriteStyled(line, m_codeColor, false, false, true);
+    auto renderVisualSegment = [this, kInterior, &codepointCount](const std::string& segment) {
+        const int contentCells = codepointCount(segment);
+        int pad = kInterior - contentCells;
+        if (pad < 0) pad = 0;
 
-    // Right wall — only if the line fits the box.  Lines that exceed the
-    // interior skip the right wall entirely (the frame "opens" on that line
-    // and reconnects on the next).  Better than letting the wall drift off
-    // the box's right edge and breaking the bottom-border alignment visually.
-    if (pad >= 1) {
-        std::string rightSide(pad, ' ');
+        // Left wall.
+        WriteStyled("\xE2\x94\x82 ",
+            m_codeLabelColor, false, false, true);  // │ + space
+
+        // Code content in syntax-highlight color.
+        WriteStyled(segment, m_codeColor, false, false, true);
+
+        // Right wall.  pad may be zero when the segment exactly fills the
+        // interior, which is still valid and keeps the frame closed.
+        std::string rightSide(static_cast<size_t>(pad), ' ');
         rightSide += " \xE2\x94\x82\n";   // space + │ + newline
         WriteStyled(rightSide, m_codeLabelColor, false, false, true);
-    } else {
-        WriteStyled("\n", m_codeLabelColor, false, false, true);
+    };
+
+    if (line.empty()) {
+        renderVisualSegment(std::string());
+        return;
     }
+
+    size_t offset = 0;
+    while (offset < line.size()) {
+        const size_t remaining = line.size() - offset;
+        size_t take = std::min(static_cast<size_t>(kInterior), remaining);
+
+        // UTF-8 safety: if `take` lands inside a multi-byte sequence,
+        // walk back to a UTF-8 lead byte so we never split a codepoint
+        // and ship invalid bytes to wxString::FromUTF8.  Continuation
+        // bytes match 10xxxxxx; lead bytes (and ASCII) do not.  Worst
+        // case we walk back 3 bytes, since valid UTF-8 codepoints are
+        // ≤ 4 bytes.
+        while (take > 0 && (offset + take) < line.size() &&
+               (static_cast<unsigned char>(line[offset + take]) & 0xC0) == 0x80) {
+            --take;
+        }
+        if (take == 0) {
+            // Defensive: malformed UTF-8 starting at offset would
+            // otherwise loop forever (we'd walk all the way back to
+            // zero and not advance).  Take the original byte slice;
+            // wxString::FromUTF8 substitutes replacement glyphs but
+            // the loop terminates.  Valid input never hits this path.
+            take = std::min(static_cast<size_t>(kInterior), remaining);
+        }
+
+        renderVisualSegment(line.substr(offset, take));
+        offset += take;
+    }
+}
+
+// Finalize the currently-open code block.  Called from three places:
+//
+//   1. RenderCompleteLine when a closing ``` arrives — drawBottomBorder=true.
+//      Normal happy path; the model behaved.
+//
+//   2. Flush() when a stream ended without a closing fence — drawBottomBorder=true.
+//      The model never closed the block (cancelled, errored, hit the token
+//      ceiling, just stopped).  We give the block visual closure so the
+//      user can see where it ended.
+//
+//   3. Reset() before clearing stream state — drawBottomBorder=false.
+//      Defense against cancel/error paths that didn't go through Flush.
+//      Also handles the rare case where Reset is called between turns
+//      with a still-open block.  We don't draw the border here because
+//      Reset doesn't own the wxRichTextCtrl write position.
+//
+// The Copy link recorded at fence-open time references m_codeBlocks.size()
+// at that moment.  Pushing here — every time the block goes out of scope,
+// not just on the closing fence — keeps the index stable.  Without this,
+// an abandoned block leaves m_codeBlocks one short of its expected size,
+// and the next code block in a later message lands at the orphaned
+// index, silently retargeting the dangling Copy link to its content.
+void MarkdownRenderer::FinalizeOpenCodeBlock(bool drawBottomBorder)
+{
+    if (!m_inCodeBlock) return;
+
+    // Pop trailing newline so the saved block doesn't carry a stray
+    // blank line at the end.  Same convention as the original close path.
+    if (!m_currentCodeContent.empty() && m_currentCodeContent.back() == '\n')
+        m_currentCodeContent.pop_back();
+
+    // Push *unconditionally* — index integrity is the whole point.
+    m_codeBlocks.push_back(m_currentCodeContent);
+    m_currentCodeContent.clear();
+
+    if (drawBottomBorder) {
+        // Bottom border:  ╰──…──╯
+        // Only drawn when a header was drawn (i.e. a language was
+        // present).  For fences without a language, we just emit a
+        // newline so the code body flows back into regular prose
+        // without decorative chrome.
+        if (!m_codeBlockLang.empty()) {
+            constexpr int kBoxWidth   = 72;
+            constexpr int kInnerWidth = kBoxWidth - 2;
+
+            std::string hfill;
+            hfill.reserve(kInnerWidth * 3);
+            for (int i = 0; i < kInnerWidth; ++i) hfill += "\xE2\x94\x80";  // ─
+
+            std::string bottomBorder;
+            bottomBorder += "\xE2\x95\xB0";   // ╰  (U+2570)
+            bottomBorder += hfill;
+            bottomBorder += "\xE2\x95\xAF";   // ╯  (U+256F)
+            bottomBorder += "\n";
+            WriteStyled(bottomBorder, m_codeLabelColor, false, false, true);
+        } else {
+            WriteStyled("\n", m_codeLabelColor);
+        }
+    }
+
+    m_inCodeBlock = false;
+    m_codeBlockLang.clear();
+    m_codeBlockFilename.clear();
 }
 
 void MarkdownRenderer::RenderHeading(const std::string& text, int level,

@@ -21,7 +21,9 @@
 #include <chrono>
 #include <set>
 #include <cctype>
+#include <cstdlib>
 #include <initializer_list>
+#include "ui_event_post.h"
 
 // ── Event definitions ────────────────────────────────────────────
 wxDEFINE_EVENT(wxEVT_SERVER_READY, wxCommandEvent);
@@ -107,6 +109,15 @@ static bool LooksLikeJinjaOrTemplateFailure(const std::string& error)
 
     return false;
 }
+
+static bool SameServerConfig(const ServerConfig& a, const ServerConfig& b)
+{
+    return a.port == b.port &&
+           a.gpuLayers == b.gpuLayers &&
+           a.ctxSize == b.ctxSize &&
+           a.threads == b.threads &&
+           a.flashAttn == b.flashAttn;
+}
 // ═══════════════════════════════════════════════════════════════════
 
 ServerHealthThread::ServerHealthThread(wxEvtHandler* handler,
@@ -149,13 +160,7 @@ bool ServerHealthThread::SafePost(wxCommandEvent* ev)
         delete ev;
         return false;
     }
-    auto alive = m_aliveToken.lock();
-    if (!alive || !alive->load()) {
-        delete ev;
-        return false;
-    }
-    wxQueueEvent(m_handler, ev);
-    return true;
+    return LbQueueEventIfAlive(m_handler, m_aliveToken, ev);
 }
 
 wxThread::ExitCode ServerHealthThread::Entry()
@@ -568,6 +573,78 @@ static bool IsMmprojFilename(const wxString& filename)
     return filename.Lower().Contains("mmproj");
 }
 
+// ── Internal: collect bundle-local mmproj candidates ──────────────
+// wxDir enumeration order is not a stable user-facing choice. Keep the
+// collection sorted so diagnostics are repeatable, but do not use sorting
+// to silently choose among multiple projector files in a bundle.
+static std::vector<wxString> CollectBundleMmprojs(const wxString& bundleDir)
+{
+    std::vector<wxString> projs;
+
+    wxDir dir(bundleDir);
+    if (!dir.IsOpened()) return projs;
+
+    wxString filename;
+    bool found = dir.GetFirst(&filename, "*mmproj*.gguf", wxDIR_FILES);
+    while (found) {
+        projs.push_back(filename);
+        found = dir.GetNext(&filename);
+    }
+
+    std::sort(projs.begin(), projs.end(),
+        [](const wxString& a, const wxString& b) {
+            return a.CmpNoCase(b) < 0;
+        });
+
+    return projs;
+}
+
+static std::string JoinBundleFileUtf8(const wxString& bundleDir,
+                                      const wxString& filename)
+{
+    return (bundleDir + wxFILE_SEP_PATH + filename).ToUTF8().data();
+}
+
+// Resolve a projector for a bundle only when there is exactly one.
+// Multiple projectors are safer to skip than to pair incorrectly.
+static std::string ResolveBundleMmproj(const wxString& bundleDir,
+                                       Poco::Logger* logger = nullptr)
+{
+    std::vector<wxString> projs = CollectBundleMmprojs(bundleDir);
+    const std::string bundlePath = bundleDir.ToUTF8().data();
+
+    if (projs.empty()) {
+        if (logger) {
+            logger->information(
+                "mmproj: no projector in bundle \"" + bundlePath +
+                "\" — launching text-only");
+        }
+        return "";
+    }
+
+    if (projs.size() == 1) {
+        std::string result = JoinBundleFileUtf8(bundleDir, projs[0]);
+        if (logger)
+            logger->information("mmproj: bundled pair \"" + result + "\"");
+        return result;
+    }
+
+    if (logger) {
+        logger->warning(
+            "mmproj: multiple projector files found in bundle \"" +
+            bundlePath +
+            "\"; skipping projector pairing until only one remains");
+
+        for (const wxString& proj : projs) {
+            logger->warning(
+                "mmproj:   candidate \"" +
+                JoinBundleFileUtf8(bundleDir, proj) + "\"");
+        }
+    }
+
+    return "";
+}
+
 // ── Internal: scan a single bundle subfolder ─────────────────────
 // Returns a ModelEntry if the folder contains exactly one non-mmproj
 // .gguf. Returns an empty entry (ggufPath empty) otherwise — skip it.
@@ -581,14 +658,11 @@ static ServerManager::ModelEntry ScanBundle(const wxString& bundleDir,
     if (!dir.IsOpened()) return entry;
 
     std::vector<wxString> weights;   // non-mmproj .gguf files
-    std::vector<wxString> projs;     // mmproj .gguf files
 
     wxString filename;
     bool found = dir.GetFirst(&filename, "*.gguf", wxDIR_FILES);
     while (found) {
-        if (IsMmprojFilename(filename))
-            projs.push_back(filename);
-        else
+        if (!IsMmprojFilename(filename))
             weights.push_back(filename);
         found = dir.GetNext(&filename);
     }
@@ -602,12 +676,11 @@ static ServerManager::ModelEntry ScanBundle(const wxString& bundleDir,
     entry.bundleDir   = bundleDir.ToUTF8().data();
     entry.isBundle    = true;
 
-    // Pair the first mmproj found. Bundles should only have one by
-    // convention; if someone dropped multiple in, first-wins is
-    // deterministic and the user can resolve by removing extras.
-    if (!projs.empty()) {
-        entry.mmprojPath = (bundleDir + wxFILE_SEP_PATH + projs[0]).ToUTF8().data();
-    }
+    // Pair only when the bundle has exactly one projector. If multiple
+    // mmproj files exist, leave the model usable as text-only rather than
+    // silently attaching the wrong vision projector. StartServer() repeats
+    // this check with logging because current callers pass only ggufPath.
+    entry.mmprojPath = ResolveBundleMmproj(bundleDir);
 
     return entry;
 }
@@ -885,20 +958,27 @@ std::string ServerManager::FindMatchingMmproj(const std::string& modelGgufPath,
 bool ServerManager::StartServer(const std::string& ggufPath, const ServerConfig& config)
 {
 #ifdef __WXMSW__
+    // A no-jinja retry is the one deliberate path where m_jinjaForceOff
+    // should survive into StartServer().  If the user switches models while
+    // a retry is pending/loading, treat that as a fresh launch and restore
+    // the normal "try --jinja first" behavior.
+    const bool retryingWithoutJinja =
+        m_jinjaForceOff &&
+        m_jinjaRetryAttempted &&
+        ggufPath == m_lastGgufPath &&
+        SameServerConfig(config, m_lastConfig);
+
+    if (!retryingWithoutJinja) {
+        ResetJinjaRetryState();
+    }
+
     // Stop any existing server first
     StopServer();
 
     // Cache the launch args so MaybeRetryWithoutJinja() can re-invoke
-    // us with the same (model, config) minus the --jinja flag.  When
-    // m_jinjaForceOff is already true we're being called BY that
-    // retry path; preserve the flag.  Otherwise this is a fresh load
-    // attempt — clear any leftover retry state from a previous model
-    // so the new model also tries jinja first.
+    // us with the same (model, config) minus the --jinja flag.
     m_lastGgufPath = ggufPath;
     m_lastConfig   = config;
-    if (!m_jinjaForceOff) {
-        m_jinjaRetryAttempted = false;
-    }
 
     // Capture the launch mode before any later retry-state cleanup.
     // This is the truth for the server process we are about to start.
@@ -933,7 +1013,7 @@ bool ServerManager::StartServer(const std::string& ggufPath, const ServerConfig&
                       "Place them in a 'bin\\cpu\\' or 'bin\\cuda12\\' folder "
                       "next to LlamaBoss.exe.\n\n"
                       "Models go in:\n" + GetModelsDir());
-        wxQueueEvent(m_eventHandler, ev);
+        LbQueueEventIfAlive(m_eventHandler, m_aliveToken, ev);
         return false;
     }
 
@@ -944,7 +1024,7 @@ bool ServerManager::StartServer(const std::string& ggufPath, const ServerConfig&
 
         auto* ev = new wxCommandEvent(wxEVT_SERVER_ERROR);
         ev->SetString("Model file not found:\n" + ggufPath);
-        wxQueueEvent(m_eventHandler, ev);
+        LbQueueEventIfAlive(m_eventHandler, m_aliveToken, ev);
         return false;
     }
 
@@ -985,6 +1065,8 @@ bool ServerManager::StartServer(const std::string& ggufPath, const ServerConfig&
     if (config.threads > 0)
         cmd << " -t " << config.threads;
 
+    std::string launchMmproj;
+
     // ── Auto-detect multimodal projector (mmproj) ────────────────
     // Bundle mode (casual): the model's own folder either contains
     // an mmproj or it doesn't. Zero ambiguity — no scoring needed.
@@ -1010,28 +1092,10 @@ bool ServerManager::StartServer(const std::string& ggufPath, const ServerConfig&
                          (wxFileName(modelFolder).GetPath() == modelsRoot);
 
         if (isBundled) {
-            // Look for *mmproj*.gguf in the same folder as the model.
-            // If exactly one exists, pair it. If none, model is
-            // text-only (or the user hasn't downloaded the projector).
-            wxDir bundleDir(modelFolder);
-            if (bundleDir.IsOpened()) {
-                wxString filename;
-                bool found = bundleDir.GetFirst(&filename, "*mmproj*.gguf",
-                                                wxDIR_FILES);
-                if (found) {
-                    mmproj = (modelFolder + wxFILE_SEP_PATH + filename)
-                                .ToUTF8().data();
-                    if (m_logger)
-                        m_logger->information(
-                            "mmproj: bundled pair \"" + mmproj + "\"");
-                }
-                else if (m_logger) {
-                    m_logger->information(
-                        "mmproj: no projector in bundle \"" +
-                        std::string(modelFolder.ToUTF8().data()) +
-                        "\" — launching text-only");
-                }
-            }
+            // Bundle layout is intentionally strict: exactly one projector
+            // in the model folder pairs automatically; zero launches
+            // text-only; more than one is ambiguous and skipped.
+            mmproj = ResolveBundleMmproj(modelFolder, m_logger);
         }
         else {
             // Flat layout — use filename scoring (power-mode fallback).
@@ -1041,10 +1105,11 @@ bool ServerManager::StartServer(const std::string& ggufPath, const ServerConfig&
         if (!mmproj.empty())
             cmd << " --mmproj \"" << mmproj << "\"";
 
-        // Cache for Phase 3b's tool-protocol detection: the cache key
-        // hashes (model, mmproj) so a newly-paired projector triggers
-        // a fresh probe even if the model itself is unchanged.
-        m_loadedMmproj = mmproj;
+        // Cache after successful process launch below.  Keeping this local
+        // prevents a failed CreateProcess/ResumeThread attempt from leaving
+        // GetLoadedMmproj() pointing at a projector for a server that is not
+        // actually running.
+        launchMmproj = mmproj;
     }
 
     std::string cmdLine = cmd.str();
@@ -1126,7 +1191,7 @@ bool ServerManager::StartServer(const std::string& ggufPath, const ServerConfig&
         cmdBuf.data(),      // lpCommandLine
         NULL, NULL,         // process/thread security
         TRUE,               // bInheritHandles (for log file)
-        CREATE_NO_WINDOW,   // dwCreationFlags
+        CREATE_NO_WINDOW | CREATE_SUSPENDED, // assign to job before CUDA/model load
         NULL,               // lpEnvironment
         wWorkDir.c_str(),   // lpCurrentDirectory
         &si,
@@ -1145,30 +1210,115 @@ bool ServerManager::StartServer(const std::string& ggufPath, const ServerConfig&
         auto* ev = new wxCommandEvent(wxEVT_SERVER_ERROR);
         ev->SetString("Failed to start llama-server (Windows error " +
                       std::to_string(err) + ")");
-        wxQueueEvent(m_eventHandler, ev);
+        LbQueueEventIfAlive(m_eventHandler, m_aliveToken, ev);
+        return false;
+    }
+
+    // Put llama-server in a Windows Job Object with KILL_ON_JOB_CLOSE.
+    // This gives us a hard safety net: if LlamaBoss closes unexpectedly,
+    // the job handle closes and Windows tears down the server process tree,
+    // releasing the loaded model and CUDA VRAM instead of leaving an orphan.
+    HANDLE jobHandle = CreateJobObjectW(NULL, NULL);
+    if (jobHandle) {
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION jobInfo = {};
+        jobInfo.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+
+        if (!SetInformationJobObject(jobHandle,
+                                     JobObjectExtendedLimitInformation,
+                                     &jobInfo,
+                                     sizeof(jobInfo))) {
+            DWORD err = GetLastError();
+            if (m_logger)
+                m_logger->warning("SetInformationJobObject failed, error=" +
+                                  std::to_string(err));
+            CloseHandle(jobHandle);
+            jobHandle = NULL;
+        }
+        else if (!AssignProcessToJobObject(jobHandle, pi.hProcess)) {
+            DWORD err = GetLastError();
+            if (m_logger)
+                m_logger->warning("AssignProcessToJobObject failed, error=" +
+                                  std::to_string(err) +
+                                  "; normal StopServer fallback will be used");
+            CloseHandle(jobHandle);
+            jobHandle = NULL;
+        }
+    }
+    else if (m_logger) {
+        DWORD err = GetLastError();
+        m_logger->warning("CreateJobObject failed, error=" + std::to_string(err));
+    }
+
+    if (ResumeThread(pi.hThread) == (DWORD)-1) {
+        DWORD err = GetLastError();
+        if (m_logger)
+            m_logger->error("ResumeThread failed after starting llama-server, error=" +
+                            std::to_string(err));
+
+        TerminateProcess(pi.hProcess, 1);
+        if (jobHandle)
+            CloseHandle(jobHandle);
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+
+        auto* ev = new wxCommandEvent(wxEVT_SERVER_ERROR);
+        ev->SetString("Failed to resume llama-server (Windows error " +
+                      std::to_string(err) + ")");
+        LbQueueEventIfAlive(m_eventHandler, m_aliveToken, ev);
         return false;
     }
 
     m_processHandle       = pi.hProcess;
     m_threadHandle        = pi.hThread;
+    m_jobHandle           = jobHandle;
     m_processId           = pi.dwProcessId;
     m_loadedModel         = ggufPath;
+    m_loadedMmproj        = launchMmproj;
     m_currentJinjaEnabled = launchJinjaEnabled;
 
     if (m_logger)
         m_logger->information("llama-server started, PID=" +
                               std::to_string(m_processId));
 
-    // Start health-check thread (polls /health until 200 or timeout)
+    // Start health-check thread (polls /health until 200 or timeout).
+    // wxThread requires Create() before Run(); if either step fails, do not
+    // leave llama-server running with the UI stuck at "Loading..." and no
+    // wxEVT_SERVER_READY / wxEVT_SERVER_ERROR path back to the frame.
     m_healthCancelFlag = std::make_shared<std::atomic<bool>>(false);
     auto* healthThread = new ServerHealthThread(
         m_eventHandler, GetBaseUrl(), m_healthCancelFlag, m_aliveToken,
         m_processHandle, logPath, 120000); // 2min timeout
 
-    if (healthThread->Run() != wxTHREAD_NO_ERROR) {
-        delete healthThread;
+    auto failHealthMonitorStart = [&](const std::string& detail) -> bool {
         if (m_logger)
-            m_logger->error("Failed to start health-check thread");
+            m_logger->error("Failed to start health-check thread: " + detail);
+
+        // The server process is alive, but without the readiness monitor the
+        // UI cannot reliably leave the loading state. Tear it down and surface
+        // the real failure instead of silently returning success.
+        StopServer();
+
+        auto* ev = new wxCommandEvent(wxEVT_SERVER_ERROR);
+        ev->SetString("Failed to start llama-server readiness monitor.\n\n"
+                      "The server was stopped so LlamaBoss does not stay "
+                      "stuck loading.\n\n"
+                      "Details: " + detail);
+        LbQueueEventIfAlive(m_eventHandler, m_aliveToken, ev);
+        return false;
+    };
+
+    wxThreadError createErr = healthThread->Create();
+    if (createErr != wxTHREAD_NO_ERROR) {
+        delete healthThread;
+        return failHealthMonitorStart("wxThread::Create failed with code " +
+                                      std::to_string(static_cast<int>(createErr)));
+    }
+
+    wxThreadError runErr = healthThread->Run();
+    if (runErr != wxTHREAD_NO_ERROR) {
+        delete healthThread;
+        return failHealthMonitorStart("wxThread::Run failed with code " +
+                                      std::to_string(static_cast<int>(runErr)));
     }
 
     return true;
@@ -1318,20 +1468,64 @@ bool ServerManager::IsProcessRunning() const
 void ServerManager::KillProcess()
 {
 #ifdef __WXMSW__
+    const DWORD pid = m_processId;
+
     if (m_processHandle != INVALID_HANDLE_VALUE) {
         if (m_logger)
             m_logger->information("Stopping llama-server PID=" +
-                                  std::to_string(m_processId));
+                                  std::to_string(pid));
 
-        TerminateProcess(m_processHandle, 0);
-        WaitForSingleObject(m_processHandle, 5000); // Wait up to 5s
+        // If the process is in our job, closing the job handle kills the
+        // whole process tree. This is stronger than TerminateProcess alone
+        // and protects against orphaned helper children.
+        const bool hadJob = (m_jobHandle != NULL);
+        if (hadJob) {
+            CloseHandle(m_jobHandle);
+            m_jobHandle = NULL;
+        }
+        else {
+            if (!TerminateProcess(m_processHandle, 0)) {
+                DWORD err = GetLastError();
+                if (m_logger)
+                    m_logger->warning("TerminateProcess failed for llama-server PID=" +
+                                      std::to_string(pid) + ", error=" +
+                                      std::to_string(err));
+            }
+        }
+
+        DWORD waitResult = WaitForSingleObject(m_processHandle, 10000);
+        if (waitResult == WAIT_TIMEOUT && pid != 0) {
+            if (m_logger)
+                m_logger->warning("llama-server PID=" + std::to_string(pid) +
+                                  " did not exit after 10s; trying taskkill /T /F");
+
+            // PID is numeric and comes from CreateProcess, so this command line
+            // is not user-controlled. It is only a last-resort cleanup fallback.
+            std::string cmd = "taskkill /PID " + std::to_string(pid) +
+                              " /T /F >NUL 2>NUL";
+            std::system(cmd.c_str());
+            waitResult = WaitForSingleObject(m_processHandle, 5000);
+
+            if (waitResult == WAIT_TIMEOUT && m_logger) {
+                m_logger->error("llama-server PID=" + std::to_string(pid) +
+                                " still appears to be running after taskkill");
+            }
+        }
+
         CloseHandle(m_processHandle);
         m_processHandle = INVALID_HANDLE_VALUE;
     }
+
     if (m_threadHandle != INVALID_HANDLE_VALUE) {
         CloseHandle(m_threadHandle);
         m_threadHandle = INVALID_HANDLE_VALUE;
     }
+
+    if (m_jobHandle != NULL) {
+        CloseHandle(m_jobHandle);
+        m_jobHandle = NULL;
+    }
+
     m_processId = 0;
 #endif
 }

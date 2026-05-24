@@ -26,6 +26,7 @@
 #include <Poco/Exception.h>
 
 #include <sstream>
+#include "ui_event_post.h"
 
 // Define custom events
 wxDEFINE_EVENT(wxEVT_ASSISTANT_DELTA, wxCommandEvent);
@@ -56,14 +57,8 @@ ChatWorkerThread::ChatWorkerThread(wxEvtHandler* eventHandler,
 
 bool ChatWorkerThread::SafeQueueEvent(wxCommandEvent* event)
 {
-    auto alive = m_aliveToken.lock();
-    if (!alive || !alive->load()) {
-        delete event;
-        return false;
-    }
     event->SetExtraLong(m_generationId);
-    wxQueueEvent(m_eventHandler, event);
-    return true;
+    return LbQueueEventIfAlive(m_eventHandler, m_aliveToken, event);
 }
 
 wxThread::ExitCode ChatWorkerThread::Entry()
@@ -138,6 +133,12 @@ wxThread::ExitCode ChatWorkerThread::Entry()
         // ── Parse SSE stream ─────────────────────────────────────
         // Each event is: "data: <json>\n\n"
         // Final event is: "data: [DONE]\n\n"
+        //
+        // Track whether the server actually ended the stream.  A dropped
+        // socket / crashed llama-server can otherwise look like a clean EOF,
+        // causing LlamaBoss to render a partial assistant answer as complete.
+        bool sawTerminalEvent = false;
+        bool sawAnySseData = false;
         std::string line;
 
         while (std::getline(in, line) && !isCancelled()) {
@@ -158,8 +159,12 @@ wxThread::ExitCode ChatWorkerThread::Entry()
                 data.erase(0, 1);
 
             // End of stream marker
-            if (data == "[DONE]")
+            if (data == "[DONE]") {
+                sawTerminalEvent = true;
                 break;
+            }
+
+            sawAnySseData = true;
 
             try {
                 Poco::JSON::Parser parser;
@@ -273,17 +278,34 @@ wxThread::ExitCode ChatWorkerThread::Entry()
                     }
                 }
 
-                // Check finish_reason for completion
+                // Check finish_reason for completion.  OpenAI-compatible
+                // servers normally send this on the final chunk before [DONE].
+                // Treat any non-empty finish_reason as terminal so uncommon
+                // reasons (for example "content_filter") do not force us to
+                // wait for a marker that some local servers may omit.
                 if (choice->has("finish_reason") && !choice->isNull("finish_reason")) {
                     std::string reason = choice->getValue<std::string>("finish_reason");
-                    if (reason == "stop" || reason == "length" || reason == "tool_calls")
+                    if (!reason.empty()) {
+                        sawTerminalEvent = true;
                         break;
+                    }
                 }
             }
             catch (const Poco::JSON::JSONException&) {
                 // Skip malformed JSON lines
                 continue;
             }
+        }
+
+        if (!isCancelled() && !sawTerminalEvent) {
+            wxCommandEvent* event = new wxCommandEvent(wxEVT_ASSISTANT_ERROR);
+            event->SetString(wxString::FromUTF8(
+                sawAnySseData
+                    ? "Stream ended unexpectedly before llama-server sent a terminal event."
+                    : "Stream ended before llama-server sent any response data."
+            ));
+            SafeQueueEvent(event);
+            return (ExitCode)0;
         }
 
         if (!isCancelled()) {

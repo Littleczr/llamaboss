@@ -68,10 +68,17 @@ struct ToolContext {
     // responsibility — typically a member of MyFrame.
     const ChatHistory* history = nullptr;
 
-    // Optional active project metadata (Projects Phase 1).  Tools do not
-    // write into this folder automatically; it is context for future
-    // project-aware tools and workflows.
+    // Optional active project metadata.  File mutation tools treat
+    // activeProjectRoot as an additional allowed write root when set,
+    // so project chats can create durable Inputs, Outputs, Notes, and
+    // Workflows without changing the conversation cwd.
     std::string activeProjectId;
     std::string activeProjectName;
     std::string activeProjectRoot;
+
+    // Global reusable Skills folder.  Skill contracts and helper scripts
+    // are user-authored LlamaBoss assets, so mutation tools may update
+    // files beneath this root through the normal approval flow instead of
+    // hard-blocking Skill development outside the chat workspace.
+    std::string skillsRoot;
 };

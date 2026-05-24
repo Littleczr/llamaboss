@@ -41,6 +41,7 @@
 #include "tool_dispatcher.h"   // DispatchOutcome, ToolInvocationResult
 #include "tool_invocation.h"   // ToolInvocation, tool_names::*
 #include "tool_context.h"      // ToolContext
+#include "tool_safety.h"       // RiskTier, NetworkReach, Reversibility, ToolSafetyProfile
 
 #include <functional>
 #include <string>
@@ -63,41 +64,10 @@ struct DispatchDeps {
 };
 
 // ─── Tool safety metadata ────────────────────────────────────────
-// Small, internal safety profile used as the single source of truth
-// for model-facing prompt summaries and future approval/audit surfaces.
-// Enforcement still lives in the actual tool implementations and
-// policy layers; this metadata describes the contract the model sees.
-struct ToolSafetyProfile {
-    // True when the tool is intended only to inspect/read state.
-    bool readOnly = false;
-
-    // True when the tool can create, edit, delete, or otherwise mutate
-    // local files/folders or create artifact outputs.  Moderate tools
-    // may run after conversational consent or explicit slash invocation;
-    // only tools with requiresApproval pause for an approval card.
-    bool mutatesFiles = false;
-
-    // True when the UI/agent flow must pause for user approval before
-    // dispatching the tool.
-    bool requiresApproval = false;
-
-    // True when read-only inspection may target absolute local paths
-    // outside the conversation working directory, if the underlying
-    // tool/policy allows the path.
-    bool mayInspectOutsideCwd = false;
-
-    // True when writes/mutations are restricted to the conversation
-    // working directory.
-    bool writesInsideCwdOnly = false;
-
-    // True for broad shell/process tools whose safety is enforced by
-    // a separate policy allowlist.
-    bool policyEnforced = false;
-
-    // Human-readable safety summary.  Keep short: this is used in
-    // prompts and may be appended to native tool descriptions.
-    std::string summary;
-};
+// Lifted out of this header into tool_safety.h so tool_approval.h
+// can read RiskTier without dragging in the full router/dispatcher
+// surface.  See tool_safety.h for the ToolSafetyProfile definition
+// and the RiskTier / NetworkReach / Reversibility enums it carries.
 
 // ─── ToolSpec ────────────────────────────────────────────────────
 // Pure value type.  Everything a tool exposes to the rest of the
@@ -208,6 +178,11 @@ ToolRouter& GetGlobalRouter();
 // protocol is ToolProtocol::Native.  XML-protocol requests do not
 // call this and the resulting body has no "tools" field.
 std::string BuildToolsArrayJson(const ToolRouter& router);
+
+// Cached OpenAI-shape tool catalog for the global router.  The built-in
+// tool registry is static after startup, so native-agent requests should use
+// this instead of reparsing every ToolSpec schema on each turn/iteration.
+const std::string& GetCachedToolsArrayJson();
 
 // Short generated safety summary for the system prompt.  This keeps
 // XML and native prompts from drifting away from ToolSpec metadata.
