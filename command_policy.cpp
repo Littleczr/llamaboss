@@ -626,3 +626,145 @@ PolicyDecision EvaluatePowerShellCommand(const std::string& cmdIn) {
     out.allowed = true;
     return out;
 }
+
+
+// ─── Advisory lint: hazardous-but-legal string constructs ───────
+//
+// See command_policy.h for the contract.  Kept deliberately narrow:
+// two checks with low false-positive rates.  Warnings ride on the
+// tool result so the model can self-correct on the next call; they
+// never influence the allow/approve/reject decision above.
+
+namespace {
+
+// Return true when `command` contains an assignment to $name
+// ("$name =" / "$name=" / "${name} ="), scanning case-insensitively
+// the way PowerShell resolves variables.
+bool HasAssignmentTo(const std::string& command, const std::string& name)
+{
+    auto ciFind = [](const std::string& hay, const std::string& needle,
+                     size_t from) -> size_t {
+        if (needle.empty() || hay.size() < needle.size()) return std::string::npos;
+        for (size_t i = from; i + needle.size() <= hay.size(); ++i) {
+            size_t j = 0;
+            while (j < needle.size() &&
+                   std::tolower((unsigned char)hay[i + j]) ==
+                   std::tolower((unsigned char)needle[j])) {
+                ++j;
+            }
+            if (j == needle.size()) return i;
+        }
+        return std::string::npos;
+    };
+
+    const std::string bare   = "$"  + name;
+    const std::string braced = "${" + name + "}";
+
+    for (const std::string& form : { bare, braced }) {
+        size_t pos = 0;
+        while ((pos = ciFind(command, form, pos)) != std::string::npos) {
+            size_t after = pos + form.size();
+            // Bare form must not be a prefix of a longer identifier.
+            if (form[1] != '{' && after < command.size() &&
+                IsIdentChar(command[after])) {
+                ++pos;
+                continue;
+            }
+            size_t k = after;
+            while (k < command.size() &&
+                   (command[k] == ' ' || command[k] == '\t')) {
+                ++k;
+            }
+            if (k < command.size() && command[k] == '=' &&
+                (k + 1 >= command.size() || command[k + 1] != '=')) {
+                return true;
+            }
+            ++pos;
+        }
+    }
+    return false;
+}
+
+} // namespace
+
+std::vector<std::string> LintPowerShellHazards(const std::string& command)
+{
+    std::vector<std::string> warnings;
+
+    // ── 1. Backtick-escaped double quote anywhere in the command ──
+    // Legal PowerShell, and -EncodedCommand delivers it intact here,
+    // but it is the construct most often mangled when the model
+    // regenerates or relays the text through any other quoting layer,
+    // and it is almost never necessary: single quotes inside a
+    // double-quoted string interpolate-safely without escaping.
+    if (command.find("`\"") != std::string::npos) {
+        warnings.push_back(
+            "backtick-escaped double quote (`\") present. Prefer single "
+            "quotes inside a double-quoted string when interpolation is "
+            "needed, or the -f format operator when it is not; escaped "
+            "double quotes are the construct most often corrupted when "
+            "code is regenerated or relayed.");
+    }
+
+    // ── 2. $Name_With_Underscores inside a double-quoted string ───
+    // In a double-quoted string PowerShell greedily parses the longest
+    // identifier after $, so "$Version_DRAFT" is ONE variable, not
+    // $Version + "_DRAFT".  Flag underscore-bearing variables used in
+    // a double-quoted context when the command never assigns them —
+    // strong signal the author meant ${Shorter}_literal.
+    std::vector<std::string> flagged;
+    bool inSingle = false, inDouble = false;
+    for (size_t i = 0; i < command.size(); ++i) {
+        const char c = command[i];
+        if (inSingle) {
+            if (c == '\'') {
+                if (i + 1 < command.size() && command[i + 1] == '\'') ++i;
+                else inSingle = false;
+            }
+            continue;
+        }
+        if (inDouble) {
+            if (c == '`') { ++i; continue; }          // escape next char
+            if (c == '"') {
+                if (i + 1 < command.size() && command[i + 1] == '"') ++i;
+                else inDouble = false;
+                continue;
+            }
+            if (c == '$' && i + 1 < command.size()) {
+                const char n = command[i + 1];
+                if (n == '{' || n == '(') continue;   // braced / subexpr: fine
+                if (!IsIdentStartChar(n)) continue;
+                size_t j = i + 1;
+                std::string name;
+                while (j < command.size() && IsIdentChar(command[j])) {
+                    name += command[j];
+                    ++j;
+                }
+                i = j - 1;
+                if (name.size() < 2) continue;         // skip $_ and 1-char
+                if (name.find('_') == std::string::npos) continue;
+                bool seen = false;
+                for (const std::string& f : flagged) {
+                    if (EqualsCi(f, name.c_str())) { seen = true; break; }
+                }
+                if (!seen && !HasAssignmentTo(command, name)) {
+                    flagged.push_back(name);
+                }
+            }
+            continue;
+        }
+        if (c == '\'')      inSingle = true;
+        else if (c == '"')  inDouble = true;
+        else if (c == '`')  ++i;                       // escape outside strings
+    }
+    for (const std::string& name : flagged) {
+        warnings.push_back(
+            "\"$" + name + "\" inside a double-quoted string parses as ONE "
+            "variable name (underscores are identifier characters), and no "
+            "assignment to $" + name + " appears in this command. If a "
+            "shorter variable plus literal text was intended, brace it: "
+            "${Var}_suffix.");
+    }
+
+    return warnings;
+}

@@ -39,6 +39,7 @@
 #pragma once
 
 #include <string>
+#include <vector>
 
 struct PolicyDecision {
     // True only for clearly read-only allowlisted commands that may run
@@ -59,3 +60,20 @@ struct PolicyDecision {
 // Classify `command` against the PowerShell auto-run / approval policy.
 // Pure function: no I/O, no global state, safe to call from any thread.
 PolicyDecision EvaluatePowerShellCommand(const std::string& command);
+
+// ─── Advisory lint: hazardous-but-legal string constructs ───────
+//
+// Returns zero or more human/model-readable warnings for constructs
+// that are valid PowerShell but historically caused silent breakage
+// when generated or relayed by a model:
+//
+//   1. Backtick-escaped double quotes (`") — legal, but the most
+//      fragile construct to regenerate through any re-quoting layer.
+//   2. An underscore-bearing variable used inside a double-quoted
+//      string with no assignment to that variable anywhere in the
+//      same command — the classic $Version_DRAFT misparse, where the
+//      author meant ${Version}_DRAFT.
+//
+// Purely advisory: callers surface these alongside output; they never
+// block or gate execution.  Pure function, thread-safe, no I/O.
+std::vector<std::string> LintPowerShellHazards(const std::string& command);
