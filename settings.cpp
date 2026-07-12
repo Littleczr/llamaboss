@@ -9,6 +9,11 @@
 //   • Appearance (theme dropdown, font size slider)
 //   • OK / Cancel footer
 //
+// The section body is a vertical wxScrolledWindow sized to the content
+// and clamped to ~90% of the monitor work area, so adding sections can
+// never silently clip the ones at the bottom again (the Appearance
+// section was invisible for a while for exactly that reason).
+//
 // Model selection scans %LOCALAPPDATA%\LlamaBoss\models\ for .gguf files.
 // No Ollama API dependency.
 //
@@ -22,6 +27,8 @@
 
 #include "settings.h"
 #include "connections_dialog.h"
+#include "endpoints_dialog.h"
+#include "endpoint_store.h"
 #include "model_downloader.h"
 #include "model_manager.h"
 #include "secrets_store.h"
@@ -34,7 +41,9 @@
 #include <wx/filename.h>
 #include <wx/statline.h>
 #include <wx/dirdlg.h>
+#include <wx/display.h>
 
+#include <algorithm>
 #include <sstream>
 #include <iomanip>
 
@@ -76,28 +85,42 @@ wxEND_EVENT_TABLE()
 
 SettingsDialog::SettingsDialog(wxWindow* parent,
                                const std::string& currentModelPath,
+                               const std::string& loadedModelPath,
                                const std::string& currentTheme,
                                int currentCtxSize,
                                int currentFontSize,
                                bool currentAgentDefaultOn,
+                               bool currentContextMeterOn,
+                               bool currentKvCacheQ8,
                                const ThemeData& theme,
-                               SecretsStore* secretsStore)
+                               SecretsStore* secretsStore,
+                               EndpointStore* endpointStore)
     : wxDialog(parent, wxID_ANY, "Settings",
-               wxDefaultPosition, wxSize(600, 840))
+               wxDefaultPosition, wxDefaultSize)
+      // Height is computed at the end of CreateControls() from the actual
+      // content, clamped to the monitor's work area. The old hard-coded
+      // wxSize(600, 840) silently clipped the Appearance section once the
+      // Behavior + Remote Endpoints sections grew the body past 840px.
     , m_selectedModel(currentModelPath)
+    , m_loadedModelPath(loadedModelPath)
     , m_selectedTheme(currentTheme)
     , m_selectedCtxSize(currentCtxSize)
     , m_selectedFontSize(currentFontSize)
     , m_selectedAgentDefault(currentAgentDefaultOn)
+    , m_selectedContextMeter(currentContextMeterOn)
+    , m_selectedKvCacheQ8(currentKvCacheQ8)
     , m_originalModel(currentModelPath)
     , m_originalTheme(currentTheme)
     , m_originalCtxSize(currentCtxSize)
     , m_originalFontSize(currentFontSize)
     , m_originalAgentDefault(currentAgentDefaultOn)
+    , m_originalContextMeter(currentContextMeterOn)
+    , m_originalKvCacheQ8(currentKvCacheQ8)
     , m_originalFolderOverride(ServerManager::GetModelsDirOverride())
     , m_theme(&theme)
 {
     m_secretsStore = secretsStore;
+    m_endpointStore = endpointStore;
 
     wxFont f = GetFont();
     f.SetPointSize(11);
@@ -108,6 +131,7 @@ SettingsDialog::SettingsDialog(wxWindow* parent,
     PopulateModelList();
     UpdateFolderUi();
     UpdateConnectionsLabel();
+    UpdateEndpointsLabel();
     ApplyTheme();
 
     // Match the title bar to the body when dark theme is active.
@@ -202,7 +226,16 @@ void SettingsDialog::CreateControls()
 
     // Content lives inside a padded body panel so we can give the dialog
     // consistent 18px margins without every child having to specify them.
-    auto* body = new wxPanel(this, wxID_ANY);
+    //
+    // The body is a wxScrolledWindow (vertical only) rather than a plain
+    // wxPanel: on short displays — or whenever a future section makes the
+    // content taller than the screen — the body scrolls instead of
+    // silently clipping the sections at the bottom. On displays tall
+    // enough to fit everything, the scrollbar never appears and the
+    // dialog behaves exactly as before.
+    auto* body = new wxScrolledWindow(this, wxID_ANY,
+        wxDefaultPosition, wxDefaultSize, wxVSCROLL | wxBORDER_NONE);
+    body->SetScrollRate(0, 12);
     auto* bodySizer = new wxBoxSizer(wxVERTICAL);
 
     // ─────────────────────────────────────────────────────────────
@@ -248,6 +281,13 @@ void SettingsDialog::CreateControls()
     m_locationPath = new wxStaticText(body, wxID_ANY, "",
         wxDefaultPosition, wxDefaultSize, wxST_ELLIPSIZE_MIDDLE);
     { wxFont pf = m_locationPath->GetFont(); pf.SetPointSize(10); m_locationPath->SetFont(pf); }
+    // Critical for long Windows paths: wxST_ELLIPSIZE_MIDDLE only
+    // affects painting, not the label's best/min size. If we let the
+    // full path report its natural width, the scrolled-window virtual
+    // width grows and right-edge controls (Change/Manage) get clipped
+    // instead of the path shrinking. Give the path a small floor and
+    // let the row allocate whatever remaining width is available.
+    m_locationPath->SetMinSize(wxSize(120, -1));
     locRow->Add(m_locationPath, 1, wxALIGN_CENTER_VERTICAL | wxRIGHT, 8);
 
     m_changeBtn = MakeAccentButton(body, wxID_ANY, "Change", 26);
@@ -263,6 +303,10 @@ void SettingsDialog::CreateControls()
     m_defaultPathRow = new wxStaticText(body, wxID_ANY, "",
         wxDefaultPosition, wxDefaultSize, wxST_ELLIPSIZE_MIDDLE);
     { wxFont df = m_defaultPathRow->GetFont(); df.SetPointSize(10); m_defaultPathRow->SetFont(df); }
+    // Same shrinkability issue as the active Location path above.
+    // This row is usually hidden, but custom model-folder users may
+    // show a long default path; never let it widen the scroll body.
+    m_defaultPathRow->SetMinSize(wxSize(120, -1));
     bodySizer->Add(m_defaultPathRow, 0, wxEXPAND | wxBOTTOM, 6);
 
     // Status line (muted)
@@ -307,6 +351,23 @@ void SettingsDialog::CreateControls()
         });
     bodySizer->Add(m_ctxSlider, 0, wxEXPAND | wxBOTTOM, 14);
 
+    // 8-bit KV cache lives in the Context section, not Behavior:
+    // it is a context-capacity control (same -c launch-argument
+    // family as the slider above) and reads naturally next to it.
+    m_kvCacheQ8CheckBox = new wxCheckBox(
+        body, wxID_ANY, "8-bit KV cache (recommended)");
+    { wxFont kvf = m_kvCacheQ8CheckBox->GetFont();
+      kvf.SetPointSize(11);
+      m_kvCacheQ8CheckBox->SetFont(kvf); }
+    m_kvCacheQ8CheckBox->SetValue(m_selectedKvCacheQ8);
+    bodySizer->Add(m_kvCacheQ8CheckBox, 0, wxBOTTOM, 4);
+
+    auto* kvHint = new wxStaticText(body, wxID_ANY,
+        "Halves context memory use, so about twice the context fits in "
+        "VRAM. Changing this reloads the model.");
+    { wxFont kh = kvHint->GetFont(); kh.SetPointSize(10); kvHint->SetFont(kh); }
+    bodySizer->Add(kvHint, 0, wxBOTTOM, 14);
+
     // ─────────────────────────────────────────────────────────────
     //  SECTION 3 — BEHAVIOR
     // ─────────────────────────────────────────────────────────────
@@ -329,6 +390,19 @@ void SettingsDialog::CreateControls()
     { wxFont ah = agentHint->GetFont(); ah.SetPointSize(10); agentHint->SetFont(ah); }
     bodySizer->Add(agentHint, 0, wxBOTTOM, 14);
 
+    m_contextMeterCheckBox = new wxCheckBox(
+        body, wxID_ANY, "Show context meter in the top bar");
+    { wxFont cmf = m_contextMeterCheckBox->GetFont();
+      cmf.SetPointSize(11);
+      m_contextMeterCheckBox->SetFont(cmf); }
+    m_contextMeterCheckBox->SetValue(m_selectedContextMeter);
+    bodySizer->Add(m_contextMeterCheckBox, 0, wxBOTTOM, 4);
+
+    auto* meterHint = new wxStaticText(body, wxID_ANY,
+        "Shows how full the model's context window is (tokens used / total).");
+    { wxFont mh = meterHint->GetFont(); mh.SetPointSize(10); meterHint->SetFont(mh); }
+    bodySizer->Add(meterHint, 0, wxBOTTOM, 14);
+
     // ─────────────────────────────────────────────────────────────
     //  SECTION 3b — CONNECTIONS
     // ─────────────────────────────────────────────────────────────
@@ -344,6 +418,9 @@ void SettingsDialog::CreateControls()
         "No connections configured");
     { wxFont cf = m_connectionsLabel->GetFont(); cf.SetPointSize(11);
       m_connectionsLabel->SetFont(cf); }
+    // Keep the right-side Manage button visible even if this text grows
+    // in a future build (or localization makes it longer).
+    m_connectionsLabel->SetMinSize(wxSize(120, -1));
     connRow->Add(m_connectionsLabel, 1, wxALIGN_CENTER_VERTICAL);
 
     m_manageConnBtn = MakeAccentButton(body, wxID_ANY, "Manage", 26);
@@ -356,6 +433,38 @@ void SettingsDialog::CreateControls()
         "Skill scripts read these via os.environ (e.g. GMAIL_API_KEY).");
     { wxFont ch = connHint->GetFont(); ch.SetPointSize(10); connHint->SetFont(ch); }
     bodySizer->Add(connHint, 0, wxBOTTOM, 14);
+
+    // ─────────────────────────────────────────────────────────────
+    //  SECTION 3b — REMOTE ENDPOINTS
+    // ─────────────────────────────────────────────────────────────
+    //  Remote OpenAI-compatible inference endpoints (OpenRouter, OpenAI,
+    //  etc.). Each endpoint's models appear in the model picker; the API
+    //  key is resolved from a Connections entry by provider/key name.
+    //  Stored as JSON at %LOCALAPPDATA%\LlamaBoss\endpoints.json.
+    bodySizer->Add(MakeSectionDivider(body), 0, wxEXPAND | wxBOTTOM, 14);
+    bodySizer->Add(MakeSectionHeader(body, "Remote Endpoints"), 0, wxBOTTOM, 8);
+
+    auto* epRow = new wxBoxSizer(wxHORIZONTAL);
+    m_endpointsLabel = new wxStaticText(body, wxID_ANY,
+        "No remote endpoints configured");
+    { wxFont ef = m_endpointsLabel->GetFont(); ef.SetPointSize(11);
+      m_endpointsLabel->SetFont(ef); }
+    // Same shrinkability guard as Connections.
+    m_endpointsLabel->SetMinSize(wxSize(120, -1));
+    epRow->Add(m_endpointsLabel, 1, wxALIGN_CENTER_VERTICAL);
+
+    m_manageEndpointsBtn = MakeAccentButton(body, wxID_ANY, "Manage", 26);
+    m_manageEndpointsBtn->Bind(wxEVT_BUTTON,
+                               &SettingsDialog::OnManageEndpoints, this);
+    epRow->Add(m_manageEndpointsBtn, 0, wxLEFT, 10);
+    bodySizer->Add(epRow, 0, wxEXPAND | wxBOTTOM, 6);
+
+    auto* epHint = new wxStaticText(body, wxID_ANY,
+        "Each endpoint's models show in the model picker. Set the API key "
+        "under Connections, using the endpoint's provider/key name.");
+    { wxFont eh = epHint->GetFont(); eh.SetPointSize(10); epHint->SetFont(eh); }
+    epHint->Wrap(520);   // 540 → 520: clearance for the body scrollbar when it shows
+    bodySizer->Add(epHint, 0, wxBOTTOM, 14);
 
     // ─────────────────────────────────────────────────────────────
     //  SECTION 4 — APPEARANCE
@@ -422,6 +531,7 @@ void SettingsDialog::CreateControls()
     bodySizer->Add(m_fontSlider, 0, wxEXPAND | wxBOTTOM, 14);
 
     body->SetSizer(bodySizer);
+    body->FitInside();   // set the scrolled window's virtual size from content
     rootSizer->Add(body, 1, wxEXPAND | wxALL, 18);
 
     // ─────────────────────────────────────────────────────────────
@@ -454,6 +564,41 @@ void SettingsDialog::CreateControls()
     rootSizer->Add(footer, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 18);
 
     SetSizer(rootSizer);
+
+    // ─────────────────────────────────────────────────────────────
+    //  SIZING — fit the content, clamp to the screen
+    // ─────────────────────────────────────────────────────────────
+    //  Ideal client height = full body content + margins + footer.
+    //  If that fits within ~90% of the monitor's work area, the dialog
+    //  shows every section with no scrollbar — same look as before.
+    //  If not (short display, or a future section pushes the content
+    //  taller), the dialog caps at the work area and the body scrolls.
+    //  Nothing gets clipped either way.
+    const int contentH = bodySizer->GetMinSize().GetHeight();
+    const int footerH  = footSizer->GetMinSize().GetHeight();
+    const int wantClientH = 18 + contentH + 18   // body + top/bottom margins
+                          + footerH + 18;        // footer + bottom margin
+    const int wantWinH =
+        ClientToWindowSize(wxSize(0, wantClientH)).GetHeight();
+
+    int maxWinH = 840;   // conservative floor if display lookup fails
+    int winW    = 720;   // wider default: room for new KV/endpoint rows
+    const int dispIdx = wxDisplay::GetFromWindow(
+        GetParent() ? GetParent() : static_cast<wxWindow*>(this));
+    if (dispIdx != wxNOT_FOUND) {
+        const wxRect workArea = wxDisplay(static_cast<unsigned>(dispIdx))
+                                    .GetClientArea();
+        maxWinH = workArea.GetHeight() * 9 / 10;
+
+        // Old 600px width was barely enough before the KV-cache and
+        // remote-endpoint sections; with a vertical scrollbar visible,
+        // right-edge buttons could look cut off. Prefer 720px, but keep
+        // the dialog inside small monitors.
+        winW = std::min(720, std::max(600, workArea.GetWidth() * 9 / 10));
+    }
+
+    SetSize(wxSize(winW, std::min(wantWinH, maxWinH)));
+    SetMinSize(wxSize(600, std::min(wantWinH, 480)));
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -508,9 +653,17 @@ void SettingsDialog::ApplyTheme()
 
     // wxCheckBox isn't touched by ApplyDialogThemeRecursive (it handles
     // wxStaticText and wxButton only), so tint the label + surface here.
+    if (m_kvCacheQ8CheckBox) {
+        m_kvCacheQ8CheckBox->SetForegroundColour(t.textPrimary);
+        m_kvCacheQ8CheckBox->SetBackgroundColour(t.bgDialogSurface);
+    }
     if (m_agentDefaultCheckBox) {
         m_agentDefaultCheckBox->SetForegroundColour(t.textPrimary);
         m_agentDefaultCheckBox->SetBackgroundColour(t.bgDialogSurface);
+    }
+    if (m_contextMeterCheckBox) {
+        m_contextMeterCheckBox->SetForegroundColour(t.textPrimary);
+        m_contextMeterCheckBox->SetBackgroundColour(t.bgDialogSurface);
     }
 
     // Hand the sliders our theme palette
@@ -618,6 +771,10 @@ void SettingsDialog::OnOK(wxCommandEvent&)
     // since construction without m_selectedAgentDefault being updated.
     if (m_agentDefaultCheckBox)
         m_selectedAgentDefault = m_agentDefaultCheckBox->GetValue();
+    if (m_contextMeterCheckBox)
+        m_selectedContextMeter = m_contextMeterCheckBox->GetValue();
+    if (m_kvCacheQ8CheckBox)
+        m_selectedKvCacheQ8 = m_kvCacheQ8CheckBox->GetValue();
 
     // Sliders keep m_selectedCtxSize / m_selectedFontSize live via their
     // onChange callbacks — nothing to do here beyond diff'ing.
@@ -626,6 +783,8 @@ void SettingsDialog::OnOK(wxCommandEvent&)
     m_ctxSizeChanged      = (m_selectedCtxSize       != m_originalCtxSize);
     m_fontSizeChanged     = (m_selectedFontSize      != m_originalFontSize);
     m_agentDefaultChanged = (m_selectedAgentDefault  != m_originalAgentDefault);
+    m_contextMeterChanged = (m_selectedContextMeter  != m_originalContextMeter);
+    m_kvCacheQ8Changed    = (m_selectedKvCacheQ8     != m_originalKvCacheQ8);
 
     // Folder override was committed live by Change/Reset; compare current
     // value to what we captured at construction.
@@ -654,7 +813,7 @@ void SettingsDialog::OnDownloadModels(wxCommandEvent&)
 
 void SettingsDialog::OnManageModels(wxCommandEvent&)
 {
-    ModelManagerDialog dlg(this, m_theme);
+    ModelManagerDialog dlg(this, m_theme, m_loadedModelPath, m_originalModel);
     dlg.ShowModal();
     PopulateModelList();
 }
@@ -782,4 +941,51 @@ void SettingsDialog::UpdateConnectionsLabel()
     }
     if (m_connectionsLabel->GetParent())
         m_connectionsLabel->GetParent()->Layout();
+}
+
+// ─── Remote Endpoints ───────────────────────────────────────────
+
+void SettingsDialog::OnManageEndpoints(wxCommandEvent&)
+{
+    if (!m_endpointStore) {
+        wxMessageBox(
+            "Endpoint store is not available. Restart LlamaBoss "
+            "and try again.",
+            "Remote Endpoints", wxOK | wxICON_INFORMATION, this);
+        return;
+    }
+
+    EndpointsDialog dlg(this, m_endpointStore, *m_theme);
+    dlg.ShowModal();
+
+    // Persist immediately on close, like Connections — endpoint config is
+    // user-edited state that should survive even if Settings is later
+    // cancelled.
+    const bool saved = m_endpointStore->Save();
+    if (!saved) {
+        wxMessageBox(
+            "Endpoints were updated for this session, but LlamaBoss could "
+            "not save them to disk. They may be lost after restart.",
+            "Endpoints Not Saved", wxOK | wxICON_WARNING, this);
+    }
+
+    UpdateEndpointsLabel();
+}
+
+void SettingsDialog::UpdateEndpointsLabel()
+{
+    if (!m_endpointsLabel) return;
+    size_t count = 0;
+    if (m_endpointStore) count = m_endpointStore->Endpoints().size();
+
+    if (count == 0) {
+        m_endpointsLabel->SetLabel("No remote endpoints configured");
+    } else if (count == 1) {
+        m_endpointsLabel->SetLabel("1 remote endpoint configured");
+    } else {
+        m_endpointsLabel->SetLabel(
+            wxString::Format("%zu remote endpoints configured", count));
+    }
+    if (m_endpointsLabel->GetParent())
+        m_endpointsLabel->GetParent()->Layout();
 }

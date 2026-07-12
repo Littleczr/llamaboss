@@ -138,7 +138,7 @@ inline std::string CommandEcho(const ToolInvocation& inv)
     if (inv.name == tool_names::kPythonInstallPackage)
         return Trim(inv.args).empty() ? std::string("/python_install_package")
                                       : ("/python_install_package " + Trim(inv.args));
-    if (inv.name == tool_names::kWrite || inv.name == tool_names::kOverwriteFile || inv.name == tool_names::kEdit) {
+    if (inv.name == tool_names::kWrite || inv.name == tool_names::kOverwriteFile || inv.name == tool_names::kWritePowerShellScript || inv.name == tool_names::kEdit) {
         std::string first = FirstLine(inv.args);
         return first.empty() ? ("/" + inv.name) : ("/" + inv.name + " " + first);
     }
@@ -148,52 +148,26 @@ inline std::string CommandEcho(const ToolInvocation& inv)
 
 inline std::string ToolDisplayName(const std::string& name)
 {
-    if (name == tool_names::kWrite)      return "Write";
-    if (name == tool_names::kOverwriteFile) return "Overwrite File";
-    if (name == tool_names::kEdit)       return "Edit";
-    if (name == tool_names::kDelete)     return "Delete";
-    if (name == tool_names::kMkdir)      return "Mkdir";
-    if (name == tool_names::kPowerShell) return "PowerShell";
-    if (name == tool_names::kPythonHealth) return "Python Health";
-    if (name == tool_names::kCsvInspect) return "CSV Inspect";
-    if (name == tool_names::kCsvReport)  return "CSV Report";
-    if (name == tool_names::kCsvToXlsx)  return "CSV to XLSX";
-    if (name == tool_names::kXlsxInspect) return "XLSX Inspect";
-    if (name == tool_names::kXlsxReport)  return "XLSX Report";
-    if (name == tool_names::kXlsxCreateWorkbook) return "Create Workbook";
-    if (name == tool_names::kPdfExtractText) return "PDF Extract Text";
-    if (name == tool_names::kPythonCreateScript) return "Python Script";
-    if (name == tool_names::kPythonRunScript) return "Python Run";
-    if (name == tool_names::kPythonInstallPackage) return "Install Python Package";
-    if (name == tool_names::kRead)       return "Read";
-    if (name == tool_names::kReadHead)   return "Read Head";
-    if (name == tool_names::kLs)         return "List";
-    if (name == tool_names::kGrep)       return "Grep";
-    if (name == tool_names::kPwd)        return "Pwd";
-    if (name == tool_names::kOpen)       return "Open";
+    // Single source of truth: ToolSpec.displayName, populated by the
+    // kPresentation table in tool_router.cpp.  The per-tool if-ladder
+    // that used to live here was one of three hand-maintained copies
+    // of the same mapping (with HandlePythonComplete's ternary ladder
+    // and the dispatch bodies' PreFill literals) and could silently
+    // drift.  Fallback mirrors the old ladder's default.
+    const ToolSpec* spec = GetGlobalRouter().Find(name);
+    if (spec && !spec->displayName.empty()) return spec->displayName;
     return name.empty() ? std::string("Tool") : name;
 }
 
 inline std::string ToolIcon(const std::string& name)
 {
-    if (name == tool_names::kWrite)      return "\xF0\x9F\x93\x9D"; // 📝
-    if (name == tool_names::kOverwriteFile) return "\xE2\x99\xBB"; // ♻
-    if (name == tool_names::kEdit)       return "\xE2\x9C\x8F";     // ✏
-    if (name == tool_names::kDelete)     return "\xF0\x9F\x97\x91"; // 🗑
-    if (name == tool_names::kMkdir)      return "\xE2\x9E\x95";     // ➕
-    if (name == tool_names::kPowerShell) return "\xE2\x9A\x99";     // ⚙
-    if (name == tool_names::kPythonHealth) return "\xF0\x9F\x90\x8D"; // 🐍
-    if (name == tool_names::kCsvInspect) return "\xF0\x9F\x93\x8A";   // 📊
-    if (name == tool_names::kCsvReport)  return "\xF0\x9F\x93\x9D";   // 📝
-    if (name == tool_names::kCsvToXlsx)  return "\xF0\x9F\x93\x97";   // 📗
-    if (name == tool_names::kXlsxInspect) return "\xF0\x9F\x93\x8A";  // 📊
-    if (name == tool_names::kXlsxReport)  return "\xF0\x9F\x93\x97";  // 📗
-    if (name == tool_names::kXlsxCreateWorkbook) return "\xF0\x9F\x93\x97";  // 📗
-    if (name == tool_names::kPdfExtractText) return "\xF0\x9F\x93\x84"; // 📄
-    if (name == tool_names::kPythonCreateScript) return "\xF0\x9F\x90\x8D"; // 🐍
-    if (name == tool_names::kPythonRunScript) return "\xF0\x9F\x90\x8D"; // 🐍
-    if (name == tool_names::kPythonInstallPackage) return "\xF0\x9F\x90\x8D"; // 🐍
-    if (name == tool_names::kRead || name == tool_names::kReadHead) return "\xF0\x9F\x93\x84"; // 📄
+    // Single source of truth: ToolSpec.iconUtf8 (see kPresentation in
+    // tool_router.cpp).  Side benefit over the old ladder: tools the
+    // ladder never listed (pdf_inspect_form, pdf_fill_form, docx_*,
+    // notes_*, open, ls) now render their real icons on approval and
+    // pending cards instead of the ⚠ fallback.
+    const ToolSpec* spec = GetGlobalRouter().Find(name);
+    if (spec && !spec->iconUtf8.empty()) return spec->iconUtf8;
     return "\xE2\x9A\xA0";                                         // ⚠
 }
 
@@ -323,6 +297,18 @@ inline std::string PreviewForInvocation(const ToolInvocation& inv,
           << "Bytes: " << content.size() << "\n"
           << "Lines: " << CountLines(content) << "\n\n"
           << LimitText(content.empty() ? std::string("[empty file]") : content);
+        return p.str();
+    }
+
+    if (inv.name == tool_names::kWritePowerShellScript) {
+        std::string path, content;
+        SplitWriteArgs(inv.args, path, content);
+        targetOut = ResolveTargetForPreview(path, ctx);
+        p << "Target PowerShell script: " << targetOut << "\n"
+          << "Bytes: " << content.size() << "\n"
+          << "Lines: " << CountLines(content) << "\n\n"
+          << "Creates or replaces a .ps1 file only; it does not execute it. Review the source below before approving.\n\n"
+          << LimitText(content.empty() ? std::string("[empty script body]") : content);
         return p.str();
     }
 
@@ -462,6 +448,7 @@ inline std::string ApprovalActionVerb(const ToolInvocation& inv)
     if (inv.name == tool_names::kPythonInstallPackage) return "install it";
     if (inv.name == tool_names::kWrite) return "create it";
     if (inv.name == tool_names::kOverwriteFile) return "overwrite it";
+    if (inv.name == tool_names::kWritePowerShellScript) return "write it";
     if (inv.name == tool_names::kMkdir) return "create it";
     if (inv.name == tool_names::kEdit) return "edit it";
     if (inv.name == tool_names::kDelete) return "delete it";
@@ -533,6 +520,10 @@ inline bool RequiresApproval(const ToolInvocation& inv,
     else if (inv.name == tool_names::kPythonInstallPackage) {
         out.required = true;
         out.reason = "This installs one Python package from PyPI into the user's Python user-site using pip. It changes the local Python environment and uses the network, so it requires approval -- and every install renders its own card showing the exact package name, even when one-approval mode is on.";
+    }
+    else if (inv.name == tool_names::kWritePowerShellScript) {
+        out.required = true;
+        out.reason = "Creates or replaces a PowerShell .ps1 script. The script is written but not executed; review the source before approving.";
     }
     else {
         // Defensive default for any future Dangerous-tier addition

@@ -14,6 +14,11 @@
 
 #include <fstream>
 #include <algorithm>
+#include <cctype>
+
+#ifdef __WXMSW__
+#include <windows.h>   // GetFileAttributesExW — cheap stat in ScanConversations
+#endif
 
 namespace {
 
@@ -62,6 +67,33 @@ std::string JsonUnescapeForLabel(const std::string& in)
     return out;
 }
 
+std::string WxToUtf8String(const wxString& s)
+{
+    wxCharBuffer buf = s.ToUTF8();
+    return buf.data() ? std::string(buf.data()) : std::string();
+}
+
+wxString SidebarDisplayTitleFromUtf8(const std::string& utf8)
+{
+    // Titles are stored as UTF-8 in the JSON conversation files.  Decode
+    // first, then truncate in wxString/Unicode code-point space so we never
+    // split a multi-byte UTF-8 sequence and accidentally feed invalid UTF-8
+    // back into wxStaticText.
+    wxString title = wxString::FromUTF8(utf8.c_str());
+    if (title.length() > 35)
+        title = title.Left(32) + wxS("...");
+    return title;
+}
+
+std::string SidebarSearchKeyFromUtf8(const std::string& utf8)
+{
+    // Search against the full title, not the shortened display label.
+    // Lowercase in wxString space so Unicode text is handled much better
+    // than byte-wise std::tolower on UTF-8.
+    wxString title = wxString::FromUTF8(utf8.c_str());
+    return WxToUtf8String(title.Lower());
+}
+
 } // namespace
 
 // ═══════════════════════════════════════════════════════════════════
@@ -101,6 +133,20 @@ ConversationSidebar::ConversationSidebar(wxWindow* parent,
     ncFont.SetWeight(wxFONTWEIGHT_MEDIUM);
     m_newChatButton->SetFont(ncFont);
     contentSizer->Add(m_newChatButton, 0, wxEXPAND | wxALL, 8);
+
+    // "+ New Window" button — shorter and regular-weight so New Chat
+    // keeps visual priority, but same colors as New Chat so the pair
+    // reads as one action group.  Same behavior as Ctrl+Shift+N; the
+    // host frame provides the action.
+    m_newWindowButton = new wxButton(m_content, wxID_ANY, "+ New Window",
+        wxDefaultPosition, wxSize(-1, 34), wxBORDER_NONE);
+    m_newWindowButton->SetBackgroundColour(theme.modelPillBg);
+    m_newWindowButton->SetForegroundColour(theme.textPrimary);
+    wxFont nwFont = m_newWindowButton->GetFont();
+    nwFont.SetPointSize(10);
+    m_newWindowButton->SetFont(nwFont);
+    contentSizer->Add(m_newWindowButton, 0,
+                      wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 8);
 
     // Search box
     m_searchBox = new wxTextCtrl(m_content, wxID_ANY, wxEmptyString,
@@ -165,6 +211,11 @@ ConversationSidebar::ConversationSidebar(wxWindow* parent,
     m_newChatButton->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) {
         if (m_callbacks.onNewChatClicked)
             m_callbacks.onNewChatClicked();
+    });
+
+    m_newWindowButton->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) {
+        if (m_callbacks.onNewWindowClicked)
+            m_callbacks.onNewWindowClicked();
     });
 
     // ── Search box events ────────────────────────────────────────
@@ -270,7 +321,9 @@ void ConversationSidebar::Refresh(const std::string& activeFilePath)
 {
     if (!m_listSizer || !m_listWindow) return;
 
+    const std::string previousActiveFilePath = m_activeFilePath;
     m_activeFilePath = activeFilePath;
+    const bool activeChatChanged = (m_activeFilePath != previousActiveFilePath);
 
     // Scan and sort
     auto entries = ScanConversations();
@@ -296,47 +349,77 @@ void ConversationSidebar::Refresh(const std::string& activeFilePath)
     std::unordered_map<std::string, Group> groupsById;
 
     for (const auto& e : entries) {
-        const std::string id = e.projectId.empty() ? kUnassignedId : e.projectId;
+        // Bucket precedence: a real project wins (a chat that has both a
+        // project and a goal stays under its project); otherwise a goal
+        // routes the chat to the Goals section; a plain project-less chat
+        // falls through to Unassigned.
+        std::string id;
+        if (!e.projectId.empty())          id = e.projectId;
+        else if (!e.goalObjective.empty()) id = kGoalsId;
+        else                               id = kUnassignedId;
+
         auto& g = groupsById[id];
         if (g.id.empty()) {
             g.id = id;
-            g.displayName = (id == kUnassignedId)
-                ? std::string("Unassigned")
-                : (e.projectName.empty() ? std::string("(unnamed project)")
-                                         : e.projectName);
+            if (id == kUnassignedId)
+                g.displayName = "Unassigned";
+            else if (id == kGoalsId)
+                g.displayName = "Goals";
+            else
+                g.displayName = e.projectName.empty()
+                    ? std::string("(unnamed project)")
+                    : e.projectName;
         }
         g.entries.push_back(&e);
     }
 
     std::vector<Group*> orderedGroups;
     orderedGroups.reserve(groupsById.size());
+    // Real projects only here — the two sentinel sections are appended
+    // afterward at fixed positions so they aren't sorted in among the
+    // project names.
     for (auto& [id, g] : groupsById) {
-        if (id != kUnassignedId) orderedGroups.push_back(&g);
+        if (id != kUnassignedId && id != kGoalsId)
+            orderedGroups.push_back(&g);
     }
     std::sort(orderedGroups.begin(), orderedGroups.end(),
         [](const Group* a, const Group* b) {
-            std::string an = a->displayName;
-            std::string bn = b->displayName;
-            std::transform(an.begin(), an.end(), an.begin(), ::tolower);
-            std::transform(bn.begin(), bn.end(), bn.begin(), ::tolower);
+            // Lowercase in wxString space instead of calling ::tolower
+            // on raw UTF-8 bytes.  The old byte-wise version could trip
+            // MSVC debug assertions for non-ASCII project names.
+            std::string an = SidebarSearchKeyFromUtf8(a->displayName);
+            std::string bn = SidebarSearchKeyFromUtf8(b->displayName);
             return an < bn;
         });
+    // Fixed tail order: projects, then Goals, then Unassigned last.
+    if (auto it = groupsById.find(kGoalsId); it != groupsById.end()) {
+        orderedGroups.push_back(&it->second);
+    }
     if (auto it = groupsById.find(kUnassignedId); it != groupsById.end()) {
         orderedGroups.push_back(&it->second);
     }
 
-    // ── Recompute override-expanded set for this render ──────────
-    // A collapsed section is force-expanded for display only when it
-    // contains the active chat or (later) a search match.  This does not
-    // touch m_collapsedGroups, so the user's persisted intent survives.
-    m_overrideExpandedGroups.clear();
-    if (!m_activeFilePath.empty()) {
-        for (const auto* g : orderedGroups) {
-            for (const auto* e : g->entries) {
-                if (e->filePath == m_activeFilePath) {
-                    if (m_collapsedGroups.count(g->id))
-                        m_overrideExpandedGroups.insert(g->id);
-                    break;
+    // ── Recompute override-expanded set ──────────────────────────
+    // A collapsed section is force-expanded for display when it contains
+    // the active chat, so loading a conversation reveals where it lives.
+    // This is recomputed ONLY when the active chat actually changes.  On
+    // refreshes where it's unchanged — autosave after a message, a
+    // collapse/expand click, a rename — the previous override is left
+    // intact.  That's what lets an explicit header collapse win: a
+    // collapse click drops the group from the override (see
+    // OnProjectHeaderClicked) and the refresh it triggers does not re-add
+    // it, so a group can be collapsed even while it holds the active chat.
+    // None of this touches m_collapsedGroups, so persisted intent survives.
+    if (activeChatChanged) {
+        m_overrideExpandedGroups.clear();
+        if (!m_activeFilePath.empty()) {
+            for (const auto* g : orderedGroups) {
+                for (const auto* e : g->entries) {
+                    if (e->filePath == m_activeFilePath) {
+                        if (m_collapsedGroups.count(g->id))
+                            m_overrideExpandedGroups.insert(g->id);
+                        break;
+                    }
                 }
             }
         }
@@ -386,8 +469,14 @@ void ConversationSidebar::Refresh(const std::string& activeFilePath)
     }
 
     // ── Lay out: header → its chats → next header → ... ──────────
+    // Project headers sit flush at the list's left edge; chat rows are
+    // inset by kChildIndent so each group reads as a tree, with its
+    // conversations nested under the header instead of sharing the same
+    // vertical line.  The inset moves the whole row panel (background,
+    // hover, and selection included), not just the title text.
+    static constexpr int kChildIndent = 24;
     size_t sizerIdx = 0;
-    auto placeAtSizerIndex = [&](wxPanel* panel) {
+    auto placeAtSizerIndex = [&](wxPanel* panel, int leftInset) {
         wxSizerItem* currentItem =
             (sizerIdx < m_listSizer->GetItemCount())
                 ? m_listSizer->GetItem(sizerIdx)
@@ -395,7 +484,10 @@ void ConversationSidebar::Refresh(const std::string& activeFilePath)
         wxWindow* currentWindow = currentItem ? currentItem->GetWindow() : nullptr;
         if (currentWindow != panel) {
             m_listSizer->Detach(panel);
-            m_listSizer->Insert(sizerIdx, panel, 0, wxEXPAND);
+            if (leftInset > 0)
+                m_listSizer->Insert(sizerIdx, panel, 0, wxEXPAND | wxLEFT, leftInset);
+            else
+                m_listSizer->Insert(sizerIdx, panel, 0, wxEXPAND);
         }
         ++sizerIdx;
     };
@@ -419,7 +511,7 @@ void ConversationSidebar::Refresh(const std::string& activeFilePath)
         }
         if (headerIt->second.panel) {
             headerIt->second.panel->Show();
-            placeAtSizerIndex(headerIt->second.panel);
+            placeAtSizerIndex(headerIt->second.panel, 0);
         }
 
         // Chat rows for this group.  Hidden rows are not added to
@@ -454,7 +546,7 @@ void ConversationSidebar::Refresh(const std::string& activeFilePath)
             }
 
             panel->Show();
-            placeAtSizerIndex(panel);
+            placeAtSizerIndex(panel, kChildIndent);
             m_orderedPaths.push_back(entry.filePath);
 
             panel->SetBackgroundColour(GetRowBackground(entry.filePath));
@@ -506,6 +598,26 @@ void ConversationSidebar::SelectRange(const std::string& from,
         m_selected.insert(m_orderedPaths[i]);
 }
 
+
+void ConversationSidebar::RebuildOrderedPathsFromVisibleRows()
+{
+    m_orderedPaths.clear();
+
+    if (!m_listSizer || !m_listWindow)
+        return;
+
+    for (size_t i = 0; i < m_listSizer->GetItemCount(); ++i) {
+        wxSizerItem* item = m_listSizer->GetItem(i);
+        wxWindow* win = item ? item->GetWindow() : nullptr;
+        if (!win || !win->IsShown())
+            continue;
+
+        std::string path = PathFromWidget(win, m_listWindow);
+        if (!path.empty())
+            m_orderedPaths.push_back(path);
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════
 //  Theming
 // ═══════════════════════════════════════════════════════════════════
@@ -518,6 +630,8 @@ void ConversationSidebar::ApplyTheme(const ThemeData& theme)
     m_content->SetBackgroundColour(theme.bgDialogSurface);
     m_newChatButton->SetBackgroundColour(theme.modelPillBg);
     m_newChatButton->SetForegroundColour(theme.textPrimary);
+    m_newWindowButton->SetBackgroundColour(theme.modelPillBg);
+    m_newWindowButton->SetForegroundColour(theme.textPrimary);
     m_searchBox->SetBackgroundColour(theme.bgInputField);
     m_searchBox->SetForegroundColour(theme.textPrimary);
     m_listWindow->SetBackgroundColour(theme.bgDialogSurface);
@@ -580,7 +694,7 @@ void ConversationSidebar::RefreshAllRowBackgrounds()
 void ConversationSidebar::FilterRows()
 {
     wxString raw = m_searchBox->GetValue();
-    std::string newFilter = raw.Lower().ToUTF8().data();
+    std::string newFilter = WxToUtf8String(raw.Lower());
     const bool wasFiltered  = !m_searchFilter.empty();
     const bool nowFiltered  = !newFilter.empty();
     const bool transition   = (wasFiltered != nowFiltered);
@@ -594,7 +708,13 @@ void ConversationSidebar::FilterRows()
     // unfiltered regime, per-row visibility tweaks are enough.
     if (transition) {
         Refresh(m_activeFilePath);
-        if (!nowFiltered) return;  // Cleared filter — Refresh did the work
+        // Refresh's tail (end of Refresh) already reapplied the current
+        // filter exactly once for the now-active case, and fully rebuilt the
+        // unfiltered list for the cleared case.  Falling through to the
+        // per-row pass below would only redo that work — and add a redundant
+        // Freeze/Thaw cycle (visible as a flicker on the activating
+        // keystroke) — so stop here for either transition direction.
+        return;
     }
 
     m_listWindow->Freeze();
@@ -609,10 +729,10 @@ void ConversationSidebar::FilterRows()
 
         bool show = true;
         if (nowFiltered) {
-            // displayedTitleLower is kept in sync at row create / update
-            // time, so the per-keystroke filter is now a single find()
-            // instead of N lowercase transforms across the whole list.
-            show = (row.displayedTitleLower.find(m_searchFilter)
+            // searchTitleLower is built from the full conversation title,
+            // not the shortened display label, so long titles remain fully
+            // searchable even when the row label is truncated.
+            show = (row.searchTitleLower.find(m_searchFilter)
                     != std::string::npos);
         }
 
@@ -633,6 +753,8 @@ void ConversationSidebar::FilterRows()
             header.panel->Show(groupsWithMatches.count(id) != 0);
         }
     }
+
+    RebuildOrderedPathsFromVisibleRows();
 
     m_listWindow->FitInside();
     m_listWindow->Layout();
@@ -682,9 +804,64 @@ ConversationSidebar::ScanConversations()
         ConversationEntry entry;
         entry.filePath = fullPath.ToUTF8().data();
 
-        wxFileName fn(fullPath);
-        fn.GetTimes(nullptr, &entry.modTime, nullptr);
-        time_t thisMtime = entry.modTime.IsValid() ? entry.modTime.GetTicks() : 0;
+        // ── Cheap stat ───────────────────────────────────────────
+        // Cache key uses millisecond-resolution mtime (NTFS file times are
+        // sub-second) plus the file size.  GetTicks() was seconds-only, so a
+        // second save inside the same wall-clock second produced an identical
+        // key and the sidebar reused stale title/project metadata.  The size
+        // is a belt-and-suspenders change check that holds even where the
+        // filesystem mtime can't resolve sub-second.
+        //
+        // On MSW this used to be wxFileName::GetTimes() + GetSize() — each
+        // opens a file handle (CreateFile), so every sidebar refresh paid
+        // TWO handle opens per conversation, and Refresh runs once per
+        // completed turn (AutoSaveConversation → Refresh).  With hundreds
+        // of conversations plus Defender in the open path, that stacked a
+        // few ms onto the same end-of-turn moment as the autosave itself.
+        // GetFileAttributesExW returns size + last-write time in a single
+        // metadata query with no handle open.
+        long long          thisMtimeMs = 0;
+        unsigned long long thisSize    = 0;
+#ifdef __WXMSW__
+        {
+            WIN32_FILE_ATTRIBUTE_DATA fad{};
+            const std::wstring wPath = path_safety::Utf8ToWide(entry.filePath);
+            if (!wPath.empty() &&
+                ::GetFileAttributesExW(wPath.c_str(), GetFileExInfoStandard, &fad)) {
+                // FILETIME (100ns ticks since 1601 UTC) → ms since Unix epoch.
+                ULARGE_INTEGER uli;
+                uli.LowPart  = fad.ftLastWriteTime.dwLowDateTime;
+                uli.HighPart = fad.ftLastWriteTime.dwHighDateTime;
+                if (uli.QuadPart >= 116444736000000000ULL) {
+                    thisMtimeMs = (long long)((uli.QuadPart
+                                   - 116444736000000000ULL) / 10000ULL);
+                }
+                thisSize = ((unsigned long long)fad.nFileSizeHigh << 32)
+                           | fad.nFileSizeLow;
+
+                // entry.modTime is only used for the newest-first sort and
+                // must agree with the cache key.  Build it from the same ms
+                // value: wxDateTime(time_t) + SetMillisecond reproduces
+                // exactly GetValue() == thisMtimeMs.
+                entry.modTime = wxDateTime((time_t)(thisMtimeMs / 1000));
+                entry.modTime.SetMillisecond(
+                    (unsigned short)(thisMtimeMs % 1000));
+            }
+        }
+#else
+        {
+            wxFileName fn(fullPath);
+            fn.GetTimes(nullptr, &entry.modTime, nullptr);
+            thisMtimeMs =
+                entry.modTime.IsValid() ? entry.modTime.GetValue().GetValue() : 0;
+            thisSize = fn.GetSize().GetValue();
+        }
+#endif
+        // A file deleted between enumeration and the stat leaves modTime
+        // invalid; wxDateTime comparison asserts on invalid operands in
+        // debug builds.  Pin it to the epoch so the entry just sorts last.
+        if (!entry.modTime.IsValid())
+            entry.modTime = wxDateTime((time_t)0);
 
         // ── Cache lookup ─────────────────────────────────────────
         // If we've seen this path before and its mtime hasn't moved,
@@ -692,13 +869,15 @@ ConversationSidebar::ScanConversations()
         // rewritten so title and project association are unchanged.
         auto cachedIt = m_metaCache.find(entry.filePath);
         bool cacheHit = (cachedIt != m_metaCache.end() &&
-                         cachedIt->second.mtime == thisMtime &&
-                         thisMtime != 0);
+                         cachedIt->second.mtimeMs == thisMtimeMs &&
+                         cachedIt->second.size    == thisSize &&
+                         thisMtimeMs != 0);
 
         if (cacheHit) {
-            entry.title       = cachedIt->second.title;
-            entry.projectId   = cachedIt->second.projectId;
-            entry.projectName = cachedIt->second.projectName;
+            entry.title         = cachedIt->second.title;
+            entry.projectId     = cachedIt->second.projectId;
+            entry.projectName   = cachedIt->second.projectName;
+            entry.goalObjective = cachedIt->second.goalObjective;
         }
         else {
             // Cache miss (new file, or rewritten since we last looked).
@@ -715,16 +894,38 @@ ConversationSidebar::ScanConversations()
                 std::ifstream file(path_safety::Utf8ToWide(entry.filePath), std::ios::in);
                 if (file.is_open()) {
                     bool sawTitle = false, sawProjectId = false, sawProjectName = false;
+                    bool sawObjective = false;
                     auto extractStringField = [](const std::string& line,
                                                  const std::string& key,
                                                  std::string& out) -> bool {
                         std::string needle = "\"" + key + "\"";
                         size_t keyPos = line.find(needle);
                         if (keyPos == std::string::npos) return false;
+
+                        // Only accept real top-level keys emitted by Poco's
+                        // pretty-printer.  Escaped text inside user-controlled
+                        // strings can contain "project_id" etc., but those
+                        // occurrences are not the first token on the line.
+                        size_t firstToken = line.find_first_not_of(" \t");
+                        if (firstToken == std::string::npos || firstToken != keyPos)
+                            return false;
+
                         size_t colonPos = line.find(':', keyPos + needle.size());
                         if (colonPos == std::string::npos) return false;
-                        size_t openQuote = line.find('"', colonPos + 1);
-                        if (openQuote == std::string::npos) return false;
+                        size_t valuePos = colonPos + 1;
+                        while (valuePos < line.size() &&
+                               std::isspace(static_cast<unsigned char>(line[valuePos]))) {
+                            ++valuePos;
+                        }
+                        // Only accept actual JSON string values.  Without
+                        // this guard, a malformed one-line fragment such as
+                        // "project_id": null, "project_name": "Foo"
+                        // could skip past null and accidentally grab the
+                        // next key name/value.
+                        if (valuePos >= line.size() || line[valuePos] != '"')
+                            return false;
+
+                        size_t openQuote = valuePos;
                         size_t end = openQuote + 1;
                         while (end < line.size()) {
                             if (line[end] == '"') {
@@ -770,8 +971,16 @@ ConversationSidebar::ScanConversations()
                             sawProjectId = true;
                         if (!sawProjectName && extractStringField(line, "project_name", entry.projectName))
                             sawProjectName = true;
+                        // "objective" lives one level down inside the "goal"
+                        // object, which SaveToFile writes before "messages".
+                        // extractStringField keys off the first token on the
+                        // line, so the indented "objective": line still
+                        // matches, and the key is unique (the contract block
+                        // has no "objective"), so there's no ambiguity.
+                        if (!sawObjective && extractStringField(line, "objective", entry.goalObjective))
+                            sawObjective = true;
 
-                        if (sawTitle && sawProjectId && sawProjectName) break;
+                        if (sawTitle && sawProjectId && sawProjectName && sawObjective) break;
                     }
                 }
             }
@@ -785,7 +994,8 @@ ConversationSidebar::ScanConversations()
 
             // Populate cache for next refresh
             m_metaCache[entry.filePath] = {
-                entry.title, entry.projectId, entry.projectName, thisMtime
+                entry.title, entry.projectId, entry.projectName,
+                entry.goalObjective, thisMtimeMs, thisSize
             };
         }
 
@@ -976,8 +1186,9 @@ ConversationSidebar::CreateProjectHeader(const std::string& groupId,
 
     // Monospace font matches the project status strip + the box-drawing
     // sidebar idiom.  Bold weight keeps the section break visually
-    // distinct from chat titles.
-    wxFont monoFont(11, wxFONTFAMILY_TELETYPE, wxFONTSTYLE_NORMAL,
+    // distinct from chat titles, and the larger 13pt size (vs the 11pt
+    // chat titles) makes each header read as the root node of its group.
+    wxFont monoFont(13, wxFONTFAMILY_TELETYPE, wxFONTSTYLE_NORMAL,
                     wxFONTWEIGHT_BOLD, false, "Consolas");
 
     header.triangle = new wxStaticText(header.panel, wxID_ANY,
@@ -996,16 +1207,19 @@ ConversationSidebar::CreateProjectHeader(const std::string& groupId,
     sizer->Add(header.nameLabel, 0,
                wxALIGN_CENTER_VERTICAL | wxLEFT | wxTOP | wxBOTTOM, 6);
 
-    // Count label is only populated when collapsed, but we always
-    // create the widget so toggling doesn't allocate/destroy.
+    // Chat count — always visible and right-aligned (the stretch spacer
+    // below pushes it to the panel's right edge so the numbers form a
+    // clean column).  Created once; only its text changes on refresh.
     header.countLabel = new wxStaticText(header.panel, wxID_ANY, "");
     header.countLabel->SetForegroundColour(m_theme->textMuted);
     header.countLabel->SetFont(monoFont);
     header.countLabel->SetCursor(wxCursor(wxCURSOR_HAND));
-    sizer->Add(header.countLabel, 0,
-               wxALIGN_CENTER_VERTICAL | wxLEFT | wxTOP | wxBOTTOM, 4);
-
+    // Spacer first → count is pushed to the right edge, independent of
+    // how long the project name is.  Right margin clears the list's
+    // vertical scrollbar.
     sizer->AddStretchSpacer(1);
+    sizer->Add(header.countLabel, 0,
+               wxALIGN_CENTER_VERTICAL | wxRIGHT | wxTOP | wxBOTTOM, 10);
 
     header.panel->SetSizer(sizer);
 
@@ -1028,10 +1242,12 @@ ConversationSidebar::CreateProjectHeader(const std::string& groupId,
 
     // ── Right-click → header context menu ──────────────────────
     // Frame builds the popup (Attach this chat / open folders /
-    // delete project).  Unassigned sections pass an empty groupId
-    // up so the frame can either show a slim menu or nothing.
+    // delete project).  Sentinel sections (Unassigned, Goals) pass an
+    // empty groupId up so the frame shows nothing — neither is a real
+    // project, so there are no project actions to offer.
     const std::string contextId =
-        (groupId == kUnassignedId) ? std::string() : groupId;
+        (groupId == kUnassignedId || groupId == kGoalsId)
+            ? std::string() : groupId;
     auto rightClickMenu =
         [this, contextId, panel = header.panel](wxMouseEvent&) {
             if (m_callbacks.onProjectHeaderContextMenuRequested) {
@@ -1050,7 +1266,15 @@ ConversationSidebar::CreateProjectHeader(const std::string& groupId,
     // a project via DnD.  The OS routes drops over child static-text
     // widgets up to the parent panel since the children have no drop
     // target of their own.
-    header.panel->SetDropTarget(new HeaderDropTarget(this, groupId));
+    //
+    // The Goals section is deliberately NOT a drop target: membership
+    // there is derived from whether a chat has a goal, which can't be
+    // set by dragging.  Without a target the OS shows the no-drop cursor
+    // over it, which is the correct affordance.  (OnChatsDroppedOnHeader
+    // also guards kGoalsId defensively in case the wiring ever changes.)
+    if (groupId != kGoalsId) {
+        header.panel->SetDropTarget(new HeaderDropTarget(this, groupId));
+    }
 
     return header;
 }
@@ -1077,12 +1301,14 @@ void ConversationSidebar::UpdateProjectHeader(HeaderWidgets& header,
         }
     }
 
-    // Show "(N)" only while collapsed — when expanded, the rows
-    // themselves convey the count and the trailing number is noise.
+    // Count is always shown now, expanded or collapsed — a bare,
+    // right-aligned number in the muted color (Outlook-style ledger
+    // column).  Zero is suppressed, though in practice a rendered
+    // header always has at least one chat.
     if (header.countLabel) {
-        if (collapsed && chatCount > 0) {
-            std::string label = "  (" + std::to_string(chatCount) + ")";
-            header.countLabel->SetLabel(wxString::FromUTF8(label));
+        if (chatCount > 0) {
+            header.countLabel->SetLabel(
+                wxString::FromUTF8(std::to_string(chatCount)));
         }
         else {
             header.countLabel->SetLabel("");
@@ -1110,11 +1336,22 @@ void ConversationSidebar::OnProjectHeaderClicked(const std::string& groupId)
 {
     if (groupId.empty()) return;
 
-    if (m_collapsedGroups.count(groupId)) {
-        m_collapsedGroups.erase(groupId);
+    // Toggle based on what the user actually sees, not the raw persisted
+    // flag.  A group can be persisted-collapsed yet displayed expanded
+    // because it holds the active chat (auto-reveal); in that case the
+    // header shows ▼ and a click should collapse it, even though
+    // m_collapsedGroups already contains it.
+    if (!IsGroupCollapsed(groupId)) {
+        // Currently shown expanded → collapse it.  Dropping it from the
+        // auto-reveal override (which is only rebuilt when the active chat
+        // changes) is what makes the collapse stick even while this group
+        // holds the active chat.
+        m_collapsedGroups.insert(groupId);
+        m_overrideExpandedGroups.erase(groupId);
     }
     else {
-        m_collapsedGroups.insert(groupId);
+        // Currently shown collapsed → expand it.
+        m_collapsedGroups.erase(groupId);
     }
 
     if (m_callbacks.onCollapsedProjectsChanged) {
@@ -1183,6 +1420,13 @@ void ConversationSidebar::OnChatsDroppedOnHeader(
     if (!m_callbacks.onChatsDroppedOnProject) return;
     if (paths.empty()) return;
 
+    // The Goals section isn't a real bucket you can drop into — its
+    // membership comes from each chat's goal state, not from project
+    // assignment.  The header has no drop target installed, so this
+    // shouldn't fire for it, but guard anyway so a stray drop can never
+    // be misread as "clear project."
+    if (groupId == kGoalsId) return;
+
     // Translate the Unassigned sentinel back to the empty-string
     // convention MoveChatsToProject already uses.  The frame doesn't
     // know about kUnassignedId — keep that abstraction local.
@@ -1203,14 +1447,9 @@ ConversationSidebar::CreateRow(const ConversationEntry& entry)
     row.filePath = entry.filePath;
     row.modTime = entry.modTime;
 
-    row.displayedTitle = entry.title;
-    if (row.displayedTitle.size() > 35)
-        row.displayedTitle = row.displayedTitle.substr(0, 32) + "...";
-
-    row.displayedTitleLower = row.displayedTitle;
-    std::transform(row.displayedTitleLower.begin(),
-                   row.displayedTitleLower.end(),
-                   row.displayedTitleLower.begin(), ::tolower);
+    wxString displayTitle = SidebarDisplayTitleFromUtf8(entry.title);
+    row.displayedTitle = WxToUtf8String(displayTitle);
+    row.searchTitleLower = SidebarSearchKeyFromUtf8(entry.title);
 
     row.displayedTime = RelativeTimeString(entry.modTime);
 
@@ -1223,17 +1462,17 @@ ConversationSidebar::CreateRow(const ConversationEntry& entry)
     // ── Top row: title + trash icon ──────────────────────────────
     auto* topSizer = new wxBoxSizer(wxHORIZONTAL);
 
-    row.titleLabel = new wxStaticText(row.panel, wxID_ANY,
-        wxString::FromUTF8(row.displayedTitle));
+    row.titleLabel = new wxStaticText(row.panel, wxID_ANY, displayTitle);
     row.titleLabel->SetForegroundColour(m_theme->chatAssistant);
     wxFont titleFont = row.titleLabel->GetFont();
     titleFont.SetPointSize(11);
     titleFont.SetWeight(wxFONTWEIGHT_BOLD);
     row.titleLabel->SetFont(titleFont);
-    // Indented past the header triangle so chats sit visually under
-    // the project name.  The leading indent is intentionally larger
-    // than the header's triangle padding (8px) — chat titles align
-    // roughly under the project name's first character.
+    // Small left pad inside the (already inset) row panel so the title
+    // doesn't butt against the row's left edge.  The structural tree
+    // indent is applied to the whole panel at sizer-insert time
+    // (kChildIndent in Refresh); this 12px just adds breathing room, and
+    // together they land the title roughly under the project name.
     topSizer->Add(row.titleLabel, 1, wxLEFT | wxTOP, 12);
 
     // Trash icon — hidden by default, shown on hover
@@ -1456,20 +1695,20 @@ void ConversationSidebar::UpdateRow(RowWidgets& row,
     row.filePath = entry.filePath;
     row.modTime = entry.modTime;
 
-    std::string newTitle = entry.title;
-    if (newTitle.size() > 35)
-        newTitle = newTitle.substr(0, 32) + "...";
+    wxString displayTitle = SidebarDisplayTitleFromUtf8(entry.title);
+    std::string newDisplayedTitle = WxToUtf8String(displayTitle);
+    std::string newSearchTitleLower = SidebarSearchKeyFromUtf8(entry.title);
 
     std::string newTime = RelativeTimeString(entry.modTime);
 
-    if (newTitle != row.displayedTitle) {
-        row.displayedTitle = newTitle;
-        row.displayedTitleLower = newTitle;
-        std::transform(row.displayedTitleLower.begin(),
-                       row.displayedTitleLower.end(),
-                       row.displayedTitleLower.begin(), ::tolower);
+    if (newDisplayedTitle != row.displayedTitle) {
+        row.displayedTitle = newDisplayedTitle;
         if (row.titleLabel)
-            row.titleLabel->SetLabel(wxString::FromUTF8(newTitle));
+            row.titleLabel->SetLabel(displayTitle);
+    }
+
+    if (newSearchTitleLower != row.searchTitleLower) {
+        row.searchTitleLower = newSearchTitleLower;
     }
 
     if (newTime != row.displayedTime) {

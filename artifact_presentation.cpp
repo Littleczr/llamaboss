@@ -1,5 +1,3 @@
-#define _CRT_SECURE_NO_WARNINGS
-
 // artifact_presentation.cpp
 #include "artifact_presentation.h"
 
@@ -21,7 +19,9 @@ std::string LbPresentedFileExtLower(const PresentedFile& f)
     if (slash != std::string::npos) name = name.substr(slash + 1);
 
     size_t dot = name.find_last_of('.');
-    if (dot == std::string::npos || dot + 1 >= name.size()) return std::string();
+    if (dot == std::string::npos || dot == 0 || dot + 1 >= name.size()) {
+        return std::string();
+    }
     return LbLowerAscii(name.substr(dot + 1));
 }
 
@@ -57,7 +57,9 @@ ArtifactPresentation BuildArtifactPresentation(const std::vector<PresentedFile>&
             hasMarkdown = true;
         } else if (ext == "txt" || lang == "text") {
             hasText = true;
-        } else if (ext == "png" || ext == "jpg" || ext == "jpeg" || ext == "webp") {
+        } else if (ext == "png" || ext == "jpg" || ext == "jpeg" ||
+                   ext == "webp" || ext == "gif" || ext == "bmp" ||
+                   ext == "svg") {
             hasImage = true;
         } else {
             hasOther = true;
@@ -69,7 +71,7 @@ ArtifactPresentation BuildArtifactPresentation(const std::vector<PresentedFile>&
                       (hasText ? 1 : 0) + (hasImage ? 1 : 0) +
                       (hasOther ? 1 : 0);
 
-    if (files.size() == 1 && kinds == 1) {
+    if (files.size() == 1) {
         if (hasDocx)     return { "\xF0\x9F\x93\x84", "Create Word Document" };      // 📄
         if (hasSheet)    return { "\xF0\x9F\x93\x8A", "Create Spreadsheet" };        // 📊
         if (hasPdf)      return { "\xF0\x9F\x93\x84", "Create PDF" };                 // 📄
@@ -83,6 +85,8 @@ ArtifactPresentation BuildArtifactPresentation(const std::vector<PresentedFile>&
     if (hasSheet && kinds == 1)     return { "\xF0\x9F\x93\x8A", "Create Spreadsheets" };
     if (hasPdf && kinds == 1)       return { "\xF0\x9F\x93\x84", "Create PDFs" };
     if (hasMarkdown && kinds == 1) return { "\xF0\x9F\x93\x9D", "Create Markdown Documents" };
+    if (hasText && kinds == 1)     return { "\xF0\x9F\x93\x84", "Create Text Documents" };
+    if (hasImage && kinds == 1)    return { "\xF0\x9F\x96\xBC", "Create Images" };
 
     return { "\xF0\x9F\x93\xA6", "Create Files" };                                    // 📦
 }

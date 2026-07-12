@@ -1,7 +1,7 @@
 // tool_mkdir.h
 //
-// Phase 6 sibling to tool_write: create a single directory under
-// the per-conversation tool CWD.
+// Phase 6 sibling to tool_write: create a directory under
+// the per-conversation tool CWD or active project root.
 //
 // MakeDirectory is idempotent on directories: if the leaf already
 // exists AS a directory, the call succeeds and is reported as
@@ -11,10 +11,11 @@
 //
 // Same containment story as tool_write: the resolved path must
 // land inside ctx.cwd, the leaf basename must survive
-// path_safety::SanitizeFilename intact, and the parent directory
-// must already exist (single operations only; no implicit chain
-// creation).  Risky-extension classification doesn't apply --
-// directories aren't executed by ShellExecute.
+// path_safety::SanitizeFilename intact. Missing intermediate
+// directories are created safely (mkdir -p style), but every new
+// segment is sanitized and the final resolved path must remain inside
+// the allowed write roots. Risky-extension classification doesn't
+// apply -- directories aren't executed by ShellExecute.
 //
 // Synchronous on the caller's thread.  CreateDirectoryW on a
 // local NTFS volume is microsecond-scale.
@@ -47,10 +48,10 @@ struct MkdirResult {
     std::string bodyLang;
 };
 
-// Creates a single directory at `path` (relative paths resolve
-// against ctx.cwd).  Refuses traversal escapes, unsafe names, and
-// inputs whose parent directory doesn't exist.  Returns "exists"
-// rather than failing if the path is already a directory.
+// Creates a directory at `path` (relative paths resolve against
+// ctx.cwd/project root). Missing intermediate directories are created
+// safely. Refuses traversal escapes, unsafe names, and file collisions.
+// Returns "exists" rather than failing if the path is already a directory.
 //
 // Never throws.  Every path through the function returns a fully
 // populated MkdirResult.

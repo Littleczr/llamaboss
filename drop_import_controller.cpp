@@ -241,6 +241,30 @@ bool DropImportController::QueueDocxAttachmentFromDrop(
     return QueueDroppedFileImport(filePath, spec);
 }
 
+bool DropImportController::QueueCsvAttachmentFromDrop(
+    const std::string& filePath) const
+{
+    DroppedFileSpec spec;
+    spec.extLower     = "csv";
+    spec.displayLabel = "CSV";
+    spec.iconUtf8     = "\xF0\x9F\x93\x8A";   // 📊
+    spec.byteCap      = 100ULL * 1024ULL * 1024ULL;
+    spec.attach       = m_callbacks.attachCsvFile;
+    return QueueDroppedFileImport(filePath, spec);
+}
+
+bool DropImportController::QueueZipAttachmentFromDrop(
+    const std::string& filePath) const
+{
+    DroppedFileSpec spec;
+    spec.extLower     = "zip";
+    spec.displayLabel = "ZIP";
+    spec.iconUtf8     = "\xF0\x9F\x93\xA6";   // 📦
+    spec.byteCap      = 100ULL * 1024ULL * 1024ULL;
+    spec.attach       = m_callbacks.attachZipFile;
+    return QueueDroppedFileImport(filePath, spec);
+}
+
 void DropImportController::NotifyDocmDropRejected(
     const std::string& filePath) const
 {

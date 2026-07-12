@@ -13,6 +13,10 @@
 #include <Poco/DateTimeFormatter.h>
 #include <Poco/DateTimeFormat.h>
 #include <Poco/UUIDGenerator.h>
+#include <Poco/Types.h>
+#include <Poco/Base64Encoder.h>   // image attachment wire projection
+#include <Poco/FileStream.h>      // UTF-8-safe binary reads on Windows
+#include <Poco/StreamCopier.h>    // file → base64 encoder pump
 
 // wxWidgets for paths and file system
 #include <wx/stdpaths.h>
@@ -112,6 +116,112 @@ int JsonIntOrDefault(const Poco::JSON::Object::Ptr& obj,
 {
     if (!obj || !obj->has(key)) return fallback;
     return obj->getValue<int>(key);
+}
+
+bool EndsWithAsciiNoCase(const std::string& value, const std::string& suffix)
+{
+    if (suffix.size() > value.size()) return false;
+
+    const size_t offset = value.size() - suffix.size();
+    for (size_t i = 0; i < suffix.size(); ++i) {
+        const unsigned char a = static_cast<unsigned char>(value[offset + i]);
+        const unsigned char b = static_cast<unsigned char>(suffix[i]);
+        if (std::tolower(a) != std::tolower(b)) return false;
+    }
+    return true;
+}
+
+bool LooksLikeLocalGgufModel(const std::string& model)
+{
+    // Local LlamaBoss sends the loaded GGUF filesystem path as the wire
+    // "model" value. Remote providers receive ids like
+    // "anthropic/claude..." or "openai/gpt..." and must not be sent
+    // llama.cpp-only sampler extensions such as top_k/min_p.
+    return EndsWithAsciiNoCase(model, ".gguf");
+}
+
+void ApplyLocalLlamaSampling(Poco::JSON::Object::Ptr root,
+                             const std::string& model,
+                             bool agentSamplingProfile)
+{
+    if (!LooksLikeLocalGgufModel(model)) return;
+
+    // Keep defaults explicit instead of inheriting llama-server's more
+    // creative defaults.  Normal chat stays flexible; agent/goal/skill
+    // builder turns run cooler for more stable JSON/tool/code output.
+    root->set("temperature", agentSamplingProfile ? 0.4 : 0.6);
+    root->set("top_p", 0.95);
+    root->set("top_k", 40);
+    root->set("min_p", 0.05);
+}
+
+// ─── Image attachment wire projection ────────────────────────────
+//
+// Reads a persisted attachment image from disk and returns it as an
+// OpenAI-style image_url data URI ("" on any failure — a missing or
+// unreadable file must degrade to a text-only message, never fail
+// the whole request build).  Poco::FileInputStream handles UTF-8
+// paths correctly on Windows; std::ifstream would not.  Base64 is
+// emitted without line wrapping — Poco inserts a newline every 72
+// chars by default and providers reject wrapped payloads.
+std::string LoadImageAsDataUri(const std::string& absPath,
+                               const std::string& mimeType)
+{
+    std::ostringstream b64;
+    try {
+        Poco::FileInputStream in(absPath);
+        Poco::Base64Encoder enc(b64);
+        enc.rdbuf()->setLineLength(0);
+        Poco::StreamCopier::copyStream(in, enc);
+        enc.close();   // flush base64 padding
+    } catch (...) {
+        return std::string();
+    }
+    if (b64.str().empty()) return std::string();
+
+    const std::string mime = mimeType.empty()
+        ? std::string("image/png") : mimeType;
+    return "data:" + mime + ";base64," + b64.str();
+}
+
+// ─── Reasoning stripping ─────────────────────────────────────────
+//
+// Model thinking is display/storage-only: it renders once in the
+// collapsed block and persists in the conversation file, but it is
+// never resent on the wire.  Resending burns context (the meter
+// reclaims it automatically since counting happens on the stripped
+// wire copy) and deviates from what reasoning-model templates
+// expect — llama-server's own webui and the DeepSeek/OpenAI APIs
+// all drop prior-turn reasoning.
+//
+// Handles multiple blocks per message and an unterminated open tag
+// (a turn cancelled mid-thinking stores "<think>partial…" with no
+// close — dropped to end of content).  When anything was stripped,
+// leading whitespace left behind by the "</think>\n" separator is
+// trimmed so the wire content starts at the first visible byte.
+std::string StripThinkBlocks(const std::string& content)
+{
+    static const std::string kOpen  = "<think>";
+    static const std::string kClose = "</think>";
+
+    std::string out = content;
+    for (;;) {
+        const size_t open = out.find(kOpen);
+        if (open == std::string::npos) break;
+
+        const size_t close = out.find(kClose, open + kOpen.size());
+        if (close == std::string::npos) {
+            out.erase(open);          // unterminated — drop to end
+            break;
+        }
+        out.erase(open, close + kClose.size() - open);
+    }
+
+    if (out.size() != content.size()) {
+        const size_t first = out.find_first_not_of(" \t\r\n");
+        out.erase(0, first == std::string::npos ? out.size() : first);
+    }
+    return out;
 }
 
 // ─── Tool-result compaction helpers ──────────────────────────────
@@ -230,6 +340,83 @@ std::string ElideToolResultBody(const std::string& content)
         statusLine = content.substr(statusStart + 1);  // drop leading \n
     }
 
+    // ── Error summary preservation ───────────────────────────────
+    // For FAILED results, the error text is usually the load-bearing
+    // context for why the model changed approach afterwards.  Eliding
+    // it makes the surviving transcript read like the model abandoned
+    // a working plan for no reason — and invites re-trying the failed
+    // call.  Keep a bounded head of the [error] section.
+    //
+    // FormatToolBlockAsUserMessage emits the section as:
+    //   \n[error]\n<fence>\n<errorBody...><fence>\n
+    // where <fence> is a backtick run on its own line.  Parse by
+    // locating the marker, taking the next line as the fence, and
+    // capturing until a line equal to that fence.
+    std::string errorSummary;
+    {
+        constexpr const char* kErrMarker = "\n[error]\n";
+        constexpr size_t kErrMarkerLen   = 9;   // strlen("\n[error]\n")
+        constexpr size_t kMaxErrorSummaryBytes = 480;
+        constexpr int    kMaxErrorSummaryLines = 6;
+
+        size_t errPos = content.find(kErrMarker);
+        if (errPos != std::string::npos) {
+            size_t fenceStart = errPos + kErrMarkerLen;
+            size_t fenceEnd   = content.find('\n', fenceStart);
+            if (fenceEnd != std::string::npos && fenceEnd > fenceStart) {
+                std::string fence = content.substr(fenceStart,
+                                                   fenceEnd - fenceStart);
+                bool fenceOk = !fence.empty();
+                for (char c : fence) if (c != '`') { fenceOk = false; break; }
+
+                if (fenceOk) {
+                    size_t bodyStart = fenceEnd + 1;
+                    size_t closePos  = content.find("\n" + fence + "\n",
+                                                    bodyStart);
+                    size_t bodyEnd = (closePos != std::string::npos)
+                                         ? closePos
+                                         : content.size();
+
+                    std::string err = content.substr(bodyStart,
+                                                     bodyEnd - bodyStart);
+
+                    // Bound by lines, then by bytes (UTF-8 safe cut).
+                    int    lines = 0;
+                    size_t cut   = err.size();
+                    for (size_t i = 0; i < err.size(); ++i) {
+                        if (err[i] == '\n' &&
+                            ++lines >= kMaxErrorSummaryLines) {
+                            cut = i;
+                            break;
+                        }
+                    }
+                    bool truncated = cut < err.size();
+                    if (cut > kMaxErrorSummaryBytes) {
+                        cut = kMaxErrorSummaryBytes;
+                        while (cut > 0 &&
+                               (static_cast<unsigned char>(err[cut]) & 0xC0)
+                                   == 0x80) {
+                            --cut;
+                        }
+                        truncated = true;
+                    }
+                    errorSummary = err.substr(0, cut);
+                    // Trim trailing whitespace so the marker reads tight.
+                    while (!errorSummary.empty() &&
+                           (errorSummary.back() == ' '  ||
+                            errorSummary.back() == '\t' ||
+                            errorSummary.back() == '\r' ||
+                            errorSummary.back() == '\n')) {
+                        errorSummary.pop_back();
+                    }
+                    if (truncated && !errorSummary.empty()) {
+                        errorSummary += "\n... [error truncated]";
+                    }
+                }
+            }
+        }
+    }
+
     // Rebuild: header + echo + elision marker + status.
     // Echo has the ">" prefix baked in, strip it so the marker reads
     // naturally.  This remains plain text and will not be parsed as a
@@ -256,10 +443,30 @@ std::string ElideToolResultBody(const std::string& content)
             << "` just to recover omitted output.]\n";
     }
 
+    if (!errorSummary.empty()) {
+        out << "\n[error summary preserved from the elided result]\n"
+            << errorSummary << "\n";
+    }
+
     if (!statusLine.empty()) {
         out << "\n" << statusLine;
     }
     return out.str();
+}
+
+std::string StripAgentStepTrailer(const std::string& content)
+{
+    constexpr const char* kMarker = "\n\n[agent tool step ";
+    const size_t pos = content.rfind(kMarker);
+    if (pos == std::string::npos) return content;
+
+    const size_t close = content.find(']', pos + 2);
+    if (close == std::string::npos) return content;
+
+    // The trailer is always appended at the end of a formatted tool result.
+    // It may optionally be followed by the one-sentence budget warning; both
+    // are live-loop guidance and become misleading once older turns replay.
+    return content.substr(0, pos);
 }
 
 } // anonymous namespace
@@ -303,6 +510,8 @@ void ChatHistory::AddUserMessage(const std::string& content, const std::string& 
                 kind = "pdf_file";
             else if (a.kind == AttachmentInfo::Kind::SpreadsheetFile)
                 kind = "spreadsheet_file";
+            else if (a.kind == AttachmentInfo::Kind::ZipFile)
+                kind = "zip_file";
             obj->set("kind", kind);
             obj->set("filename", a.filename);
             obj->set("mime_type", a.mimeType);
@@ -315,19 +524,19 @@ void ChatHistory::AddUserMessage(const std::string& content, const std::string& 
     }
 
     m_messages.push_back(msg);
-    m_dirty = true;
+    MarkDirty();
 }
 
 void ChatHistory::AddAssistantMessage(const std::string& content, const std::string& model)
 {
     m_messages.push_back(CreateMessage("assistant", content, model));
-    m_dirty = true;
+    MarkDirty();
 }
 
 void ChatHistory::AddSystemMessage(const std::string& content)
 {
     m_messages.push_back(CreateMessage("system", content));
-    m_dirty = true;
+    MarkDirty();
 }
 
 // ── Phase 3c-ii: native sidecar fields ─────────────────────────
@@ -352,11 +561,31 @@ void ChatHistory::SetLastAssistantToolCalls(const std::string& toolCallsJson)
         Poco::JSON::Array::Ptr arr = var.extract<Poco::JSON::Array::Ptr>();
         if (arr && arr->size() > 0) {
             last->set("tool_calls", arr);
-            m_dirty = true;
+            MarkDirty();
         }
     } catch (...) {
         // Drop silently — request builder treats this assistant
         // message as plain prose.
+    }
+}
+
+void ChatHistory::SetLastAssistantImages(const std::vector<std::string>& relPaths)
+{
+    if (relPaths.empty()) return;
+    if (m_messages.empty()) return;
+
+    auto& last = m_messages.back();
+    try {
+        if (last->getValue<std::string>("role") != "assistant") return;
+    } catch (...) { return; }
+
+    Poco::JSON::Array::Ptr arr = new Poco::JSON::Array;
+    for (const auto& p : relPaths) {
+        if (!p.empty()) arr->add(p);
+    }
+    if (arr->size() > 0) {
+        last->set("images", arr);
+        MarkDirty();
     }
 }
 
@@ -372,7 +601,7 @@ void ChatHistory::AddToolResultMessage(const std::string& toolCallId,
         msg->set("tool_call_id", toolCallId);
     }
     m_messages.push_back(msg);
-    m_dirty = true;
+    MarkDirty();
 }
 
 void ChatHistory::Clear()
@@ -386,6 +615,7 @@ void ChatHistory::Clear()
     m_updatedAt.clear();
     m_toolCwd.clear();
     m_toolTimeoutMs = 0;
+    m_thinkOverride = ThinkOverride::Auto;
     m_projectId.clear();
     m_projectName.clear();
     m_projectRoot.clear();
@@ -393,6 +623,7 @@ void ChatHistory::Clear()
     m_chatApprovedTools.clear();
     m_chatApprovalTrustEnabled = false;
     m_dirty = false;
+    m_revision = 0;
 }
 
 size_t ChatHistory::GetMessageCount() const
@@ -425,12 +656,50 @@ bool ChatHistory::HasPersistableContent() const
 //  API Request Builders
 // ═══════════════════════════════════════════════════════════════════
 
+// ── Context meter support ────────────────────────────────────────
+
+size_t ChatHistory::EstimateTokensFromBytes(size_t bytes)
+{
+    // Same constant the elision budget uses (kBytesPerToken above), so
+    // the meter and the request builder agree by construction.
+    return (size_t)((double)bytes / kBytesPerToken);
+}
+
+double ChatHistory::ElisionBudgetFraction()
+{
+    return kBudgetFraction;
+}
+
+size_t ChatHistory::EstimateHistoryTokens() const
+{
+    size_t bytes = 0;
+    for (const auto& msg : m_messages) {
+        if (!msg) continue;
+        try {
+            if (msg->has("content") && !msg->isNull("content"))
+                bytes += msg->getValue<std::string>("content").size();
+        } catch (...) { /* non-string content — skip */ }
+        if (msg->has("tool_calls")) bytes += 200;  // sidecar overhead, rough
+        bytes += 40;                               // per-message JSON + role
+    }
+    // Include content still sitting in the streaming buffer that hasn't
+    // been synced to the JSON object yet (sub-4KiB partial replies).
+    bytes += m_streamBuffer.size();
+    return EstimateTokensFromBytes(bytes);
+}
+
 std::string ChatHistory::BuildChatRequestJson(const std::string& model, bool stream,
                                                const std::string& systemPrompt,
                                                int contextTokens,
                                                const std::string& toolsArrayJson,
-                                               bool nativeProtocol)
+                                               bool nativeProtocol,
+                                               bool agentSamplingProfile,
+                                               bool imageOutput)
 {
+    // Context meter: fresh count for this build; incremented by the
+    // elision pass below when tool-result bodies are actually dropped.
+    m_lastBuildElidedCount = 0;
+
     // Make sure any in-flight streamed content is reflected in the JSON
     // objects before we build the wire request.  AppendToLastAssistantMessage
     // amortizes the sync; this is the read-side counterpart.
@@ -470,6 +739,14 @@ std::string ChatHistory::BuildChatRequestJson(const std::string& model, bool str
         // matching field on disk.
         std::string             toolCallId;     // user message answering an assistant call
         Poco::JSON::Array::Ptr  toolCalls;      // assistant message that emitted calls
+        // Image-projection sidecars.  attachMeta is the message's
+        // stored attachments array (kind/mime_type/storage_path);
+        // isImageCarrier marks the single message whose persisted
+        // images ride the wire this request.  A flag on the element
+        // (not an index) so the elision/sanitizer phases that mutate
+        // or remove wire entries can never orphan the selection.
+        Poco::JSON::Array::Ptr  attachMeta;
+        bool                    isImageCarrier = false;
     };
     std::vector<WireMsg> wire;
     wire.reserve(m_messages.size() + (systemPrompt.empty() ? 0 : 1));
@@ -483,12 +760,24 @@ std::string ChatHistory::BuildChatRequestJson(const std::string& model, bool str
                                   ? msg->getValue<std::string>("content")
                                   : std::string();
 
-        // Skip placeholder assistant messages that have no content
-        // AND no tool_calls.  An assistant message with tool_calls
-        // and empty content is valid (and required) under the
-        // native protocol.
+        // Reasoning never goes back on the wire (see StripThinkBlocks).
+        // Applied here — before the blank-content skip, elision, and
+        // token counting — so all downstream phases see the wire-true
+        // content and a thinking-only assistant turn drops out entirely
+        // (its native tool_calls sidecar, when present, still survives
+        // via the hasToolCalls path below).
+        if (role == "assistant")
+            content = StripThinkBlocks(content);
+
+        // Skip placeholder assistant messages that have no visible content.
+        // An assistant message with tool_calls and empty content is valid
+        // only when projecting a Native tool-calling transcript.  Under the
+        // XML/plain protocol, sidecars are ignored, so keeping that row would
+        // put an empty assistant turn on the wire after model switching.
         const bool hasToolCalls = msg->has("tool_calls");
-        if (content.empty() && !hasToolCalls) continue;
+        const bool blankContent =
+            content.find_first_not_of(" \t\r\n") == std::string::npos;
+        if (blankContent && !(nativeProtocol && hasToolCalls)) continue;
 
         WireMsg w;
         w.role         = std::move(role);
@@ -505,9 +794,78 @@ std::string ChatHistory::BuildChatRequestJson(const std::string& model, bool str
                 w.toolCalls = msg->getArray("tool_calls");
             } catch (...) { /* leave null */ }
         }
+        if (w.role == "user" && !w.isToolResult && msg->has("attachments")) {
+            try {
+                w.attachMeta = msg->getArray("attachments");
+            } catch (...) { /* leave null */ }
+        }
 
         wire.push_back(std::move(w));
     }
+
+    // ── Phase 1b: strip stale live-loop budget trailers ─────────
+    // AgentController appends a model-facing "[agent tool step N of 12]"
+    // trailer to the newest counted tool result while a loop is actively
+    // iterating.  That trailer is useful for the immediate follow-up request,
+    // but stale trailers from older turns become misleading instructions.
+    // Keep it only when the latest non-system wire message is itself a tool
+    // result; otherwise strip it from every tool result before request build.
+    size_t lastNonSystemIndex = wire.size();
+    for (size_t i = wire.size(); i-- > 0;) {
+        if (wire[i].role != "system") {
+            lastNonSystemIndex = i;
+            break;
+        }
+    }
+
+    for (size_t i = 0; i < wire.size(); ++i) {
+        if (!wire[i].isToolResult) continue;
+        if (i == lastNonSystemIndex) continue;
+        wire[i].content = StripAgentStepTrailer(wire[i].content);
+    }
+
+    // ── Phase 1c: image carrier selection ────────────────────────
+    // User-attached images are persisted to the conversation's
+    // attachments sidecar folder, but historically rode the wire only
+    // in the single request built right after attach (via
+    // AttachmentManager::InjectImagesIntoRequest).  Any rebuild —
+    // every agent-loop iteration, or a follow-up turn — silently
+    // dropped them, so vision models (Grok, Gemini, local mmproj
+    // pairs) went blind after one tool call and truthfully claimed
+    // they could not see the image.
+    //
+    // Policy: project images from the NEWEST real user message (not a
+    // tool result under either protocol), and only that one.  This
+    // keeps the image visible for the entire agent loop of the attach
+    // turn and for immediate re-asks, while bounding per-request
+    // upload cost to one message's images.  Once the user sends a
+    // newer message, older images age off the wire — which also means
+    // switching to a text-only model afterwards keeps working exactly
+    // as before.
+    for (size_t i = wire.size(); i-- > 0;) {
+        WireMsg& w = wire[i];
+        if (w.role != "user" || w.isToolResult || !w.toolCallId.empty())
+            continue;
+        // Newest real user message found — carrier iff it has at
+        // least one persisted image attachment.
+        if (w.attachMeta) {
+            for (unsigned k = 0; k < w.attachMeta->size(); ++k) {
+                Poco::JSON::Object::Ptr a = w.attachMeta->getObject(k);
+                if (a &&
+                    a->optValue<std::string>("kind", "") == "image" &&
+                    !a->optValue<std::string>("storage_path", "").empty()) {
+                    w.isImageCarrier = true;
+                    break;
+                }
+            }
+        }
+        break;
+    }
+
+    // Resolved once; the stringify lambda below may run twice (before
+    // and after elision) and must not recompute path plumbing.
+    const std::string imageWorkflowDir =
+        m_filePath.empty() ? std::string() : GetWorkflowDir(m_filePath);
 
     // ── Phase 2: optional compaction ────────────────────────────
     // Only runs when the caller provided a context-window hint.
@@ -520,6 +878,47 @@ std::string ChatHistory::BuildChatRequestJson(const std::string& model, bool str
         Poco::JSON::Object::Ptr root = new Poco::JSON::Object;
         root->set("model", model);
         root->set("stream", stream);
+        ApplyLocalLlamaSampling(root, model, agentSamplingProfile);
+
+        // ── Reasoning override (/think on|off) ───────────────────
+        // Auto sends nothing, keeping the historical request shape
+        // byte-for-byte.  Local llama-server targets (.gguf model
+        // value) get chat_template_kwargs.enable_thinking, which
+        // hybrid-reasoning chat templates (Qwen3 family and similar)
+        // honor when the server runs with --jinja; templates that
+        // never reference the flag ignore it, and llama-server
+        // ignores the field entirely without --jinja.  Remote
+        // OpenAI-compatible targets get an OpenRouter-style
+        // reasoning object.  A strict remote endpoint that rejects
+        // unknown fields surfaces its error in chat, and /think auto
+        // restores the untouched request.  Skipped on image-output
+        // turns so provider routing for image models is unaffected.
+        if (m_thinkOverride != ThinkOverride::Auto && !imageOutput) {
+            const bool wantThink = (m_thinkOverride == ThinkOverride::On);
+            if (LooksLikeLocalGgufModel(model)) {
+                Poco::JSON::Object::Ptr kwargs = new Poco::JSON::Object;
+                kwargs->set("enable_thinking", wantThink);
+                root->set("chat_template_kwargs", kwargs);
+            } else {
+                Poco::JSON::Object::Ptr reasoning = new Poco::JSON::Object;
+                reasoning->set("enabled", wantThink);
+                root->set("reasoning", reasoning);
+            }
+        }
+
+        // Image-generation turn (OpenRouter chat-completions image
+        // models).  Without an explicit modalities request the
+        // provider returns text only; with it, generated images
+        // arrive on the assistant message's `images` field as base64
+        // data URLs.  Callers pass imageOutput=true only for remote
+        // targets whose selected model carries the image_output flag,
+        // so local llama-server never sees this field.
+        if (imageOutput) {
+            Poco::JSON::Array::Ptr modalities = new Poco::JSON::Array;
+            modalities->add(std::string("image"));
+            modalities->add(std::string("text"));
+            root->set("modalities", modalities);
+        }
 
         Poco::JSON::Array::Ptr arr = new Poco::JSON::Array;
         for (const auto& w : wire) {
@@ -560,8 +959,56 @@ std::string ChatHistory::BuildChatRequestJson(const std::string& model, bool str
                 m->set("content", w.content);
             }
             else {
-                m->set("role",    w.role);
-                m->set("content", w.content);
+                m->set("role", w.role);
+
+                // Image carrier: rebuild the OpenAI-style content
+                // array (image_url data-URI parts + text part) from
+                // the persisted attachment files.  Unreadable or
+                // missing files are skipped individually; if nothing
+                // loads, fall back to the plain string so the request
+                // stays valid.  Capped at 8 parts as a safety bound.
+                bool emittedParts = false;
+                if (w.isImageCarrier && !imageWorkflowDir.empty()) {
+                    Poco::JSON::Array::Ptr parts = new Poco::JSON::Array;
+                    int imageCount = 0;
+                    for (unsigned k = 0;
+                         k < w.attachMeta->size() && imageCount < 8; ++k) {
+                        Poco::JSON::Object::Ptr a =
+                            w.attachMeta->getObject(k);
+                        if (!a) continue;
+                        if (a->optValue<std::string>("kind", "") != "image")
+                            continue;
+                        const std::string rel =
+                            a->optValue<std::string>("storage_path", "");
+                        if (rel.empty()) continue;
+
+                        const std::string uri = LoadImageAsDataUri(
+                            imageWorkflowDir + "/" + rel,
+                            a->optValue<std::string>("mime_type", ""));
+                        if (uri.empty()) continue;
+
+                        Poco::JSON::Object::Ptr imageUrl =
+                            new Poco::JSON::Object;
+                        imageUrl->set("url", uri);
+                        Poco::JSON::Object::Ptr part =
+                            new Poco::JSON::Object;
+                        part->set("type", "image_url");
+                        part->set("image_url", imageUrl);
+                        parts->add(part);
+                        ++imageCount;
+                    }
+                    if (imageCount > 0) {
+                        Poco::JSON::Object::Ptr textPart =
+                            new Poco::JSON::Object;
+                        textPart->set("type", "text");
+                        textPart->set("text", w.content);
+                        parts->add(textPart);
+                        m->set("content", parts);
+                        emittedParts = true;
+                    }
+                }
+                if (!emittedParts)
+                    m->set("content", w.content);
             }
 
             arr->add(m);
@@ -574,6 +1021,17 @@ std::string ChatHistory::BuildChatRequestJson(const std::string& model, bool str
         // response.  3c-ii consumes those tool_calls.
         if (toolsArr) {
             root->set("tools", toolsArr);
+
+            // LlamaBoss dispatches exactly one tool call per assistant
+            // turn (AgentController truncates extra entries via
+            // KeepOnlySelectedToolCallJson).  Ask the model not to
+            // generate parallel calls in the first place: extra calls
+            // would only be silently discarded, wasting tokens and
+            // leaving the model believing it issued work that never
+            // ran.  llama.cpp's OpenAI-compatible endpoint honors this
+            // for templates that support it and ignores it otherwise;
+            // the controller-side truncation remains as the backstop.
+            root->set("parallel_tool_calls", false);
         }
 
         std::ostringstream oss;
@@ -634,6 +1092,7 @@ std::string ChatHistory::BuildChatRequestJson(const std::string& model, bool str
 
                 if (oldSize > newSize) {
                     estimatedBodySize -= (oldSize - newSize);
+                    ++m_lastBuildElidedCount;   // context meter: real drop
                 }
                 wireDirty = true;
 
@@ -797,7 +1256,7 @@ void ChatHistory::AppendToLastAssistantMessage(const std::string& delta)
         // ever forgets to flush before reading m_messages directly.
         m_streamBuffer += delta;
         m_streamBufferDirty += delta.size();
-        m_dirty = true;
+        MarkDirty();
 
         constexpr std::size_t kStreamSyncThresholdBytes = 4 * 1024;
         if (m_streamBufferDirty >= kStreamSyncThresholdBytes) {
@@ -811,7 +1270,7 @@ void ChatHistory::UpdateLastAssistantMessage(const std::string& content)
 {
     if (!m_messages.empty() && IsLastMessageRole("assistant")) {
         m_messages.back()->set("content", content);
-        m_dirty = true;
+        MarkDirty();
     }
     // Replacing content makes any buffered streaming bytes obsolete.
     // Clear them so subsequent FlushStreamBuffer() calls don't overwrite
@@ -824,7 +1283,7 @@ void ChatHistory::RemoveLastAssistantMessage()
 {
     if (!m_messages.empty() && IsLastMessageRole("assistant")) {
         m_messages.pop_back();
-        m_dirty = true;
+        MarkDirty();
     }
     // Defensive: if the removed assistant message was an in-flight
     // streaming target, the buffer carried its content and would
@@ -834,6 +1293,14 @@ void ChatHistory::RemoveLastAssistantMessage()
     // not.
     m_streamBuffer.clear();
     m_streamBufferDirty = 0;
+}
+
+void ChatHistory::RemoveLastSystemMessage()
+{
+    if (!m_messages.empty() && IsLastMessageRole("system")) {
+        m_messages.pop_back();
+        MarkDirty();
+    }
 }
 
 bool ChatHistory::HasAssistantPlaceholder() const
@@ -946,266 +1413,286 @@ bool ChatHistory::IsLastMessageRole(const std::string& role) const
 //  File Persistence
 // ═══════════════════════════════════════════════════════════════════
 
-bool ChatHistory::SaveToFile(const std::string& filePath, const std::vector<std::string>& models)
+bool ChatHistory::CreateSaveSnapshot(
+    const std::string& filePath,
+    const std::vector<std::string>& models,
+    SaveSnapshot& outSnapshot)
 {
-    std::string savePath = filePath.empty() ? m_filePath : filePath;
-    if (savePath.empty()) return false;
-    if (!HasPersistableContent()) return false;
+    const std::string savePath = filePath.empty() ? m_filePath : filePath;
+    if (savePath.empty() || !HasPersistableContent()) return false;
 
-    // Make sure any buffered streaming bytes land on the JSON object
-    // before we serialize.  Auto-save can fire mid-stream (Stop button,
-    // OnClose); without this, partial assistant content would be lost.
+    // Make any buffered streaming bytes part of the immutable snapshot.
     FlushStreamBuffer();
 
     try {
-        // Set timestamps
-        if (m_createdAt.empty()) {
-            m_createdAt = CurrentTimestamp();
-        }
+        if (m_createdAt.empty()) m_createdAt = CurrentTimestamp();
         m_updatedAt = CurrentTimestamp();
 
-        // Auto-generate a title once useful user content exists.  Project
-        // attachment can persist a metadata-only conversation before the
-        // user types anything; that first save used to lock the sidebar at
-        // "Untitled conversation" forever because later saves only checked
-        // for an empty title.  Treat the default placeholder as replaceable
-        // until a real generated title is available.  Non-placeholder titles
-        // are left alone so future manual rename support is respected.
-        {
-            const std::string generatedTitle = GenerateTitle();
-            if (m_title.empty() ||
-                (m_title == "Untitled conversation" &&
-                 generatedTitle != "Untitled conversation")) {
-                m_title = generatedTitle;
-            }
+        const std::string generatedTitle = GenerateTitle();
+        if (m_title.empty() ||
+            (m_title == "Untitled conversation" &&
+             generatedTitle != "Untitled conversation")) {
+            m_title = generatedTitle;
         }
 
-        // Build the JSON document
-        // preserveInsertOrder=true keeps title/metadata before messages,
-        // which enables fast title extraction in the sidebar.
+        SaveSnapshot snapshot;
+        snapshot.filePath      = savePath;
+        snapshot.title         = m_title;
+        snapshot.createdAt     = m_createdAt;
+        snapshot.updatedAt     = m_updatedAt;
+        snapshot.toolCwd       = m_toolCwd;
+        snapshot.toolTimeoutMs = m_toolTimeoutMs;
+        snapshot.thinkOverride = m_thinkOverride;
+        snapshot.projectId     = m_projectId;
+        snapshot.projectName   = m_projectName;
+        snapshot.projectRoot   = m_projectRoot;
+        snapshot.goalState     = m_goalState;
+        snapshot.models        = models;
+        snapshot.revision      = m_revision;
+        snapshot.messages.reserve(m_messages.size());
+
+        auto ArrayToJson = [](const Poco::JSON::Array::Ptr& arr) -> std::string {
+            if (!arr) return {};
+            std::ostringstream oss;
+            Poco::JSON::Stringifier::stringify(arr, oss);
+            return oss.str();
+        };
+
+        for (const auto& msg : m_messages) {
+            if (!msg) continue;
+
+            const std::string content = msg->has("content")
+                ? msg->getValue<std::string>("content")
+                : std::string();
+            const bool hasToolCalls  = msg->has("tool_calls");
+            const bool hasToolCallId = msg->has("tool_call_id");
+            const bool hasImages     = msg->has("images");
+            const bool hasAttachments = msg->has("attachments");
+            if (content.empty() && !hasToolCalls && !hasToolCallId &&
+                !hasImages) {
+                continue;
+            }
+
+            SaveMessageSnapshot saved;
+            saved.role    = msg->getValue<std::string>("role");
+            saved.content = content;
+            saved.model   = GetMessageModel(msg);
+            saved.target  = GetMessageTarget(msg);
+            if (hasToolCallId) {
+                saved.toolCallId =
+                    msg->getValue<std::string>("tool_call_id");
+            }
+            if (hasAttachments) {
+                try { saved.attachmentsJson = ArrayToJson(msg->getArray("attachments")); }
+                catch (...) { saved.attachmentsJson.clear(); }
+            }
+            if (hasToolCalls) {
+                try { saved.toolCallsJson = ArrayToJson(msg->getArray("tool_calls")); }
+                catch (...) { saved.toolCallsJson.clear(); }
+            }
+            if (hasImages) {
+                try { saved.imagesJson = ArrayToJson(msg->getArray("images")); }
+                catch (...) { saved.imagesJson.clear(); }
+            }
+            snapshot.messages.push_back(std::move(saved));
+        }
+
+        // Resolve the optional cosmetic marker on the UI thread because the
+        // wx filesystem helpers are not part of the worker contract.
+        try {
+            const std::string workflowDir = GetWorkflowDir(savePath);
+            if (!workflowDir.empty() &&
+                wxDirExists(wxString::FromUTF8(workflowDir))) {
+                snapshot.titleMarkerPath =
+                    JoinWorkflowPath(workflowDir, "_title.txt");
+            }
+        } catch (...) {
+            snapshot.titleMarkerPath.clear();
+        }
+
+        outSnapshot = std::move(snapshot);
+        return true;
+    }
+    catch (...) {
+        return false;
+    }
+}
+
+bool ChatHistory::WriteSaveSnapshot(const SaveSnapshot& snapshot,
+                                    bool durable)
+{
+    if (snapshot.filePath.empty()) return false;
+
+    try {
+        auto ParseArray = [](const std::string& json) -> Poco::JSON::Array::Ptr {
+            if (json.empty()) return nullptr;
+            Poco::JSON::Parser parser;
+            auto var = parser.parse(json);
+            return var.extract<Poco::JSON::Array::Ptr>();
+        };
+
         Poco::JSON::Object::Ptr root = new Poco::JSON::Object(true);
         root->set("version", CONVERSATION_FORMAT_VERSION);
-        root->set("title", m_title);
-        root->set("created_at", m_createdAt);
-        root->set("updated_at", m_updatedAt);
+        root->set("title", snapshot.title);
+        root->set("created_at", snapshot.createdAt);
+        root->set("updated_at", snapshot.updatedAt);
 
-        // Tool execution context (Phase 3) — only written when the
-        // user has customized them.  Older readers tolerate unknown
-        // keys; newer readers tolerate missing keys.  No version bump.
-        if (!m_toolCwd.empty()) {
-            root->set("tool_cwd", m_toolCwd);
-        }
-        if (m_toolTimeoutMs != 0) {
-            root->set("tool_timeout_ms", (Poco::UInt64)m_toolTimeoutMs);
-        }
+        if (!snapshot.toolCwd.empty())
+            root->set("tool_cwd", snapshot.toolCwd);
+        if (snapshot.toolTimeoutMs != 0)
+            root->set("tool_timeout_ms", (Poco::UInt64)snapshot.toolTimeoutMs);
+        // Reasoning override — omitted entirely when Auto so older
+        // builds and untouched conversations keep an identical file.
+        if (snapshot.thinkOverride == ThinkOverride::On)
+            root->set("think", std::string("on"));
+        else if (snapshot.thinkOverride == ThinkOverride::Off)
+            root->set("think", std::string("off"));
 
-        // Optional long-lived project association (Projects Phase 1).
-        // Older readers tolerate unknown keys; newer readers tolerate
-        // missing keys.
-        if (HasProject()) {
-            root->set("project_id", m_projectId);
-            root->set("project_name", m_projectName);
-            root->set("project_root", m_projectRoot);
+        if (!snapshot.projectId.empty() && !snapshot.projectRoot.empty()) {
+            root->set("project_id", snapshot.projectId);
+            root->set("project_name", snapshot.projectName);
+            root->set("project_root", snapshot.projectRoot);
         }
 
-        // Durable goal state (Goals Phase 5).  The runtime-only
-        // explicitlyCleared tombstone is intentionally not persisted.
-        if (m_goalState.HasGoal()) {
+        const GoalState& goal = snapshot.goalState;
+        if (goal.HasGoal()) {
             Poco::JSON::Object::Ptr goalObj = new Poco::JSON::Object;
-            goalObj->set("status", PersistedGoalStatus(m_goalState.status));
-            goalObj->set("objective", m_goalState.objective);
-            goalObj->set("turns_used", m_goalState.turnsUsed);
-            goalObj->set("verifier_passes", m_goalState.verifierPasses);
-            goalObj->set("verifier_failures", m_goalState.verifierFailures);
-            if (!m_goalState.lastVerifierReason.empty()) {
-                goalObj->set("last_verifier_reason", m_goalState.lastVerifierReason);
-            }
-            if (!m_goalState.lastInterruptionReason.empty()) {
-                goalObj->set("last_interruption_reason", m_goalState.lastInterruptionReason);
-            }
-            if (!m_goalState.awaitingUserReason.empty()) {
-                goalObj->set("awaiting_user_reason", m_goalState.awaitingUserReason);
-            }
-            if (!m_goalState.awaitingUserPromptEvidence.empty()) {
-                goalObj->set("awaiting_user_prompt_evidence", m_goalState.awaitingUserPromptEvidence);
-            }
-            if (!m_goalState.awaitingUserReplyEvidence.empty()) {
-                goalObj->set("awaiting_user_reply_evidence", m_goalState.awaitingUserReplyEvidence);
-            }
-            if (!m_goalState.structuredAgentEvidence.empty()) {
-                goalObj->set(
-                    "structured_agent_evidence",
-                    StringVectorToJsonArray(m_goalState.structuredAgentEvidence));
+            goalObj->set("status", PersistedGoalStatus(goal.status));
+            goalObj->set("objective", goal.objective);
+            goalObj->set("turns_used", goal.turnsUsed);
+            goalObj->set("verifier_passes", goal.verifierPasses);
+            goalObj->set("verifier_failures", goal.verifierFailures);
+            if (!goal.lastVerifierReason.empty())
+                goalObj->set("last_verifier_reason", goal.lastVerifierReason);
+            if (!goal.lastInterruptionReason.empty())
+                goalObj->set("last_interruption_reason", goal.lastInterruptionReason);
+            if (!goal.awaitingUserReason.empty())
+                goalObj->set("awaiting_user_reason", goal.awaitingUserReason);
+            if (!goal.awaitingUserPromptEvidence.empty())
+                goalObj->set("awaiting_user_prompt_evidence", goal.awaitingUserPromptEvidence);
+            if (!goal.awaitingUserReplyEvidence.empty())
+                goalObj->set("awaiting_user_reply_evidence", goal.awaitingUserReplyEvidence);
+            if (!goal.structuredAgentEvidence.empty()) {
+                goalObj->set("structured_agent_evidence",
+                             StringVectorToJsonArray(goal.structuredAgentEvidence));
             }
 
-            const GoalContract& contract = m_goalState.contract;
+            const GoalContract& contract = goal.contract;
             if (contract.status != GoalContractStatus::None ||
                 !contract.successCriteria.empty() ||
                 !contract.constraints.empty() ||
                 !contract.evidenceChecks.empty() ||
                 !contract.lastBuilderReason.empty()) {
                 Poco::JSON::Object::Ptr contractObj = new Poco::JSON::Object;
-                contractObj->set("status", PersistedGoalContractStatus(contract.status));
-                contractObj->set("success_criteria", StringVectorToJsonArray(contract.successCriteria));
-                contractObj->set("constraints", StringVectorToJsonArray(contract.constraints));
-                contractObj->set("evidence_checks", StringVectorToJsonArray(contract.evidenceChecks));
-                if (!contract.lastBuilderReason.empty()) {
-                    contractObj->set("last_builder_reason", contract.lastBuilderReason);
-                }
+                contractObj->set("status",
+                                 PersistedGoalContractStatus(contract.status));
+                contractObj->set("success_criteria",
+                                 StringVectorToJsonArray(contract.successCriteria));
+                contractObj->set("constraints",
+                                 StringVectorToJsonArray(contract.constraints));
+                contractObj->set("evidence_checks",
+                                 StringVectorToJsonArray(contract.evidenceChecks));
+                if (!contract.lastBuilderReason.empty())
+                    contractObj->set("last_builder_reason",
+                                     contract.lastBuilderReason);
                 goalObj->set("contract", contractObj);
             }
-
             root->set("goal", goalObj);
         }
 
-        // Write models array (v2 format)
         Poco::JSON::Array::Ptr modelsArray = new Poco::JSON::Array;
-        for (const auto& m : models) {
-            modelsArray->add(m);
-        }
+        for (const auto& model : snapshot.models) modelsArray->add(model);
         root->set("models", modelsArray);
-
-        // Also write single "model" for v1 backwards compat (first model)
-        if (!models.empty()) {
-            root->set("model", models.front());
-        }
+        if (!snapshot.models.empty()) root->set("model", snapshot.models.front());
 
         Poco::JSON::Array::Ptr messagesArray = new Poco::JSON::Array;
-        for (const auto& msg : m_messages) {
-            // Save messages that have visible content OR native
-            // function-calling sidecars.  Native assistant tool-call
-            // turns commonly have content == "" and tool_calls != [].
-            // Skipping them would leave their following tool result
-            // orphaned after reload.  Still skip true empty placeholders.
-            std::string content = msg->has("content")
-                                      ? msg->getValue<std::string>("content")
-                                      : std::string();
-            const bool hasToolCalls  = msg->has("tool_calls");
-            const bool hasToolCallId = msg->has("tool_call_id");
-            if (!content.empty() || hasToolCalls || hasToolCallId) {
-                // Write the full message including "model" field if present
-                Poco::JSON::Object::Ptr saveMsg = new Poco::JSON::Object;
-                saveMsg->set("role", msg->getValue<std::string>("role"));
-                saveMsg->set("content", content);
-                std::string msgModel = GetMessageModel(msg);
-                if (!msgModel.empty()) {
-                    saveMsg->set("model", msgModel);
-                }
-                std::string msgTarget = GetMessageTarget(msg);
-                if (!msgTarget.empty()) {
-                    saveMsg->set("target", msgTarget);
-                }
-                // Preserve attachment metadata (v3 format)
-                if (msg->has("attachments")) {
-                    saveMsg->set("attachments", msg->getArray("attachments"));
-                }
+        for (const auto& msg : snapshot.messages) {
+            Poco::JSON::Object::Ptr saveMsg = new Poco::JSON::Object;
+            saveMsg->set("role", msg.role);
+            saveMsg->set("content", msg.content);
+            if (!msg.model.empty()) saveMsg->set("model", msg.model);
+            if (!msg.target.empty()) saveMsg->set("target", msg.target);
+            if (!msg.toolCallId.empty())
+                saveMsg->set("tool_call_id", msg.toolCallId);
 
-                // Phase 3c-ii: persist native function-calling
-                // sidecars so a saved conversation reloads with its
-                // structured tool_calls intact.  Both are protocol-
-                // independent on disk; BuildChatRequestJson decides
-                // at request time whether to project them onto the
-                // wire.  An XML-protocol model loading a saved
-                // conversation that has these fields just ignores
-                // them — they don't perturb display or wire shape
-                // when nativeProtocol=false.
-                if (msg->has("tool_call_id")) {
-                    saveMsg->set("tool_call_id",
-                                 msg->getValue<std::string>("tool_call_id"));
-                }
-                if (msg->has("tool_calls")) {
-                    saveMsg->set("tool_calls", msg->getArray("tool_calls"));
-                }
-                messagesArray->add(saveMsg);
-            }
+            try {
+                if (auto arr = ParseArray(msg.attachmentsJson))
+                    saveMsg->set("attachments", arr);
+            } catch (...) { /* malformed sidecar: omit */ }
+            try {
+                if (auto arr = ParseArray(msg.toolCallsJson))
+                    saveMsg->set("tool_calls", arr);
+            } catch (...) { /* malformed sidecar: omit */ }
+            try {
+                if (auto arr = ParseArray(msg.imagesJson))
+                    saveMsg->set("images", arr);
+            } catch (...) { /* malformed sidecar: omit */ }
+
+            messagesArray->add(saveMsg);
         }
         root->set("messages", messagesArray);
 
-        // Write to file with pretty formatting
         std::ostringstream oss;
         Poco::JSON::Stringifier::stringify(root, oss, 2);
-
-        // ── Atomic save via staged temp + rename ─────────────────
-        // Mirrors tool_write/tool_edit's crash-safe pattern.  An
-        // ofstream(...trunc) directly to savePath leaves a window
-        // where a crash, power loss, or exception during write
-        // truncates the conversation file to whatever was flushed.
-        // Auto-save runs after every assistant turn, so that
-        // window is hit constantly.  Writing to a sibling temp
-        // and then MoveFileExW with REPLACE_EXISTING means the
-        // user either sees the previous successful save or the
-        // new save — never a half-written file.
         const std::string body = oss.str();
 
         tool_staged_write::StagedTempFile tmp =
-            tool_staged_write::CreateStagedTempFile(savePath);
+            tool_staged_write::CreateStagedTempFile(snapshot.filePath);
         if (tmp.handle == INVALID_HANDLE_VALUE) return false;
 
-        {
-            const char* data   = body.data();
-            size_t      remain = body.size();
-            while (remain > 0) {
-                DWORD chunk = (remain > 0x40000000U)
-                                  ? 0x40000000U
-                                  : static_cast<DWORD>(remain);
-                DWORD written = 0;
-                BOOL  ok = ::WriteFile(tmp.handle, data, chunk, &written, nullptr);
-                if (!ok || written == 0) {
-                    ::CloseHandle(tmp.handle);
-                    ::DeleteFileW(tmp.wPath.c_str());
-                    return false;
-                }
-                data   += written;
-                remain -= written;
+        const char* data = body.data();
+        size_t remain = body.size();
+        while (remain > 0) {
+            const DWORD chunk = remain > 0x40000000U
+                ? 0x40000000U : static_cast<DWORD>(remain);
+            DWORD written = 0;
+            if (!::WriteFile(tmp.handle, data, chunk, &written, nullptr) ||
+                written == 0) {
+                ::CloseHandle(tmp.handle);
+                ::DeleteFileW(tmp.wPath.c_str());
+                return false;
             }
+            data += written;
+            remain -= written;
         }
 
+        if (durable && !::FlushFileBuffers(tmp.handle)) {
+            ::CloseHandle(tmp.handle);
+            ::DeleteFileW(tmp.wPath.c_str());
+            return false;
+        }
         if (!::CloseHandle(tmp.handle)) {
             ::DeleteFileW(tmp.wPath.c_str());
             return false;
         }
 
-        std::wstring wFinal = path_safety::Utf8ToWide(savePath);
+        const std::wstring wFinal =
+            path_safety::Utf8ToWide(snapshot.filePath);
         if (wFinal.empty()) {
             ::DeleteFileW(tmp.wPath.c_str());
             return false;
         }
 
-        if (!::MoveFileExW(tmp.wPath.c_str(), wFinal.c_str(),
-                           MOVEFILE_REPLACE_EXISTING |
-                           MOVEFILE_WRITE_THROUGH)) {
+        const DWORD moveFlags = MOVEFILE_REPLACE_EXISTING |
+            (durable ? MOVEFILE_WRITE_THROUGH : 0);
+        if (!::MoveFileExW(tmp.wPath.c_str(), wFinal.c_str(), moveFlags)) {
             ::DeleteFileW(tmp.wPath.c_str());
             return false;
         }
 
-        m_filePath = savePath;
-        m_dirty = false;
-
-        // Update the human-readable marker inside the per-conversation
-        // workflow folder so users browsing %USERPROFILE%\LlamaBoss\Workflows
-        // can identify which chat_xxxxxxxx belongs to which conversation.
-        // Only written when the workflow folder already exists — text-only
-        // chats that never invoked tools or attachments don't grow a
-        // workflow folder just from saving.
-        try {
-            std::string workflowDir = GetWorkflowDir(savePath);
-            if (!workflowDir.empty()
-                && wxDirExists(wxString::FromUTF8(workflowDir)))
-            {
-                std::string markerPath =
-                    JoinWorkflowPath(workflowDir, "_title.txt");
+        if (!snapshot.titleMarkerPath.empty()) {
+            try {
                 std::ofstream marker(
-                    path_safety::Utf8ToWide(markerPath),
+                    path_safety::Utf8ToWide(snapshot.titleMarkerPath),
                     std::ios::out | std::ios::trunc);
                 if (marker.is_open()) {
-                    marker << m_title         << "\n\n"
-                           << "Created: " << m_createdAt << "\n"
-                           << "Updated: " << m_updatedAt << "\n";
+                    marker << snapshot.title << "\n\n"
+                           << "Created: " << snapshot.createdAt << "\n"
+                           << "Updated: " << snapshot.updatedAt << "\n";
                 }
+            } catch (...) {
+                // Cosmetic marker failure never fails the conversation save.
             }
-        } catch (...) {
-            // Marker is purely cosmetic for filesystem browsing — never
-            // let a failure here propagate up and fail the save.
         }
 
         return true;
@@ -1215,9 +1702,34 @@ bool ChatHistory::SaveToFile(const std::string& filePath, const std::vector<std:
     }
 }
 
-bool ChatHistory::SaveToFile(const std::string& filePath, const std::string& model)
+void ChatHistory::CommitSaveSnapshot(const SaveSnapshot& snapshot)
 {
-    return SaveToFile(filePath, std::vector<std::string>{ model });
+    // Async completion can arrive after a conversation switch.  Never let a
+    // stale snapshot rewrite the identity or dirty flag of the new history.
+    if (m_filePath != snapshot.filePath) return;
+    if (m_revision == snapshot.revision) m_dirty = false;
+}
+
+bool ChatHistory::SaveToFile(const std::string& filePath,
+                             const std::vector<std::string>& models,
+                             bool durable)
+{
+    SaveSnapshot snapshot;
+    if (!CreateSaveSnapshot(filePath, models, snapshot)) return false;
+    if (!WriteSaveSnapshot(snapshot, durable)) return false;
+
+    // Synchronous Save/Save-As owns this transition and may intentionally
+    // change the current path.  Async callers use CommitSaveSnapshot directly,
+    // which rejects completions for a different active conversation.
+    m_filePath = snapshot.filePath;
+    CommitSaveSnapshot(snapshot);
+    return true;
+}
+
+bool ChatHistory::SaveToFile(const std::string& filePath, const std::string& model,
+                             bool durable)
+{
+    return SaveToFile(filePath, std::vector<std::string>{ model }, durable);
 }
 
 bool ChatHistory::LoadFromFile(const std::string& filePath, std::vector<std::string>& outModels)
@@ -1241,48 +1753,70 @@ bool ChatHistory::LoadFromFile(const std::string& filePath, std::vector<std::str
         auto result = parser.parse(content);
         auto root = result.extract<Poco::JSON::Object::Ptr>();
 
-        // Per-chat approval choices remain intentionally in-memory only.
-        // Goal state is durable as of Goals Phase 5, but reset first so a
-        // load without a "goal" object cannot carry state from the prior chat.
-        m_chatApprovedTools.clear();
-        m_chatApprovalTrustEnabled = false;
-        m_goalState.Reset();
+        // ── Strong exception guarantee ───────────────────────────────
+        // Everything below parses into *locals* and commits to members
+        // only in the noexcept block at the very end.  A throw (bad field
+        // type, missing "role", non-convertible model) or a structurally
+        // malformed array now leaves this ChatHistory exactly as it was —
+        // the previously loaded conversation stays intact, and the `false`
+        // return is truthful.  This matters because m_filePath is left
+        // pointing at the prior conversation on failure, so a half-mutated
+        // state could otherwise be autosaved over a perfectly good file.
+        //
+        // Fields the original code overwrote only when present (title,
+        // timestamps) seed their locals from the current members so the
+        // "absent => unchanged" behaviour is preserved.  Fields the
+        // original cleared-then-maybe-set (tool/project) start empty so the
+        // "absent => cleared" behaviour is preserved.
+        std::string   newTitle      = m_title;
+        std::string   newCreatedAt  = m_createdAt;
+        std::string   newUpdatedAt  = m_updatedAt;
+        std::string   newToolCwd;
+        unsigned long newToolTimeoutMs = 0;
+        ThinkOverride newThinkOverride = ThinkOverride::Auto;
+        std::string   newProjectId;
+        std::string   newProjectName;
+        std::string   newProjectRoot;
+        GoalState     newGoal;                       // default == Reset() (no goal)
+        std::vector<std::string>               newModels;
+        std::vector<Poco::JSON::Object::Ptr>   newMessages;
 
         // Read metadata
         if (root->has("title")) {
-            m_title = root->getValue<std::string>("title");
+            newTitle = root->getValue<std::string>("title");
         }
         if (root->has("created_at")) {
-            m_createdAt = root->getValue<std::string>("created_at");
+            newCreatedAt = root->getValue<std::string>("created_at");
         }
         if (root->has("updated_at")) {
-            m_updatedAt = root->getValue<std::string>("updated_at");
+            newUpdatedAt = root->getValue<std::string>("updated_at");
         }
 
-        // Tool execution context (Phase 3) — default-initialized to
-        // empty/0, overwritten only if the key is present in the file.
-        m_toolCwd.clear();
-        m_toolTimeoutMs = 0;
+        // Tool execution context (Phase 3) — locals default to empty/0,
+        // overwritten only if the key is present in the file.
         if (root->has("tool_cwd")) {
-            m_toolCwd = root->getValue<std::string>("tool_cwd");
+            newToolCwd = root->getValue<std::string>("tool_cwd");
         }
         if (root->has("tool_timeout_ms")) {
-            m_toolTimeoutMs =
+            newToolTimeoutMs =
                 (unsigned long)root->getValue<Poco::UInt64>("tool_timeout_ms");
+        }
+        if (root->has("think")) {
+            const std::string t = root->getValue<std::string>("think");
+            if (t == "on")       newThinkOverride = ThinkOverride::On;
+            else if (t == "off") newThinkOverride = ThinkOverride::Off;
+            // anything else (including future values) loads as Auto
         }
 
         // Optional long-lived project association (Projects Phase 1).
-        m_projectId.clear();
-        m_projectName.clear();
-        m_projectRoot.clear();
         if (root->has("project_id")) {
-            m_projectId = root->getValue<std::string>("project_id");
+            newProjectId = root->getValue<std::string>("project_id");
         }
         if (root->has("project_name")) {
-            m_projectName = root->getValue<std::string>("project_name");
+            newProjectName = root->getValue<std::string>("project_name");
         }
         if (root->has("project_root")) {
-            m_projectRoot = root->getValue<std::string>("project_root");
+            newProjectRoot = root->getValue<std::string>("project_root");
         }
 
         // Durable goal state (Goals Phase 5).  Older conversations simply
@@ -1299,37 +1833,37 @@ bool ChatHistory::LoadFromFile(const std::string& filePath, std::vector<std::str
                 const GoalStatus loadedStatus = GoalStatusFromPersisted(statusText);
 
                 if (!objective.empty() && loadedStatus != GoalStatus::None) {
-                    m_goalState.status = loadedStatus;
-                    m_goalState.objective = objective;
-                    m_goalState.turnsUsed = JsonIntOrDefault(goalObj, "turns_used", 0);
-                    m_goalState.verifierPasses = JsonIntOrDefault(goalObj, "verifier_passes", 0);
-                    m_goalState.verifierFailures = JsonIntOrDefault(goalObj, "verifier_failures", 0);
-                    m_goalState.lastVerifierReason = goalObj->has("last_verifier_reason")
+                    newGoal.status = loadedStatus;
+                    newGoal.objective = objective;
+                    newGoal.turnsUsed = JsonIntOrDefault(goalObj, "turns_used", 0);
+                    newGoal.verifierPasses = JsonIntOrDefault(goalObj, "verifier_passes", 0);
+                    newGoal.verifierFailures = JsonIntOrDefault(goalObj, "verifier_failures", 0);
+                    newGoal.lastVerifierReason = goalObj->has("last_verifier_reason")
                         ? goalObj->getValue<std::string>("last_verifier_reason")
                         : std::string();
-                    m_goalState.lastInterruptionReason = goalObj->has("last_interruption_reason")
+                    newGoal.lastInterruptionReason = goalObj->has("last_interruption_reason")
                         ? goalObj->getValue<std::string>("last_interruption_reason")
                         : std::string();
-                    m_goalState.awaitingUserReason = goalObj->has("awaiting_user_reason")
+                    newGoal.awaitingUserReason = goalObj->has("awaiting_user_reason")
                         ? goalObj->getValue<std::string>("awaiting_user_reason")
                         : std::string();
-                    m_goalState.awaitingUserPromptEvidence = goalObj->has("awaiting_user_prompt_evidence")
+                    newGoal.awaitingUserPromptEvidence = goalObj->has("awaiting_user_prompt_evidence")
                         ? goalObj->getValue<std::string>("awaiting_user_prompt_evidence")
                         : std::string();
-                    m_goalState.awaitingUserReplyEvidence = goalObj->has("awaiting_user_reply_evidence")
+                    newGoal.awaitingUserReplyEvidence = goalObj->has("awaiting_user_reply_evidence")
                         ? goalObj->getValue<std::string>("awaiting_user_reply_evidence")
                         : std::string();
-                    m_goalState.structuredAgentEvidence =
+                    newGoal.structuredAgentEvidence =
                         goalObj->has("structured_agent_evidence")
                             ? JsonArrayToStringVector(goalObj->getArray("structured_agent_evidence"))
                             : std::vector<std::string>{};
-                    m_goalState.TrimStructuredAgentEvidenceToCap();
-                    m_goalState.explicitlyCleared = false;
+                    newGoal.TrimStructuredAgentEvidenceToCap();
+                    newGoal.explicitlyCleared = false;
 
                     if (goalObj->has("contract")) {
                         Poco::JSON::Object::Ptr contractObj = goalObj->getObject("contract");
                         if (contractObj) {
-                            GoalContract& contract = m_goalState.contract;
+                            GoalContract& contract = newGoal.contract;
                             const std::string contractStatusText = contractObj->has("status")
                                 ? contractObj->getValue<std::string>("status")
                                 : std::string("none");
@@ -1366,28 +1900,31 @@ bool ChatHistory::LoadFromFile(const std::string& filePath, std::vector<std::str
             }
         }
 
-        // Read models — prefer v2 "models" array, fall back to v1 "model" string
+        // Read models — prefer v2 "models" array, fall back to v1 "model" string.
+        // A present-but-non-array "models" yields a null Ptr from getArray();
+        // treat that as a malformed file (clean failure, members untouched)
+        // rather than dereferencing null.
         if (root->has("models")) {
             auto arr = root->getArray("models");
+            if (!arr) return false;
             for (size_t i = 0; i < arr->size(); ++i) {
-                outModels.push_back(arr->get(i).convert<std::string>());
+                newModels.push_back(arr->get(i).convert<std::string>());
             }
         }
         else if (root->has("model")) {
-            outModels.push_back(root->getValue<std::string>("model"));
+            newModels.push_back(root->getValue<std::string>("model"));
         }
 
-        // Read messages (with optional per-message "model" field)
-        m_messages.clear();
-        // Loading a conversation always puts the history into a clean
-        // state.  An unflushed streaming buffer from a prior session
-        // would otherwise leak into the next assistant message added.
-        m_streamBuffer.clear();
-        m_streamBufferDirty = 0;
+        // Read messages (with optional per-message "model" field).  As with
+        // "models", a non-array "messages" or a non-object element would have
+        // dereferenced a null Poco Ptr (an uncatchable crash, not an
+        // exception); guard both as a clean load failure.
         if (root->has("messages")) {
             auto messagesArray = root->getArray("messages");
+            if (!messagesArray) return false;
             for (size_t i = 0; i < messagesArray->size(); ++i) {
                 auto msgObj = messagesArray->getObject(i);
+                if (!msgObj) return false;
                 std::string role = msgObj->getValue<std::string>("role");
                 std::string msgContent = msgObj->has("content")
                                              ? msgObj->getValue<std::string>("content")
@@ -1416,12 +1953,46 @@ bool ChatHistory::LoadFromFile(const std::string& filePath, std::vector<std::str
                 if (msgObj->has("tool_calls")) {
                     loadedMsg->set("tool_calls", msgObj->getArray("tool_calls"));
                 }
-                m_messages.push_back(loadedMsg);
+
+                // Generated-images sidecar (absent in older files).
+                if (msgObj->has("images")) {
+                    try {
+                        loadedMsg->set("images", msgObj->getArray("images"));
+                    } catch (...) { /* malformed — skip */ }
+                }
+                newMessages.push_back(loadedMsg);
             }
         }
 
-        m_filePath = filePath;
-        m_dirty = false;
+        // ── Commit ───────────────────────────────────────────────────
+        // Past every throw/return point.  Only moves and scalar assigns
+        // below, all non-throwing, so the object transitions atomically
+        // from the old conversation to the new one.
+        m_title          = std::move(newTitle);
+        m_createdAt      = std::move(newCreatedAt);
+        m_updatedAt      = std::move(newUpdatedAt);
+        m_toolCwd        = std::move(newToolCwd);
+        m_toolTimeoutMs  = newToolTimeoutMs;
+        m_thinkOverride  = newThinkOverride;
+        m_projectId      = std::move(newProjectId);
+        m_projectName    = std::move(newProjectName);
+        m_projectRoot    = std::move(newProjectRoot);
+        m_goalState      = std::move(newGoal);
+        m_messages       = std::move(newMessages);
+
+        // Per-chat approval choices are intentionally in-memory only and
+        // reset on every load.  Loading also clears any unflushed streaming
+        // buffer so a prior session can't leak into the next assistant
+        // message.
+        m_chatApprovedTools.clear();
+        m_chatApprovalTrustEnabled = false;
+        m_streamBuffer.clear();
+        m_streamBufferDirty = 0;
+
+        outModels   = std::move(newModels);
+        m_filePath  = filePath;
+        m_dirty     = false;
+        m_revision  = 0;
         return true;
     }
     catch (...) {
@@ -1585,7 +2156,20 @@ std::string TitleTruncate(std::string s, size_t maxLen = 60)
 {
     s = TitleCollapseWhitespace(std::move(s));
     if (s.size() > maxLen) {
-        s = s.substr(0, maxLen - 3) + "...";
+        // Titles are UTF-8.  Truncate by byte budget, but only on a
+        // code-point boundary so we never persist invalid UTF-8 into
+        // the conversation JSON.  This keeps downstream wxString::FromUTF8
+        // calls from producing blank labels for CJK/emoji/accented titles.
+        if (maxLen <= 3) {
+            s = s.substr(0, maxLen);
+        } else {
+            size_t cut = maxLen - 3;
+            while (cut > 0 &&
+                   (static_cast<unsigned char>(s[cut]) & 0xC0) == 0x80) {
+                --cut;
+            }
+            s = s.substr(0, cut) + "...";
+        }
     }
     return s.empty() ? "Untitled conversation" : s;
 }
@@ -1784,7 +2368,8 @@ std::string ChatHistory::FormatToolBlockAsUserMessage(
     const std::string& body,
     const std::string& errorBody,
     const std::vector<std::string>& statusChips,
-    const std::string& bodyLang)
+    const std::string& bodyLang,
+    const std::vector<PresentedFile>& presentedFiles)
 {
     // Longest contiguous run of backticks in `s` — used to pick a
     // fence longer than anything that can appear inside the body.
@@ -1850,8 +2435,31 @@ std::string ChatHistory::FormatToolBlockAsUserMessage(
         ss << fence << "\n";
     }
 
+    bool wroteArtifactsHeader = false;
+    for (const PresentedFile& file : presentedFiles) {
+        // Persist only disk-backed artifacts. Inline-only chips are generated
+        // from transient in-memory content and cannot be reopened after reload.
+        if (file.diskPath.empty()) continue;
+
+        if (!wroteArtifactsHeader) {
+            ss << "\n[artifacts]\n";
+            wroteArtifactsHeader = true;
+        }
+
+        Poco::JSON::Object obj;
+        obj.set("display_name", file.displayName);
+        obj.set("language", file.language);
+        obj.set("disk_path", file.diskPath);
+        obj.set("size_bytes", static_cast<Poco::UInt64>(file.sizeBytes));
+        obj.set("line_count", file.lineCount);
+        Poco::JSON::Stringifier::stringify(obj, ss);
+        ss << "\n";
+    }
+
     // Status chips — comma-joined, always emitted (even if empty, so
     // the closing bracket marks the end of the block unambiguously).
+    // Keep this as the final section; the context-compaction helper relies
+    // on [status: ...] being the footer.
     ss << "\n[status: ";
     for (size_t i = 0; i < statusChips.size(); ++i) {
         if (i > 0) ss << ", ";

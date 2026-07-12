@@ -6,8 +6,8 @@
 // state at a glance.
 //
 // Layout (packed left, stretch space on the right):
-//   ─ Project: <name> · N sources · M workflows  [ ⋯ ]    Goal: <status> · <objective>  [ details ] ─
-//   ─ No project attached  [ + attach ]  [ + New Skill ]   Goal: none  [ /goal ] ─
+//   ─ Project: <name> · N sources · M workflows  [ Change... ]  [ + New Skill ]   Goal: <status> · <objective>  [ details ] ─
+//   ─ [ + Load Project... ]  [ + New Skill ]   Goal: none  [ /goal ] ─
 //
 // The strip never reads ChatHistory / ProjectManager / GoalState
 // itself.  The frame computes the current State and pushes it via
@@ -60,9 +60,9 @@ public:
         // the menu should be parented to (for screen-coord conversion).
         std::function<void(wxWindow* anchor)> onMenuRequested;
 
-        // Fired when the user left-clicks [ + attach ] while no project
-        // is attached.  The frame routes this directly into its existing
-        // OnProjectAttach() flow so the chip behaves like the menu action,
+        // Fired when the user left-clicks [ + Load Project... ] while no
+        // project is attached.  The frame routes this directly into its
+        // existing OnProjectAttach() flow so the chip behaves like the menu action,
         // without forcing the extra popup-menu hop.
         std::function<void()> onAttachRequested;
 
@@ -78,6 +78,14 @@ public:
         // flow so the slash-command path and the click path stay
         // unified.
         std::function<void()> onGoalActionClicked;
+
+        // Fired when the user clicks the goal affordance ([ Goal v ]).
+        // The frame builds and shows a state-aware goal popup menu
+        // (Set a Goal / Goal Details / Pause / Resume / Verify / Clear);
+        // |anchor| is the window the menu parents to for screen-coord
+        // conversion.  Supersedes the single-action onGoalActionClicked
+        // path above (which is left in place but no longer fired).
+        std::function<void(wxWindow* anchor)> onGoalMenuRequested;
     };
 
     ProjectStatusStrip(wxWindow* parent,
@@ -107,8 +115,8 @@ private:
     wxPanel*      m_panel           = nullptr;  // top-level strip panel
     wxPanel*      m_row             = nullptr;  // horizontal content row
     wxStaticText* m_stateLabel       = nullptr;  // project state text
-    wxStaticText* m_actionLabel      = nullptr;  // project action ([ ⋯ ] / [ + attach ])
-    wxStaticText* m_skillActionLabel = nullptr;  // no-project shortcut ([ + New Skill ])
+    wxStaticText* m_actionLabel      = nullptr;  // project action ([ Change... ] / [ + Load Project... ])
+    wxStaticText* m_skillActionLabel = nullptr;  // shortcut ([ + New Skill ])
     wxStaticText* m_goalStateLabel   = nullptr;  // goal state text
     wxStaticText* m_goalActionLabel = nullptr;  // goal action ([ details ] / [ /goal ])
     wxPanel*      m_separator       = nullptr;  // 1px bottom border

@@ -18,6 +18,7 @@
 #include "agent_controller.h"
 #include "python_runner.h"
 #include "python_arg_policy.h"
+#include "path_safety.h"
 
 #include "app_state.h"
 #include "chat_history.h"
@@ -25,6 +26,7 @@
 #include "server_manager.h"    // ModelDisplayName
 #include "tool_call_parser.h"
 #include "tool_grep.h"         // GrepResult definition
+#include "tool_web_fetch.h"    // WebFetchResult definition
 #include "tool_router.h"       // BuildToolsArrayJson, GetGlobalRouter
 #include "tool_approval.h"     // Phase 6 approval cards
 
@@ -35,24 +37,30 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstddef>
 #include <fstream>
+#include <map>
 #include <sstream>
+#include <utility>
+
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
 
 
 namespace {
 
-// Phase 3 bugfix #1:
+// Phase 3 bugfix #1 (now the Phase 10 fallback):
 // Native function-calling responses may contain several tool_calls in
-// one assistant turn.  LlamaBoss currently executes only one tool per
-// agent iteration, so the history must also expose only the one tool_call
-// that is actually being executed.  If the full tool_calls array is stored
-// while only the first result is appended, the next OpenAI-style request is
-// invalid: assistant.tool_calls contains A+B, but only role:"tool" for A
-// exists.
-//
-// This helper keeps the native path conservative for Phase 3: one native
-// tool call per assistant turn.  Later phases can replace this with true
-// multi-call dispatch when the agent loop/event stream is ready for it.
+// one assistant turn.  Phase 10 executes the whole batch sequentially
+// and persists the full sidecar via KeepExecutableToolCallsJson — but
+// only when every call carries a usable unique id.  When ids are
+// missing or ambiguous, the controller falls back to this conservative
+// single-call helper: execute one tool, persist only the matching
+// tool_call entry.  Storing entries we will not answer would make the
+// next OpenAI-style request invalid: assistant.tool_calls contains
+// A+B, but only role:"tool" for A exists.
 std::string KeepOnlySelectedToolCallJson(const std::string& toolCallsJson,
                                          const std::string& selectedCallId)
 {
@@ -107,6 +115,68 @@ std::string KeepOnlySelectedToolCallJson(const std::string& toolCallsJson,
     }
 }
 
+// Phase 10: multi-call sidecar builder.  Returns a tool_calls array
+// containing exactly the entries (in invocation order) whose ids match
+// the invocations LlamaBoss is about to execute sequentially.  The
+// controller guarantees one role:"tool" reply per executed invocation
+// (real result, error result, denied, or skipped), so persisting all of
+// them keeps the OpenAI transcript valid:
+//   assistant.tool_calls = [A, B, C]
+//   role:"tool" tool_call_id=A, then B, then C — consecutive, in order.
+//
+// Fails closed (returns empty) when any selected invocation has a
+// missing or duplicate id, or when an id cannot be found in the source
+// array.  The caller falls back to the conservative single-call path in
+// that case, which tolerates id-less providers exactly as before.
+std::string KeepExecutableToolCallsJson(
+    const std::string&                 toolCallsJson,
+    const std::vector<ToolInvocation>& selected)
+{
+    if (toolCallsJson.empty() || selected.empty()) return std::string();
+
+    try {
+        Poco::JSON::Parser parser;
+        auto var = parser.parse(toolCallsJson);
+        Poco::JSON::Array::Ptr arr = var.extract<Poco::JSON::Array::Ptr>();
+        if (!arr || arr->empty()) return std::string();
+
+        // Index source entries by id.  Reject duplicate source ids —
+        // pairing would be ambiguous.
+        std::map<std::string, Poco::JSON::Object::Ptr> byId;
+        for (size_t i = 0; i < arr->size(); ++i) {
+            Poco::JSON::Object::Ptr obj;
+            try { obj = arr->getObject(i); } catch (...) { continue; }
+            if (!obj) continue;
+
+            std::string id;
+            try { id = obj->getValue<std::string>("id"); }
+            catch (...) { continue; }
+            if (id.empty()) continue;
+
+            if (byId.count(id)) return std::string();   // duplicate id
+            byId[id] = obj;
+        }
+
+        Poco::JSON::Array out;
+        std::map<std::string, bool> used;
+        for (const ToolInvocation& inv : selected) {
+            if (inv.toolCallId.empty()) return std::string();
+            if (used.count(inv.toolCallId)) return std::string();
+            auto it = byId.find(inv.toolCallId);
+            if (it == byId.end()) return std::string();
+            used[inv.toolCallId] = true;
+            out.add(it->second);
+        }
+        if (out.size() == 0) return std::string();
+
+        std::ostringstream oss;
+        out.stringify(oss);
+        return oss.str();
+    } catch (...) {
+        return std::string();
+    }
+}
+
 
 
 
@@ -115,6 +185,36 @@ std::string AgentLowerAscii(std::string s)
     for (char& ch : s)
         ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
     return s;
+}
+
+// List the top-level keys of a JSON object payload ("path, contents,
+// mode").  Used to enrich native tool-call validation errors: when a
+// model invents a parameter name ({"file": "x.txt"} instead of
+// {"args": ...}), the generic "requires a path" error gives it nothing
+// to correct against, and it burns the malformed budget re-guessing.
+// Echoing the keys it actually sent lets it self-correct in one retry.
+// Empty string when the payload is not a JSON object or has no keys.
+std::string AgentListJsonObjectKeys(const std::string& json)
+{
+    if (json.empty()) return std::string();
+    try {
+        Poco::JSON::Parser parser;
+        auto var = parser.parse(json);
+        Poco::JSON::Object::Ptr obj = var.extract<Poco::JSON::Object::Ptr>();
+        if (!obj) return std::string();
+
+        std::vector<std::string> names;
+        obj->getNames(names);
+
+        std::string out;
+        for (const std::string& n : names) {
+            if (!out.empty()) out += ", ";
+            out += n;
+        }
+        return out;
+    } catch (...) {
+        return std::string();
+    }
 }
 
 std::string AgentPresentedFileExtLower(const PresentedFile& f)
@@ -353,7 +453,12 @@ bool TryReadSmallTextFile(const std::string& path,
     out.clear();
     sizeOut = 0;
 
+#ifdef _WIN32
+    std::ifstream file(path_safety::Utf8ToWide(path),
+                       std::ios::binary | std::ios::ate);
+#else
     std::ifstream file(path, std::ios::binary | std::ios::ate);
+#endif
     if (!file) return false;
 
     std::streampos end = file.tellg();
@@ -395,20 +500,82 @@ void InlineSmallPdfExtractedMarkdown(ToolInvocationResult& r)
 
 
 
+
+std::string AgentJoinPath(const std::string& a, const std::string& b)
+{
+    if (a.empty()) return b;
+    const char sep = '\\';
+    if (a.back() == '/' || a.back() == '\\') return a + b;
+    return a + std::string(1, sep) + b;
+}
+
+std::string AgentConversationScriptsDirForCwd(const std::string& cwd)
+{
+    // Shared lane resolver.  This used to be a hand-mirrored copy of
+    // python_runner's conversation-lane recognizer; because this
+    // function guards the one-shot python_run_script approval bypass
+    // against cross-lane shadowing, a silent divergence between the
+    // copies would weaken exactly the safety property it protects.
+    // Both sides now resolve through ServerManager.
+    return ServerManager::ConversationScriptsDirForCwd(cwd);
+}
+
+bool AgentRegularFileExists(const std::string& path)
+{
+    std::wstring wide = path_safety::Utf8ToWide(path);
+    if (wide.empty()) return false;
+
+    DWORD attrs = ::GetFileAttributesW(wide.c_str());
+    return attrs != INVALID_FILE_ATTRIBUTES &&
+           (attrs & FILE_ATTRIBUTE_DIRECTORY) == 0;
+}
+
+bool ProjectScriptRunBypassWouldBeShadowedByConversationScript(
+    const ToolContext& ctx,
+    const std::string& createdDisplayName)
+{
+    // Project-scoped python_create_script writes to the project's Workflows
+    // folder, but python_run_script resolves bare filenames by checking the
+    // conversation Scripts lane first.  If a stale same-named script already
+    // exists there, a filename-only one-shot bypass would execute that older
+    // higher-priority file instead of the just-reviewed project workflow file.
+    if (ctx.activeProjectRoot.empty() || createdDisplayName.empty()) return false;
+
+    std::string scriptsDir = AgentConversationScriptsDirForCwd(ctx.cwd);
+    if (scriptsDir.empty()) return false;
+
+    return AgentRegularFileExists(AgentJoinPath(scriptsDir, createdDisplayName));
+}
+
 std::string NormalizeScriptNameForOneShotApproval(const std::string& input)
 {
+    // python_run_script's preferred contract is multiline args:
+    //   script.py
+    //   arg1
+    //   arg2
+    // The one-shot bypass must compare only the script request line, not the
+    // argv payload.  Otherwise a legitimate immediate run such as
+    // "report.py\nC:\\input.csv" would miss the carry-forward approval.
     std::string name = input;
+    size_t lineEnd = name.find_first_of("\r\n");
+    if (lineEnd != std::string::npos)
+        name = name.substr(0, lineEnd);
 
     size_t a = name.find_first_not_of(" \t\r\n");
     if (a == std::string::npos) return std::string();
     size_t b = name.find_last_not_of(" \t\r\n");
     name = name.substr(a, b - a + 1);
 
-    // python_run_script accepts filenames only, but artifact display names
-    // are also filenames. Be defensive and collapse accidental paths to the
-    // basename before comparing.
-    size_t slash = name.find_last_of("/\\");
-    if (slash != std::string::npos) name = name.substr(slash + 1);
+    // The carry-forward approval is intentionally narrow: it applies only to
+    // the exact filename created by python_create_script.  python_run_script
+    // also accepts path-shaped in-lane requests, but those may resolve to a
+    // different older script with the same basename.  Do not collapse paths to
+    // basenames here; path-shaped requests must show the normal approval card.
+    if (name.find('/') != std::string::npos ||
+        name.find('\\') != std::string::npos ||
+        name.find(':') != std::string::npos) {
+        return std::string();
+    }
 
     size_t dot = name.find_last_of('.');
     if (dot == std::string::npos) name += ".py";
@@ -515,20 +682,78 @@ bool HasChip(const ToolInvocationResult& r, const std::string& chip)
 
 bool IsAgentPythonAsyncToolName(const std::string& name)
 {
-    return name == tool_names::kPythonHealth ||
-           name == tool_names::kCsvInspect ||
-           name == tool_names::kCsvReport ||
-           name == tool_names::kCsvToXlsx ||
-           name == tool_names::kXlsxInspect ||
-           name == tool_names::kXlsxReport ||
-           name == tool_names::kXlsxCreateWorkbook ||
-           name == tool_names::kPdfExtractText ||
-           name == tool_names::kPdfInspectForm ||
-           name == tool_names::kPdfFillForm ||
-           name == tool_names::kDocxExtractText ||
-           name == tool_names::kDocxInspect ||
-           name == tool_names::kPythonRunScript ||
-           name == tool_names::kPythonInstallPackage;
+    if (name == tool_names::kGrep ||
+        name == tool_names::kPowerShell ||
+        name == tool_names::kWebFetchUrl) {
+        return false;
+    }
+
+    const ToolSpec* spec = GetGlobalRouter().Find(name);
+    return spec && spec->safety.isAsync;
+}
+
+bool IsAgentWebFetchAsyncToolName(const std::string& name)
+{
+    return name == tool_names::kWebFetchUrl;
+}
+
+ToolInvocationResult MakeWebFetchToolResult(const ToolInvocation& inv,
+                                            const WebFetchResult& webResult)
+{
+    ToolInvocationResult r;
+    r.toolTag       = tool_names::kWebFetchUrl;
+    r.invocationRaw = inv.rawBlock;
+    r.iconUtf8      = tool_approval::ToolIcon(tool_names::kWebFetchUrl);
+    r.toolName      = tool_approval::ToolDisplayName(tool_names::kWebFetchUrl);
+    r.commandEcho   = webResult.commandEcho.empty()
+                        ? std::string("/web_fetch_url ") + inv.args
+                        : webResult.commandEcho;
+    r.chips         = webResult.chips;
+    r.body          = webResult.body;
+    r.errorBody     = webResult.errorBody;
+    r.bodyLang      = webResult.bodyLang;
+
+    if (!webResult.textPath.empty()) {
+        PresentedFile textFile;
+        textFile.displayName = webResult.textDisplayName.empty()
+            ? std::string("webpage_text.md")
+            : webResult.textDisplayName;
+        textFile.language  = "markdown";
+        textFile.diskPath  = webResult.textPath;
+        textFile.sizeBytes = webResult.textBytes;
+        textFile.lineCount = webResult.textLineCount;
+        r.presentedFiles.push_back(std::move(textFile));
+    }
+
+    if (!webResult.rawHtmlPath.empty()) {
+        PresentedFile htmlFile;
+        htmlFile.displayName = webResult.rawHtmlDisplayName.empty()
+            ? std::string("webpage_raw.html")
+            : webResult.rawHtmlDisplayName;
+        htmlFile.language  = "html";
+        htmlFile.diskPath  = webResult.rawHtmlPath;
+        htmlFile.sizeBytes = webResult.htmlBytes;
+        htmlFile.lineCount = 0;
+        r.presentedFiles.push_back(std::move(htmlFile));
+    }
+
+    return r;
+}
+
+ToolInvocationResult MakeAsyncLaunchErrorResult(const ToolInvocation& inv,
+                                                const std::string&    errorText)
+{
+    ToolInvocationResult r;
+    r.toolTag       = inv.name.empty() ? std::string("tool") : inv.name;
+    r.invocationRaw = inv.rawBlock;
+    r.iconUtf8      = tool_approval::ToolIcon(inv.name);
+    r.toolName      = tool_approval::ToolDisplayName(inv.name);
+    r.commandEcho   = tool_approval::CommandEcho(inv);
+    r.chips         = { "error", "launch failed" };
+    r.errorBody     = errorText.empty()
+        ? std::string("Tool failed to start before producing a result.")
+        : errorText;
+    return r;
 }
 
 // Standalone file/artifact requests usually end immediately after write or
@@ -582,13 +807,17 @@ AgentController::AgentController(std::unique_ptr<ChatHistory>& history,
                                  AppState*       appState,
                                  GrepExecutor*   grepExec,
                                  CmdExecutor*    cmdExec,
-                                 PythonRunner*   pythonRunner)
+                                 PythonRunner*   pythonRunner,
+                                 WebFetchExecutor* webFetchExec,
+                                 ToolWorkerExecutor* toolWorker)
     : m_history(history)
     , m_sink(sink)
     , m_appState(appState)
     , m_grepExec(grepExec)
     , m_cmdExec(cmdExec)
     , m_pythonRunner(pythonRunner)
+    , m_webFetchExec(webFetchExec)
+    , m_toolWorker(toolWorker)
 {}
 
 // ═══════════════════════════════════════════════════════════════════
@@ -599,22 +828,29 @@ void AgentController::Begin()
 {
     m_active               = true;
     m_cancelled            = false;
-    m_iterationsUsed       = 0;   // incremented when we receive iteration 1's reply
+    m_iterationsUsed       = 0;   // incremented when a counted tool result is fed back
     m_consecutiveMalformed = 0;
     m_awaitingAsyncResult    = false;
     m_pendingAsyncInvocation = ToolInvocation{};
+    m_pendingAsyncContext    = ToolContext{};
     m_awaitingApproval       = false;
     m_pendingApprovalInvocation = ToolInvocation{};
     m_pendingApprovalContext    = ToolContext{};
     m_currentToolCallId.clear();
     m_recentToolSignatures.clear();
     m_pendingSoftHint.clear();
-    // Note: m_oneShotApprovedScriptRun is intentionally NOT cleared here.
-    // It survives a Normal EndLoop (model paused with "Want me to run it?"
-    // prose and ended the turn) so the user's natural "yes" reply lands
-    // on a still-armed bypass instead of forcing a second /approve.
-    // Abnormal exits (Cancel, LoopGuard, errors) clear it inside EndLoop.
-    // Single-use consumption clears it inside the gate.
+    m_queuedInvocations.clear();
+    // The one-shot python_create_script -> python_run_script bypass may
+    // survive one follow-up user turn so a natural "yes, run it" can work.
+    // If it was not consumed in that next turn, clear it on the following
+    // Begin() so an old approval cannot surprise-run an unrelated script.
+    if (!m_oneShotApprovedScriptRun.empty()) {
+        if (m_oneShotApprovedScriptRunBeginCredits <= 0) {
+            m_oneShotApprovedScriptRun.clear();
+        } else {
+            --m_oneShotApprovedScriptRunBeginCredits;
+        }
+    }
 
     // Phase 5: signal loop start so the frame (or future P9 parent)
     // can install loop-scoped UI state.  Currently a no-op in
@@ -643,6 +879,14 @@ void AgentController::Cancel()
                  m_pythonRunner) {
             m_pythonRunner->Cancel();
         }
+        else if (IsAgentWebFetchAsyncToolName(m_pendingAsyncInvocation.name) &&
+                 m_webFetchExec) {
+            m_webFetchExec->Cancel();
+        }
+        else if (ShouldDispatchToolOnWorker(m_pendingAsyncInvocation.name) &&
+                 m_toolWorker) {
+            m_toolWorker->Cancel();
+        }
     }
 }
 
@@ -652,18 +896,26 @@ void AgentController::EndLoop(AgentEndReason     reason,
     m_active                 = false;
     m_awaitingAsyncResult    = false;
     m_pendingAsyncInvocation = ToolInvocation{};
+    m_pendingAsyncContext    = ToolContext{};
     m_awaitingApproval       = false;
     m_pendingApprovalInvocation = ToolInvocation{};
     m_pendingApprovalContext    = ToolContext{};
     m_currentToolCallId.clear();
     m_recentToolSignatures.clear();
     m_pendingSoftHint.clear();
+    // Safety net: call sites that abandon a partially-executed batch
+    // must drain it (with skipped results) BEFORE calling EndLoop so
+    // native transcript pairing survives.  Clearing here guards any
+    // future path that forgets, at the cost of the sanitizer stripping
+    // the orphaned sidecar on the next request.
+    m_queuedInvocations.clear();
     // Bundled-approval bypass survives a Normal exit (model paused with
     // "Want me to run it?" prose).  Abnormal exits — user cancelled,
     // loop guard tripped, malformed cap, iteration cap, send/stream
     // errors — wipe it because the user's intent context is gone.
     if (reason != AgentEndReason::Normal) {
         m_oneShotApprovedScriptRun.clear();
+        m_oneShotApprovedScriptRunBeginCredits = 0;
     }
 
     // Phase 5: single sink call replaces the Phase-4 pair of
@@ -671,6 +923,54 @@ void AgentController::EndLoop(AgentEndReason     reason,
     // implementation surfaces the message via DisplaySystemMessage
     // when non-empty and runs its standard finalization sequence.
     if (m_sink) m_sink->OnAgentEvent(AgentEvent::LoopEnd(reason, userFacingMessage));
+}
+
+void AgentController::SetMaxToolSteps(int steps)
+{
+    if (steps < kMinConfigurableToolSteps) steps = kMinConfigurableToolSteps;
+    if (steps > kMaxConfigurableToolSteps) steps = kMaxConfigurableToolSteps;
+    m_maxToolSteps = steps;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Phase 10: native multi-call batch queue
+// ═══════════════════════════════════════════════════════════════════
+
+bool AgentController::DispatchNextQueuedInvocation()
+{
+    if (m_queuedInvocations.empty()) return false;
+
+    ToolInvocation next = m_queuedInvocations.front();
+    m_queuedInvocations.erase(m_queuedInvocations.begin());
+    return DispatchAndContinue(next);
+}
+
+void AgentController::DrainQueuedInvocationsWithSkippedResults(
+    const std::string& reason)
+{
+    if (m_queuedInvocations.empty()) return;
+
+    std::vector<ToolInvocation> drained;
+    drained.swap(m_queuedInvocations);
+
+    for (const ToolInvocation& inv : drained) {
+        ToolInvocationResult r;
+        r.toolTag       = inv.name.empty() ? std::string("tool") : inv.name;
+        r.invocationRaw = inv.rawBlock;
+        r.iconUtf8      = tool_approval::ToolIcon(inv.name);
+        r.toolName      = tool_approval::ToolDisplayName(inv.name);
+        r.commandEcho   = tool_approval::CommandEcho(inv);
+        r.chips         = { "skipped" };
+        r.errorBody     = "Not executed: " + reason +
+                          " Re-issue this tool call in your next turn if it "
+                          "is still needed.";
+
+        // Thread each skipped result with its own call id so the
+        // assistant.tool_calls sidecar persisted for this batch keeps a
+        // complete, consecutive set of role:"tool" replies.
+        m_currentToolCallId = inv.toolCallId;
+        EmitAndStoreTerminalToolResult(r, /*startExpanded=*/false);
+    }
 }
 
 // Phase 5: pack a ToolInvocationResult into a ToolBlock and send it
@@ -702,7 +1002,7 @@ void AgentController::EmitAndStoreTerminalToolResult(const ToolInvocationResult&
     EmitToolBlock(r, startExpanded);
 
     std::string formatted = ChatHistory::FormatToolBlockAsUserMessage(
-        r.toolTag, r.commandEcho, r.body, r.errorBody, r.chips, r.bodyLang);
+        r.toolTag, r.commandEcho, r.body, r.errorBody, r.chips, r.bodyLang, r.presentedFiles);
     m_history->AddToolResultMessage(m_currentToolCallId, formatted);
     m_currentToolCallId.clear();
 }
@@ -768,32 +1068,112 @@ bool AgentController::WouldTripLoopGuard(const ToolInvocation& inv,
     const size_t start = (n > keepBeforeCandidate) ? (n - keepBeforeCandidate) : 0;
 
     for (size_t i = start; i < n; ++i) {
-        if (m_recentToolSignatures[i] == signatureOut)
+        if (m_recentToolSignatures[i].signature == signatureOut)
             ++repeatCountOut;
     }
 
     return repeatCountOut >= kLoopGuardRepeatThreshold;
 }
 
+bool AgentController::WouldTripCycleGuard(const ToolInvocation& inv,
+                                          std::string&          signatureOut,
+                                          int&                  distinctCountOut) const
+{
+    signatureOut = BuildToolSignature(inv);
+    distinctCountOut = 0;
+    if (signatureOut.empty()) return false;
+
+    std::vector<std::string> window;
+    window.reserve(static_cast<size_t>(kCycleGuardWindow));
+
+    const size_t keepBeforeCandidate =
+        (kCycleGuardWindow > 0) ? static_cast<size_t>(kCycleGuardWindow - 1) : 0;
+    const size_t n = m_recentToolSignatures.size();
+    const size_t start = (n > keepBeforeCandidate) ? (n - keepBeforeCandidate) : 0;
+
+    for (size_t i = start; i < n; ++i) {
+        if (!m_recentToolSignatures[i].signature.empty())
+            window.push_back(m_recentToolSignatures[i].signature);
+    }
+    window.push_back(signatureOut);
+
+    if (window.size() < static_cast<size_t>(kCycleGuardWindow))
+        return false;
+
+    std::map<std::string, int> counts;
+    for (const auto& sig : window)
+        ++counts[sig];
+
+    distinctCountOut = static_cast<int>(counts.size());
+    if (distinctCountOut > kCycleGuardMaxDistinct)
+        return false;
+
+    for (const auto& kv : counts) {
+        if (kv.second < kCycleGuardMinRepeats)
+            return false;
+    }
+
+    return true;
+}
+
 void AgentController::RecordToolSignature(const std::string& signature)
 {
     if (signature.empty()) return;
 
-    m_recentToolSignatures.push_back(signature);
+    m_recentToolSignatures.push_back(ToolSignatureRecord{signature, false});
     const size_t maxKeep = static_cast<size_t>(
-        std::max(kLoopGuardWindow, kLoopGuardRepeatThreshold));
+        std::max(kLoopGuardWindow,
+                 std::max(kLoopGuardRepeatThreshold,
+                          kCycleGuardWindow - 1)));
     while (m_recentToolSignatures.size() > maxKeep)
         m_recentToolSignatures.erase(m_recentToolSignatures.begin());
 }
 
-void AgentController::EmitToolCallEvent(const ToolInvocation& inv)
+void AgentController::ResolveToolSignatureOutcome(const ToolInvocation& inv,
+                                                  bool                  failed)
+{
+    const std::string sig = BuildToolSignature(inv);
+    if (sig.empty() || m_recentToolSignatures.empty()) return;
+
+    // The matching record is normally the newest one (recorded at this
+    // call's dispatch).  An async completion can only resolve after its
+    // own dispatch, and the batch queue is sequential, so back() is the
+    // right slot whenever the signatures agree.
+    if (m_recentToolSignatures.back().signature == sig) {
+        m_recentToolSignatures.back().failed = failed;
+    }
+
+    if (!failed) {
+        // Phase 7d: a success after earlier failures of the SAME call
+        // proves the blocking state changed (run(missing) ->
+        // python_create_script -> run(ok) is the canonical transcript).
+        // Purge those failed records so a later legitimate identical
+        // call is not hard-blocked or soft-hinted as a "stuck loop".
+        // Successful records stay, keeping the identical-successful-call
+        // doom-loop guard intact.
+        for (size_t i = 0; i + 1 < m_recentToolSignatures.size(); ) {
+            if (m_recentToolSignatures[i].failed &&
+                m_recentToolSignatures[i].signature == sig) {
+                m_recentToolSignatures.erase(
+                    m_recentToolSignatures.begin() +
+                    static_cast<std::ptrdiff_t>(i));
+            } else {
+                ++i;
+            }
+        }
+    }
+}
+
+void AgentController::EmitToolCallEvent(const ToolInvocation& inv,
+                                        const std::string&   signature)
 {
     if (!m_sink) return;
 
     m_sink->OnAgentEvent(AgentEvent::ToolCall(
         inv.name,
         tool_approval::CommandEcho(inv),
-        inv.toolCallId));
+        inv.toolCallId,
+        signature));
 }
 
 
@@ -835,7 +1215,8 @@ std::string AgentController::BuildRequestBody()
 
     return m_history->BuildChatRequestJson(model, /*stream*/ true,
                                            sysPrompt, ctxTokens,
-                                           tools, native);
+                                           tools, native,
+                                           true);
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -872,10 +1253,22 @@ bool AgentController::DenyPendingTool()
     m_awaitingApproval = false;
     m_pendingApprovalInvocation = ToolInvocation{};
     m_pendingApprovalContext    = ToolContext{};
+    m_pendingSoftHint.clear();
 
     ToolInvocationResult r = tool_approval::DeniedResult(
         inv, "Denied by user. Tool was not executed.");
-    FeedResultAndIterate(r);
+
+    // Phase 10: a deny aborts the rest of the current batch.  Later
+    // calls in the same assistant turn may depend on the denied one
+    // (e.g. write file -> run script), and executing them would do
+    // work the user just declined.  Feed the denial, emit skipped
+    // results for the remainder (keeping native transcript pairing),
+    // then continue to the next model request so the model can
+    // re-plan with the full picture.
+    FeedResultOnly(r, /*countTowardIterationCap=*/false);
+    DrainQueuedInvocationsWithSkippedResults(
+        "an earlier tool call in this batch was denied by the user.");
+    ContinueLoop();
     return true;
 }
 
@@ -887,10 +1280,14 @@ bool AgentController::CancelPendingApproval()
     m_awaitingApproval = false;
     m_pendingApprovalInvocation = ToolInvocation{};
     m_pendingApprovalContext    = ToolContext{};
+    m_pendingSoftHint.clear();
 
     ToolInvocationResult r = tool_approval::DeniedResult(
         inv, "Cancelled by user before approval. Tool was not executed.");
     EmitAndStoreTerminalToolResult(r, true);
+
+    DrainQueuedInvocationsWithSkippedResults(
+        "the agent loop was stopped by the user before this call ran.");
 
     EndLoop(AgentEndReason::Cancelled, "Agent stopped by user.");
     return true;
@@ -911,22 +1308,55 @@ bool AgentController::DispatchAndContinue(const ToolInvocation& inv)
         // ticks up; if we exceed the cap, EndLoop.
         ++m_consecutiveMalformed;
 
+        // Echo a head+tail PREVIEW of the broken block, never the full
+        // block. The batch parser already previews its malformed
+        // rawText, but invocations that arrive here via the recovery
+        // shims (parsed-but-invalid: unknown tool, bad args) carry the
+        // full rawBlock. Echoing a multi-KB copy of the model's own
+        // mistake back into context makes the broken pattern the
+        // strongest signal the model sees, and small models then repeat
+        // it verbatim until the cap trips (observed 2026-06-11).
+        const std::string rawPreview =
+            MakeToolCallDiagnosticPreview(inv.rawBlock);
+
         ToolInvocationResult r;
         r.toolTag       = inv.name.empty() ? "tool" : inv.name;
-        r.invocationRaw = inv.rawBlock;
+        r.invocationRaw = rawPreview;
         r.toolName      = inv.name.empty() ? "Tool" : inv.name;
-        r.commandEcho   = inv.rawBlock.empty()
-            ? std::string("<malformed tool_call>") : inv.rawBlock;
+        r.commandEcho   = rawPreview.empty()
+            ? std::string("<malformed tool_call>") : rawPreview;
         r.errorBody     = inv.invalidReason.empty()
             ? "Invalid tool invocation."
             : inv.invalidReason;
         r.iconUtf8      = "\xE2\x9A\xA0";  // ⚠
         r.chips         = { "error" };
 
+        // Second strike and beyond: the first corrective message did
+        // not land, so escalate. Name the repetition explicitly and
+        // demand a bare corrected block — small models that ignore the
+        // format reminder often still respond to a direct prohibition
+        // on repeating the previous output.
+        if (m_consecutiveMalformed >= 2 &&
+            m_consecutiveMalformed < kMaxMalformedPerTurn) {
+            r.errorBody +=
+                "\nThis is malformed tool call " +
+                std::to_string(m_consecutiveMalformed) + " of " +
+                std::to_string(kMaxMalformedPerTurn) +
+                " allowed. Do NOT repeat the previous block. Reply with"
+                " ONLY one corrected tool call block and nothing else,"
+                " ending with the literal closing tag </tool_call>.";
+        }
+
         if (m_consecutiveMalformed >= kMaxMalformedPerTurn) {
-            // Render the error so the user sees WHY we bailed,
-            // then stop.  No iteration follow-up.
-            EmitToolBlock(r);
+            // Render and store the terminal error so native tool-call
+            // sidecars are not left orphaned on disk.  No iteration
+            // follow-up, but the final error still round-trips through
+            // history with the current tool_call_id when one exists.
+            EmitAndStoreTerminalToolResult(r, true);
+
+            DrainQueuedInvocationsWithSkippedResults(
+                "the agent stopped on repeated malformed tool calls "
+                "before this call ran.");
 
             EndLoop(AgentEndReason::MalformedCap,
                     "Agent stopped: " +
@@ -936,17 +1366,12 @@ bool AgentController::DispatchAndContinue(const ToolInvocation& inv)
         }
 
         // Feed the error back and let the model try again.
-        FeedResultAndIterate(r);
+        FeedResultAndIterate(r, /*countTowardIterationCap=*/false);
         return true;
     }
 
     // Valid invocation — reset malformed counter (we saw progress).
     m_consecutiveMalformed = 0;
-
-    // Phase 9: typed, non-rendered event for observers/tests/future
-    // sub-agent forwarders.  The existing UI ignores ToolCall by
-    // default, so this adds structure without adding visible noise.
-    EmitToolCallEvent(inv);
 
     // Phase 7: controlled multi-step loop guard.  Stop before
     // dispatch if the model is about to repeat the same exact tool
@@ -967,27 +1392,39 @@ bool AgentController::DispatchAndContinue(const ToolInvocation& inv)
             " times within the recent loop window. Tool was not executed.";
 
         EmitAndStoreTerminalToolResult(r, true);
+        DrainQueuedInvocationsWithSkippedResults(
+            "the loop guard stopped the agent before this call ran.");
         EndLoop(AgentEndReason::LoopGuard,
                 "Agent stopped: repeated the same tool call.");
         return false;
     }
-    RecordToolSignature(signature);
 
-    // Phase 7b: soft-hint nudge.  When the model is one repeat away
-    // from tripping the loop guard, stash a notice that
-    // FeedResultAndIterate will append to the upcoming tool result
-    // body.  That gives the model one chance to break the pattern
-    // before the hard stop on the next iteration.  The repeatCount
-    // >= 2 floor protects against someone lowering the kill threshold
-    // to 2, which would otherwise fire on every first call.
-    if (repeatCount == kLoopGuardRepeatThreshold - 1 && repeatCount >= 2) {
-        m_pendingSoftHint =
-            "\n\n[notice] You just repeated this exact tool call. One more "
-            "identical call will trip the loop guard and stop the agent. "
-            "Try a different approach: call notes_read if a saved path may "
-            "exist, ask the user where the file lives, or use a different "
-            "tool. Do NOT repeat this exact call.";
+    int cycleDistinctCount = 0;
+    if (WouldTripCycleGuard(inv, signature, cycleDistinctCount)) {
+        ToolInvocationResult r;
+        r.toolTag       = inv.name.empty() ? "tool" : inv.name;
+        r.invocationRaw = inv.rawBlock;
+        r.iconUtf8      = "\xE2\x9A\xA0";  // ⚠
+        r.toolName      = "Loop Guard";
+        r.commandEcho   = tool_approval::CommandEcho(inv);
+        r.chips         = { "blocked", "loop guard", "cycle" };
+        r.errorBody     =
+            "Agent stopped before dispatch: the recent tool window appears "
+            "to be cycling across " + std::to_string(cycleDistinctCount) +
+            " repeated tool calls. Tool was not executed.";
+
+        EmitAndStoreTerminalToolResult(r, true);
+        DrainQueuedInvocationsWithSkippedResults(
+            "the cycle guard stopped the agent before this call ran.");
+        EndLoop(AgentEndReason::LoopGuard,
+                "Agent stopped: repeated a cycle of tool calls.");
+        return false;
     }
+    // NOTE: the signature is recorded in DispatchApprovedAndContinue,
+    // i.e. only when the tool actually dispatches.  Recording here —
+    // before the approval gate — meant a DENIED call still counted as
+    // a repeat, so a legitimate deny → model re-asks → user approves
+    // sequence could trip the guard on a tool that only ever ran once.
 
     ToolContext ctx = m_cb.buildToolContext ? m_cb.buildToolContext()
                                               : ToolContext{};
@@ -1016,6 +1453,7 @@ bool AgentController::DispatchAndContinue(const ToolInvocation& inv)
         // a different script, fall through to the normal approval card and
         // do not keep a stale bypass around for later.
         m_oneShotApprovedScriptRun.clear();
+        m_oneShotApprovedScriptRunBeginCredits = 0;
     }
 
     tool_approval::ApprovalDecision approval;
@@ -1035,17 +1473,90 @@ bool AgentController::DispatchAndContinue(const ToolInvocation& inv)
 bool AgentController::DispatchApprovedAndContinue(const ToolInvocation& inv,
                                                   const ToolContext&    ctx)
 {
-    DispatchOutcome out = DispatchInvocation(inv, ctx, m_grepExec, m_cmdExec, m_pythonRunner);
+    // Phase 7b: soft-hint nudge.  Set this only at the approved dispatch
+    // point so a denied approval cannot receive a factually-wrong repeat
+    // warning.  The exact-repeat hard guard already ran before any approval
+    // card was shown; this is only the one-step-early model-facing hint.
+    std::string signature;
+    int repeatCount = 0;
+    (void)WouldTripLoopGuard(inv, signature, repeatCount);
+    const bool consecutiveRepeat =
+        !signature.empty() &&
+        !m_recentToolSignatures.empty() &&
+        m_recentToolSignatures.back().signature == signature;
 
+    if (consecutiveRepeat &&
+        repeatCount == kLoopGuardRepeatThreshold - 1 &&
+        repeatCount >= 2) {
+        m_pendingSoftHint +=
+            "\n\n[notice] You just repeated this exact tool call. One more "
+            "identical call will trip the loop guard and stop the agent. "
+            "Try a different approach: call notes_read if a saved path may "
+            "exist, ask the user where the file lives, or use a different "
+            "tool. Do NOT repeat this exact call.";
+    }
+
+    // Phase 7 loop guard bookkeeping happens HERE — at the moment the
+    // tool actually dispatches — not at the pre-approval check in
+    // DispatchAndContinue.  Denied or cancelled approvals therefore
+    // never count as "repeats" against a later, genuinely-approved
+    // attempt at the same call.
+    const std::string dispatchSignature =
+        signature.empty() ? BuildToolSignature(inv) : signature;
+    RecordToolSignature(dispatchSignature);
+
+    // Phase 9/Phase 3 trace: typed, non-rendered event for
+    // observers/tests/loggers.  Emit at the approved-dispatch point so
+    // trace durations do not include approval wait time or denied calls.
+    EmitToolCallEvent(inv, dispatchSignature);
+
+    // Filesystem tools are synchronous at the router layer, but reads,
+    // listings, writes, and Python syntax checks can all block on
+    // antivirus or slow/network-backed paths.  Run registered candidates on
+    // the frame-owned serialized worker rather than in this wx event handler.
+    if (ShouldDispatchToolOnWorker(inv.name)) {
+        if (!m_toolWorker || !m_toolWorker->Start(inv, ctx)) {
+            ResolveToolSignatureOutcome(inv, /*failed=*/true);
+            ToolInvocationResult r = MakeAsyncLaunchErrorResult(
+                inv, "The background tool worker is already busy or could not start.");
+            FeedResultAndIterate(r, /*countTowardIterationCap=*/false);
+            return true;
+        }
+
+        m_awaitingAsyncResult    = true;
+        m_pendingAsyncInvocation = inv;
+        m_pendingAsyncContext    = ctx;
+        EmitPendingToolBlock(inv);
+        return true;
+    }
+
+    const DispatchOutcome out = DispatchInvocation(
+        inv, ctx, m_grepExec, m_cmdExec, m_pythonRunner, m_webFetchExec);
+    return FinishDispatchedInvocation(inv, ctx, out);
+}
+
+bool AgentController::FinishDispatchedInvocation(
+    const ToolInvocation& inv,
+    const ToolContext&    ctx,
+    const DispatchOutcome& out)
+{
     switch (out.status) {
         case DispatchStatus::Completed:
+            // Phase 7d: resolve the just-recorded signature's outcome so
+            // the loop guards can distinguish failure loops from
+            // legitimate successful repeats.
+            ResolveToolSignatureOutcome(inv, !out.result.errorBody.empty());
+
             if (inv.name == tool_names::kPythonCreateScript &&
                 out.result.errorBody.empty() &&
                 !out.result.presentedFiles.empty()) {
                 m_oneShotApprovedScriptRun.clear();
+                m_oneShotApprovedScriptRunBeginCredits = 0;
 
                 // Grant the one-shot run bypass ONLY for the final on-disk
-                // artifact name returned by python_create_script.
+                // artifact filename returned by python_create_script.  The
+                // bypass is filename-only by design; path-shaped run requests
+                // are forced through the normal approval card.
                 //
                 // Important safety edge case:
                 //   requested: report.py
@@ -1057,13 +1568,29 @@ bool AgentController::DispatchApprovedAndContinue(const ToolInvocation& inv,
                 // older script instead of the just-reviewed artifact.  Collision
                 // renamed scripts therefore require the model to run the final
                 // displayed artifact name, or the normal approval card appears.
+                const PresentedFile& createdScript = out.result.presentedFiles.front();
                 std::string finalName = NormalizeScriptNameForOneShotApproval(
-                    out.result.presentedFiles.front().displayName);
-                if (!finalName.empty())
+                    createdScript.displayName);
+
+                // Project scripts are created in the project Workflows lane,
+                // but bare python_run_script filenames resolve conversation
+                // Scripts first.  If a stale same-named conversation script
+                // exists, skip the bypass so the normal approval card appears
+                // instead of silently running the higher-priority older file.
+                if (!finalName.empty() &&
+                    !ProjectScriptRunBypassWouldBeShadowedByConversationScript(
+                        ctx, createdScript.displayName)) {
                     m_oneShotApprovedScriptRun.push_back(finalName);
+                    m_oneShotApprovedScriptRunBeginCredits = 1;
+                }
             }
 
-            if (ShouldStopAfterStandaloneWriteArtifact(inv, out.result, ctx)) {
+            // Phase 10: the deterministic write-and-stop heuristic exists
+            // to keep small models from re-writing the same artifact in a
+            // solo-call loop.  When the model explicitly batched more
+            // calls behind this write, it has a plan — let the batch run.
+            if (m_queuedInvocations.empty() &&
+                ShouldStopAfterStandaloneWriteArtifact(inv, out.result, ctx)) {
                 EmitAndStoreTerminalToolResult(out.result, false);
 
                 if (m_sink) {
@@ -1078,31 +1605,63 @@ bool AgentController::DispatchApprovedAndContinue(const ToolInvocation& inv,
             FeedResultAndIterate(out.result);
             return true;
 
-        case DispatchStatus::Invalid: {
-            // Dispatch-level failure (e.g. grep path resolution).
-            // Render, feed back, continue loop — do NOT bump the
-            // malformed counter since the INVOCATION was valid;
-            // only the runtime state was wrong.
+        case DispatchStatus::Invalid:
+            // Dispatch-level failure (e.g. path resolution).  Render, feed
+            // back, continue loop — the invocation itself was well-formed.
+            ResolveToolSignatureOutcome(inv, /*failed=*/true);
             FeedResultAndIterate(out.result);
             return true;
-        }
 
-        case DispatchStatus::Async: {
-            // Worker running. Stash the invocation for when the completion
-            // event arrives, then show a lightweight pending card immediately.
-            // Without this, approvals / natural "yes run it" follow-ups can
-            // look like a blank assistant turn until the worker finishes.
+        case DispatchStatus::Async:
+            // Specialized worker running.  Stash both the invocation and its
+            // original context so all async completion paths have one state
+            // shape and future result policy remains deterministic.
             m_awaitingAsyncResult    = true;
             m_pendingAsyncInvocation = inv;
+            m_pendingAsyncContext    = ctx;
             EmitPendingToolBlock(inv);
             return true;
-        }
     }
     return false;
 }
 
+bool AgentController::HandleToolWorkerComplete(
+    const ToolWorkerResult& workerResult)
+{
+    if (!m_active || !m_awaitingAsyncResult) return false;
+    if (!ShouldDispatchToolOnWorker(m_pendingAsyncInvocation.name)) return false;
+    if (workerResult.toolName != m_pendingAsyncInvocation.name) return false;
 
-void AgentController::FeedResultAndIterate(const ToolInvocationResult& rIn)
+    m_awaitingAsyncResult = false;
+    ToolInvocation inv = m_pendingAsyncInvocation;
+    ToolContext ctx = m_pendingAsyncContext;
+    m_pendingAsyncInvocation = ToolInvocation{};
+    m_pendingAsyncContext = ToolContext{};
+
+    if (m_cancelled || workerResult.cancelled) {
+        // A filesystem operation may have crossed its non-cancellable commit
+        // point before Stop was pressed.  Preserve the real result on screen
+        // and in history, then terminate the loop rather than asking the model
+        // for another step.
+        ResolveToolSignatureOutcome(
+            inv, workerResult.outcome.status != DispatchStatus::Completed ||
+                 !workerResult.outcome.result.errorBody.empty());
+        return FinishAsyncToolResult(
+            inv, workerResult.outcome.result, /*cancelled=*/true);
+    }
+
+    return FinishDispatchedInvocation(inv, ctx, workerResult.outcome);
+}
+
+void AgentController::FeedResultAndIterate(const ToolInvocationResult& rIn,
+                                           bool countTowardIterationCap)
+{
+    FeedResultOnly(rIn, countTowardIterationCap);
+    ContinueLoop();
+}
+
+void AgentController::FeedResultOnly(const ToolInvocationResult& rIn,
+                                     bool countTowardIterationCap)
 {
     ToolInvocationResult r = rIn;
     InlineSmallPdfExtractedMarkdown(r);
@@ -1133,25 +1692,53 @@ void AgentController::FeedResultAndIterate(const ToolInvocationResult& rIn)
     // and AddToolResultMessage degrades to AddUserMessage in that
     // case, preserving Phase 1/2 behaviour.
     std::string formatted = ChatHistory::FormatToolBlockAsUserMessage(
-        r.toolTag, r.commandEcho, r.body, r.errorBody, r.chips, r.bodyLang);
+        r.toolTag, r.commandEcho, r.body, r.errorBody, r.chips, r.bodyLang, r.presentedFiles);
+
+    // Step-budget trailer (model-facing only).  Only counted, actually
+    // dispatched tool results consume the hard cap; approval denials and
+    // malformed-call coaching are recovery/control messages, not tool work.
+    if (countTowardIterationCap) {
+        const int stepsUsed = m_iterationsUsed + 1;   // this result inclusive
+        const int remaining = m_maxToolSteps - stepsUsed;
+        formatted += "\n\n[agent tool step " + std::to_string(stepsUsed) +
+                     " of " + std::to_string(m_maxToolSteps) + "]";
+        if (remaining <= 2 && remaining > 0) {
+            formatted += " Budget nearly exhausted: answer from the evidence "
+                         "you already have unless one final tool call is "
+                         "essential to complete the user's request.";
+        }
+    }
+
     m_history->AddToolResultMessage(m_currentToolCallId, formatted);
 
     // Consumed — clear so the next iteration's malformed-error
     // path or sync dispatch doesn't accidentally re-use it.
     m_currentToolCallId.clear();
 
-    // Iteration-cap check BEFORE kicking off the next request.
-    ++m_iterationsUsed;
-    if (m_iterationsUsed >= kMaxIterations) {
+    if (countTowardIterationCap)
+        ++m_iterationsUsed;
+}
+
+void AgentController::ContinueLoop()
+{
+    // Iteration-cap check BEFORE kicking off the next request.  A
+    // partially-executed batch is drained with skipped results first so
+    // the persisted assistant.tool_calls sidecar keeps one reply per
+    // call and the next native request stays valid.
+    if (m_iterationsUsed >= m_maxToolSteps) {
+        DrainQueuedInvocationsWithSkippedResults(
+            "the agent reached its tool step cap before this call ran.");
+
         const std::string msg =
             "Agent stopped after " +
-            std::to_string(kMaxIterations) +
+            std::to_string(m_maxToolSteps) +
             " tool step(s). This is a safety cap to prevent runaway loops. "
-            "Ask the model to continue if you want more inspection.";
+            "Ask the model to continue if you want more inspection, or "
+            "raise the cap with /agent_steps <n>.";
 
         EmitAndStoreAgentStatusCard(
             "Agent Status",
-            { "stopped", "tool cap", std::to_string(kMaxIterations) + " steps" },
+            { "stopped", "tool cap", std::to_string(m_maxToolSteps) + " steps" },
             msg,
             true);
 
@@ -1159,7 +1746,17 @@ void AgentController::FeedResultAndIterate(const ToolInvocationResult& rIn)
         return;
     }
     if (m_cancelled) {
+        DrainQueuedInvocationsWithSkippedResults(
+            "the agent loop was stopped by the user.");
         EndLoop(AgentEndReason::Cancelled, "Agent stopped by user.");
+        return;
+    }
+
+    // Phase 10: still inside a multi-call batch — execute the next
+    // queued invocation from this assistant turn before asking the
+    // model for anything new.
+    if (!m_queuedInvocations.empty()) {
+        DispatchNextQueuedInvocation();
         return;
     }
 
@@ -1209,12 +1806,13 @@ bool AgentController::HandleAssistantComplete(const std::string& fullResponse,
     // role:"tool" replies, and dispatch through the router exactly
     // the same way XML invocations dispatch.
     //
-    // Phase 3 bugfix #1: keep native dispatch one-call-at-a-time.
-    // If the model emits multiple native tool_calls in one assistant
-    // turn, execute only the first parsed invocation AND persist only
-    // that matching tool_call sidecar.  Storing the full array while
-    // appending one result would create an invalid OpenAI transcript:
-    // assistant.tool_calls = A+B, but role:"tool" result only for A.
+    // Phase 10: multi-call batch dispatch.  When every parsed call has
+    // a usable unique id, the full tool_calls sidecar is persisted and
+    // the calls execute sequentially (first now, the rest queued); the
+    // controller guarantees one role:"tool" reply per persisted call so
+    // the transcript stays paired.  Id-less or ambiguous batches fall
+    // back to the conservative Phase 3 rule: execute only the first
+    // invocation and persist only its matching sidecar entry.
     const bool nativeActive =
         m_cb.getActiveProtocol &&
         m_cb.getActiveProtocol() == ToolProtocol::Native;
@@ -1224,12 +1822,70 @@ bool AgentController::HandleAssistantComplete(const std::string& fullResponse,
             ParseStructuredToolCalls(toolCallsJson);
 
         if (!invocations.empty()) {
-            // Conservative Phase 3 rule: execute exactly one native
-            // tool call per assistant turn.  Most importantly, persist
-            // only the same tool_call that we are about to dispatch.
-            // That guarantees the next request has a valid pair:
-            //   assistant.tool_calls[0].id == role:"tool".tool_call_id
+            // Phase 10: multi-call batch dispatch.  Persist the
+            // tool_calls sidecar for every invocation we will execute,
+            // queue the rest of the batch, and dispatch sequentially.
+            // The controller guarantees one role:"tool" reply per
+            // persisted call (result, error, denied, or skipped), so
+            // the next native request keeps a valid paired transcript:
+            //   assistant.tool_calls[k].id == role:"tool"[k].tool_call_id
+            //
+            // Ceiling: anything past kMaxNativeCallsPerTurn is dropped
+            // from the sidecar entirely (so no orphaned ids) and the
+            // model is told to re-issue the remainder next turn.
+            std::string overflowNotice;
+            if (invocations.size() >
+                static_cast<size_t>(kMaxNativeCallsPerTurn)) {
+                const size_t dropped =
+                    invocations.size() -
+                    static_cast<size_t>(kMaxNativeCallsPerTurn);
+                invocations.resize(
+                    static_cast<size_t>(kMaxNativeCallsPerTurn));
+                overflowNotice =
+                    "\n\n[notice] You emitted more tool calls than the per-"
+                    "turn batch ceiling (" +
+                    std::to_string(kMaxNativeCallsPerTurn) + "). The last " +
+                    std::to_string(dropped) + " call(s) were dropped. "
+                    "Re-issue them after reading these results if they are "
+                    "still needed.";
+            }
+
+            bool batchMode = invocations.size() > 1;
+            std::string sidecarJson;
+            if (batchMode) {
+                sidecarJson =
+                    KeepExecutableToolCallsJson(toolCallsJson, invocations);
+                // Fail closed to the conservative single-call path when
+                // ids are missing, duplicated, or unmatched — pairing
+                // would be ambiguous otherwise.
+                if (sidecarJson.empty()) batchMode = false;
+            }
+
+            if (batchMode) {
+                m_history->SetLastAssistantToolCalls(sidecarJson);
+
+                m_queuedInvocations.assign(invocations.begin() + 1,
+                                           invocations.end());
+                if (!overflowNotice.empty()) {
+                    m_pendingSoftHint += overflowNotice;
+                }
+
+                bool cont = DispatchAndContinue(invocations.front());
+                return cont;
+            }
+
+            // ── Single-call path (also the id-less fallback) ─────
+            // Execute exactly one native tool call and persist only the
+            // matching sidecar entry, exactly as Phase 3 did.
             ToolInvocation first = invocations.front();
+            if (invocations.size() > 1) {
+                m_pendingSoftHint +=
+                    "\n\n[notice] You emitted " + std::to_string(invocations.size()) +
+                    " tool calls in one assistant turn, but this provider did "
+                    "not supply usable tool call ids, so LlamaBoss executed only "
+                    "the first one to keep the native transcript valid. Re-issue "
+                    "any remaining tool calls one at a time after reading this result.";
+            }
             std::string oneToolCallJson =
                 KeepOnlySelectedToolCallJson(toolCallsJson, first.toolCallId);
 
@@ -1285,6 +1941,25 @@ bool AgentController::HandleAssistantComplete(const std::string& fullResponse,
     // Treat this as if we received one invalid invocation — the
     // counter-based stop rule kicks in.
     if (!parsed.hasInvocation && !parsed.malformed.empty()) {
+        // Strip the unparseable block from the stored assistant
+        // message, mirroring the valid-invocation strip below.
+        // MyFrame's OnAssistantComplete already finalized the last
+        // assistant message with the FULL response — broken block
+        // included — and replaying a multi-KB verbatim copy of the
+        // model's own mistake on every remaining iteration re-anchors
+        // exactly the pattern the error result is coaching it away
+        // from (see the 2026-06-11 note in DispatchAndContinue).  The
+        // compact head+tail preview still reaches the model once, via
+        // the error result's command echo, so it can self-correct
+        // without the full block dominating its context.
+        if (m_history->HasAssistantPlaceholder() ||
+            m_history->GetMessageCount() > 0) {
+            m_history->UpdateLastAssistantMessage(parsed.prose);
+        }
+        if (parsed.prose.empty()) {
+            m_history->RemoveLastAssistantMessage();
+        }
+
         ToolInvocation bad;
         bad.valid         = false;
         bad.rawBlock      = parsed.malformed.front().rawText;
@@ -1391,6 +2066,23 @@ std::vector<ToolInvocation> AgentController::ParseStructuredToolCalls(
         } else if (!ValidateToolArgs(inv.name, inv.args, reason)) {
             inv.valid         = false;
             inv.invalidReason = reason;
+
+            // The most common native-path validation failure is a
+            // hallucinated parameter name: ProjectStructuredArgs found
+            // none of the schema fields, projected an empty args
+            // string, and the validator reported a generic "requires
+            // a path"-style error.  Name the keys the model actually
+            // sent so it can fix the parameter name on the next try
+            // instead of re-guessing blind.
+            if (inv.args.empty() && !argsRaw.empty()) {
+                std::string keys = AgentListJsonObjectKeys(argsRaw);
+                if (!keys.empty()) {
+                    inv.invalidReason +=
+                        " (your tool call sent JSON argument keys: " + keys +
+                        " — none match this tool's parameter schema; use the"
+                        " parameter names from the tool catalog)";
+                }
+            }
         } else {
             inv.valid = true;
         }
@@ -1410,14 +2102,17 @@ std::vector<ToolInvocation> AgentController::ParseStructuredToolCalls(
 // parsers without a structured-args branch.  pwd is the lone
 // no-args exception: empty string always.
 //
-// Phase 3c-iii: write and edit moved to structured shapes.
-//   write : {path, content}              → "path\ncontent"
-//   edit  : {path, old_str, new_str}     → "path\n<<<OLD>>>\nold\n<<<NEW>>>\nnew"
-// The flattened result feeds the existing SplitPathAndContent /
-// ParseEditArgs parsers verbatim, so the tool implementations stay
-// unchanged.  Backward-compat: if a model emits the old {args}
-// shape for write or edit, the trailing fallback at the bottom
-// picks it up and the dispatchers run as before.
+// Phase 3c-iii/iv: several native tools moved to structured shapes.
+//   write             : {path, content}              → "path\ncontent"
+//   overwrite_file    : {path, content}              → "path\ncontent"
+//   read/open/ls/mkdir/delete: {path} or aliases     → "path"
+//   edit              : {path, old_str, new_str}     → sentinel form
+//   grep              : {pattern, path?}             → "pattern\npath"
+//   python_run_script : {script, argv?[]}            → "script\narg1\narg2"
+// The flattened result feeds the existing dispatcher/parser code
+// verbatim, so tool internals stay unchanged.  Backward-compat:
+// if a model emits the old {args} shape, the trailing fallback at
+// the bottom picks it up and the dispatchers run as before.
 //
 // On parse failure we fall through to the raw string; most
 // dispatchers tolerate that for single-arg tools and the
@@ -1447,6 +2142,49 @@ std::string AgentController::ProjectStructuredArgs(
         catch (...) { return std::string(); }
     };
 
+    // Small helper: pull the most common path-ish native field.
+    // A few providers/models keep choosing {path} even for legacy
+    // single-string tools that historically declared {args}; accept
+    // those aliases so harmless read/open/ls/mkdir calls do not burn
+    // the malformed-call budget.
+    auto getPathLike = [&]() -> std::string {
+        static const char* kKeys[] = {
+            "path", "file_path", "filepath", "file", "filename", "directory", "dir"
+        };
+        for (const char* key : kKeys) {
+            std::string v = getStr(key);
+            if (!v.empty()) return v;
+        }
+        return std::string();
+    };
+
+    // Small helper: pull a JSON array field as text argv tokens.
+    // String entries pass through unchanged; simple scalar entries are
+    // converted by Poco so native callers cannot accidentally drop
+    // a numeric option value such as 1.
+    auto getStringArray = [&](const std::string& key) -> std::vector<std::string> {
+        std::vector<std::string> out;
+        if (!obj->has(key)) return out;
+        try {
+            Poco::JSON::Array::Ptr arr = obj->getArray(key);
+            if (!arr) return out;
+            out.reserve(arr->size());
+            for (size_t i = 0; i < arr->size(); ++i) {
+                try {
+                    std::string item = arr->get(i).convert<std::string>();
+                    out.push_back(std::move(item));
+                } catch (...) {
+                    // Skip malformed argv entries; validator/runtime
+                    // will still reject an empty script name below.
+                }
+            }
+        } catch (...) {
+            // Not an array.  Leave empty so legacy {args} fallback
+            // can still run if present.
+        }
+        return out;
+    };
+
     // ── python_create_script: {filename, content} → "filename\n" + content
     // This creates a reviewable .py artifact in the Scripts lane.
     // It does not execute the script.
@@ -1466,7 +2204,9 @@ std::string AgentController::ProjectStructuredArgs(
     // engage this branch if `path` is present; otherwise we fall
     // through so a model still emitting the old {args} shape gets
     // handled as a backward-compat case.
-    if ((toolName == tool_names::kWrite || toolName == tool_names::kOverwriteFile) && obj->has("path")) {
+    if ((toolName == tool_names::kWrite ||
+         toolName == tool_names::kOverwriteFile ||
+         toolName == tool_names::kWritePowerShellScript) && obj->has("path")) {
         std::string path    = getStr("path");
         std::string content = getStr("content");
         if (!path.empty()) {
@@ -1492,9 +2232,23 @@ std::string AgentController::ProjectStructuredArgs(
         }
     }
 
+    // ── simple path tools: {path} / {file_path} → "path" ─────────
+    // Some native callers prefer structured path keys even when the
+    // tool catalog still exposes a legacy {args} string.  Keep the
+    // legacy {args} fallback below, but accept path-like aliases for
+    // tools whose dispatcher consumes a single path argument.
+    if (toolName == tool_names::kRead ||
+        toolName == tool_names::kOpen ||
+        toolName == tool_names::kLs ||
+        toolName == tool_names::kMkdir ||
+        toolName == tool_names::kDelete) {
+        std::string path = getPathLike();
+        if (!path.empty()) return path;
+    }
+
     // ── read_head: {path, lines} → "<lines>\n<path>" ─────────
-    if (toolName == tool_names::kReadHead && obj->has("path")) {
-        std::string path = getStr("path");
+    if (toolName == tool_names::kReadHead) {
+        std::string path = getPathLike();
         std::string lines;
         if (obj->has("lines")) {
             try { lines = std::to_string(obj->getValue<int>("lines")); }
@@ -1505,14 +2259,49 @@ std::string AgentController::ProjectStructuredArgs(
         }
     }
 
+    // ── grep: {pattern, path?} → "pattern\npath" ───────────────
+    // The newline shape lets native callers search for literal patterns
+    // containing spaces without triggering the legacy "first whitespace
+    // token is pattern" parser.  DoGrep keeps the one-line legacy parser
+    // for XML and old native {args} calls.
+    if (toolName == tool_names::kGrep && obj->has("pattern")) {
+        std::string pattern = getStr("pattern");
+        std::string path    = getStr("path");
+        if (!pattern.empty()) {
+            return path.empty() ? pattern : (pattern + "\n" + path);
+        }
+    }
+
+    // ── python_run_script: {script, argv?[]} → script + arg lines ──
+    // The runner already treats every later line as exactly one argv
+    // token.  Native structured argv removes the fragile model-facing
+    // "one token per line" prose while preserving runner behavior.
+    if (toolName == tool_names::kPythonRunScript && obj->has("script")) {
+        std::string script = getStr("script");
+        if (!script.empty()) {
+            std::ostringstream flat;
+            flat << script;
+            for (const std::string& arg : getStringArray("argv")) {
+                // The legacy runner's transport is one argv token per
+                // line, so keep each native argv element on exactly one
+                // line.  If a model tries to put embedded newlines in an
+                // argument, collapse them to spaces instead of letting one
+                // JSON array element become several argv tokens.
+                std::string oneLineArg = arg;
+                std::replace(oneLineArg.begin(), oneLineArg.end(), '\r', ' ');
+                std::replace(oneLineArg.begin(), oneLineArg.end(), '\n', ' ');
+                flat << "\n" << oneLineArg;
+            }
+            return flat.str();
+        }
+    }
+
     // ── Single-string tools, plus backward-compat fallback ──────
-    // Every other tool (read, ls, grep, open, mkdir, delete,
-    // powershell) declares a single "args" string property and
-    // the dispatcher's per-tool parser consumes it.  This branch
-    // is also the fallback for write/edit when a model emits
-    // the pre-Phase-3c-iii {args} shape — saved-history replay,
-    // older models, or transient regressions all land here and
-    // continue to work.
+    // Remaining single-string tools (read, ls, open, mkdir, delete,
+    // powershell, etc.) declare one "args" string property and the
+    // dispatcher's per-tool parser consumes it. This branch is also
+    // the backward-compat fallback for tools migrated to structured
+    // schemas when a model or saved replay still emits {args}.
     if (obj->has("args")) {
         try { return obj->getValue<std::string>("args"); }
         catch (...) { /* fall through */ }
@@ -1520,6 +2309,37 @@ std::string AgentController::ProjectStructuredArgs(
     return std::string();
 }
 
+
+bool AgentController::FinishAsyncToolResult(const ToolInvocation&       inv,
+                                            const ToolInvocationResult& r,
+                                            bool                        cancelled)
+{
+    if (cancelled) {
+        // Still render the (likely-partial) result so the user sees
+        // what came back before the cancel landed, and round-trip it
+        // to history so the model's transcript reflects what actually
+        // happened.
+        EmitToolBlock(r);
+
+        std::string formatted = ChatHistory::FormatToolBlockAsUserMessage(
+            r.toolTag, r.commandEcho, r.body, r.errorBody, r.chips, r.bodyLang, r.presentedFiles);
+        m_history->AddToolResultMessage(inv.toolCallId, formatted);
+
+        DrainQueuedInvocationsWithSkippedResults(
+            "the agent loop was stopped by the user before this call ran.");
+
+        EndLoop(AgentEndReason::Cancelled, "Agent stopped by user.");
+        return true;
+    }
+
+    // Phase 7d: async outcome lands here; resolve before continuing so
+    // a successful retry-after-fix purges the earlier failed records of
+    // the same call (e.g. python_run_script after python_create_script).
+    ResolveToolSignatureOutcome(inv, !r.errorBody.empty());
+
+    FeedResultAndIterate(r);
+    return true;
+}
 
 bool AgentController::HandleGrepComplete(const GrepResult& grepResult)
 {
@@ -1534,45 +2354,20 @@ bool AgentController::HandleGrepComplete(const GrepResult& grepResult)
     m_awaitingAsyncResult = false;
     ToolInvocation inv = m_pendingAsyncInvocation;
     m_pendingAsyncInvocation = ToolInvocation{};
+    m_pendingAsyncContext = ToolContext{};
 
-    if (m_cancelled || grepResult.cancelled) {
-        // Still render the (likely-partial) result so the user
-        // sees what was found before cancel.
-        ToolInvocationResult r;
-        r.toolTag       = tool_names::kGrep;
-        r.invocationRaw = inv.rawBlock;
-        r.iconUtf8      = "\xF0\x9F\x94\x8D";
-        r.toolName      = "Grep";
-        r.commandEcho   = grepResult.commandEcho;
-        r.chips         = grepResult.chips;
-        r.body          = grepResult.body;
-        r.errorBody     = grepResult.errorBody;
-        r.bodyLang      = grepResult.bodyLang;
-
-        EmitToolBlock(r);
-
-        std::string formatted = ChatHistory::FormatToolBlockAsUserMessage(
-            r.toolTag, r.commandEcho, r.body, r.errorBody, r.chips, r.bodyLang);
-        m_history->AddToolResultMessage(inv.toolCallId, formatted);
-
-        EndLoop(AgentEndReason::Cancelled, "Agent stopped by user.");
-        return true;
-    }
-
-    // Build the result struct and continue the loop normally.
     ToolInvocationResult r;
     r.toolTag       = tool_names::kGrep;
     r.invocationRaw = inv.rawBlock;
-    r.iconUtf8      = "\xF0\x9F\x94\x8D";
-    r.toolName      = "Grep";
+    r.iconUtf8      = tool_approval::ToolIcon(inv.name);
+    r.toolName      = tool_approval::ToolDisplayName(inv.name);
     r.commandEcho   = grepResult.commandEcho;
     r.chips         = grepResult.chips;
     r.body          = grepResult.body;
     r.errorBody     = grepResult.errorBody;
     r.bodyLang      = grepResult.bodyLang;
 
-    FeedResultAndIterate(r);
-    return true;
+    return FinishAsyncToolResult(inv, r, m_cancelled || grepResult.cancelled);
 }
 
 // ─── powershell completion ──────────────────────────────────────
@@ -1599,6 +2394,7 @@ bool AgentController::HandleCmdComplete(const CmdResult& cmdResult)
     m_awaitingAsyncResult = false;
     ToolInvocation inv = m_pendingAsyncInvocation;
     m_pendingAsyncInvocation = ToolInvocation{};
+    m_pendingAsyncContext = ToolContext{};
 
     // Build chips identical to the slash /cmd result layout.
     std::vector<std::string> chips;
@@ -1623,8 +2419,8 @@ bool AgentController::HandleCmdComplete(const CmdResult& cmdResult)
     ToolInvocationResult r;
     r.toolTag       = tool_names::kPowerShell;
     r.invocationRaw = inv.rawBlock;
-    r.iconUtf8      = "\xE2\x9A\x99";       // ⚙
-    r.toolName      = "PowerShell";
+    r.iconUtf8      = tool_approval::ToolIcon(inv.name);
+    r.toolName      = tool_approval::ToolDisplayName(inv.name);
     r.commandEcho   = cmdResult.command;
     r.chips         = chips;
     r.body          = cmdResult.stdoutText;
@@ -1632,21 +2428,7 @@ bool AgentController::HandleCmdComplete(const CmdResult& cmdResult)
     r.bodyLang      = "powershell";
     r.presentedFiles = cmdResult.presentedFiles;
 
-    if (m_cancelled || cmdResult.cancelled) {
-        // Render the (possibly partial) result so the user sees
-        // what came back before the cancel landed.
-        EmitToolBlock(r);
-
-        std::string formatted = ChatHistory::FormatToolBlockAsUserMessage(
-            r.toolTag, r.commandEcho, r.body, r.errorBody, r.chips, r.bodyLang);
-        m_history->AddToolResultMessage(inv.toolCallId, formatted);
-
-        EndLoop(AgentEndReason::Cancelled, "Agent stopped by user.");
-        return true;
-    }
-
-    FeedResultAndIterate(r);
-    return true;
+    return FinishAsyncToolResult(inv, r, m_cancelled || cmdResult.cancelled);
 }
 
 // ─── controlled Python helper completion ─────────────────────────
@@ -1661,6 +2443,7 @@ bool AgentController::HandlePythonComplete(const PythonRunResult& pythonResult)
     m_awaitingAsyncResult = false;
     ToolInvocation inv = m_pendingAsyncInvocation;
     m_pendingAsyncInvocation = ToolInvocation{};
+    m_pendingAsyncContext = ToolContext{};
 
     std::vector<std::string> chips;
     if (pythonResult.cancelled) {
@@ -1683,58 +2466,25 @@ bool AgentController::HandlePythonComplete(const PythonRunResult& pythonResult)
         chips.push_back(pythonResult.pythonCommand);
     if (pythonResult.truncated) chips.push_back("truncated");
 
-    const bool isInspect = (inv.name == tool_names::kCsvInspect);
-    const bool isReport  = (inv.name == tool_names::kCsvReport);
-    const bool isCsvToXlsx = (inv.name == tool_names::kCsvToXlsx);
-    const bool isXlsxIns = (inv.name == tool_names::kXlsxInspect);
-    const bool isXlsxRep = (inv.name == tool_names::kXlsxReport);
+    // Presentation comes from the spec's kPresentation row via the
+    // router-backed tool_approval helpers.  This replaces the
+    // 13-flag ternary ladder that hand-duplicated icon, display
+    // name, and echo fallback per Python helper — the third copy of
+    // that mapping in the codebase, and the one that drifted first.
     const bool isXlsxCreate = (inv.name == tool_names::kXlsxCreateWorkbook);
-    const bool isPdf     = (inv.name == tool_names::kPdfExtractText);
-    const bool isPdfInspect = (inv.name == tool_names::kPdfInspectForm);
-    const bool isPdfFill = (inv.name == tool_names::kPdfFillForm);
-    const bool isDocx    = (inv.name == tool_names::kDocxExtractText);
-    const bool isDocxIns = (inv.name == tool_names::kDocxInspect);
-    const bool isRun     = (inv.name == tool_names::kPythonRunScript);
-    const bool isInstall = (inv.name == tool_names::kPythonInstallPackage);
+    const bool isRun        = (inv.name == tool_names::kPythonRunScript);
+    const bool isInstall    = (inv.name == tool_names::kPythonInstallPackage);
 
     ToolInvocationResult r;
     r.toolTag       = inv.name;
     r.invocationRaw = inv.rawBlock;
-    r.iconUtf8      = (isPdf || isPdfInspect || isPdfFill ||
-                       isDocx || isDocxIns)        ? std::string("\xF0\x9F\x93\x84")  // 📄
-                    : (isXlsxRep || isXlsxCreate || isCsvToXlsx) ? std::string("\xF0\x9F\x93\x97")      // 📗
-                    : isReport ? std::string("\xF0\x9F\x93\x9D")       // 📝
-                    : (isInspect || isXlsxIns) ? std::string("\xF0\x9F\x93\x8A") // 📊
-                                : std::string("\xF0\x9F\x90\x8D");     // 🐍
-    r.toolName      = isInstall ? std::string("Install Python Package")
-                    : isRun ? std::string("Python Run")
-                    : isPdf ? std::string("PDF Extract Text")
-                    : isPdfInspect ? std::string("PDF Inspect Form")
-                    : isPdfFill ? std::string("PDF Fill Form")
-                    : isDocx ? std::string("DOCX Extract Text")
-                    : isDocxIns ? std::string("DOCX Inspect")
-                    : isXlsxCreate ? std::string("Create Workbook")
-                    : isCsvToXlsx ? std::string("CSV to XLSX")
-                    : isXlsxRep ? std::string("XLSX Report")
-                    : isXlsxIns ? std::string("XLSX Inspect")
-                    : isReport ? std::string("CSV Report")
-                    : isInspect ? std::string("CSV Inspect")
-                                : std::string("Python Health");
+    r.iconUtf8      = tool_approval::ToolIcon(inv.name);
+    r.toolName      = tool_approval::ToolDisplayName(inv.name);
+    // The helper's own echo wins; the fallback is the wire name,
+    // which is exactly what the old per-tool fallback ladder spelled
+    // out ("python_run_script", "csv_inspect", ...).
     r.commandEcho   = pythonResult.commandEcho.empty()
-                        ? (isInstall ? std::string("python_install_package")
-                          : isRun ? std::string("python_run_script")
-                          : isPdf ? std::string("pdf_extract_text")
-                          : isPdfInspect ? std::string("pdf_inspect_form")
-                          : isPdfFill ? std::string("pdf_fill_form")
-                          : isDocx ? std::string("docx_extract_text")
-                          : isDocxIns ? std::string("docx_inspect")
-                          : isXlsxCreate ? std::string("xlsx_create_workbook")
-                          : isCsvToXlsx ? std::string("csv_to_xlsx")
-                          : isXlsxRep ? std::string("xlsx_report")
-                          : isXlsxIns ? std::string("xlsx_inspect")
-                          : isReport ? std::string("csv_report")
-                          : isInspect ? std::string("csv_inspect")
-                                      : std::string("python_health"))
+                        ? inv.name
                         : pythonResult.commandEcho;
     r.chips         = chips;
     r.body          = pythonResult.stdoutText;
@@ -1747,14 +2497,7 @@ bool AgentController::HandlePythonComplete(const PythonRunResult& pythonResult)
     ApplyAgentMissingPythonPackageRecovery(r, pythonResult);
 
     if (m_cancelled || pythonResult.cancelled) {
-        EmitToolBlock(r);
-
-        std::string formatted = ChatHistory::FormatToolBlockAsUserMessage(
-            r.toolTag, r.commandEcho, r.body, r.errorBody, r.chips, r.bodyLang);
-        m_history->AddToolResultMessage(inv.toolCallId, formatted);
-
-        EndLoop(AgentEndReason::Cancelled, "Agent stopped by user.");
-        return true;
+        return FinishAsyncToolResult(inv, r, true);
     }
 
     // If workbook creation failed after the fixed helper had a chance to
@@ -1762,11 +2505,18 @@ bool AgentController::HandlePythonComplete(const PythonRunResult& pythonResult)
     // failing tool result back into the model. Local models commonly retry
     // the identical bad JSON, which looks like a loop to the user.
     if (isXlsxCreate &&
+        m_queuedInvocations.empty() &&
         pythonResult.exitCode != 0 &&
         !pythonResult.cancelled &&
         !pythonResult.timedOut) {
         EmitAndStoreTerminalToolResult(r, true);
-        EndLoop(AgentEndReason::Normal,
+        // ToolFailedStop, not Normal: the loop is stopping BECAUSE a
+        // tool failed terminally.  The agent-trace JSONL records the
+        // end reason verbatim, and labeling failure stops "normal"
+        // silently skews any analysis run over the traces.  Goal mode
+        // also keys off this: a non-Normal reason skips the pointless
+        // verification pass and keeps the goal active instead.
+        EndLoop(AgentEndReason::ToolFailedStop,
                 "I couldn't create the Excel workbook. Check the tool details above for the exact error.");
         return true;
     }
@@ -1781,6 +2531,7 @@ bool AgentController::HandlePythonComplete(const PythonRunResult& pythonResult)
     // feels finished even though we intentionally skip the model's final
     // prose pass.
     if (isXlsxCreate &&
+        m_queuedInvocations.empty() &&
         pythonResult.exitCode == 0 &&
         !pythonResult.timedOut &&
         !pythonResult.presentedFiles.empty()) {
@@ -1807,7 +2558,85 @@ bool AgentController::HandlePythonComplete(const PythonRunResult& pythonResult)
         return true;
     }
 
-    FeedResultAndIterate(r);
+    return FinishAsyncToolResult(inv, r, false);
+}
+
+
+bool AgentController::HandleWebFetchComplete(const WebFetchResult& webResult)
+{
+    if (!m_active || !m_awaitingAsyncResult) return false;
+
+    if (!IsAgentWebFetchAsyncToolName(m_pendingAsyncInvocation.name))
+        return false;
+
+    m_awaitingAsyncResult = false;
+    ToolInvocation inv = m_pendingAsyncInvocation;
+    m_pendingAsyncInvocation = ToolInvocation{};
+    m_pendingAsyncContext = ToolContext{};
+
+    ToolInvocationResult r = MakeWebFetchToolResult(inv, webResult);
+
+    return FinishAsyncToolResult(inv, r, m_cancelled || webResult.cancelled);
+}
+
+bool AgentController::HandleCmdError(const std::string& errorText)
+{
+    if (!m_active || !m_awaitingAsyncResult) return false;
+    if (m_pendingAsyncInvocation.name != tool_names::kPowerShell) return false;
+
+    m_awaitingAsyncResult = false;
+    ToolInvocation inv = m_pendingAsyncInvocation;
+    m_pendingAsyncInvocation = ToolInvocation{};
+    m_pendingAsyncContext = ToolContext{};
+
+    // Phase 7d: a launch failure is a FAILED outcome for the loop-guard
+    // records.  Without this, launch-failed attempts stay marked as
+    // non-failed, a later success of the same call cannot purge them,
+    // and a legitimate retry after the fix can trip the exact-repeat
+    // guard (run(launch-fail) ×2 → fix → run(ok) → run again blocked).
+    ResolveToolSignatureOutcome(inv, /*failed=*/true);
+
+    ToolInvocationResult r = MakeAsyncLaunchErrorResult(inv, errorText);
+    FeedResultAndIterate(r, /*countTowardIterationCap=*/false);
+    return true;
+}
+
+bool AgentController::HandlePythonError(const std::string& errorText)
+{
+    if (!m_active || !m_awaitingAsyncResult) return false;
+    if (!IsAgentPythonAsyncToolName(m_pendingAsyncInvocation.name)) return false;
+
+    m_awaitingAsyncResult = false;
+    ToolInvocation inv = m_pendingAsyncInvocation;
+    m_pendingAsyncInvocation = ToolInvocation{};
+    m_pendingAsyncContext = ToolContext{};
+
+    // Phase 7d: see HandleCmdError — launch failures must be marked
+    // failed so a later success of the same call purges them.
+    ResolveToolSignatureOutcome(inv, /*failed=*/true);
+
+    ToolInvocationResult r = MakeAsyncLaunchErrorResult(inv, errorText);
+    FeedResultAndIterate(r, /*countTowardIterationCap=*/false);
+    return true;
+}
+
+
+bool AgentController::HandleWebFetchError(const std::string& errorText)
+{
+    if (!m_active || !m_awaitingAsyncResult) return false;
+    if (!IsAgentWebFetchAsyncToolName(m_pendingAsyncInvocation.name)) return false;
+
+    m_awaitingAsyncResult = false;
+    ToolInvocation inv = m_pendingAsyncInvocation;
+    m_pendingAsyncInvocation = ToolInvocation{};
+    m_pendingAsyncContext = ToolContext{};
+
+    // Phase 7d: see HandleCmdError — launch failures must be marked
+    // failed so a later success of the same call purges them.
+    ResolveToolSignatureOutcome(inv, /*failed=*/true);
+
+    ToolInvocationResult r = MakeAsyncLaunchErrorResult(inv, errorText);
+    FeedResultAndIterate(r, /*countTowardIterationCap=*/false);
     return true;
 }
 

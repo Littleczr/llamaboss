@@ -1,5 +1,7 @@
 // model_switcher.cpp
 #include "model_switcher.h"
+
+#include "model_service.h"
 #include "app_state.h"
 #include "server_manager.h"
 #include "chat_display.h"
@@ -9,12 +11,68 @@
 #include "model_manager.h"
 #include "model_downloader.h"   // first-run onboarding
 #include "theme.h"
+#include "path_safety.h"
+#include "secrets_store.h"     // resolve remote API key
+#include "inference_target.h"  // InferenceTarget
+#include "tool_protocol.h"     // ToolProtocol
+#include "endpoint_store.h"    // 2d: configured remote endpoints
 
 #include <algorithm>
 #include <cctype>
 #include <vector>
+#include <unordered_map>
+
+#include <wx/filename.h>
 
 namespace {
+
+// ── Remote selection key ─────────────────────────────────────────
+// A remote selection is encoded as the model "key":
+//   remote:<endpointId>/<wireModelId>
+// e.g. remote:openrouter/anthropic/claude-sonnet-4.6
+// The user never sees this string — it's just what a picker row hands
+// to SwitchToModel so it can tell a remote selection from a local
+// .gguf path. The endpoint and model come from EndpointStore.
+constexpr char kRemotePrefix[] = "remote:";
+
+bool IsRemoteModelKey(const std::string& key)
+{
+    const std::string prefix(kRemotePrefix);
+    return key.size() >= prefix.size() &&
+           key.compare(0, prefix.size(), prefix) == 0;
+}
+
+bool SameSelectionKey(const std::string& a, const std::string& b)
+{
+    if (a.empty() || b.empty()) return false;
+    if (IsRemoteModelKey(a) || IsRemoteModelKey(b)) return a == b;
+    return path_safety::SameModelPath(a, b);
+}
+
+// Build the picker key for a configured (endpoint, model) pair.
+std::string RemoteModelKey(const std::string& endpointId,
+                           const std::string& wireModelId)
+{
+    return std::string(kRemotePrefix) + endpointId + "/" + wireModelId;
+}
+
+bool ParseRemoteModelKey(const std::string& key,
+                         std::string& endpointId,
+                         std::string& wireModelId)
+{
+    endpointId.clear();
+    wireModelId.clear();
+    if (!IsRemoteModelKey(key)) return false;
+
+    const std::string rest = key.substr(std::string(kRemotePrefix).size());
+    const size_t slash = rest.find('/');
+    if (slash == std::string::npos || slash == 0 || slash + 1 >= rest.size())
+        return false;
+
+    endpointId  = rest.substr(0, slash);
+    wireModelId = rest.substr(slash + 1);
+    return true;
+}
 
 // Heuristic: does this token look like a GGUF or torch quantization
 // label (so we can render it as a " · <q>" suffix in the pill)?
@@ -96,9 +154,40 @@ std::string FormatModelNameForPill(const std::string& displayName)
     return out;
 }
 
+std::string LowerAscii(std::string s)
+{
+    for (char& c : s) {
+        c = static_cast<char>(
+            std::tolower(static_cast<unsigned char>(c)));
+    }
+    return s;
+}
+
+bool EndsWithGguf(const std::string& s)
+{
+    if (s.size() < 5) return false;
+    return LowerAscii(s.substr(s.size() - 5)) == ".gguf";
+}
+
+bool ModelFileExists(const std::string& path)
+{
+    return !path.empty() && wxFileExists(wxString::FromUTF8(path.c_str()));
+}
+
+std::string PickExistingModelFallback(const std::string& preferred)
+{
+    if (ModelFileExists(preferred)) return preferred;
+
+    auto models = ServerManager::ScanModelPaths();
+    if (!models.empty()) return models.front();
+
+    return {};
+}
+
 } // namespace
 
-ModelSwitcher::ModelSwitcher(AppState& appState,
+ModelSwitcher::ModelSwitcher(ModelService& service,
+                             AppState& appState,
                              ServerManager& serverManager,
                              ChatDisplay* chatDisplay,
                              std::unique_ptr<ChatHistory>& chatHistory,
@@ -106,7 +195,8 @@ ModelSwitcher::ModelSwitcher(AppState& appState,
                              StatusDot* statusDot,
                              wxStaticText* modelLabel,
                              wxWindow* parentFrame)
-    : m_appState(appState)
+    : m_service(service)
+    , m_appState(appState)
     , m_serverManager(serverManager)
     , m_chatDisplay(chatDisplay)
     , m_chatHistory(chatHistory)
@@ -115,14 +205,230 @@ ModelSwitcher::ModelSwitcher(AppState& appState,
     , m_modelLabel(modelLabel)
     , m_parentFrame(parentFrame)
 {
+    wxASSERT_MSG(m_chatDisplay, "ModelSwitcher requires a non-null ChatDisplay");
+    wxASSERT_MSG(m_chatHistory, "ModelSwitcher requires a non-null ChatHistory");
+    wxASSERT_MSG(m_statusDot, "ModelSwitcher requires a non-null StatusDot");
+    wxASSERT_MSG(m_modelLabel, "ModelSwitcher requires a non-null model label");
+}
+
+bool ModelSwitcher::IsConversationTargetActive() const
+{
+    if (m_conversationSelectionKey.empty()) return true;
+    return SameSelectionKey(m_conversationSelectionKey,
+                            m_service.GetActiveSelectionKey());
+}
+
+bool ModelSwitcher::IsServerReady() const
+{
+    return m_service.IsServerReady() && IsConversationTargetActive();
+}
+
+void ModelSwitcher::MarkServerNotReady()
+{
+    // Shared readiness is service-owned.  This legacy helper now affects only
+    // the current frame's projection of that state.
+    if (m_statusDot) m_statusDot->SetConnected(false);
+}
+
+std::string ModelSwitcher::GetConversationModelForSave() const
+{
+    return m_conversationModelForSave.empty()
+        ? m_appState.GetModel()
+        : m_conversationModelForSave;
+}
+
+void ModelSwitcher::SetConversationPreferredLocalModel(
+    const std::string& modelPath)
+{
+    m_conversationSelectionKey = modelPath;
+    m_conversationModelForSave = modelPath;
+
+    if (SameSelectionKey(modelPath, m_service.GetActiveSelectionKey()) &&
+        m_service.IsServerReady()) {
+        m_pendingDeferredModel.clear();
+    }
+    else {
+        m_pendingDeferredModel = modelPath;
+    }
+}
+
+void ModelSwitcher::SetConversationPreferredRemoteModel(
+    const std::string& selectionKey,
+    const std::string& wireModel)
+{
+    m_conversationSelectionKey = selectionKey;
+    m_conversationModelForSave = wireModel;
+    m_pendingDeferredModel.clear();
+}
+
+
+bool ModelSwitcher::SetConversationPreferredSavedModel(
+    const std::string& savedModel)
+{
+    if (savedModel.empty()) return false;
+
+    if (ModelFileExists(savedModel)) {
+        SetConversationPreferredLocalModel(savedModel);
+        return true;
+    }
+
+    // A conversation currently using the active remote model can retain the
+    // endpoint identity exactly, even though older conversation files persist
+    // only the wire model id.
+    const InferenceTarget activeTarget = m_service.ResolveTarget();
+    const std::string activeKey = m_service.GetActiveSelectionKey();
+    if (!activeTarget.managed && activeTarget.modelId == savedModel &&
+        IsRemoteModelKey(activeKey)) {
+        SetConversationPreferredRemoteModel(activeKey, savedModel);
+        return true;
+    }
+
+    EndpointStore* endpoints = m_appState.GetEndpointStore();
+    if (!endpoints) return false;
+
+    // Prefer the last explicit remote selection when it names this wire model.
+    // This disambiguates common ids that appear under multiple providers.
+    std::string lastEndpoint;
+    std::string lastWireModel;
+    const std::string lastSelection = m_appState.GetLastSelection();
+    if (ParseRemoteModelKey(lastSelection, lastEndpoint, lastWireModel) &&
+        lastWireModel == savedModel) {
+        if (const EndpointStore::Endpoint* ep =
+                endpoints->FindEndpoint(lastEndpoint)) {
+            const bool stillConfigured = std::any_of(
+                ep->models.begin(), ep->models.end(),
+                [&savedModel](const EndpointStore::Model& model) {
+                    return model.id == savedModel;
+                });
+            if (stillConfigured) {
+                SetConversationPreferredRemoteModel(lastSelection, savedModel);
+                return true;
+            }
+        }
+    }
+
+    // Otherwise accept only a unique endpoint/model match.  Guessing when two
+    // endpoints expose the same wire id could silently send private chat data
+    // to the wrong provider.
+    std::string matchedKey;
+    size_t matches = 0;
+    for (const auto& ep : endpoints->Endpoints()) {
+        for (const auto& model : ep.models) {
+            if (model.id != savedModel) continue;
+            matchedKey = RemoteModelKey(ep.id, model.id);
+            ++matches;
+        }
+    }
+
+    if (matches == 1) {
+        SetConversationPreferredRemoteModel(matchedKey, savedModel);
+        return true;
+    }
+
+    return false;
+}
+
+void ModelSwitcher::AdoptActiveTargetForConversation()
+{
+    m_conversationSelectionKey = m_service.GetActiveSelectionKey();
+    m_conversationModelForSave = m_service.ResolveTarget().modelId;
+    if (m_conversationModelForSave.empty())
+        m_conversationModelForSave = m_appState.GetModel();
+    m_pendingDeferredModel.clear();
+}
+
+void ModelSwitcher::ClearConversationPreference()
+{
+    m_conversationSelectionKey.clear();
+    m_conversationModelForSave.clear();
+    m_pendingDeferredModel.clear();
+}
+
+bool ModelSwitcher::NeedsRemoteActivationForConversation() const
+{
+    return IsRemoteModelKey(m_conversationSelectionKey) &&
+           !IsConversationTargetActive();
+}
+
+bool ModelSwitcher::ActivateConversationPreferredRemoteTarget()
+{
+    if (!NeedsRemoteActivationForConversation())
+        return IsServerReady();
+
+    if (m_service.AnyOtherWindowBusy(m_parentFrame)) {
+        const int r = wxMessageBox(
+            "Another window is generating a response. Activating this "
+            "conversation's remote model will interrupt it.\n\nSwitch anyway?",
+            "Model Switch", wxYES_NO | wxICON_WARNING, m_parentFrame);
+        if (r != wxYES) return false;
+    }
+
+    return ActivateRemoteModel(m_conversationSelectionKey);
+}
+
+void ModelSwitcher::OnServiceStateChanged()
+{
+    if (m_conversationSelectionKey.empty())
+        AdoptActiveTargetForConversation();
+
+    const bool targetMatches = IsConversationTargetActive();
+    if (targetMatches) {
+        if (m_service.IsServerReady())
+            m_pendingDeferredModel.clear();
+        if (m_statusDot)
+            m_statusDot->SetConnected(m_service.IsServerReady());
+    }
+    else {
+        if (!IsRemoteModelKey(m_conversationSelectionKey) &&
+            !m_conversationSelectionKey.empty() &&
+            wxFileExists(wxString::FromUTF8(m_conversationSelectionKey))) {
+            m_pendingDeferredModel = m_conversationSelectionKey;
+        }
+        else {
+            m_pendingDeferredModel.clear();
+        }
+        if (m_statusDot) m_statusDot->SetConnected(false);
+    }
+
+    UpdateModelLabel();
+    if (m_cb.updateWindowTitle) m_cb.updateWindowTitle();
 }
 
 // ═════════════════════════════════════════════════════════════════
 //  SERVER BOOTSTRAP
 // ═════════════════════════════════════════════════════════════════
 
+// ── KV slot ownership forwarding ─────────────────────────────────
+// Invalidation stays a thin pass-through (always safe).  The stamp
+// routes through ModelService (Phase 3c) so a goal auto-continuation
+// dispatched while another window is mid-generation invalidates
+// instead of claiming — same adjudication as the main send path.
+
+void ModelSwitcher::InvalidateKvSlotOwner()
+{
+    m_serverManager.InvalidateSlotOwner();
+}
+
+void ModelSwitcher::NoteKvSlotOwner(const std::string& conversationPath)
+{
+    m_service.NoteSlotOwner(m_parentFrame, conversationPath);
+}
+
 void ModelSwitcher::StartInitialServer()
 {
+    // 2d-iv: restore the last selection if it was a remote endpoint —
+    // before any local-model scan or first-run flow. A remote-only user
+    // (no local GGUFs) should land back on their remote model rather than
+    // the first-run downloader. If the endpoint or its key is gone,
+    // ActivateRemoteModel fails and we fall through to the local boot path,
+    // which overwrites the stale remote selection once a local model loads.
+    {
+        const std::string lastSel = m_appState.GetLastSelection();
+        if (IsRemoteModelKey(lastSel) && ActivateRemoteModel(lastSel)) {
+            return;
+        }
+    }
+
     auto models = ServerManager::ScanModelPaths();
 
     if (models.empty()) {
@@ -148,6 +454,17 @@ void ModelSwitcher::StartInitialServer()
                                           mc, ac);
                 m_completingFirstRun = true;
                 models = ServerManager::ScanModelPaths();
+                if (models.empty()) {
+                    m_completingFirstRun = false;
+                    m_statusDot->SetConnected(false);
+                    m_chatDisplay->DisplaySystemMessage(
+                        "Download finished, but LlamaBoss could not find "
+                        "the model when rescanning the models folder.\n\n"
+                        "Open Settings → Download Models, or drop a .gguf "
+                        "file into: " + ServerManager::GetModelsDir());
+                    ServerManager::EnsureDataDirs();
+                    return;
+                }
                 // Fall through — models is now non-empty.
             } else {
                 // Dismissed without downloading. Leave the first-run
@@ -178,7 +495,7 @@ void ModelSwitcher::StartInitialServer()
     std::string savedModel = m_appState.GetModel();
     std::string modelToLoad;
 
-    if (!savedModel.empty() && wxFileExists(savedModel)) {
+    if (!savedModel.empty() && wxFileExists(wxString::FromUTF8(savedModel.c_str()))) {
         modelToLoad = savedModel;
     }
     else {
@@ -187,12 +504,13 @@ void ModelSwitcher::StartInitialServer()
         m_appState.UpdateSettings(modelToLoad, m_appState.GetApiUrl(), mc, ac);
     }
 
+    SetConversationPreferredLocalModel(modelToLoad);
     UpdateModelLabel();
     m_chatDisplay->DisplaySystemMessage(
         "Loading " + ServerManager::ModelDisplayName(modelToLoad) + "...");
     m_statusDot->SetConnected(false);
 
-    m_serverManager.StartServer(modelToLoad, m_appState.MakeServerConfig());
+    m_service.RequestLocalModel(modelToLoad, m_appState.MakeServerConfig());
 }
 
 // ═════════════════════════════════════════════════════════════════
@@ -201,10 +519,25 @@ void ModelSwitcher::StartInitialServer()
 
 void ModelSwitcher::OnServerReady()
 {
-    m_serverReady = true;
+    if (!IsConversationTargetActive()) {
+        if (m_statusDot) m_statusDot->SetConnected(false);
+        return;
+    }
+
     m_statusDot->SetConnected(true);
 
-    m_appState.SetApiUrl(m_serverManager.GetBaseUrl());
+    // A ready event only satisfies a parked deferred-load intent when the
+    // model that became ready is the deferred model.  This matters during
+    // startup: the initial model may finish loading after the user has already
+    // browsed to a saved conversation that wants a different model.  In that
+    // case, keep the marker so the first send still loads the conversation's
+    // intended model instead of silently using the startup model.
+    if (!m_pendingDeferredModel.empty() &&
+        path_safety::SameModelPath(m_serverManager.GetLoadedModel(),
+                      m_pendingDeferredModel)) {
+        m_pendingDeferredModel.clear();
+    }
+
 
     std::string displayName = ServerManager::ModelDisplayName(
         m_serverManager.GetLoadedModel());
@@ -228,10 +561,18 @@ void ModelSwitcher::OnServerReady()
 
 void ModelSwitcher::OnServerError(const std::string& error)
 {
-    m_serverReady = false;
-    m_statusDot->SetConnected(false);
+    if (!IsConversationTargetActive()) {
+        if (m_statusDot) m_statusDot->SetConnected(false);
+        return;
+    }
 
+    m_statusDot->SetConnected(false);
     m_chatDisplay->DisplaySystemMessage("Server error: " + error);
+
+    // First-run completion is tied to the specific starter-model load that
+    // followed a successful downloader run.  If that load fails, do not let
+    // some later unrelated ready event mark onboarding complete.
+    m_completingFirstRun = false;
 
     if (auto* logger = m_appState.GetLogger())
         logger->error("Server error: " + error);
@@ -243,7 +584,11 @@ void ModelSwitcher::OnServerError(const std::string& error)
 
 void ModelSwitcher::OnModelPillClick(wxWindow* popupParent)
 {
-    if (m_cb.isBusy && m_cb.isBusy()) return;
+    if (m_cb.isBusy && m_cb.isBusy()) {
+        m_chatDisplay->DisplaySystemMessage(
+            "Can't switch models while a response is streaming. Stop the response first.");
+        return;
+    }
 
     auto models = ServerManager::ScanModelPaths();
     if (models.empty()) {
@@ -258,9 +603,67 @@ void ModelSwitcher::OnModelPillClick(wxWindow* popupParent)
 
 void ModelSwitcher::OnModelPillRightClick(wxWindow* parent)
 {
-    if (m_cb.isBusy && m_cb.isBusy()) return;
-    ModelManagerDialog dlg(parent, &m_appState.GetTheme());
+    if (m_cb.isBusy && m_cb.isBusy()) {
+        m_chatDisplay->DisplaySystemMessage(
+            "Can't open model settings while a response is streaming. Stop the response first.");
+        return;
+    }
+    const std::string configuredModel = !m_pendingDeferredModel.empty()
+        ? m_pendingDeferredModel
+        : GetConversationModelForSave();
+
+    ModelManagerDialog dlg(parent, &m_appState.GetTheme(),
+                           m_serverManager.GetLoadedModel(),
+                           configuredModel);
     dlg.ShowModal();
+
+    // The manager dialog can delete the model that was parked as a deferred
+    // load for the current conversation.  Clear that intent immediately so the
+    // next Send does not try to lazy-load a file that no longer exists.
+    bool changedSelection = false;
+    bool deletedDeferred = false;
+    if (!m_pendingDeferredModel.empty() &&
+        !ModelFileExists(m_pendingDeferredModel)) {
+        m_pendingDeferredModel.clear();
+        changedSelection = true;
+        deletedDeferred = true;
+    }
+
+    // If this conversation's preferred local model was deleted, repair only
+    // this frame's preference.  Browsing or managing a conversation must not
+    // rewrite the app-global active service target used by other windows.
+    const std::string configuredAfter = GetConversationModelForSave();
+    if (!configuredAfter.empty() && !IsRemoteModelKey(m_conversationSelectionKey) &&
+        !ModelFileExists(configuredAfter)) {
+        const std::string loaded = m_serverManager.GetLoadedModel();
+        const std::string replacement = PickExistingModelFallback(loaded);
+
+        if (!replacement.empty()) {
+            SetConversationPreferredLocalModel(replacement);
+            OnServiceStateChanged();
+        } else {
+            ClearConversationPreference();
+            m_statusDot->SetConnected(false);
+        }
+
+        changedSelection = true;
+        if (replacement.empty()) {
+            m_chatDisplay->DisplaySystemMessage(
+                "The selected model was deleted. Add or download a model before sending.");
+        } else {
+            m_chatDisplay->DisplaySystemMessage(
+                "The selected model was deleted. Switched the model pill to " +
+                ServerManager::ModelDisplayName(replacement) + ".");
+        }
+    } else if (deletedDeferred) {
+        m_chatDisplay->DisplaySystemMessage(
+            "The deferred model for this chat was deleted. Pick another model from the model pill before sending.");
+    }
+
+    if (changedSelection) {
+        UpdateModelLabel();
+        if (m_cb.updateWindowTitle) m_cb.updateWindowTitle();
+    }
 }
 
 // ═════════════════════════════════════════════════════════════════
@@ -272,31 +675,65 @@ void ModelSwitcher::ShowModelPickerMenu(wxWindow* anchor,
 {
     if (ggufPaths.empty()) return;
 
-    m_pickerModels = ggufPaths;
-    m_menuIdMap.clear();
+    std::vector<std::string> pickerModels = ggufPaths;
+    std::unordered_map<int, size_t> menuIdMap;
 
     wxMenu menu;
-    std::string currentModel = m_appState.GetModel();
+    const std::string currentModel = !m_pendingDeferredModel.empty()
+        ? m_pendingDeferredModel
+        : GetConversationModelForSave();
 
-    for (size_t i = 0; i < m_pickerModels.size(); ++i) {
-        std::string display = ServerManager::ModelDisplayName(m_pickerModels[i]);
-        int id = wxNewId();
-        m_menuIdMap[id] = i;
-        wxMenuItem* item = menu.AppendCheckItem(id, wxString::FromUTF8(display));
-        if (m_pickerModels[i] == currentModel) {
+    for (size_t i = 0; i < pickerModels.size(); ++i) {
+        const std::string display = ServerManager::ModelDisplayName(pickerModels[i]);
+        wxMenuItem* item = menu.AppendCheckItem(
+            wxID_ANY, wxString::FromUTF8(display.c_str()));
+        menuIdMap[item->GetId()] = i;
+        if (path_safety::SameModelPath(pickerModels[i], currentModel)) {
             item->Check(true);
         }
     }
 
-    menu.Bind(wxEVT_MENU, [this](wxCommandEvent& e) {
-        auto it = m_menuIdMap.find(e.GetId());
-        if (it != m_menuIdMap.end() && it->second < m_pickerModels.size()) {
-            SwitchToModel(m_pickerModels[it->second]);
+    // ── Remote endpoint rows (from EndpointStore) ────────────────
+    // One row per configured (endpoint, model) pair, below a separator
+    // that only appears if at least one remote model exists. Selecting a
+    // row routes through SwitchToModel with a remote key, which branches
+    // to the no-spawn remote path. Checked when its wire model is active.
+    std::unordered_map<int, std::string> remoteIdMap;  // menu id -> remote key
+    if (EndpointStore* endpoints = m_appState.GetEndpointStore()) {
+        bool addedSeparator = false;
+        for (const auto& ep : endpoints->Endpoints()) {
+            for (const auto& model : ep.models) {
+                if (!addedSeparator) {
+                    menu.AppendSeparator();
+                    addedSeparator = true;
+                }
+                const std::string label = ep.displayName + " - " + model.displayName;
+                wxMenuItem* item = menu.AppendCheckItem(
+                    wxID_ANY, wxString::FromUTF8(label.c_str()));
+                remoteIdMap[item->GetId()] = RemoteModelKey(ep.id, model.id);
+                if (currentModel == model.id) item->Check(true);
+            }
         }
-    });
+    }
 
-    // Show popup below the model pill
-    wxPanel* pill = static_cast<wxPanel*>(m_modelLabel->GetParent());
+    menu.Bind(wxEVT_MENU,
+        [this, pickerModels, menuIdMap, remoteIdMap](wxCommandEvent& e) {
+            auto rit = remoteIdMap.find(e.GetId());
+            if (rit != remoteIdMap.end()) {
+                SwitchToModel(rit->second);
+                return;
+            }
+            auto it = menuIdMap.find(e.GetId());
+            if (it != menuIdMap.end() && it->second < pickerModels.size()) {
+                SwitchToModel(pickerModels[it->second]);
+            }
+        });
+
+    // Show popup below the model pill.  No concrete panel type is required;
+    // the position and size methods live on wxWindow.
+    wxWindow* pill = m_modelLabel ? m_modelLabel->GetParent() : nullptr;
+    if (!pill || !anchor) return;
+
     wxPoint pos = pill->GetScreenPosition();
     pos = anchor->ScreenToClient(pos);
     pos.y += pill->GetSize().y;
@@ -309,30 +746,190 @@ void ModelSwitcher::ShowModelPickerMenu(wxWindow* anchor,
 
 void ModelSwitcher::SwitchToModel(const std::string& newModel)
 {
-    if (newModel == m_appState.GetModel()) return;
-    if (m_cb.isBusy && m_cb.isBusy()) return;
+    // ── Remote selection short-circuit ───────────────────────────
+    // A "remote:" key is never a live llama-server process or a GGUF
+    // path, so it must branch before any of the local lane logic
+    // below (targetIsLive / IsProcessRunning / StartServer).
+    if (IsRemoteModelKey(newModel)) {
+        if (m_cb.isBusy && m_cb.isBusy()) {
+            m_chatDisplay->DisplaySystemMessage(
+                "Can't switch models while a response is streaming. "
+                "Stop the response first.");
+            return;
+        }
 
-    if (!m_chatHistory->IsEmpty() && m_cb.autoSave) {
+        // ── Multi-window courtesy check (Phase 3c) ───────────────
+        // Going remote retires the local server, which kills any
+        // stream another window has in flight.  Confirm first.
+        if (m_service.AnyOtherWindowBusy(m_parentFrame)) {
+            const int r = wxMessageBox(
+                "Another window is generating a response. Switching "
+                "models will interrupt it.\n\nSwitch anyway?",
+                "Model Switch", wxYES_NO | wxICON_WARNING, m_parentFrame);
+            if (r != wxYES) return;
+        }
+
+        ActivateRemoteModel(newModel);
+        return;
+    }
+
+    const std::string loadedModel = m_serverManager.GetLoadedModel();
+    const bool targetIsLive =
+        !newModel.empty() &&
+        !loadedModel.empty() &&
+        m_serverManager.IsProcessRunning() &&
+        path_safety::SameModelPath(newModel, loadedModel);
+
+    // If the requested model is already the live llama-server process, adopt
+    // it without a VRAM unload/reload.  This is especially important after a
+    // lazy conversation load: AppState may point at a deferred model while the
+    // old server is still healthy.  Picking the old live model should simply
+    // cancel the deferral and restore the ready UI state.
+    if (targetIsLive) {
+        const bool changed =
+            !SameSelectionKey(newModel, m_conversationSelectionKey) ||
+            !IsServerReady();
+
+        SetConversationPreferredLocalModel(newModel);
+        OnServiceStateChanged();
+
+        if (changed) {
+            m_chatDisplay->DisplaySystemMessage(
+                ServerManager::ModelDisplayName(newModel) +
+                " is already loaded.");
+        }
+        return;
+    }
+
+    // Same configured-model clicks are normally no-ops, but after a server
+    // error the natural retry is to pick the same model again.  Because the
+    // live-server fast path above already handled healthy loaded models, a
+    // not-ready/dead same-model selection falls through and restarts.
+    if (m_service.IsServerReady() &&
+        SameSelectionKey(newModel, m_service.GetActiveSelectionKey())) {
+        SetConversationPreferredLocalModel(newModel);
+        OnServiceStateChanged();
+        return;
+    }
+
+    if (m_cb.isBusy && m_cb.isBusy()) {
+        m_chatDisplay->DisplaySystemMessage(
+            "Can't switch models while a response is streaming. Stop the response first.");
+        return;
+    }
+
+    // ── Multi-window courtesy check (Phase 3c) ───────────────────
+    // Restarting the local server kills any stream another window
+    // has in flight.  Confirm before doing that to someone else's
+    // response.
+    if (m_service.AnyOtherWindowBusy(m_parentFrame)) {
+        const int r = wxMessageBox(
+            "Another window is generating a response. Switching "
+            "models will interrupt it.\n\nSwitch anyway?",
+            "Model Switch", wxYES_NO | wxICON_WARNING, m_parentFrame);
+        if (r != wxYES) return;
+    }
+
+    // An explicit switch supersedes any deferred-load intent from browsing.
+    m_pendingDeferredModel.clear();
+
+    // Switching models CONTINUES the current conversation with the new
+    // model rather than starting a blank chat.  Each assistant turn is
+    // already stamped with the model that produced it, so a single chat can
+    // span models — and, importantly, a chat stays usable even after its
+    // original model is deleted: just switch to one you still have and keep
+    // going.  Persist current state first, then leave history, display, and
+    // pending attachments intact across the swap.
+    const bool continuing = !m_chatHistory->IsEmpty();
+    if (continuing && m_cb.autoSave) {
         m_cb.autoSave();
     }
 
-    bool mc, ac;
-    m_appState.UpdateSettings(newModel, m_appState.GetApiUrl(), mc, ac);
-
-    m_chatHistory->Clear();
-    m_chatDisplay->Clear();
-    m_attachments.Clear();
+    SetConversationPreferredLocalModel(newModel);
     UpdateModelLabel();
     if (m_cb.updateWindowTitle) m_cb.updateWindowTitle();
 
-    m_serverReady = false;
     m_statusDot->SetConnected(false);
     m_chatDisplay->DisplaySystemMessage(
-        "Loading " + ServerManager::ModelDisplayName(newModel) + "...");
-    m_serverManager.StartServer(newModel, m_appState.MakeServerConfig());
+        "Loading " + ServerManager::ModelDisplayName(newModel) +
+        (continuing ? "... new messages in this chat will use it."
+                    : "..."));
+    m_service.RequestLocalModel(newModel, m_appState.MakeServerConfig());
 
     if (auto* logger = m_appState.GetLogger())
-        logger->information("Quick-switched to model: " + newModel);
+        logger->information(
+            std::string("Switched to model (") +
+            (continuing ? "continuing chat" : "empty chat") + "): " + newModel);
+}
+
+// ═════════════════════════════════════════════════════════════════
+//  REMOTE ACTIVATION (no server spawn)
+// ═════════════════════════════════════════════════════════════════
+
+bool ModelSwitcher::ActivateRemoteModel(const std::string& remoteKey)
+{
+    // Parse "remote:<endpointId>/<wireModelId>".
+    std::string endpointId;
+    std::string wireModel;
+    if (!ParseRemoteModelKey(remoteKey, endpointId, wireModel)) {
+        m_chatDisplay->DisplaySystemMessage("Invalid remote model selection.");
+        return false;
+    }
+
+    EndpointStore* endpoints = m_appState.GetEndpointStore();
+    SecretsStore*  secrets   = m_appState.GetSecretsStore();
+    if (!endpoints || !secrets) {
+        m_chatDisplay->DisplaySystemMessage("Remote endpoints are unavailable.");
+        return false;
+    }
+
+    // Resolve into a ready-to-send target (pulls the API key from
+    // SecretsStore on the UI thread). On failure the reason explains
+    // whether the endpoint is unknown or the key is missing.
+    InferenceTarget target;
+    std::string reason;
+    if (!endpoints->ResolveTarget(endpointId, wireModel, *secrets, target, reason)) {
+        m_chatDisplay->DisplaySystemMessage(reason);
+        return false;
+    }
+
+    // Continue the current conversation across the switch, like a local
+    // model switch — each assistant turn is stamped with its own model.
+    const bool continuing = !m_chatHistory->IsEmpty();
+    if (continuing && m_cb.autoSave) m_cb.autoSave();
+
+    // This conversation adopts the chosen remote target.  ModelService
+    // retires the local process, installs the app-global target once, and
+    // publishes synthesized-ready state to every frame.
+    SetConversationPreferredRemoteModel(remoteKey, wireModel);
+    m_service.ActivateRemoteTarget(target, remoteKey);
+    m_statusDot->SetConnected(true);
+
+    UpdateModelLabel();
+    if (m_cb.updateWindowTitle) m_cb.updateWindowTitle();
+
+    // Friendly "<model> ready (remote: <endpoint>)", using configured
+    // display names where available.
+    const EndpointStore::Endpoint* ep = endpoints->FindEndpoint(endpointId);
+    std::string endpointDisplay = ep ? ep->displayName : endpointId;
+    std::string modelDisplay    = wireModel;
+    if (ep) {
+        for (const auto& m : ep->models) {
+            if (m.id == wireModel) { modelDisplay = m.displayName; break; }
+        }
+    }
+    m_chatDisplay->DisplaySystemMessage(
+        modelDisplay + " ready (remote: " + endpointDisplay + ")" +
+        (continuing ? ". New messages in this chat will use it."
+                    : "."));
+
+    if (m_cb.onRemoteActivated) m_cb.onRemoteActivated(target.protocol);
+
+    if (auto* logger = m_appState.GetLogger())
+        logger->information("Activated remote model: " + wireModel +
+                            " via " + endpointId);
+
+    return true;
 }
 
 // ═════════════════════════════════════════════════════════════════
@@ -341,7 +938,9 @@ void ModelSwitcher::SwitchToModel(const std::string& newModel)
 
 void ModelSwitcher::UpdateModelLabel()
 {
-    std::string model = m_appState.GetModel();
+    std::string model = GetConversationModelForSave();
+    const bool preferredRemote =
+        IsRemoteModelKey(m_conversationSelectionKey);
 
     // If the stored model looks like a filesystem path (contains a
     // separator) or a .gguf filename, run it through ModelDisplayName
@@ -351,8 +950,7 @@ void ModelSwitcher::UpdateModelLabel()
         const bool hasSeparator =
             m.find('\\') != std::string::npos ||
             m.find('/')  != std::string::npos;
-        const bool endsWithGguf =
-            m.size() > 5 && m.substr(m.size() - 5) == ".gguf";
+        const bool endsWithGguf = EndsWithGguf(m);
 
         if (hasSeparator || endsWithGguf) {
             return ServerManager::ModelDisplayName(m);
@@ -360,14 +958,43 @@ void ModelSwitcher::UpdateModelLabel()
         return m;
     };
 
-    // Take the friendly display ("gemma 4 e4b it f16") and reformat it
-    // for the pill: "gemma-4-e4b-it · f16".  Hyphens replace the spaces
-    // in the identity tokens, and any trailing quantization-like token
-    // (f16, bf16, q4_K_M, iq4_NL, ...) gets peeled off as a " · <q>"
-    // suffix.  The ▾ caret is no longer appended -- the brackets that
-    // now wrap the pill (added in ui_builder.cpp) carry the affordance.
-    std::string display = FormatModelNameForPill(shortenModel(model));
-    const wxString displayWx = wxString::FromUTF8(display);
+    std::string display;
+    if (preferredRemote) {
+        // Remote endpoint: show the endpoint's configured model display
+        // name verbatim. The wire id (e.g. "anthropic/claude-sonnet-4.6")
+        // contains a '/', so the GGUF-oriented prettifier above would
+        // mangle it ("claude-sonnet-4"); skip it entirely here.
+        if (EndpointStore* endpoints = m_appState.GetEndpointStore()) {
+            std::string endpointId;
+            std::string wireModel;
+            if (ParseRemoteModelKey(m_conversationSelectionKey,
+                                    endpointId, wireModel)) {
+                if (const EndpointStore::Endpoint* ep =
+                        endpoints->FindEndpoint(endpointId)) {
+                    for (const auto& configuredModel : ep->models) {
+                        if (configuredModel.id == wireModel) {
+                            display = configuredModel.displayName;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        if (display.empty()) display = model;   // ad hoc / unknown id
+    } else {
+        // Take the friendly display ("gemma 4 e4b it f16") and reformat it
+        // for the pill: "gemma-4-e4b-it · f16".  Hyphens replace the spaces
+        // in the identity tokens, and any trailing quantization-like token
+        // (f16, bf16, q4_K_M, iq4_NL, ...) gets peeled off as a " · <q>"
+        // suffix.  The ▾ caret is no longer appended -- the brackets that
+        // now wrap the pill (added in ui_builder.cpp) carry the affordance.
+        display = FormatModelNameForPill(shortenModel(model));
+    }
+    const wxString displayWx = wxString::FromUTF8(display.c_str());
+
+    if (m_modelLabel->GetLabel() == displayWx) {
+        return;
+    }
 
     m_modelLabel->SetLabel(displayWx);
 

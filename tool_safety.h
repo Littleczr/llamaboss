@@ -173,10 +173,18 @@ struct ToolSafetyProfile {
     Reversibility reversibility = Reversibility::Reversible;
 
     // ── Dispatch shape ──────────────────────────────────────────
-    // Declarative async-or-sync flag.  Reserved for a follow-up
-    // change that asserts DispatchInvocation's returned status
-    // matches this declaration; descriptive only for now.
+    // Declarative async-or-sync flag.  True means the tool's own
+    // dispatch function starts a specialized executor and returns
+    // DispatchStatus::Async (grep, PowerShell, Python helpers, etc.).
     bool isAsync = false;
+
+    // True for otherwise-synchronous tools whose implementation may
+    // perform blocking filesystem work or launch a syntax-check process.
+    // The agent/slash controllers wrap these dispatches in the shared
+    // ToolWorkerExecutor so wx event handlers never run the work inline.
+    // This is deliberately separate from isAsync: the ToolSpec dispatch
+    // still returns Completed/Invalid; only the caller thread changes.
+    bool dispatchOnWorker = false;
 
     // ── Policy-enforced (orthogonal to tier) ────────────────────
     // True for broad shell/process tools whose safety is classified

@@ -51,6 +51,7 @@
 class GrepExecutor;
 class CmdExecutor;
 class PythonRunner;
+class WebFetchExecutor;
 
 // ─── Dispatch dependencies ──────────────────────────────────────
 // Per-call non-owning pointers to the long-lived executors that
@@ -61,6 +62,7 @@ struct DispatchDeps {
     GrepExecutor* grepExec     = nullptr;
     CmdExecutor*  cmdExec      = nullptr;
     PythonRunner* pythonRunner = nullptr;
+    WebFetchExecutor* webFetchExec = nullptr;
 };
 
 // ─── Tool safety metadata ────────────────────────────────────────
@@ -102,6 +104,20 @@ struct ToolSpec {
     // read-only, which tools mutate files, and which tools require
     // approval.
     ToolSafetyProfile safety;
+
+    // Presentation metadata — the single source of truth for how this
+    // tool renders in the UI.  Before these fields existed, the icon
+    // and display name were duplicated across three hand-maintained
+    // ladders (tool_approval::ToolIcon / ToolDisplayName, the dispatch
+    // bodies' PreFill calls, and AgentController::HandlePythonComplete's
+    // ternary ladder) and could silently disagree.  Populated for every
+    // built-in by ApplyPresentationMetadata() in tool_router.cpp.
+    //
+    // displayName : human-readable card title ("Read Head", "CSV Report").
+    // iconUtf8    : UTF-8 emoji shown on the tool card.
+    // Empty fields fall back to the tool's wire name / a warning icon.
+    std::string displayName;
+    std::string iconUtf8;
 
     // Shape-level argument validation.  Mirrors the contract of the
     // historical ValidateToolArgs: returns true if args are
@@ -187,3 +203,18 @@ const std::string& GetCachedToolsArrayJson();
 // Short generated safety summary for the system prompt.  This keeps
 // XML and native prompts from drifting away from ToolSpec metadata.
 std::string BuildToolSafetySummaryText(const ToolRouter& router);
+
+// Comma-separated list of every registered tool name, in registration
+// order ("read, read_head, ls, ..., web_fetch_url").  Used by the XML
+// agent system prompt's "Available tool names:" line so the canonical
+// list can never drift from the router again.  (The hand-maintained
+// list shipped in v0.1.4 had drifted: it omitted read_head,
+// overwrite_file, and web_fetch_url while the same prompt's prose
+// instructed the model to use them.)
+std::string BuildToolNamesListText(const ToolRouter& router);
+
+// Cached variant for the global router.  The built-in registry is
+// static after startup, and the agent system prompt is rebuilt every
+// send, so cache once like GetCachedToolsArrayJson.  Byte-stable
+// across turns, which keeps the llama.cpp KV prefix cache warm.
+const std::string& GetCachedToolNamesListText();

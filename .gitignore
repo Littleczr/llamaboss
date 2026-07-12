@@ -1,4 +1,4 @@
-# Visual Studio
+﻿# Visual Studio
 .vs/
 *.user
 *.suo
@@ -70,4 +70,3 @@ venv/
 secrets.json
 tokens.json
 credentials.json
-vcpkg_installed/

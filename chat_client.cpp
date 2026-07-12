@@ -1,7 +1,12 @@
 // chat_client.cpp
 //
-// Communicates with llama-server's OpenAI-compatible endpoint:
-//   POST /v1/chat/completions  (SSE streaming)
+// Communicates with an OpenAI-compatible chat-completions endpoint:
+//   POST <baseUrl><chatPath>   (default: /v1/chat/completions, SSE streaming)
+//
+// The endpoint may be the local llama-server (plain http, no auth) or
+// a remote provider (TLS + auth header). Both are described by an
+// InferenceTarget; the SSE response handling is identical for both
+// because remote providers used here speak the OpenAI streaming shape.
 //
 // Response format (Server-Sent Events):
 //   data: {"choices":[{"delta":{"content":"hello"}}]}
@@ -13,6 +18,7 @@
 // Poco headers for HTTP communication
 #include <Poco/URI.h>
 #include <Poco/Net/HTTPClientSession.h>
+#include <Poco/Net/HTTPSClientSession.h>
 #include <Poco/Net/HTTPRequest.h>
 #include <Poco/Net/HTTPResponse.h>
 #include <Poco/Net/NetException.h>
@@ -25,8 +31,10 @@
 #include <Poco/JSON/JSONException.h>
 #include <Poco/Exception.h>
 
+#include <memory>
 #include <sstream>
 #include "ui_event_post.h"
+#include "lb_ssl.h"
 
 // Define custom events
 wxDEFINE_EVENT(wxEVT_ASSISTANT_DELTA, wxCommandEvent);
@@ -38,17 +46,15 @@ wxDEFINE_EVENT(wxEVT_ASSISTANT_ERROR, wxCommandEvent);
 // ═══════════════════════════════════════════════════════════════════
 
 ChatWorkerThread::ChatWorkerThread(wxEvtHandler* eventHandler,
-    const std::string& model,
-    const std::string& apiUrl,
-    const std::string& requestBody,
+    InferenceTarget target,
+    std::string requestBody,
     std::shared_ptr<std::atomic<bool>> cancelFlag,
     std::weak_ptr<std::atomic<bool>> aliveToken,
     unsigned long generationId)
     : wxThread(wxTHREAD_DETACHED)
     , m_eventHandler(eventHandler)
-    , m_model(model)
-    , m_apiUrl(apiUrl)
-    , m_requestBody(requestBody)
+    , m_target(std::move(target))
+    , m_requestBody(std::move(requestBody))
     , m_cancelFlag(cancelFlag)
     , m_aliveToken(aliveToken)
     , m_generationId(generationId)
@@ -64,6 +70,19 @@ bool ChatWorkerThread::SafeQueueEvent(wxCommandEvent* event)
 wxThread::ExitCode ChatWorkerThread::Entry()
 {
     std::string fullReply;
+
+    // ── Reasoning surfacing state ────────────────────────────────
+    // With --jinja, llama-server extracts model thinking into
+    // delta.reasoning_content instead of inline <think> tags
+    // (DeepSeek R1 distills, Qwen3, GPT-OSS templates); some
+    // OpenAI-compatible remotes use delta.reasoning.  Those deltas
+    // are re-wrapped below as inline <think>…</think> so the
+    // existing ChatDisplay probe/collapse/replay machinery and the
+    // conversation file format work unchanged.  Reasoning always
+    // precedes visible content, so the open tag lands at byte 0 —
+    // exactly what the display's probe phase detects.  True while
+    // an open tag has been emitted without its close.
+    bool inReasoningBlock = false;
 
     // ── Phase 3c-ii: structured tool_calls accumulator ──────────
     // OpenAI streaming format delivers tool_calls in fragments
@@ -86,6 +105,35 @@ wxThread::ExitCode ChatWorkerThread::Entry()
     };
     std::vector<ToolCallAcc> toolCalls;
 
+    // ── Generated image accumulator ──────────────────────────────
+    // Image-output models (requested via "modalities": ["image",
+    // "text"]) return generated images on the message's `images`
+    // field.  On the streaming path OpenRouter delivers them as
+    // delta.images — each entry {"type":"image_url","image_url":
+    // {"url":"data:image/png;base64,..."}} — typically in one chunk
+    // near the end of the stream, since there is no partial-image
+    // streaming over chat completions.  Accumulated verbatim as data
+    // URLs; decode + disk persistence happen on the UI thread (the
+    // save location is keyed on the conversation file path, which
+    // the worker doesn't know).  Exact-duplicate URLs are dropped in
+    // case a provider repeats the array across chunks.
+    std::vector<std::string> imageDataUrls;
+
+    auto collectImageUrl = [&](const std::string& url) {
+        if (url.empty()) return;
+        for (const auto& existing : imageDataUrls)
+            if (existing == url) return;
+        imageDataUrls.push_back(url);
+    };
+
+    // ── Context meter: exact token usage from the stream ─────────
+    // Latest `usage` object seen on any SSE chunk.  llama-server puts
+    // usage on the final chunk (the one carrying finish_reason);
+    // OpenAI-style providers send it on a trailing usage-only chunk
+    // (choices: []) after finish_reason.  -1 = not reported.
+    long usagePromptTokens     = -1;
+    long usageCompletionTokens = -1;
+
     auto ensureToolCallSlot = [&](int idx) -> ToolCallAcc* {
         if (idx < 0) return nullptr;
         if ((size_t)idx >= toolCalls.size()) {
@@ -97,10 +145,27 @@ wxThread::ExitCode ChatWorkerThread::Entry()
     auto isCancelled = [this]() { return m_cancelFlag->load(); };
 
     try {
-        // ── Connect to llama-server's OpenAI-compatible endpoint ──
-        Poco::URI uri(m_apiUrl + "/v1/chat/completions");
-        Poco::Net::HTTPClientSession sess(uri.getHost(), uri.getPort());
-        sess.setTimeout(Poco::Timespan(120, 0)); // 2min timeout for large models
+        // ── Connect to the target's OpenAI-compatible endpoint ──
+        // The path comes from the target so an Anthropic-native
+        // adapter (future) can redirect to /v1/messages without
+        // touching the transport. Port is resolved explicitly so an
+        // authority-only URL ("https://host") still connects on 443.
+        Poco::URI uri(m_target.baseUrl + m_target.chatPath);
+
+        int port = uri.getPort();
+        if (port == 0)
+            port = m_target.useTls ? 443 : 80;
+
+        std::unique_ptr<Poco::Net::HTTPClientSession> sess;
+        if (m_target.useTls) {
+            // SSL is initialized lazily and once per process; only the
+            // TLS branch pays for it, so local-only users never load it.
+            lb::EnsureSSLInitialized();
+            sess.reset(new Poco::Net::HTTPSClientSession(uri.getHost(), port));
+        } else {
+            sess.reset(new Poco::Net::HTTPClientSession(uri.getHost(), port));
+        }
+        sess->setTimeout(Poco::Timespan(120, 0)); // 2min timeout for large models
 
         Poco::Net::HTTPRequest req(
             Poco::Net::HTTPRequest::HTTP_POST,
@@ -110,12 +175,24 @@ wxThread::ExitCode ChatWorkerThread::Entry()
         req.setContentType("application/json");
         req.setContentLength((long)m_requestBody.size());
 
-        std::ostream& out = sess.sendRequest(req);
+        // Auth + provider-fixed headers. Both are empty for local
+        // lanes, so this is a no-op there and the request is
+        // byte-for-byte what it was before the target refactor.
+        if (!m_target.authHeaderName.empty() &&
+            !m_target.authHeaderValue.empty()) {
+            req.set(m_target.authHeaderName, m_target.authHeaderValue);
+        }
+        for (const auto& h : m_target.extraHeaders) {
+            if (!h.first.empty())
+                req.set(h.first, h.second);
+        }
+
+        std::ostream& out = sess->sendRequest(req);
         out << m_requestBody;
         out.flush();
 
         Poco::Net::HTTPResponse resp;
-        std::istream& in = sess.receiveResponse(resp);
+        std::istream& in = sess->receiveResponse(resp);
 
         if (resp.getStatus() != Poco::Net::HTTPResponse::HTTP_OK) {
             std::string err;
@@ -141,6 +218,14 @@ wxThread::ExitCode ChatWorkerThread::Entry()
         bool sawAnySseData = false;
         std::string line;
 
+        // The read loop gets its own guard: once sawTerminalEvent is
+        // set, the only thing still being read is the optional trailing
+        // usage chunk / [DONE] marker.  A transport exception in that
+        // drain phase (e.g. a non-conforming server holding the socket
+        // open until the receive timeout) must not demote an already
+        // complete reply to a stream error.  Pre-terminal exceptions
+        // are real failures and are rethrown to the handlers below.
+        try {
         while (std::getline(in, line) && !isCancelled()) {
             // Strip trailing \r
             if (!line.empty() && line.back() == '\r')
@@ -195,6 +280,34 @@ wxThread::ExitCode ChatWorkerThread::Entry()
                     return (ExitCode)0;
                 }
 
+                // ── Context meter: capture `usage` when present ──────
+                // Must run BEFORE the choices gate below: OpenAI-style
+                // trailing usage chunks carry "choices": [] and would be
+                // skipped by it.  Keep the latest values seen.
+                if (obj->has("usage") && !obj->isNull("usage")) {
+                    try {
+                        auto usage = obj->getObject("usage");
+                        if (usage) {
+                            if (usage->has("prompt_tokens")) {
+                                try {
+                                    usagePromptTokens =
+                                        usage->getValue<long>("prompt_tokens");
+                                } catch (...) { /* non-numeric — skip */ }
+                            }
+                            if (usage->has("completion_tokens")) {
+                                try {
+                                    usageCompletionTokens =
+                                        usage->getValue<long>("completion_tokens");
+                                } catch (...) { /* non-numeric — skip */ }
+                            }
+                        }
+                    } catch (...) { /* malformed usage — skip */ }
+
+                    // If the stream is already terminal, usage was the
+                    // only thing we were still draining for.
+                    if (sawTerminalEvent && usagePromptTokens >= 0) break;
+                }
+
                 if (!obj->has("choices")) continue;
                 auto choices = obj->getArray("choices");
                 if (!choices || choices->size() == 0) continue;
@@ -204,14 +317,109 @@ wxThread::ExitCode ChatWorkerThread::Entry()
                 // Extract content delta
                 if (choice->has("delta")) {
                     auto delta = choice->getObject("delta");
+
+                    // ── Reasoning deltas ─────────────────────────
+                    // Re-wrapped as inline think tags; see the state
+                    // declaration above.  Non-string or null values
+                    // are skipped defensively — provider validators
+                    // differ on how they encode an absent field.
+                    std::string reasoningDelta;
+                    if (delta->has("reasoning_content") &&
+                        !delta->isNull("reasoning_content")) {
+                        try {
+                            reasoningDelta =
+                                delta->getValue<std::string>("reasoning_content");
+                        } catch (...) { /* non-string — skip */ }
+                    }
+                    else if (delta->has("reasoning") &&
+                             !delta->isNull("reasoning")) {
+                        try {
+                            reasoningDelta =
+                                delta->getValue<std::string>("reasoning");
+                        } catch (...) { /* non-string — skip */ }
+                    }
+                    if (!reasoningDelta.empty()) {
+                        std::string out;
+                        if (!inReasoningBlock) {
+                            inReasoningBlock = true;
+                            out = "<think>";
+                        }
+                        out += reasoningDelta;
+                        fullReply += out;
+
+                        wxCommandEvent* event = new wxCommandEvent(wxEVT_ASSISTANT_DELTA);
+                        event->SetString(wxString::FromUTF8(out));
+                        if (!SafeQueueEvent(event))
+                            return (ExitCode)0;
+                    }
+
                     if (delta->has("content") && !delta->isNull("content")) {
                         std::string content = delta->getValue<std::string>("content");
+
+                        // First visible content byte after reasoning:
+                        // close the think block so display and stored
+                        // reply transition cleanly.  Empty content
+                        // deltas (role-priming chunks) never close —
+                        // reasoning may still be streaming.
+                        if (inReasoningBlock && !content.empty()) {
+                            inReasoningBlock = false;
+                            content = "</think>\n" + content;
+                        }
+
                         fullReply += content;
 
                         wxCommandEvent* event = new wxCommandEvent(wxEVT_ASSISTANT_DELTA);
                         event->SetString(wxString::FromUTF8(content));
                         if (!SafeQueueEvent(event))
                             return (ExitCode)0;
+                    }
+
+                    // ── Generated images ─────────────────────────
+                    // Entries are image_url objects wrapping base64
+                    // data URLs (see accumulator above).  A bare
+                    // string entry or a direct "url" key are handled
+                    // too — providers vary and a skipped image is
+                    // worse than a lenient parse.
+                    if (delta->has("images") && !delta->isNull("images")) {
+                        try {
+                            auto imgArr = delta->getArray("images");
+                            if (imgArr) {
+                                for (size_t k = 0; k < imgArr->size(); ++k) {
+                                    Poco::JSON::Object::Ptr entry;
+                                    try { entry = imgArr->getObject(k); }
+                                    catch (...) { entry = nullptr; }
+
+                                    if (!entry) {
+                                        // Bare string entry.
+                                        try {
+                                            collectImageUrl(
+                                                imgArr->get(k)
+                                                    .convert<std::string>());
+                                        } catch (...) { /* skip */ }
+                                        continue;
+                                    }
+
+                                    std::string url;
+                                    if (entry->has("image_url") &&
+                                        !entry->isNull("image_url")) {
+                                        try {
+                                            auto iu = entry->getObject("image_url");
+                                            if (iu && iu->has("url"))
+                                                url = iu->getValue<std::string>("url");
+                                        } catch (...) { /* skip */ }
+                                    }
+                                    if (url.empty() && entry->has("url")) {
+                                        try {
+                                            url = entry->getValue<std::string>("url");
+                                        } catch (...) { /* skip */ }
+                                    }
+                                    collectImageUrl(url);
+                                }
+                            }
+                        } catch (...) {
+                            // Malformed images fragment — skip; the
+                            // text portion of the reply still streams.
+                        }
                     }
 
                     // Phase 3c-ii: tool_calls fragments.  OpenAI
@@ -287,7 +495,16 @@ wxThread::ExitCode ChatWorkerThread::Entry()
                     std::string reason = choice->getValue<std::string>("finish_reason");
                     if (!reason.empty()) {
                         sawTerminalEvent = true;
-                        break;
+                        // llama-server reports usage on this same final
+                        // chunk — captured above — so the common local
+                        // case breaks here exactly as before.  When usage
+                        // hasn't arrived yet (OpenAI-style providers send
+                        // it on a trailing usage-only chunk), keep reading:
+                        // the loop exits at that usage chunk, at [DONE],
+                        // or at EOF, all of which arrive immediately after
+                        // finish_reason on conforming servers.
+                        if (usagePromptTokens >= 0) break;
+                        continue;
                     }
                 }
             }
@@ -296,19 +513,40 @@ wxThread::ExitCode ChatWorkerThread::Entry()
                 continue;
             }
         }
+        } catch (...) {
+            // Post-terminal drain failure only — the reply is complete.
+            if (!sawTerminalEvent) throw;
+        }
 
         if (!isCancelled() && !sawTerminalEvent) {
             wxCommandEvent* event = new wxCommandEvent(wxEVT_ASSISTANT_ERROR);
             event->SetString(wxString::FromUTF8(
                 sawAnySseData
-                    ? "Stream ended unexpectedly before llama-server sent a terminal event."
-                    : "Stream ended before llama-server sent any response data."
+                    ? "Stream ended unexpectedly before the server sent a terminal event."
+                    : "Stream ended before the server sent any response data."
             ));
             SafeQueueEvent(event);
             return (ExitCode)0;
         }
 
         if (!isCancelled()) {
+            // ── Close a still-open reasoning block ──────────────
+            // A reply can legitimately end while thinking is the
+            // only text emitted: reasoning straight into tool_calls
+            // (Qwen3 does this constantly) or a terminal event with
+            // no visible content.  Emit the close tag so both the
+            // stored message and the display block terminate
+            // cleanly before completion is signalled.
+            if (inReasoningBlock) {
+                inReasoningBlock = false;
+                fullReply += "</think>";
+
+                wxCommandEvent* event = new wxCommandEvent(wxEVT_ASSISTANT_DELTA);
+                event->SetString(wxString::FromUTF8("</think>"));
+                if (!SafeQueueEvent(event))
+                    return (ExitCode)0;
+            }
+
             // ── Phase 3c-ii: serialize the tool_calls accumulator ──
             // Render the per-index slots into an OpenAI-shape JSON
             // array.  Empty slots (no id AND no name AND no
@@ -356,7 +594,9 @@ wxThread::ExitCode ChatWorkerThread::Entry()
 
             wxCommandEvent* event = new wxCommandEvent(wxEVT_ASSISTANT_COMPLETE);
             event->SetString(wxString::FromUTF8(fullReply));
-            event->SetClientObject(new AssistantCompletePayload(toolCallsJson));
+            event->SetClientObject(new AssistantCompletePayload(
+                toolCallsJson, usagePromptTokens, usageCompletionTokens,
+                std::move(imageDataUrls)));
             SafeQueueEvent(event);
         }
     }
@@ -409,8 +649,7 @@ ChatClient::~ChatClient()
     StopGeneration();
 }
 
-bool ChatClient::SendMessage(const std::string& model,
-    const std::string& apiUrl,
+bool ChatClient::SendMessage(const InferenceTarget& target,
     const std::string& requestBody,
     unsigned long generationId)
 {
@@ -422,7 +661,7 @@ bool ChatClient::SendMessage(const std::string& model,
     m_cancelFlag = std::make_shared<std::atomic<bool>>(false);
 
     auto* thread = new ChatWorkerThread(
-        m_eventHandler, model, apiUrl, requestBody,
+        m_eventHandler, target, requestBody,
         m_cancelFlag, m_aliveToken, generationId);
 
     if (thread->Run() != wxTHREAD_NO_ERROR) {
@@ -433,6 +672,17 @@ bool ChatClient::SendMessage(const std::string& model,
     }
 
     return true;
+}
+
+bool ChatClient::SendMessage(const std::string& model,
+    const std::string& apiUrl,
+    const std::string& requestBody,
+    unsigned long generationId)
+{
+    // Reproduce historical behavior exactly: a plain-http, no-auth,
+    // OpenAI-compatible local target.
+    return SendMessage(InferenceTarget::Local(apiUrl, model),
+                       requestBody, generationId);
 }
 
 void ChatClient::StopGeneration()

@@ -9,12 +9,11 @@
 // compaction) deals only in ToolInvocation + ToolInvocationResult.
 //
 // ─── Sync vs async ───────────────────────────────────────────────
-// read, ls, pwd all run synchronously on the caller's thread and
-// return immediately.  grep is threaded and posts back via
-// wxEVT_GREP_COMPLETE; for these, Dispatch() returns Status::Async
-// and the caller (AgentController) waits for the event before
-// continuing the loop.  The dispatcher takes a non-owning pointer
-// to a GrepExecutor so the caller controls its lifetime.
+// ToolSpec dispatch functions are either synchronous or start a
+// specialized async executor.  Potentially blocking synchronous file tools
+// can additionally be wrapped by ToolWorkerExecutor, which preserves their
+// Completed/Invalid result shape while moving execution off the wx UI thread.
+// Specialized async tools post their own completion events and return Async.
 //
 // Note: this header deliberately does NOT include any agent-loop
 // types — it's usable from a future harness, a test harness, or a
@@ -26,13 +25,19 @@
 #include "tool_invocation.h"
 #include "presented_file.h"
 
+#include <wx/event.h>
+
+#include <atomic>
+#include <memory>
 #include <string>
 #include <vector>
+#include <utility>
 
 class ChatDisplay;    // only needed for the "Display" helper below
 class GrepExecutor;   // forward: defined in tool_grep.h
 class CmdExecutor;    // forward: defined in cmd_executor.h
 class PythonRunner;   // forward: defined in python_runner.h
+class WebFetchExecutor; // forward: defined in tool_web_fetch.h
 
 // Renderable output of a completed tool invocation.  Mirrors the
 // shape of ReadResult/LsResult/GrepResult so a ChatDisplay::ToolBlock
@@ -72,6 +77,53 @@ struct DispatchOutcome {
     ToolInvocationResult   result;   // valid iff status == Completed or Invalid
 };
 
+// Generic completion event for synchronous tool dispatches that are wrapped
+// in ToolWorkerExecutor because they may block on filesystem/process work.
+wxDECLARE_EVENT(wxEVT_TOOL_WORKER_COMPLETE, wxCommandEvent);
+
+struct ToolWorkerResult {
+    std::string toolName;
+    DispatchOutcome outcome;
+    bool cancelled = false;
+};
+
+class ToolWorkerResultClientData : public wxClientData {
+public:
+    explicit ToolWorkerResultClientData(ToolWorkerResult r)
+        : m_result(std::move(r)) {}
+    const ToolWorkerResult& GetResult() const { return m_result; }
+private:
+    ToolWorkerResult m_result;
+};
+
+// One serialized worker per frame for synchronous tools that should not run
+// inside a wx event handler (file reads/listings, write/edit,
+// python_create_script, and related filesystem work).  The tool
+// implementations remain synchronous and return their normal DispatchOutcome;
+// this facade only moves execution off the UI thread.
+class ToolWorkerExecutor {
+public:
+    ToolWorkerExecutor(wxEvtHandler* eventHandler,
+                       std::weak_ptr<std::atomic<bool>> aliveToken);
+    ~ToolWorkerExecutor();
+
+    bool Start(const ToolInvocation& inv, const ToolContext& ctx);
+    void Cancel();
+
+    bool IsRunning() const {
+        return m_isRunning && m_isRunning->load();
+    }
+
+private:
+    wxEvtHandler*                        m_eventHandler;
+    std::weak_ptr<std::atomic<bool>>     m_aliveToken;
+    std::shared_ptr<std::atomic<bool>>   m_cancelFlag;
+    std::shared_ptr<std::atomic<bool>>   m_isRunning;
+};
+
+// Router-backed predicate used by both the agent and slash-command paths.
+bool ShouldDispatchToolOnWorker(const std::string& toolName);
+
 // Run a parsed invocation.  `grepExec` may be nullptr only if the
 // caller is sure no grep calls will arrive (e.g. a reduced test
 // environment); otherwise it's required — pass the MyFrame-owned
@@ -82,4 +134,5 @@ DispatchOutcome DispatchInvocation(const ToolInvocation& inv,
                                    const ToolContext&    ctx,
                                    GrepExecutor*         grepExec,
                                    CmdExecutor*          cmdExec,
-                                   PythonRunner*         pythonRunner);
+                                   PythonRunner*         pythonRunner,
+                                   WebFetchExecutor*     webFetchExec = nullptr);

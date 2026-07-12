@@ -5,8 +5,10 @@
 #include "tool_path_safety.h"   // IsUnderAllowedWriteRoot, Basename, ParentDir
 #include "path_safety.h"
 
+#include <algorithm>
 #include <chrono>
 #include <sstream>
+#include <vector>
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -73,18 +75,6 @@ MkdirResult MakeDirectory(const std::string& pathIn,
         return r;
     }
 
-    // ── Filename sanitization (leaf only) ────────────────────────
-    std::string basename  = tool_path_safety::Basename(resolved);
-    std::string sanitized = path_safety::SanitizeFilename(basename, "");
-    if (sanitized.empty() || sanitized != basename) {
-        r.chips.push_back("blocked");
-        r.errorBody = "Directory name '" + basename +
-                      "' has characters or a shape that aren't "
-                      "safe on Windows.";
-        r.chips.push_back(ElapsedChip(t0));
-        return r;
-    }
-
     // ── Idempotency: already a directory is fine ─────────────────
     if (IsDirectory(resolved)) {
         r.chips.push_back("exists");
@@ -102,52 +92,95 @@ MkdirResult MakeDirectory(const std::string& pathIn,
         return r;
     }
 
-    // ── Parent directory must exist ──────────────────────────────
-    std::string parent = tool_path_safety::ParentDir(resolved);
-    if (parent.empty() || !IsDirectory(parent)) {
+    // ── Build missing chain (safe mkdir -p) ──────────────────────
+    // Older mkdir required the immediate parent to exist. Project
+    // scaffolding burns tool steps and produces avoidable failures under
+    // that rule (Outputs/Pong/src before Outputs/Pong). We now create
+    // the missing chain, but every new segment is still sanitized and
+    // the already-resolved final path still has to be inside the allowed
+    // write roots.
+    std::vector<std::string> toCreate;
+    std::string cur = resolved;
+    while (!cur.empty() && !IsDirectory(cur)) {
+        if (IsFile(cur)) {
+            r.chips.push_back("failed");
+            r.errorBody = "A file exists where a directory is needed: " + cur;
+            r.chips.push_back(ElapsedChip(t0));
+            return r;
+        }
+
+        std::string basename  = tool_path_safety::Basename(cur);
+        std::string sanitized = path_safety::SanitizeFilename(basename, "");
+        if (sanitized.empty() || sanitized != basename) {
+            r.chips.push_back("blocked");
+            r.errorBody = "Directory name '" + basename +
+                          "' has characters or a shape that aren't "
+                          "safe on Windows.";
+            r.chips.push_back(ElapsedChip(t0));
+            return r;
+        }
+
+        toCreate.push_back(cur);
+        std::string parent = tool_path_safety::ParentDir(cur);
+        if (parent.empty() || parent == cur) {
+            r.chips.push_back("failed");
+            r.errorBody = "Could not find an existing parent while creating: " + resolved;
+            r.chips.push_back(ElapsedChip(t0));
+            return r;
+        }
+        cur = parent;
+    }
+
+    if (cur.empty() || !IsDirectory(cur)) {
         r.chips.push_back("failed");
-        r.errorBody = "Parent directory does not exist: " + parent +
-                      ".\nCreate intermediate directories one level "
-                      "at a time.";
+        r.errorBody = "Could not find an existing parent while creating: " + resolved;
         r.chips.push_back(ElapsedChip(t0));
         return r;
     }
 
-    // ── CreateDirectoryW ─────────────────────────────────────────
-    std::wstring wResolved = path_safety::Utf8ToWide(resolved);
-    if (wResolved.empty()) {
-        r.chips.push_back("failed");
-        r.errorBody = "Path conversion failed: " + resolved;
-        r.chips.push_back(ElapsedChip(t0));
-        return r;
-    }
+    std::reverse(toCreate.begin(), toCreate.end());
 
-    if (!::CreateDirectoryW(wResolved.c_str(), nullptr)) {
-        DWORD err = ::GetLastError();
-        if (err == ERROR_ALREADY_EXISTS) {
-            // Race between IsDirectory check and CreateDirectoryW.
-            // Re-check shape and treat as idempotent if it's now a
-            // directory; otherwise it's a file collision.
-            if (IsDirectory(resolved)) {
-                r.chips.push_back("exists");
-                r.body = "Directory already exists: " + resolved + "\n";
-                r.chips.push_back(ElapsedChip(t0));
-                return r;
+    size_t createdCount = 0;
+    for (const std::string& dir : toCreate) {
+        std::wstring wDir = path_safety::Utf8ToWide(dir);
+        if (wDir.empty()) {
+            r.chips.push_back("failed");
+            r.errorBody = "Path conversion failed: " + dir;
+            r.chips.push_back(ElapsedChip(t0));
+            return r;
+        }
+
+        if (!::CreateDirectoryW(wDir.c_str(), nullptr)) {
+            DWORD err = ::GetLastError();
+            if (err == ERROR_ALREADY_EXISTS && IsDirectory(dir)) {
+                // Benign race: another caller created this segment first.
+                continue;
             }
             r.chips.push_back("failed");
-            r.errorBody = "A file appeared at this path during the "
-                          "operation: " + resolved;
-        } else {
-            r.chips.push_back("failed");
-            r.errorBody = "CreateDirectory failed (Win32 error " +
-                          std::to_string(err) + ").";
+            if (err == ERROR_ALREADY_EXISTS) {
+                r.errorBody = "A file appeared where a directory is needed: " + dir;
+            } else {
+                r.errorBody = "CreateDirectory failed for " + dir +
+                              " (Win32 error " + std::to_string(err) + ").";
+            }
+            r.chips.push_back(ElapsedChip(t0));
+            return r;
         }
-        r.chips.push_back(ElapsedChip(t0));
-        return r;
+        ++createdCount;
     }
 
-    r.chips.push_back("created");
-    r.body = "Created directory " + resolved + "\n";
+    r.chips.push_back(createdCount == 0 ? "exists" : "created");
+    if (createdCount == 0) {
+        r.body = "Directory already exists: " + resolved + "\n";
+    } else {
+        r.body = "Created directory " + resolved;
+        if (createdCount > 1) {
+            r.body += " (including " + std::to_string(createdCount - 1) +
+                      " intermediate director" +
+                      (createdCount == 2 ? "y" : "ies") + ")";
+        }
+        r.body += "\n";
+    }
     r.chips.push_back(ElapsedChip(t0));
     return r;
 }

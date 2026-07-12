@@ -43,6 +43,8 @@ public:
     struct Callbacks {
         std::function<void(const std::string& path)>              onConversationClicked;
         std::function<void()>                                      onNewChatClicked;
+        // "+ New Window" — same action as Ctrl+Shift+N in the host frame.
+        std::function<void()>                                      onNewWindowClicked;
         std::function<void(const std::vector<std::string>& paths)> onDeleteRequested;
         std::function<bool()>                                      isBusy;
         std::function<void(int width)>                             onResized;  // sidebar width changed
@@ -121,13 +123,27 @@ private:
     // hyphen, never starts/ends with double underscore).
     static constexpr const char* kUnassignedId = "__unassigned__";
 
+    // Sentinel group id for the Goals section.  A project-less chat that
+    // carries a goal is bucketed here instead of Unassigned, so missions
+    // don't get lost among loose chats.  Same double-underscore namespace
+    // as kUnassignedId, so it can never collide with a real project id.
+    // A chat that has BOTH a project and a goal stays under its project
+    // (the container is the stronger fact) — only project-less goal chats
+    // land in this section.
+    static constexpr const char* kGoalsId = "__goals__";
+
     // ── Internal data ────────────────────────────────────────────
     struct ConversationEntry {
         std::string filePath;
         std::string title;
         wxDateTime  modTime;
-        std::string projectId;     // Empty → Unassigned group
+        std::string projectId;     // Empty → Unassigned or Goals group
         std::string projectName;   // Display name; mirrors what's in the JSON
+        std::string goalObjective; // Non-empty → chat has a goal.  Drives the
+                                   // Goals section (project-less goal chats) and
+                                   // is kept for a future objective-subgrouping
+                                   // pass; the section header itself is just
+                                   // "Goals" today.
     };
 
     struct RowWidgets {
@@ -138,10 +154,10 @@ private:
 
         std::string filePath;
         std::string displayedTitle;
-        // Lowercased copy of displayedTitle kept in sync at row create /
-        // update time so FilterRows() can do a direct substring find on
-        // every keystroke without re-lowercasing every row's title.
-        std::string displayedTitleLower;
+        // Lowercased full-title search key kept in sync at row create /
+        // update time.  This intentionally uses the original title rather
+        // than displayedTitle, because displayedTitle may be shortened for UI.
+        std::string searchTitleLower;
         std::string displayedTime;
         wxDateTime  modTime;
 
@@ -175,6 +191,7 @@ private:
     static constexpr int MIN_WIDTH = 180;
     static constexpr int MAX_WIDTH = 600;
     wxButton*         m_newChatButton;    // "+ New Chat" button
+    wxButton*         m_newWindowButton;  // "+ New Window" button (secondary weight)
     wxTextCtrl*       m_searchBox;        // Search/filter conversations
     wxScrolledWindow* m_listWindow;       // Scrollable conversation list
     wxBoxSizer*       m_listSizer;        // Sizer inside m_listWindow
@@ -225,10 +242,15 @@ private:
     // the file read when mtime hasn't moved.  Stat calls remain, but
     // they're microseconds.
     struct MetaCacheEntry {
-        std::string title;
-        std::string projectId;
-        std::string projectName;
-        time_t      mtime = 0;   // Unix seconds, from wxDateTime::GetTicks()
+        std::string        title;
+        std::string        projectId;
+        std::string        projectName;
+        std::string        goalObjective;
+        long long          mtimeMs = 0;   // ms since epoch, from wxDateTime::GetValue()
+        unsigned long long size    = 0;   // file size in bytes — a second change-check
+                                          // so two saves within the same wall-clock
+                                          // second still invalidate the cache even if
+                                          // the mtime resolution can't tell them apart.
     };
     std::unordered_map<std::string, MetaCacheEntry> m_metaCache;
 
@@ -279,6 +301,7 @@ private:
 
     // Selection helpers
     void SelectRange(const std::string& from, const std::string& to);
+    void RebuildOrderedPathsFromVisibleRows();
     bool IsSelected(const std::string& path) const;
     wxColour GetRowBackground(const std::string& filePath) const;
     void RefreshAllRowBackgrounds();

@@ -15,6 +15,7 @@
 struct ThemeData;
 class TickSlider;
 class SecretsStore;
+class EndpointStore;
 
 // ── Settings dialog ──────────────────────────────────────────────
 // Lets the user pick the model, context length, theme, and chat font.
@@ -29,13 +30,17 @@ class SettingsDialog : public wxDialog
 {
 public:
     SettingsDialog(wxWindow* parent,
-                   const std::string& currentModelPath,   // full GGUF path
+                   const std::string& currentModelPath,   // configured full GGUF path
+                   const std::string& loadedModelPath,    // currently running full GGUF path, if any
                    const std::string& currentTheme,
                    int currentCtxSize,
                    int currentFontSize,
                    bool currentAgentDefaultOn,
+                   bool currentContextMeterOn,
+                   bool currentKvCacheQ8,
                    const ThemeData& theme,
-                   SecretsStore* secretsStore = nullptr);
+                   SecretsStore* secretsStore = nullptr,
+                   EndpointStore* endpointStore = nullptr);
     ~SettingsDialog();
 
     // Selected values (use these after ShowModal() returns wxID_OK)
@@ -44,6 +49,8 @@ public:
     int         GetSelectedCtxSize()  const { return m_selectedCtxSize; }
     int         GetSelectedFontSize() const { return m_selectedFontSize; }
     bool        GetSelectedAgentDefault() const { return m_selectedAgentDefault; }
+    bool        GetSelectedContextMeter() const { return m_selectedContextMeter; }
+    bool        GetSelectedKvCacheQ8()    const { return m_selectedKvCacheQ8; }
 
     // Change flags
     bool WasModelChanged()        const { return m_modelChanged; }
@@ -52,6 +59,8 @@ public:
     bool WasFontSizeChanged()     const { return m_fontSizeChanged; }
     bool WasModelsFolderChanged() const { return m_modelsFolderChanged; }
     bool WasAgentDefaultChanged() const { return m_agentDefaultChanged; }
+    bool WasContextMeterChanged() const { return m_contextMeterChanged; }
+    bool WasKvCacheQ8Changed()    const { return m_kvCacheQ8Changed; }
 
 private:
     void OnOK(wxCommandEvent& event);
@@ -62,11 +71,13 @@ private:
     void OnChangeFolder(wxCommandEvent& event);
     void OnResetFolder(wxCommandEvent& event);
     void OnManageConnections(wxCommandEvent& event);
+    void OnManageEndpoints(wxCommandEvent& event);
 
     void CreateControls();
     void PopulateModelList();
     void UpdateFolderUi();        // Refreshes Location row from GetModelsDir()
     void UpdateConnectionsLabel();// Refreshes "N connections configured" hint
+    void UpdateEndpointsLabel();  // Refreshes "N remote endpoints configured" hint
     void ApplyTheme();
 
     // Helpers for consistent styling of section headers / dividers
@@ -93,6 +104,8 @@ private:
     TickSlider*   m_ctxSlider      = nullptr;
     TickSlider*   m_fontSlider     = nullptr;
     wxCheckBox*   m_agentDefaultCheckBox = nullptr;
+    wxCheckBox*   m_contextMeterCheckBox = nullptr;
+    wxCheckBox*   m_kvCacheQ8CheckBox = nullptr;
     wxButton*     m_okBtn          = nullptr;
     wxButton*     m_cancelBtn      = nullptr;
 
@@ -100,6 +113,11 @@ private:
     wxStaticText* m_connectionsLabel = nullptr;
     wxButton*     m_manageConnBtn    = nullptr;
     SecretsStore* m_secretsStore     = nullptr;   // non-owning
+
+    // Remote Endpoints section — opens EndpointsDialog on click.
+    wxStaticText*  m_endpointsLabel     = nullptr;
+    wxButton*      m_manageEndpointsBtn = nullptr;
+    EndpointStore* m_endpointStore      = nullptr;   // non-owning
 
     // Every button that gets the solid accent fill in ApplyTheme().
     // Populated by MakeAccentButton() as buttons are constructed.
@@ -117,16 +135,21 @@ private:
 
     // Selected / original values
     std::string m_selectedModel;
+    std::string m_loadedModelPath;
     std::string m_selectedTheme;
     int         m_selectedCtxSize;
     int         m_selectedFontSize;
     bool        m_selectedAgentDefault = false;
+    bool        m_selectedContextMeter = true;
+    bool        m_selectedKvCacheQ8 = true;
 
     std::string m_originalModel;
     std::string m_originalTheme;
     int         m_originalCtxSize;
     int         m_originalFontSize;
     bool        m_originalAgentDefault = false;
+    bool        m_originalContextMeter = true;
+    bool        m_originalKvCacheQ8 = true;
 
     // Folder-override change tracking.
     // Change/Reset commit to wxFileConfig immediately so the combo can scan
@@ -141,6 +164,8 @@ private:
     bool m_fontSizeChanged     = false;
     bool m_modelsFolderChanged = false;
     bool m_agentDefaultChanged = false;
+    bool m_contextMeterChanged = false;
+    bool        m_kvCacheQ8Changed = false;
 
     const ThemeData* m_theme;
 

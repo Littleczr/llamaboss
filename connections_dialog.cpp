@@ -14,6 +14,8 @@
 #include <wx/msgdlg.h>
 #include <wx/panel.h>
 
+#include <string>
+
 // ─── Event table ────────────────────────────────────────────────
 
 enum {
@@ -99,15 +101,48 @@ wxPanel* MakeHairline(wxWindow* parent, const ThemeData& t)
     return line;
 }
 
+constexpr int kHintWrapWidth = 420;
+
+bool IsSafeConnectionIdentifier(const wxString& s)
+{
+    if (s.IsEmpty()) return false;
+
+    for (size_t i = 0; i < s.length(); ++i) {
+        const wxUniChar c = s[i];
+        if ((c >= 'a' && c <= 'z') ||
+            (c >= '0' && c <= '9') ||
+            c == '_') {
+            continue;
+        }
+        return false;
+    }
+
+    return true;
+}
+
+void ShowInvalidIdentifierMessage(wxWindow* parent,
+                                  const wxString& fieldName,
+                                  const wxString& example)
+{
+    wxMessageBox(
+        fieldName +
+            " must use lowercase letters, numbers, and underscores only.\n\n"
+            "Example: " + example,
+        "Invalid " + fieldName.Lower(),
+        wxOK | wxICON_WARNING,
+        parent);
+}
+
 }  // anonymous namespace
 
 // ─── Composite Add/Edit dialog ──────────────────────────────────
 //
 // Replaces the previous three-step wxGetTextFromUser chain.  Shows
 // every field on screen at once so users can see what they're
-// entering and which radio mode they've selected.  All three text
-// fields are required; OK validates and refuses to close with a
-// short message if anything's empty.
+// entering and which radio mode they've selected.  OK validates and
+// refuses to close with a short message if anything important is
+// missing; direct-value edits may leave the value blank to keep the
+// existing hidden secret.
 //
 // The Value field's label switches between "API key value" and
 // "Environment variable name" based on the radio choice — so the
@@ -124,10 +159,12 @@ public:
                          const wxString& seedKey,
                          bool            seedIsEnvRef,
                          const wxString& seedValue,
+                         bool            allowEmptyDirectValue,
                          const ThemeData& theme)
         : wxDialog(parent, wxID_ANY, title,
                    wxDefaultPosition, wxDefaultSize,
-                   wxDEFAULT_DIALOG_STYLE)
+                   wxDEFAULT_DIALOG_STYLE),
+          m_allowEmptyDirectValue(allowEmptyDirectValue)
     {
         // Use the dialog-surface colour to match the rest of the
         // dialog family rather than the darker chat-area bgMain.
@@ -154,10 +191,12 @@ public:
         root->Add(providerRow, 0, wxEXPAND | wxALL, 12);
 
         auto* providerHint = new wxStaticText(this, wxID_ANY,
-            "Lowercase, no spaces. Examples: gmail, smartsheet, runpod.");
+            "Lowercase letters, numbers, and underscores. "
+            "Examples: gmail, smartsheet, runpod.");
         { wxFont f = providerHint->GetFont(); f.SetPointSize(10);
           providerHint->SetFont(f); }
         providerHint->SetForegroundColour(theme.textMuted);
+        providerHint->Wrap(kHintWrapWidth);
         root->Add(providerHint, 0, wxLEFT | wxRIGHT | wxBOTTOM, 12);
 
         // ── Key ─────────────────────────────────────────────────
@@ -174,11 +213,12 @@ public:
         root->Add(keyRow, 0, wxEXPAND | wxLEFT | wxRIGHT, 12);
 
         auto* keyHint = new wxStaticText(this, wxID_ANY,
-            "Becomes the suffix of the injected env var, e.g. "
-            "'api_key' \xE2\x86\x92 GMAIL_API_KEY.");
+            "Lowercase identifier. Becomes the suffix of the injected "
+            "env var, e.g. 'api_key' \xE2\x86\x92 GMAIL_API_KEY.");
         { wxFont f = keyHint->GetFont(); f.SetPointSize(10);
           keyHint->SetFont(f); }
         keyHint->SetForegroundColour(theme.textMuted);
+        keyHint->Wrap(kHintWrapWidth);
         root->Add(keyHint, 0, wxLEFT | wxRIGHT | wxBOTTOM, 12);
 
         // ── Storage radio ───────────────────────────────────────
@@ -231,6 +271,11 @@ public:
         btnRow->Add(okBtn,     0, wxALIGN_CENTER_VERTICAL);
         root->Add(btnRow, 0, wxEXPAND | wxALL, 12);
 
+        // Populate and wrap the value hint before fitting the dialog.
+        // Otherwise the dialog can be min-sized while the hint is empty,
+        // and long env-ref guidance may clip after the radio toggle fills it.
+        UpdateValueLabel();
+
         SetSizerAndFit(root);
         SetMinSize(GetSize());
 
@@ -243,8 +288,6 @@ public:
 
         okBtn->SetDefault();   // Enter activates OK
         m_providerField->SetFocus();
-
-        UpdateValueLabel();
 
         // ── Theming ─────────────────────────────────────────────
         // ApplyDialogThemeRecursive paints foregrounds on wxStaticText
@@ -304,11 +347,19 @@ private:
                 "key, e.g. GMAIL_API_KEY.");
         } else {
             m_valueLabel->SetLabel("API key value:");
-            m_valueHint->SetLabel(
-                "Stored as plaintext in secrets.json (user-only file "
-                "ACL).");
+            if (m_allowEmptyDirectValue) {
+                m_valueHint->SetLabel(
+                    "Stored as plaintext in secrets.json. Leave blank "
+                    "to keep the existing secret.");
+            } else {
+                m_valueHint->SetLabel(
+                    "Stored as plaintext in secrets.json (user-only file "
+                    "ACL).");
+            }
         }
-        Layout();
+
+        m_valueHint->Wrap(kHintWrapWidth);
+        if (GetSizer()) Layout();
     }
 
     void OnOK(wxCommandEvent& evt)
@@ -331,7 +382,22 @@ private:
             m_keyField->SetFocus();
             return;
         }
-        if (value.IsEmpty()) {
+        if (!IsSafeConnectionIdentifier(provider)) {
+            ShowInvalidIdentifierMessage(this, "Provider name", "gmail");
+            m_providerField->SetFocus();
+            return;
+        }
+
+        if (!IsSafeConnectionIdentifier(key)) {
+            ShowInvalidIdentifierMessage(this, "Key name", "api_key");
+            m_keyField->SetFocus();
+            return;
+        }
+
+        const bool allowBlankDirectValue =
+            !m_envRefRadio->GetValue() && m_allowEmptyDirectValue;
+
+        if (value.IsEmpty() && !allowBlankDirectValue) {
             wxMessageBox(
                 m_envRefRadio->GetValue()
                     ? wxString("Environment variable name is required.")
@@ -339,23 +405,6 @@ private:
                 "Missing field", wxOK | wxICON_INFORMATION, this);
             m_valueField->SetFocus();
             return;
-        }
-
-        // Sanity: provider names should be reasonable identifiers.
-        // Reject whitespace inside the name -- it'd break env var
-        // generation and confuse the agent.  Other chars (dashes,
-        // dots, underscores) are tolerated.
-        for (size_t i = 0; i < provider.length(); ++i) {
-            wxUniChar c = provider[i];
-            if (c == ' ' || c == '\t') {
-                wxMessageBox(
-                    "Provider name cannot contain spaces. Use a "
-                    "lowercase identifier like 'gmail' or 'smartsheet'.",
-                    "Invalid provider name",
-                    wxOK | wxICON_WARNING, this);
-                m_providerField->SetFocus();
-                return;
-            }
         }
 
         evt.Skip();   // proceed with EndModal(wxID_OK)
@@ -368,6 +417,7 @@ private:
     wxStaticText*  m_valueLabel    = nullptr;
     wxStaticText*  m_valueHint     = nullptr;
     wxTextCtrl*    m_valueField    = nullptr;
+    bool           m_allowEmptyDirectValue = false;
 };
 
 }  // anonymous namespace
@@ -441,7 +491,8 @@ ConnectionsDialog::ConnectionsDialog(wxWindow* parent,
     RebuildList();
     UpdateButtonState();
 
-    // Close button is the default accelerator (Esc).
+    // Enter activates the default Close button when focus is not on the list;
+    // Esc closes through SetEscapeId.
     m_closeBtn->SetDefault();
     SetEscapeId(wxID_CLOSE);
 }
@@ -489,18 +540,31 @@ void ConnectionsDialog::ApplyTheme()
 
 // ─── List management ────────────────────────────────────────────
 
-void ConnectionsDialog::RebuildList()
+void ConnectionsDialog::RebuildList(const wxString& selectProvider,
+                                    const wxString& selectKey)
 {
     m_list->DeleteAllItems();
     if (!m_store) return;
 
+    const bool wantSelection = !selectProvider.IsEmpty() && !selectKey.IsEmpty();
+
     auto rows = m_store->ListConnections();
     long idx = 0;
     for (const auto& r : rows) {
-        long item = m_list->InsertItem(idx,
-            wxString::FromUTF8(r.provider.c_str()));
-        m_list->SetItem(item, 1, wxString::FromUTF8(r.key.c_str()));
+        const wxString provider = wxString::FromUTF8(r.provider.c_str());
+        const wxString key      = wxString::FromUTF8(r.key.c_str());
+
+        long item = m_list->InsertItem(idx, provider);
+        m_list->SetItem(item, 1, key);
         m_list->SetItem(item, 2, wxString::FromUTF8(r.displayHint.c_str()));
+
+        if (wantSelection && provider == selectProvider && key == selectKey) {
+            m_list->SetItemState(item,
+                                 wxLIST_STATE_SELECTED | wxLIST_STATE_FOCUSED,
+                                 wxLIST_STATE_SELECTED | wxLIST_STATE_FOCUSED);
+            m_list->EnsureVisible(item);
+        }
+
         ++idx;
     }
 }
@@ -529,7 +593,8 @@ bool ConnectionsDialog::PromptForConnection(const wxString& title,
                                             wxString& ioProvider,
                                             wxString& ioKey,
                                             wxString& ioValue,
-                                            bool&     ioIsEnvRef)
+                                            bool&     ioIsEnvRef,
+                                            bool      allowEmptyDirectValue)
 {
     // Single composite dialog -- every field on screen at once, with
     // a radio toggle for storage mode and a value label that updates
@@ -538,6 +603,7 @@ bool ConnectionsDialog::PromptForConnection(const wxString& title,
     ConnectionEditDialog dlg(this, title,
                              ioProvider, ioKey,
                              ioIsEnvRef, ioValue,
+                             allowEmptyDirectValue,
                              *m_theme);
 
     if (dlg.ShowModal() != wxID_OK) return false;
@@ -562,10 +628,21 @@ void ConnectionsDialog::OnAdd(wxCommandEvent&)
     std::string k = key.ToUTF8().data();
     std::string v = value.ToUTF8().data();
 
+    if (m_store->HasSecret(p, k)) {
+        int ans = wxMessageBox(
+            wxString::Format(
+                "A connection named %s.%s already exists. Replace it?",
+                provider, key),
+            "Replace existing connection?",
+            wxYES_NO | wxICON_WARNING,
+            this);
+        if (ans != wxYES) return;
+    }
+
     if (isEnvRef) m_store->SetSecretEnvRef(p, k, v);
     else          m_store->SetSecret(p, k, v);
 
-    RebuildList();
+    RebuildList(provider, key);
     UpdateButtonState();
 }
 
@@ -581,40 +658,74 @@ void ConnectionsDialog::OnEdit(wxCommandEvent&)
     // leave the old entry orphaned and end up with two rows.
     wxString originalProvider = m_list->GetItemText(sel, 0);
     wxString originalKey      = m_list->GetItemText(sel, 1);
-    wxString hint             = m_list->GetItemText(sel, 2);
+
+    const std::string originalP = std::string(originalProvider.ToUTF8().data());
+    const std::string originalK = std::string(originalKey.ToUTF8().data());
+
+    SecretsStore::SecretEntry originalEntry;
+    if (!m_store->TryGetSecretEntry(originalP, originalK, originalEntry)) {
+        wxMessageBox(
+            "Could not read the selected connection. The list will be refreshed.",
+            "Connection unavailable",
+            wxOK | wxICON_WARNING,
+            this);
+        RebuildList();
+        UpdateButtonState();
+        return;
+    }
 
     wxString provider = originalProvider;
     wxString key      = originalKey;
-
-    bool isEnvRef = hint.StartsWith("$env:");
+    bool isEnvRef     = originalEntry.isEnvRef;
     wxString value;
-    if (isEnvRef) value = hint.AfterFirst(':');
-    // For direct values we never preload the actual key (it's the
-    // secret we'd otherwise be displaying).  The user re-types it,
-    // or switches to env-ref mode.  This matches the standard
-    // password-field reset behaviour in most apps.
+
+    // Env-ref names are safe to show because they are not the secret.
+    // Direct values are intentionally not preloaded; an empty direct-value
+    // field means "keep existing" for edits of an existing direct secret.
+    if (originalEntry.isEnvRef) {
+        value = wxString::FromUTF8(originalEntry.value.c_str());
+    }
 
     if (!PromptForConnection("Edit connection",
-                             provider, key, value, isEnvRef))
+                             provider, key, value, isEnvRef,
+                             !originalEntry.isEnvRef)) {
         return;
+    }
 
     std::string p = provider.ToUTF8().data();
     std::string k = key.ToUTF8().data();
     std::string v = value.ToUTF8().data();
 
-    // Drop the original row if its identity changed.  If the user
-    // kept the same provider+key, this is a no-op (SetSecret below
-    // overwrites the existing value in place).
-    if (originalProvider != provider || originalKey != key) {
-        m_store->RemoveSecret(
-            std::string(originalProvider.ToUTF8().data()),
-            std::string(originalKey.ToUTF8().data()));
+    const bool identityChanged =
+        (originalProvider != provider || originalKey != key);
+
+    if (identityChanged && m_store->HasSecret(p, k)) {
+        int ans = wxMessageBox(
+            wxString::Format(
+                "A connection named %s.%s already exists. Replace it?",
+                provider, key),
+            "Replace existing connection?",
+            wxYES_NO | wxICON_WARNING,
+            this);
+        if (ans != wxYES) return;
+    }
+
+    // For direct-value edits, blank means keep the existing hidden secret.
+    if (!isEnvRef && v.empty() && !originalEntry.isEnvRef) {
+        v = originalEntry.value;
+    }
+
+    // Drop the original row if its identity changed.  If the user kept
+    // the same provider+key, SetSecret below overwrites the existing
+    // value in place.
+    if (identityChanged) {
+        m_store->RemoveSecret(originalP, originalK);
     }
 
     if (isEnvRef) m_store->SetSecretEnvRef(p, k, v);
     else          m_store->SetSecret(p, k, v);
 
-    RebuildList();
+    RebuildList(provider, key);
     UpdateButtonState();
 }
 

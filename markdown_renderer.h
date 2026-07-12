@@ -28,6 +28,21 @@ public:
     void Flush(const wxColour& baseColor);
     void Reset();
 
+    // ── Bulk / replay mode ────────────────────────────────────────
+    // When enabled, ProcessDelta() skips two things meant for live
+    // streaming: the partial-line preview (the caller is feeding whole
+    // messages followed by Flush(), so the preview is created and
+    // immediately consumed) and the per-call ShowPosition() scroll.
+    //
+    // The ShowPosition() suppression is the important one: it forces a
+    // wxRichTextCtrl layout pass whose cost scales with the current
+    // document size, so calling it once per message while replaying a
+    // saved conversation turns an n-message replay into O(n^2) work.
+    // ChatDisplay enables bulk mode for the duration of a replay batch
+    // (BeginReplayBatch/EndReplayBatch) and performs a single
+    // scroll-to-end once the whole transcript is rebuilt.
+    void SetBulkMode(bool enabled) { m_bulkMode = enabled; }
+
     // ── Color configuration ──────────────────────────────────────
     void SetCodeColor(const wxColour& color)           { m_codeColor = color; }
     void SetHeadingColor(const wxColour& color)         { m_headingColor = color; }
@@ -45,6 +60,10 @@ public:
     void ClearCodeBlocks();
     // Returns block index if pos is inside a [Copy] link, or -1
     int HitTestCopyLink(long pos) const;
+    // True when any [Copy] links exist at all.  Lets ChatDisplay's
+    // mouse-motion handler skip its hit-test work entirely for
+    // transcripts with no interactive ranges (see the fast path there).
+    bool HasCopyLinks() const { return !m_copyLinks.empty(); }
     // Changes the clicked code-block affordance from "Copy" to "Copied".
     // The rendered affordance reserves six monospace cells ("Copy  "), so
     // this replacement does not shift any later rich-text ranges.
@@ -67,6 +86,7 @@ private:
     std::string m_codeBlockLang;       // Language tag from opening fence (just "cpp", etc.)
     std::string m_codeBlockFilename;   // Filename parsed from opening fence (may be empty)
     long        m_partialLineStart;    // Character position where partial line begins (-1 = none)
+    bool        m_bulkMode;            // Replay mode: skip partial-line preview + per-call scroll
 
     // ── Colors ───────────────────────────────────────────────────
     wxColour m_codeColor;

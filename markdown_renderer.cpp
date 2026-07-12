@@ -23,6 +23,7 @@ MarkdownRenderer::MarkdownRenderer(wxRichTextCtrl* ctrl)
     : m_ctrl(ctrl)
     , m_inCodeBlock(false)
     , m_partialLineStart(-1)
+    , m_bulkMode(false)
     , m_codeColor(232, 184, 77)
     , m_headingColor(232, 232, 232)         // Near-white (#E8E8E8)
     , m_codeLabelColor(120, 120, 120)       // Gray
@@ -154,12 +155,24 @@ void MarkdownRenderer::ProcessDelta(const std::string& delta, const wxColour& ba
 
     // Show the remaining incomplete text as a temporary partial-line preview.
     // This gives the user immediate visual feedback for every token.
-    if (!m_lineBuffer.empty()) {
+    //
+    // In bulk/replay mode we skip the preview: the caller feeds whole
+    // messages and follows with Flush(), so the leftover text stays safely
+    // in m_lineBuffer and is rendered permanently by Flush() — building the
+    // preview here would just be thrown away on the next call.
+    if (!m_bulkMode && !m_lineBuffer.empty()) {
         RenderPartialLine(m_lineBuffer, baseColor);
     }
 
     m_ctrl->Thaw();
-    m_ctrl->ShowPosition(m_ctrl->GetLastPosition());
+
+    // Per-call scroll is for live streaming only. In bulk/replay mode the
+    // ShowPosition() — which forces a layout pass that scales with document
+    // size — is suppressed; ChatDisplay's replay batch scrolls once at the
+    // end. (See SetBulkMode in the header.)
+    if (!m_bulkMode) {
+        m_ctrl->ShowPosition(m_ctrl->GetLastPosition());
+    }
 }
 
 void MarkdownRenderer::Flush(const wxColour& baseColor)
@@ -189,7 +202,12 @@ void MarkdownRenderer::Flush(const wxColour& baseColor)
     FinalizeOpenCodeBlock(/*drawBottomBorder=*/true);
 
     m_ctrl->Thaw();
-    m_ctrl->ShowPosition(m_ctrl->GetLastPosition());
+
+    // See ProcessDelta: in bulk/replay mode the single scroll-to-end is
+    // performed by ChatDisplay's replay batch, not per message.
+    if (!m_bulkMode) {
+        m_ctrl->ShowPosition(m_ctrl->GetLastPosition());
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════

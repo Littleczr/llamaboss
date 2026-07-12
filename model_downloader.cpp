@@ -137,14 +137,20 @@ void TintFlatMuted(wxButton* btn, const ThemeData& t)
 //  each model fits ("Ultra-light" / "Recommended" / "Top quality").
 //
 //  All from bartowski on HuggingFace — publicly downloadable, no
-//  account or license gate required.  Bartowski's newer Gemma uploads
-//  use the "google_" repo prefix; older entries (Phi-4, Qwen 2.5,
-//  Llama 3.2) keep their original repo names.
+//  account or license gate required.  Bartowski's newer uploads use
+//  the "<org>_" repo prefix (google_, Qwen_, openai_); the older
+//  Llama 3.2 entry keeps its original repo name.
 //
 //  Q4_K_M is the chosen quant for every entry — well-rounded quality
 //  vs size, default-recommended by bartowski himself, and works on
 //  every llama.cpp backend including Vulkan (unlike I-quants which
 //  the Vulkan backend cannot run).
+//
+//  Exception: gpt-oss ships as MXFP4. Its feed-forward weights don't
+//  quantize well to anything else, so bartowski keeps the FFNs at
+//  MXFP4 in every quant — making MXFP4 the canonical file (all the
+//  other quants of that repo are the same size anyway). Smoke-test
+//  against the llama.cpp Vulkan backend before shipping this entry.
 // ═══════════════════════════════════════════════════════════════════
 const std::vector<DownloadableModel> ModelDownloaderDialog::kModels =
 {
@@ -182,20 +188,13 @@ const std::vector<DownloadableModel> ModelDownloaderDialog::kModels =
         "mmproj-google_gemma-4-E4B-it-f16.gguf", "1.0 GB", 1'000'000'000LL
     },
     {
-        "Qwen 2.5 7B",   "Versatile",
-        "Alibaba's capable all-rounder. Fast with strong instruction following.",
-        "bartowski", "Qwen2.5-7B-Instruct-GGUF",
-        "Qwen2.5-7B-Instruct-Q4_K_M.gguf",
-        "4.7 GB", 4'700'000'000LL
-        // Text-only — no mmproj fields
-    },
-    {
-        "Phi-4 14B",     "Reasoning",
-        "Microsoft's reasoning model. Excellent at math, code, and logic.",
-        "bartowski", "phi-4-GGUF",
-        "phi-4-Q4_K_M.gguf",
-        "9.0 GB", 9'050'000'000LL
-        // Text-only — no mmproj fields
+        "gpt-oss 20B",   "Reasoning",
+        "OpenAI's open model. Strong reasoning, math, and code. Needs 13+ GB VRAM.",
+        "bartowski", "openai_gpt-oss-20b-GGUF",
+        "openai_gpt-oss-20b-MXFP4.gguf",
+        "12.1 GB", 12'100'000'000LL
+        // Text-only — no mmproj fields.
+        // MXFP4, not Q4_K_M — see catalog header for why.
     },
     {
         "Gemma 4 26B A4B", "Fast & Powerful",
@@ -204,6 +203,17 @@ const std::vector<DownloadableModel> ModelDownloaderDialog::kModels =
         "google_gemma-4-26B-A4B-it-Q4_K_M.gguf",
         "16.0 GB", 16'000'000'000LL,
         "mmproj-google_gemma-4-26B-A4B-it-f16.gguf", "1.2 GB", 1'200'000'000LL
+    },
+    {
+        "Qwen 3.6 27B",  "Top All-Rounder",
+        "Alibaba's flagship. Frontier quality, vision-capable. Needs 20+ GB VRAM.",
+        "bartowski", "Qwen_Qwen3.6-27B-GGUF",
+        "Qwen_Qwen3.6-27B-Q4_K_M.gguf",
+        "17.5 GB", 17'530'000'000LL,
+        // NOTE: this repo's projector is bf16, not the f16 naming the
+        // Gemma entries use. Size below is approximate — confirm on
+        // first test download and tighten if needed.
+        "mmproj-Qwen_Qwen3.6-27B-bf16.gguf", "1.5 GB", 1'500'000'000LL
     },
     {
         "Gemma 4 31B",   "Top Quality",

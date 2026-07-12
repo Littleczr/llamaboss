@@ -11,10 +11,22 @@
 #include <wx/filefn.h>
 #include <wx/filename.h>
 #include <wx/msgdlg.h>
+#include <wx/menu.h>       // image thumbnail context menu
+#include <wx/statbmp.h>    // image viewer lightbox
+#include <wx/dialog.h>     // image viewer lightbox
+#include "lb_modal_scrim.h" // LbShowModalWithScrim for the image viewer
 #include <wx/utils.h>
+#include <wx/stdpaths.h>   // thumbnail cache location
+#include <wx/log.h>        // wxLogNull around cache reads
 #include <algorithm>
 #include <cctype>
+#include <cstdio>
 #include <sstream>
+#include <vector>
+
+#ifdef __WXMSW__
+#include <windows.h>       // thumbnail cache prune enumeration
+#endif
 
 namespace {
 
@@ -34,6 +46,184 @@ void HideRichTextCaret(wxRichTextCtrl* ctrl)
     if (wxCaret* caret = ctrl->GetCaret()) {
         caret->Hide();
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Thumbnail cache
+// ═══════════════════════════════════════════════════════════════════
+// Opening a conversation containing images used to decode every original
+// file at full resolution and box-filter it down to the display cap, on
+// the UI thread, inside the frozen replay batch — tens of ms per image
+// for the 1–2K px files image models emit, paid on EVERY open.  The
+// first render still pays that cost once; the scaled result is then
+// saved as a small PNG under %LOCALAPPDATA%\LlamaBoss\thumbcache and
+// every later replay loads the thumbnail instead.
+//
+// Cache key: FNV-1a hash of (absolute path | mtime ms | size | target
+// box).  Any change to the original file or to the display cap yields a
+// different key, so a stale thumbnail can never be shown — the old
+// entry is simply orphaned and eventually removed by the size-cap prune.
+//
+// Failure policy: every cache miss, unreadable cache file, or failed
+// cache write silently falls back to the original decode-and-rescale
+// path.  The cache can only ever make things faster, never wrong.
+
+unsigned long long ThumbKeyFnv1a64(const std::string& s)
+{
+    unsigned long long h = 1469598103934665603ULL;
+    for (unsigned char c : s) {
+        h ^= c;
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+std::string ThumbCacheDir()
+{
+    // %LOCALAPPDATA%\LlamaBoss\thumbcache — same root the logger,
+    // config, and secrets already use (SetAppName in MyApp::OnInit
+    // makes GetUserLocalDataDir resolve there regardless of exe name).
+    wxString dir = wxStandardPaths::Get().GetUserLocalDataDir();
+    dir += wxFileName::GetPathSeparator();
+    dir += "thumbcache";
+    return std::string(dir.ToUTF8().data());
+}
+
+#ifdef __WXMSW__
+// Size-cap prune: once per session, and only when we're about to WRITE
+// a new entry (reads never pay for this).  Thumbnails are ~50–150KB
+// PNGs, so the 1500-file cap bounds the cache to roughly 100–200MB
+// worst case; pruning down to 750 keeps the sweep rare.  Enumeration
+// uses FindFirstFileExW so no per-file handles are opened.
+void PruneThumbCacheIfOversized(const std::string& dir)
+{
+    constexpr size_t kMaxFiles = 1500;
+    constexpr size_t kKeep     = 750;
+
+    const std::wstring wdir = path_safety::Utf8ToWide(dir);
+    if (wdir.empty()) return;
+
+    struct Item {
+        unsigned long long mtime;   // FILETIME ticks — only order matters
+        std::wstring       wpath;
+    };
+    std::vector<Item> items;
+
+    WIN32_FIND_DATAW fd{};
+    HANDLE h = ::FindFirstFileExW((wdir + L"\\*.png").c_str(),
+                                  FindExInfoBasic, &fd,
+                                  FindExSearchNameMatch, nullptr, 0);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        ULARGE_INTEGER uli;
+        uli.LowPart  = fd.ftLastWriteTime.dwLowDateTime;
+        uli.HighPart = fd.ftLastWriteTime.dwHighDateTime;
+        items.push_back({ uli.QuadPart, wdir + L"\\" + fd.cFileName });
+    } while (::FindNextFileW(h, &fd));
+    ::FindClose(h);
+
+    if (items.size() <= kMaxFiles) return;
+
+    std::sort(items.begin(), items.end(),
+        [](const Item& a, const Item& b) { return a.mtime < b.mtime; });
+
+    const size_t deleteCount = items.size() - kKeep;
+    for (size_t i = 0; i < deleteCount; ++i)
+        ::DeleteFileW(items[i].wpath.c_str());
+}
+#endif
+
+// Loads |imgPath| as a display-ready thumbnail into |out|: already
+// scaled to fit maxW × maxH when the original was larger, unscaled
+// otherwise.  Returns false only when the original can't be read
+// (matching the old skip-corrupt-images behaviour at both call sites).
+bool LoadImageThumbnailCached(const std::string& imgPath,
+                              int maxW, int maxH, wxImage& out)
+{
+    // ── Stat the original for the cache key ──────────────────────
+    // A failed stat (file vanished, odd path) just disables the cache
+    // for this image; the direct path below still runs.  Unlike the
+    // sidebar's hundreds-of-files scan, this is a handful of images
+    // per conversation, so portable wxFileName here is fine.
+    long long          mtimeMs  = 0;
+    unsigned long long fileSize = 0;
+    bool               haveStat = false;
+    {
+        wxFileName fn(wxString::FromUTF8(imgPath));
+        wxDateTime mod;
+        if (fn.FileExists() && fn.GetTimes(nullptr, &mod, nullptr) &&
+            mod.IsValid()) {
+            mtimeMs  = mod.GetValue().GetValue();
+            fileSize = fn.GetSize().GetValue();
+            haveStat = true;
+        }
+    }
+
+    std::string cachePath;
+    if (haveStat) {
+        const std::string key =
+            imgPath + "|" + std::to_string(mtimeMs) +
+            "|" + std::to_string(fileSize) +
+            "|" + std::to_string(maxW) + "x" + std::to_string(maxH);
+        char name[32];
+        snprintf(name, sizeof(name), "%016llx", ThumbKeyFnv1a64(key));
+        cachePath = ThumbCacheDir();
+        cachePath += wxFileName::GetPathSeparator();
+        cachePath += name;
+        cachePath += ".png";
+
+        if (wxFileExists(wxString::FromUTF8(cachePath))) {
+            // Suppress wx error popups for a corrupt/truncated cache
+            // entry — that's a regenerate, not a user-facing error.
+            wxLogNull noLog;
+            if (out.LoadFile(wxString::FromUTF8(cachePath)) &&
+                out.GetWidth() > 0 && out.GetHeight() > 0) {
+                return true;
+            }
+            out = wxImage();   // fall through and regenerate
+        }
+    }
+
+    // ── Direct path (first sighting, stat failure, or bad cache) ─
+    if (!out.LoadFile(wxString::FromUTF8(imgPath))) return false;
+
+    const int w = out.GetWidth(), h = out.GetHeight();
+    if (w <= 0 || h <= 0) return false;
+
+    if (w > maxW || h > maxH) {
+        const double scaleW = static_cast<double>(maxW) / w;
+        const double scaleH = static_cast<double>(maxH) / h;
+        const double scale  = (scaleW < scaleH) ? scaleW : scaleH;
+        const int newW = std::max(1, static_cast<int>(w * scale));
+        const int newH = std::max(1, static_cast<int>(h * scale));
+        out.Rescale(newW, newH, wxIMAGE_QUALITY_HIGH);
+
+        // Only rescaled images are worth caching — small originals
+        // decode quickly anyway, and caching them would just duplicate
+        // their bytes on disk.  Best-effort: a failed mkdir or save
+        // means the next open pays the rescale again, nothing worse.
+        if (!cachePath.empty()) {
+            const std::string dir = ThumbCacheDir();
+            const wxString wxDirPath = wxString::FromUTF8(dir);
+            if (wxDirExists(wxDirPath) ||
+                wxFileName::Mkdir(wxDirPath, wxS_DIR_DEFAULT,
+                                  wxPATH_MKDIR_FULL)) {
+#ifdef __WXMSW__
+                static bool s_prunedThisSession = false;
+                if (!s_prunedThisSession) {
+                    s_prunedThisSession = true;
+                    PruneThumbCacheIfOversized(dir);
+                }
+#endif
+                wxLogNull noLog;
+                out.SaveFile(wxString::FromUTF8(cachePath),
+                             wxBITMAP_TYPE_PNG);
+            }
+        }
+    }
+
+    return true;
 }
 
 std::string ToLowerAscii(std::string s)
@@ -239,6 +429,13 @@ ChatDisplay::ChatDisplay(wxRichTextCtrl* displayCtrl)
         PresentFile(f);
     });
 
+    // ── Image thumbnails: right-click menu ────────────────────────
+    // Save/reveal for any thumbnail tagged with its source path (see
+    // TagLastWrittenImage).  Non-image positions Skip() through so
+    // the control's default context behavior is untouched.
+    m_displayCtrl->Bind(wxEVT_CONTEXT_MENU,
+                        &ChatDisplay::OnImageContextMenu, this);
+
     // ── Code block copy: click handler ────────────────────────────
     m_displayCtrl->Bind(wxEVT_LEFT_UP, [this](wxMouseEvent& event) {
         // wxRichTextCtrl captures the mouse on left-down for text selection.
@@ -309,6 +506,18 @@ ChatDisplay::ChatDisplay(wxRichTextCtrl* displayCtrl)
                 releaseDisplayCapture();
                 return;
             }
+            // Image thumbnail — open the lightbox viewer.  Read-only
+            // (no buffer mutation), so no interaction-enabled gate:
+            // safe to view an image even while a turn is streaming.
+            // Capture is released BEFORE the modal viewer runs so the
+            // richtext control isn't left holding the mouse across a
+            // nested event loop.
+            const wxString imgSrc = ImageSrcAtPosition(pos);
+            if (!imgSrc.empty()) {
+                releaseDisplayCapture();
+                ShowImageViewer(imgSrc);
+                return;
+            }
         }
 
         // Nothing clickable was hit, so let wxRichTextCtrl keep its
@@ -334,6 +543,26 @@ ChatDisplay::ChatDisplay(wxRichTextCtrl* displayCtrl)
     m_displayCtrl->Bind(wxEVT_MOTION,
         [this, lastPos = -1L, lastOverLink = false]
         (wxMouseEvent& event) mutable {
+            // Fast path: a transcript with no interactive ranges at all
+            // (no code-block Copy links, file chips, tool blocks,
+            // approval buttons, or image thumbnails — e.g. a
+            // plain-prose conversation) has
+            // nothing for the scan below to find.  More importantly,
+            // wxRichTextCtrl::HitTest itself walks the paragraph layout
+            // tree and is the expensive part of this handler on a long
+            // transcript, so skip it too.  Resetting the cache keys means
+            // the first motion event after a range appears re-evaluates
+            // from scratch.
+            if (m_fileChips.empty() && m_toolBlocks.empty() &&
+                m_approvalButtons.empty() &&
+                !m_hasImageThumbnails &&
+                !m_markdownRenderer->HasCopyLinks()) {
+                lastPos      = -1L;
+                lastOverLink = false;
+                event.Skip();
+                return;
+            }
+
             long pos = 0;
             auto hit = m_displayCtrl->HitTest(event.GetPosition(), &pos);
 
@@ -360,7 +589,15 @@ ChatDisplay::ChatDisplay(wxRichTextCtrl* displayCtrl)
                         || (m_toolBlockInteractionEnabled &&
                             HitTestToolBlockAffordance(pos) >= 0)
                         || (m_toolBlockInteractionEnabled &&
-                            HitTestApprovalButton(pos) >= 0);
+                            HitTestApprovalButton(pos) >= 0)
+                        // Image thumbnail — clickable lightbox target.
+                        // Guarded by the flag so transcripts without
+                        // images pay nothing; the leaf lookup itself is
+                        // cheap next to the HitTest above, and the
+                        // cell-change cache means it only runs on
+                        // character transitions anyway.
+                        || (m_hasImageThumbnails &&
+                            !ImageSrcAtPosition(pos).empty());
             }
 
             lastPos      = effectivePos;
@@ -395,6 +632,12 @@ void ChatDisplay::ThinkingTimer::Notify()
 void ChatDisplay::StartThinkingIndicator()
 {
     if (m_thinkingActive || !m_displayCtrl) return;
+
+    // Replay renders saved assistant messages synchronously. Starting and then
+    // immediately clearing the animated dots for every historical assistant
+    // message creates extra timer churn and rich-text mutations for no visible
+    // benefit, so suppress the indicator while replay batching is active.
+    if (IsReplayBatchActive()) return;
 
     m_thinkingActive    = true;
     m_thinkingDotsFrame = 0;
@@ -618,10 +861,18 @@ int ChatDisplay::HitTestFileChip(long pos) const
 void ChatDisplay::HandleFileChipClick(size_t chipIdx)
 {
     if (chipIdx >= m_fileChips.size()) return;
-    const FileChipRegion& region = m_fileChips[chipIdx];
-    const PresentedFile& file = region.file;
 
-    switch (region.action) {
+    // COPY, do not take references into m_fileChips here.  The SaveAs
+    // branch below opens wxFileDialog::ShowModal(), which spins a nested
+    // event loop — streaming deltas keep arriving underneath the dialog.
+    // A delta that calls PresentFile() push_back()s into m_fileChips
+    // (possible reallocation), and CancelPendingAssistantDisplay()/Clear()
+    // erase from it.  Either would leave a reference dangling by the time
+    // ShowModal() returns and we touch file.inlineContent.
+    const PresentedFile file   = m_fileChips[chipIdx].file;
+    const FileAction    action = m_fileChips[chipIdx].action;
+
+    switch (action) {
     case FileAction::SaveAs:
     {
         std::string safeDefault = path_safety::SanitizeFilename(
@@ -675,8 +926,15 @@ void ChatDisplay::HandleFileChipClick(size_t chipIdx)
 int ChatDisplay::HitTestToolBlockAffordance(long pos) const
 {
     for (size_t i = 0; i < m_toolBlocks.size(); ++i) {
-        if (pos >= m_toolBlocks[i].affordanceStart &&
-            pos <  m_toolBlocks[i].affordanceEnd)
+        const ToolBlockRegion& r = m_toolBlocks[i];
+
+        if (r.chevronStart >= 0 &&
+            pos >= r.chevronStart &&
+            pos <  r.chevronEnd)
+            return static_cast<int>(i);
+
+        if (pos >= r.affordanceStart &&
+            pos <  r.affordanceEnd)
             return static_cast<int>(i);
     }
     return -1;
@@ -740,6 +998,8 @@ void ChatDisplay::ShiftOtherRegions(const ToolBlockRegion* skip,
         if (tb.bodyEnd         >= pivot) tb.bodyEnd         += delta;
         if (tb.affordanceStart >= pivot) tb.affordanceStart += delta;
         if (tb.affordanceEnd   >= pivot) tb.affordanceEnd   += delta;
+        if (tb.chevronStart    >= pivot) tb.chevronStart    += delta;
+        if (tb.chevronEnd      >= pivot) tb.chevronEnd      += delta;
     }
     // Approval row: at most one is live at any time, but its position
     // shifts the same way file chips do.  When [show details] above
@@ -778,6 +1038,30 @@ void ChatDisplay::SetAffordanceText(ToolBlockRegion& r, const wxString& newText)
     // so the invariant is obvious and future-safe.
     r.affordanceEnd = r.affordanceStart + static_cast<long>(newText.length());
 }
+
+void ChatDisplay::SetChevronText(ToolBlockRegion& r, const wxString& newText)
+{
+    if (!m_displayCtrl) return;
+    if (r.chevronStart < 0 || r.chevronEnd <= r.chevronStart) return;
+
+    // Keep this replacement one displayed character. Collapsed uses ">" and
+    // expanded uses "▾" so the command line does not shift.
+    if ((r.chevronEnd - r.chevronStart) != static_cast<long>(newText.length())) {
+        return;
+    }
+
+    wxRichTextAttr chevronAttr = MakeMonoAttr(m_fileChipColor,
+                                              ResolveBaseFontSize(m_displayCtrl),
+                                              wxFONTSTYLE_ITALIC);
+
+    m_displayCtrl->SetInsertionPoint(r.chevronStart);
+    m_displayCtrl->Remove(r.chevronStart, r.chevronEnd);
+    m_displayCtrl->BeginStyle(chevronAttr);
+    m_displayCtrl->WriteText(newText);
+    m_displayCtrl->EndStyle();
+
+    r.chevronEnd = r.chevronStart + static_cast<long>(newText.length());
+}
 void ChatDisplay::HandleToolBlockAffordanceClick(size_t idx)
 {
     if (idx >= m_toolBlocks.size()) return;
@@ -809,6 +1093,7 @@ void ChatDisplay::HandleToolBlockAffordanceClick(size_t idx)
             ShiftOtherRegions(&r, pivot, delta);
         }
         SetAffordanceText(r, "[show details]");
+        SetChevronText(r, ">");
         r.expanded = false;
     } else {
         // ── Expand ──
@@ -826,6 +1111,7 @@ void ChatDisplay::HandleToolBlockAffordanceClick(size_t idx)
         ShiftOtherRegions(&r, pivot, delta);
 
         SetAffordanceText(r, "[hide details]");
+        SetChevronText(r, wxString::FromUTF8("\xE2\x96\xBE"));  // ▾
         r.expanded = true;
     }
 
@@ -938,22 +1224,15 @@ void ChatDisplay::DisplayUserMessage(const std::string& text,
     m_displayCtrl->EndStyle();
 
     // ── Inline image thumbnails ──────────────────────────────────
+    // Cached: the decode-at-full-resolution + high-quality rescale only
+    // happens the first time an image is seen; replays load the small
+    // cached PNG (see LoadImageThumbnailCached at the top of the file).
     for (const auto& imgPath : inlineImages) {
         wxImage img;
-        if (img.LoadFile(wxString::FromUTF8(imgPath))) {
-            int w = img.GetWidth(), h = img.GetHeight();
-            if (w <= 0 || h <= 0) continue;  // Skip corrupt/empty images
-
-            // Scale to thumbnail preserving aspect ratio
-            if (w > kImageMaxWidth || h > kImageMaxHeight) {
-                double scaleW = static_cast<double>(kImageMaxWidth) / w;
-                double scaleH = static_cast<double>(kImageMaxHeight) / h;
-                double scale = (scaleW < scaleH) ? scaleW : scaleH;
-                int newW = std::max(1, static_cast<int>(w * scale));
-                int newH = std::max(1, static_cast<int>(h * scale));
-                img.Rescale(newW, newH, wxIMAGE_QUALITY_HIGH);
-            }
+        if (LoadImageThumbnailCached(imgPath, kImageMaxWidth,
+                                     kImageMaxHeight, img)) {
             m_displayCtrl->WriteImage(img);
+            TagLastWrittenImage(imgPath);
             m_displayCtrl->WriteText("\n");
         }
     }
@@ -962,6 +1241,280 @@ void ChatDisplay::DisplayUserMessage(const std::string& text,
     m_displayCtrl->WriteText("\n");
 
     EnsureVisibleAtEnd();
+}
+
+// ─── Image thumbnail source tagging + context menu ───────────────
+
+void ChatDisplay::TagLastWrittenImage(const std::string& absPath)
+{
+    if (absPath.empty()) return;
+
+    // WriteImage leaves the insertion point just past the image
+    // object (images occupy exactly one buffer position), so the
+    // leaf at insertion-1 is the image we just wrote.
+    const long pos = m_displayCtrl->GetInsertionPoint();
+    if (pos <= 0) return;
+
+    wxRichTextObject* obj =
+        m_displayCtrl->GetBuffer().GetLeafObjectAtPosition(pos - 1);
+    if (auto* img = wxDynamicCast(obj, wxRichTextImage)) {
+        img->GetProperties().SetProperty(
+            "lb:src", wxString::FromUTF8(absPath));
+        // Wake the motion handler's fast path: hover over this
+        // thumbnail should now show the hand cursor.
+        m_hasImageThumbnails = true;
+    }
+}
+
+void ChatDisplay::OnImageContextMenu(wxContextMenuEvent& event)
+{
+    // Keyboard menu key sends wxDefaultPosition — nothing to hit-test.
+    const wxPoint screenPt = event.GetPosition();
+    if (screenPt == wxDefaultPosition) {
+        event.Skip();
+        return;
+    }
+
+    const wxPoint pt = m_displayCtrl->ScreenToClient(screenPt);
+    long pos = 0;
+    const auto hit = m_displayCtrl->HitTest(pt, &pos);
+    if (hit != wxTE_HT_ON_TEXT && hit != wxTE_HT_BEFORE) {
+        event.Skip();
+        return;
+    }
+
+    const wxString src = ImageSrcAtPosition(pos);
+    if (src.empty()) {
+        event.Skip();   // not one of our thumbnails — default behavior
+        return;
+    }
+
+    enum { kIdView = 1, kIdSaveAs, kIdShowInFolder };
+    wxMenu menu;
+    menu.Append(kIdView,         "View image");
+    menu.Append(kIdSaveAs,       "Save image as...");
+    menu.Append(kIdShowInFolder, "Show in folder");
+
+    const int sel =
+        m_displayCtrl->GetPopupMenuSelectionFromUser(menu, pt);
+    if      (sel == kIdView)         ShowImageViewer(src);
+    else if (sel == kIdSaveAs)       SaveImageAs(src);
+    else if (sel == kIdShowInFolder) ShowInFolder(src);
+}
+
+wxString ChatDisplay::ImageSrcAtPosition(long pos) const
+{
+    // The image is a single-position leaf; depending on which half of
+    // the cell was clicked, HitTest may resolve to the position after
+    // it.  Check the resolved position first, then one back.
+    for (long p : { pos, pos - 1 }) {
+        if (p < 0) continue;
+        wxRichTextObject* obj =
+            m_displayCtrl->GetBuffer().GetLeafObjectAtPosition(p);
+        if (auto* img = wxDynamicCast(obj, wxRichTextImage)) {
+            const wxString src =
+                img->GetProperties().GetPropertyString("lb:src");
+            if (!src.empty()) return src;
+        }
+    }
+    return wxString();
+}
+
+void ChatDisplay::ShowImageViewer(const wxString& srcPath)
+{
+    if (!wxFileExists(srcPath)) {
+        wxMessageBox("The image file no longer exists:\n" + srcPath,
+                     "View image", wxOK | wxICON_INFORMATION,
+                     m_displayCtrl);
+        return;
+    }
+
+    // Full-resolution load — the chat shows a <=300px cached
+    // thumbnail, so the viewer is where the real pixels appear.
+    wxImage full;
+    {
+        wxLogNull quiet;   // odd EXIF/ICC chunks shouldn't spam dialogs
+        if (!full.LoadFile(srcPath) || !full.IsOk()) {
+            wxBell();
+            return;
+        }
+    }
+
+    wxWindow* top = wxGetTopLevelParent(m_displayCtrl);
+    if (!top) top = m_displayCtrl;
+
+    // Fit within ~85% of the frame client area, minus a reservation
+    // for the close-X header row and padding ring.  Downscale only —
+    // upscaling past native resolution just trades sharpness for
+    // size, and native is almost always larger than the thumbnail.
+    const wxSize avail = top->GetClientSize();
+    const int maxW = std::max(320, (int)(avail.GetWidth()  * 0.85));
+    const int maxH = std::max(240, (int)(avail.GetHeight() * 0.85) - 48);
+
+    int w = full.GetWidth();
+    int h = full.GetHeight();
+    if (w > maxW || h > maxH) {
+        const double scale = std::min((double)maxW / (double)w,
+                                      (double)maxH / (double)h);
+        w = std::max(1, (int)(w * scale));
+        h = std::max(1, (int)(h * scale));
+        full.Rescale(w, h, wxIMAGE_QUALITY_HIGH);
+    }
+
+    // Borderless lightbox over the modal scrim: the scrim dims the
+    // frame, the dialog is just the image on the chat background
+    // with a thin padding ring and a close "X" in the top-right
+    // corner.  Any click or key dismisses it; the X is an explicit
+    // affordance so the exit is discoverable.
+    wxDialog dlg(top, wxID_ANY, wxEmptyString,
+                 wxDefaultPosition, wxDefaultSize, wxBORDER_NONE);
+    const wxColour bg = m_displayCtrl->GetBackgroundColour();
+    const wxColour fg = m_displayCtrl->GetForegroundColour();
+    dlg.SetBackgroundColour(bg);
+
+    // Muted at rest, full foreground on hover — works in both dark
+    // and light themes since it's derived from the live palette.
+    const wxColour mutedFg((fg.Red()   + bg.Red())   / 2,
+                           (fg.Green() + bg.Green()) / 2,
+                           (fg.Blue()  + bg.Blue())  / 2);
+
+    auto* closeX = new wxStaticText(&dlg, wxID_ANY, wxString(L"\u2715"));
+    closeX->SetForegroundColour(mutedFg);
+    closeX->SetBackgroundColour(bg);
+    {
+        wxFont f = closeX->GetFont();
+        f.SetPointSize(f.GetPointSize() + 3);
+        closeX->SetFont(f);
+    }
+    closeX->SetCursor(wxCursor(wxCURSOR_HAND));
+    closeX->SetToolTip("Close (Esc)");
+    closeX->Bind(wxEVT_ENTER_WINDOW, [closeX, fg](wxMouseEvent& e) {
+        closeX->SetForegroundColour(fg);
+        closeX->Refresh();
+        e.Skip();
+    });
+    closeX->Bind(wxEVT_LEAVE_WINDOW, [closeX, mutedFg](wxMouseEvent& e) {
+        closeX->SetForegroundColour(mutedFg);
+        closeX->Refresh();
+        e.Skip();
+    });
+
+    auto* bitmap = new wxStaticBitmap(&dlg, wxID_ANY, wxBitmap(full));
+
+    auto* topRow = new wxBoxSizer(wxHORIZONTAL);
+    topRow->AddStretchSpacer(1);
+    topRow->Add(closeX, 0, wxTOP | wxRIGHT, 10);
+
+    auto* sizer = new wxBoxSizer(wxVERTICAL);
+    sizer->Add(topRow, 0, wxEXPAND);
+    sizer->Add(bitmap, 0, wxLEFT | wxRIGHT | wxBOTTOM, 12);
+    dlg.SetSizerAndFit(sizer);
+    dlg.CentreOnParent();
+
+    const auto dismiss = [&dlg](wxMouseEvent&) {
+        dlg.EndModal(wxID_OK);
+    };
+    closeX->Bind(wxEVT_LEFT_UP, dismiss);
+    bitmap->Bind(wxEVT_LEFT_UP, dismiss);
+    dlg.Bind(wxEVT_LEFT_UP, dismiss);
+
+    // Right-click parity with the chat thumbnail: the same Save /
+    // Show-in-folder menu is available while the image is expanded
+    // ("View image" is omitted — it is already in view).  Bound on
+    // both the bitmap and the dialog; wxContextMenuEvent propagates,
+    // and the handled event is not Skip()ed, so it fires once.
+    // srcPath is captured by value: the viewer runs a nested modal
+    // loop and must not depend on the caller's reference outliving
+    // menu callbacks.
+    const wxString viewerSrc = srcPath;
+    const auto contextMenu =
+        [this, &dlg, viewerSrc](wxContextMenuEvent&) {
+            enum { kIdSaveAs = 1, kIdShowInFolder };
+            wxMenu menu;
+            menu.Append(kIdSaveAs,       "Save image as...");
+            menu.Append(kIdShowInFolder, "Show in folder");
+
+            const int sel = dlg.GetPopupMenuSelectionFromUser(menu);
+            if      (sel == kIdSaveAs)       SaveImageAs(viewerSrc);
+            else if (sel == kIdShowInFolder) ShowInFolder(viewerSrc);
+        };
+    bitmap->Bind(wxEVT_CONTEXT_MENU, contextMenu);
+    dlg.Bind(wxEVT_CONTEXT_MENU, contextMenu);
+    dlg.Bind(wxEVT_CHAR_HOOK, [&dlg](wxKeyEvent& e) {
+        const int key = e.GetKeyCode();
+        if (key == WXK_ESCAPE || key == WXK_RETURN || key == WXK_SPACE) {
+            dlg.EndModal(wxID_CANCEL);
+        } else {
+            e.Skip();
+        }
+    });
+
+    LbShowModalWithScrim(*top, dlg);
+}
+
+void ChatDisplay::SaveImageAs(const wxString& srcPath)
+{
+    if (!wxFileExists(srcPath)) {
+        wxMessageBox("The image file no longer exists:\n" + srcPath,
+                     "Save image", wxOK | wxICON_INFORMATION,
+                     m_displayCtrl);
+        return;
+    }
+
+    const wxFileName fn(srcPath);
+    const wxString ext = fn.GetExt().Lower();
+    const wxString wildcard = ext.IsEmpty()
+        ? wxString("All files (*.*)|*.*")
+        : wxString::Format("%s image (*.%s)|*.%s|All files (*.*)|*.*",
+                           ext.Upper(), ext, ext);
+
+    wxFileDialog dlg(m_displayCtrl, "Save image as", "",
+                     fn.GetFullName(), wildcard,
+                     wxFD_SAVE | wxFD_OVERWRITE_PROMPT);
+    if (dlg.ShowModal() != wxID_OK) return;
+
+    if (!wxCopyFile(srcPath, dlg.GetPath(), /*overwrite*/ true)) {
+        wxMessageBox("Could not write:\n" + dlg.GetPath(),
+                     "Save image", wxOK | wxICON_ERROR, m_displayCtrl);
+    }
+}
+
+void ChatDisplay::ShowInFolder(const wxString& path)
+{
+#ifdef __WXMSW__
+    // Native separators — explorer's /select rejects forward slashes.
+    const wxString native = wxFileName(path).GetFullPath();
+    wxExecute("explorer /select,\"" + native + "\"", wxEXEC_ASYNC);
+#else
+    wxLaunchDefaultApplication(wxFileName(path).GetPath());
+#endif
+}
+
+void ChatDisplay::DisplayInlineImages(const std::vector<std::string>& imagePaths)
+{
+    if (imagePaths.empty()) return;
+
+    SetInsertionPointToEnd();
+
+    bool wroteAny = false;
+    for (const auto& imgPath : imagePaths) {
+        // Cached thumbnail path — same rules as the user-attachment
+        // thumbnails in DisplayUserMessage (see LoadImageThumbnailCached
+        // at the top of the file).
+        wxImage img;
+        if (!LoadImageThumbnailCached(imgPath, kImageMaxWidth,
+                                      kImageMaxHeight, img)) continue;
+
+        m_displayCtrl->WriteImage(img);
+        TagLastWrittenImage(imgPath);
+        m_displayCtrl->WriteText("\n");
+        wroteAny = true;
+    }
+
+    if (wroteAny) {
+        m_displayCtrl->WriteText("\n");
+        EnsureVisibleAtEnd();
+    }
 }
 
 void ChatDisplay::DisplaySystemMessage(const std::string& text)
@@ -1022,6 +1575,18 @@ void ChatDisplay::DisplayToolBlock(const ToolBlock& block, bool startExpanded)
     int baseSize = baseFont.GetPointSize();
     if (baseSize <= 0) baseSize = 14;
 
+    const bool hasDetails = !block.body.empty() || !block.errorBody.empty();
+
+    // Initial expanded state is decided by caller intent (startExpanded)
+    // OR by automatic failure classification.  User-typed slash commands
+    // pass startExpanded=true so they always show output; agent paths
+    // pass the default (false), letting failures auto-expand while
+    // successes start collapsed.
+    bool expanded = hasDetails && (startExpanded || IsToolBlockFailure(block));
+
+    long commandChevronStart = -1;
+    long commandChevronEnd   = -1;
+
     // ── Header: "<icon> <toolName>  ·  <chip>  ·  <chip> ..."
     // Bold, system color, base font.  Chips are ·-separated using
     // U+00B7 MIDDLE DOT so they visually float above the block.
@@ -1046,12 +1611,33 @@ void ChatDisplay::DisplayToolBlock(const ToolBlock& block, bool startExpanded)
     }
 
     // ── Command echo: "> <commandEcho>" — monospace, system color.
+    // The leading chevron is also a details toggle when body output exists:
+    //   >  collapsed
+    //   ▾  expanded
     if (!block.commandEcho.empty()) {
         wxRichTextAttr cmdAttr = MakeMonoAttr(m_systemColor, baseSize);
+        wxRichTextAttr chevronAttr = hasDetails
+            ? MakeMonoAttr(m_fileChipColor, baseSize, wxFONTSTYLE_ITALIC)
+            : cmdAttr;
+
+        const wxString chevronText = (hasDetails && expanded)
+            ? wxString::FromUTF8("\xE2\x96\xBE")  // ▾
+            : wxString(">");
+
+        m_displayCtrl->BeginStyle(chevronAttr);
+        commandChevronStart = m_displayCtrl->GetInsertionPoint();
+        m_displayCtrl->WriteText(chevronText);
+        commandChevronEnd = m_displayCtrl->GetInsertionPoint();
+        m_displayCtrl->EndStyle();
 
         m_displayCtrl->BeginStyle(cmdAttr);
-        m_displayCtrl->WriteText(wxString::FromUTF8("> " + block.commandEcho + "\n"));
+        m_displayCtrl->WriteText(wxString::FromUTF8(std::string(" ") + block.commandEcho + "\n"));
         m_displayCtrl->EndStyle();
+
+        if (!hasDetails) {
+            commandChevronStart = -1;
+            commandChevronEnd   = -1;
+        }
     }
 
     // ── Presented files — always visible, even when details are
@@ -1070,13 +1656,8 @@ void ChatDisplay::DisplayToolBlock(const ToolBlock& block, bool startExpanded)
     // empty this is a zero-length region and we skip the affordance
     // entirely (nothing to hide/show).
     //
-    // Initial expanded state is decided by caller intent (startExpanded)
-    // OR by automatic failure classification.  User-typed slash commands
-    // pass startExpanded=true so they always show output; agent paths
-    // pass the default (false), letting failures auto-expand while
-    // successes start collapsed.
-    bool expanded = startExpanded || IsToolBlockFailure(block);
-
+    // Initial expanded state was decided before the command echo so the
+    // command chevron can render with the correct direction.
     long bodyStart = m_displayCtrl->GetInsertionPoint();
     long bodyChars = expanded
         ? WriteToolBodyAtCursor(block.body, block.errorBody)
@@ -1104,6 +1685,8 @@ void ChatDisplay::DisplayToolBlock(const ToolBlock& block, bool startExpanded)
         ToolBlockRegion region;
         region.affordanceStart = affStart;
         region.affordanceEnd   = affEnd;
+        region.chevronStart    = commandChevronStart;
+        region.chevronEnd      = commandChevronEnd;
         region.bodyStart       = bodyStart;
         region.bodyEnd         = bodyEnd;
         region.body            = block.body;
@@ -1355,6 +1938,21 @@ void ChatDisplay::DisplayAssistantDelta(const std::string& delta)
             const size_t kHoldBack = thought_end_marker.size() - 1;  // 7
             size_t safeLen = (combined.size() > kHoldBack)
                            ? combined.size() - kHoldBack : 0;
+
+            // Don't cut a UTF-8 sequence in half.  safeLen is a byte
+            // offset; if it lands on a continuation byte (10xxxxxx),
+            // back off until the cut sits on a lead/ASCII byte so the
+            // entire partial character moves into the probe buffer.
+            // wxString::FromUTF8 on wxMSW returns an EMPTY string for
+            // invalid UTF-8 — without this, a chunk of thought text
+            // ending mid-character would silently vanish (and the
+            // orphaned lead byte would corrupt the next chunk too).
+            // Hits regularly on models that think in non-ASCII.
+            while (safeLen > 0 &&
+                   (static_cast<unsigned char>(combined[safeLen]) & 0xC0) == 0x80) {
+                --safeLen;
+            }
+
             std::string safeToRender = combined.substr(0, safeLen);
             m_thinkEndProbeBuffer = combined.substr(safeLen);
 
@@ -1580,6 +2178,55 @@ void ChatDisplay::DisplayAssistantMessage(const std::string& modelName,
     HideRichTextCaret(m_displayCtrl);
 }
 
+void ChatDisplay::BeginReplayBatch()
+{
+    if (!m_displayCtrl) return;
+
+    if (m_replayBatchDepth++ == 0) {
+        m_replayBatchNeedsScroll = false;
+        m_displayCtrl->Freeze();
+        m_replayBatchFrozen = true;
+
+        // Put the markdown renderer in bulk mode for the replay: it skips
+        // its per-message partial-line preview and per-call ShowPosition,
+        // the latter of which would otherwise force one layout pass per
+        // message over a growing document (O(n^2) replay). The single
+        // scroll-to-end is handled by EndReplayBatch.
+        if (m_markdownRenderer) m_markdownRenderer->SetBulkMode(true);
+    }
+}
+
+void ChatDisplay::EndReplayBatch()
+{
+    if (m_replayBatchDepth <= 0) return;
+
+    --m_replayBatchDepth;
+    if (m_replayBatchDepth > 0) return;
+
+    // Replay finished — return the renderer to live-streaming behaviour.
+    if (m_markdownRenderer) m_markdownRenderer->SetBulkMode(false);
+
+    if (m_displayCtrl) {
+        if (m_replayBatchNeedsScroll) {
+            m_displayCtrl->SetInsertionPointEnd();
+            m_displayCtrl->ShowPosition(m_displayCtrl->GetLastPosition());
+        }
+        HideRichTextCaret(m_displayCtrl);
+
+        if (m_replayBatchFrozen) {
+            m_displayCtrl->Thaw();
+            m_replayBatchFrozen = false;
+        }
+
+        // Thaw usually schedules a repaint, but Refresh() keeps the end of a
+        // large restored conversation visually deterministic across wx/MSW
+        // builds after a long frozen replay.
+        m_displayCtrl->Refresh();
+    }
+
+    m_replayBatchNeedsScroll = false;
+}
+
 void ChatDisplay::Clear()
 {
     // Must stop the timer before wiping the document, otherwise the next
@@ -1590,6 +2237,7 @@ void ChatDisplay::Clear()
     // is cleared — drop them so the click handler can't hit stale regions.
     m_fileChips.clear();
     m_toolBlocks.clear();
+    m_hasImageThumbnails = false;
 
     // Approval card state.  If Clear() ever fires while an approval row
     // is live (unusual, but possible if a new chat is started without
@@ -1774,8 +2422,13 @@ void ChatDisplay::SetInsertionPointToEnd()
 
 void ChatDisplay::EnsureVisibleAtEnd()
 {
-    if (m_displayCtrl) {
-        m_displayCtrl->ShowPosition(m_displayCtrl->GetLastPosition());
-        HideRichTextCaret(m_displayCtrl);
+    if (!m_displayCtrl) return;
+
+    if (IsReplayBatchActive()) {
+        m_replayBatchNeedsScroll = true;
+        return;
     }
+
+    m_displayCtrl->ShowPosition(m_displayCtrl->GetLastPosition());
+    HideRichTextCaret(m_displayCtrl);
 }

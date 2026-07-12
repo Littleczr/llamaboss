@@ -35,6 +35,44 @@ public:
                             const std::vector<std::string>& inlineImages = {});
     void DisplaySystemMessage(const std::string& text);
 
+    // Render image thumbnails at the chat tail, outside any message
+    // prefix.  Used for assistant-generated images (image-output
+    // models): after DisplayAssistantComplete on the live path, and
+    // after DisplayAssistantMessage on conversation replay.  Absolute
+    // file paths; unloadable/corrupt entries are skipped silently —
+    // a deleted workflow folder must not break conversation replay.
+    // Scaling matches DisplayUserMessage's thumbnail rules.
+    void DisplayInlineImages(const std::vector<std::string>& imagePaths);
+
+private:
+    // ── Image thumbnail context menu ─────────────────────────────
+    // WriteImage embeds a bitmap with no memory of its source file,
+    // so every thumbnail we write is tagged with its absolute source
+    // path via wxRichTextProperties on the wxRichTextImage object
+    // itself.  Properties travel with the object, so later
+    // insertions shifting buffer positions can't orphan the mapping
+    // — no positional registry to maintain.  The context-menu
+    // handler hit-tests the click, reads the tag, and offers
+    // "Save image as..." / "Show in folder".  Untagged positions
+    // Skip() through to the control's default menu.
+    void TagLastWrittenImage(const std::string& absPath);
+    void OnImageContextMenu(wxContextMenuEvent& event);
+    void SaveImageAs(const wxString& srcPath);
+    void ShowInFolder(const wxString& path);
+
+    // Resolves the tagged source path of the thumbnail at a buffer
+    // position ("" when the position is not one of our thumbnails).
+    // Shared by the context menu and the left-click viewer so both
+    // use the same off-by-one-tolerant leaf lookup.
+    wxString ImageSrcAtPosition(long pos) const;
+
+    // Left-click lightbox: shows the full-resolution image scaled to
+    // fit the frame, over the modal scrim.  Dismissed by click,
+    // Escape, Enter, or Space.
+    void ShowImageViewer(const wxString& srcPath);
+
+public:
+
     // ── Tool-result rendering ────────────────────────────────────
     // A ToolBlock is the generic payload for any slash-command or
     // harness-driven tool invocation.  Rendering is four-part:
@@ -127,6 +165,14 @@ public:
     void Clear();
     void ScrollToBottom();
 
+    // Long saved conversations can be expensive to replay into wxRichTextCtrl
+    // because each rendered message normally scrolls/repaints the control.
+    // Batch replay freezes the transcript and defers the final scroll until the
+    // whole conversation has been rebuilt.
+    void BeginReplayBatch();
+    void EndReplayBatch();
+    bool IsReplayBatchActive() const { return m_replayBatchDepth > 0; }
+
     // Configuration methods for customizing appearance
     void SetUserColor(const wxColour& color);
     void SetAssistantColor(const wxColour& color);
@@ -147,6 +193,12 @@ private:
     wxColour m_systemColor;
     wxColour m_thoughtColor;
     wxColour m_stdoutColor;             // Body text for /cmd stdout and future tool blocks
+
+    // Replay batching suppresses repeated scroll/repaint work while a saved
+    // conversation is being rebuilt into the transcript control.
+    int  m_replayBatchDepth = 0;
+    bool m_replayBatchFrozen = false;
+    bool m_replayBatchNeedsScroll = false;
 
     // State tracking for assistant messages
     bool m_isInThoughtBlock;            // True if we are currently printing thought text
@@ -199,6 +251,15 @@ private:
         FileAction    action = FileAction::SaveAs;
     };
     std::vector<FileChipRegion> m_fileChips;
+
+    // True once any tagged image thumbnail exists in the transcript.
+    // Consulted by the wxEVT_MOTION fast path: a transcript with no
+    // interactive ranges skips HitTest entirely, and thumbnails are
+    // an interactive range too (hover shows the hand cursor, click
+    // opens the lightbox viewer).  Set by TagLastWrittenImage, reset
+    // by Clear().  Never set back to false while the document lives —
+    // images aren't individually removed, so no per-image tracking.
+    bool m_hasImageThumbnails = false;
     wxColour                    m_fileChipColor = wxColour(170, 190, 230);  // soft blue
 
     // Persistence context — set by the frame around streaming.
@@ -222,6 +283,8 @@ private:
     struct ToolBlockRegion {
         long affordanceStart;   // inclusive — first char of bracketed label
         long affordanceEnd;     // exclusive — one past last char
+        long chevronStart = -1; // optional command-echo chevron toggle
+        long chevronEnd   = -1; // exclusive — one past chevron char
         long bodyStart;         // inclusive — start of body+errorBody region
         long bodyEnd;           // exclusive — end of region (== bodyStart when collapsed)
         std::string body;       // stashed for re-render on expand
@@ -274,6 +337,10 @@ private:
     // the replacement does not shift any registered rich-text ranges.
     void SetAffordanceText(ToolBlockRegion& r, const wxString& newText);
 
+    // Swaps the optional command-echo chevron between collapsed ">" and
+    // expanded "▾". Both are one displayed character, so ranges stay stable.
+    void SetChevronText(ToolBlockRegion& r, const wxString& newText);
+
     // Shifts all region positions >= pivot by delta, EXCEPT positions
     // belonging to *skip (which the caller updates manually).  Used
     // around toggle so the current region's own position update isn't
@@ -287,8 +354,10 @@ private:
     void SetInsertionPointToEnd();
     void EnsureVisibleAtEnd();
 
-    // Image thumbnail limits for inline display
-    static constexpr int kImageMaxWidth  = 300;
-    static constexpr int kImageMaxHeight = 300;
+    // Image thumbnail limits for inline display.
+    // Bumped from 300 — at modern resolutions (1440p ultrawide and up)
+    // 300px thumbnails read as postage stamps.
+    static constexpr int kImageMaxWidth  = 440;
+    static constexpr int kImageMaxHeight = 440;
 };
 

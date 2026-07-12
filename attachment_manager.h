@@ -19,7 +19,7 @@ namespace Poco { class Logger; }
 // ═══════════════════════════════════════════════════════════════════
 
 struct AttachmentInfo {
-    enum class Kind { Image, TextFile, PdfFile, SpreadsheetFile, DocxFile };
+    enum class Kind { Image, TextFile, PdfFile, SpreadsheetFile, DocxFile, CsvFile, ZipFile };
     Kind        kind;
     std::string filename;     // "report.cpp", "photo.png"
     std::string mimeType;     // "text/x-c++src", "image/png"
@@ -38,7 +38,7 @@ struct AttachmentInfo {
 // ═══════════════════════════════════════════════════════════════════
 
 struct PendingAttachment {
-    enum class Type { Image, TextFile, PdfFile, SpreadsheetFile, DocxFile };
+    enum class Type { Image, TextFile, PdfFile, SpreadsheetFile, DocxFile, CsvFile, ZipFile };
     Type        type;
     std::string data;           // base64 for images, raw text for text files
     std::string name;           // display filename
@@ -74,6 +74,17 @@ public:
                                const std::string& toolRelativePath = std::string());
     bool AttachDocxFile(const std::string& filePath,
                         const std::string& toolRelativePath = std::string());
+    // CSV files route like spreadsheets (workspace import + tool hint),
+    // NOT like text files (inline bake).  Baking a large CSV verbatim
+    // floods small-model context and invites the model to regurgitate
+    // it back through `write` when csv_inspect can't find the file.
+    bool AttachCsvFile(const std::string& filePath,
+                       const std::string& toolRelativePath = std::string());
+    // ZIP archives route like CSV/DOCX (workspace import + tool hint),
+    // NOT an inline bake.  The archive is never decompressed at attach
+    // time; the model is handed a safe zip_inspect tool argument.
+    bool AttachZipFile(const std::string& filePath,
+                       const std::string& toolRelativePath = std::string());
 
     // ── Remove / clear ────────────────────────────────────────────
 
@@ -88,13 +99,15 @@ public:
     bool   HasPdfFile()  const;    // true if any pending item is a PDF file
     bool   HasSpreadsheetFile() const; // true if any pending item is a spreadsheet
     bool   HasDocxFile()        const; // true if any pending item is a Word document
+    bool   HasCsvFile()         const; // true if any pending item is a CSV file
+    bool   HasZipFile()         const; // true if any pending item is a ZIP archive
     size_t GetCount()    const { return m_pending.size(); }
 
     const PendingAttachment& GetAt(size_t index) const { return m_pending.at(index); }
 
     // Display label for the attachment indicator bar.
-    //   1 item:   "  🖼  photo.png" / "  📄  main.cpp"
-    //   N items:  "  📎  3 files: photo.png, main.cpp, utils.h"
+    //   1 item:   "  [img]  photo.png" / "  [file] main.cpp"
+    //   N items:  "  [files] 3 files: photo.png, main.cpp, utils.h"
     //   0 items:  ""
     std::string GetDisplayLabel() const;
 
@@ -129,8 +142,21 @@ public:
     std::string BakeDocxFilesIntoMessage(const std::string& userText,
                                          bool agentModeEnabled) const;
 
-    // Injects ALL pending images into the Ollama /api/chat request JSON,
-    // converting the last user message's "content" to a multimodal array.
+    // Bakes CSV routing hints into the message without dumping the raw
+    // rows into the visible chat. In agent mode this gives the model an
+    // exact csv_inspect tool path to use before answering.
+    std::string BakeCsvFilesIntoMessage(const std::string& userText,
+                                        bool agentModeEnabled) const;
+
+    // Bakes ZIP archive routing hints into the message without
+    // decompressing anything. In agent mode this gives the model an
+    // exact zip_inspect tool path to call before describing the archive.
+    std::string BakeZipFilesIntoMessage(const std::string& userText,
+                                        bool agentModeEnabled) const;
+
+    // Injects ALL pending images into the OpenAI-compatible / llama.cpp
+    // server request JSON, converting the last user message's "content"
+    // string to an image_url/text multimodal array.
     std::string InjectImagesIntoRequest(const std::string& requestJson) const;
 
     // ── Image persistence (Phase 3) ──────────────────────────────
@@ -139,7 +165,9 @@ public:
     // attachDir:       absolute path to the target directory (created if needed)
     // relativePrefix:  path prefix for storagePath (e.g. "attachments/chat_abc12345")
     // messageIndex:    message index used in filename (e.g. 2 → "2_photo.png")
-    // infoVec:         AttachmentInfo vector — storagePath is set for each saved image
+    // infoVec:         GetAttachmentInfo() result for the same pending list;
+    //                  this vector must be index-parallel to m_pending because
+    //                  storagePath is set on the matching image entries.
     // Returns true if all images saved successfully.
     bool SaveImagesToDisk(const std::string& attachDir,
                           const std::string& relativePrefix,
@@ -153,10 +181,16 @@ public:
     static bool IsPdfFile(const std::string& path);
     static bool IsSpreadsheetFile(const std::string& path);
     static bool IsDocxFile(const std::string& path);
+    // NOTE: callers must test IsCsvFile BEFORE IsTextFile when
+    // classifying a dropped/picked file — CSV gets workspace routing,
+    // and IsTextFile no longer claims the extension.
+    static bool IsCsvFile(const std::string& path);
+    static bool IsZipFile(const std::string& path);
     static std::string GuessMimeType(const std::string& filename);
 
-    static constexpr size_t kMaxTextFileBytes = 100 * 1024;  // 100 KB
-    static constexpr size_t kMaxAttachments   = 10;           // Max pending files
+    static constexpr size_t kMaxTextFileBytes = 100 * 1024;        // 100 KB
+    static constexpr size_t kMaxImageBytes    = 50 * 1024 * 1024;  // 50 MB
+    static constexpr size_t kMaxAttachments   = 10;                // Max pending files
 
 private:
     std::vector<PendingAttachment> m_pending;

@@ -31,6 +31,12 @@
 // as opaque byte sequences -- whatever the model puts between the
 // sentinels is what we use, including embedded newlines.
 //
+// Note: the shared tool-call parser trims the outer <args> payload before
+// EditFile sees it. That means a NEW block cannot intentionally end with
+// trailing whitespace/newlines at the very end of <args>; preserve final
+// newlines by including them inside the replacement text before the closing
+// args boundary rather than relying on whitespace after it.
+//
 // "On its own line" means the sentinel is the entire line: the
 // preceding character is '\n' (or the sentinel is at the start of
 // args after the path), and the following character is '\n' (or
@@ -83,7 +89,7 @@
 // up to 3 lines of context above and below.  bodyLang is "diff" so
 // the markdown renderer's diff highlighting picks it up.  Capped
 // at ~20 lines visible; longer changes get a "[... N more lines
-// unchanged ...]" truncation marker.
+// omitted ...]" truncation marker.
 //
 #pragma once
 

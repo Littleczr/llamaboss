@@ -4,10 +4,10 @@
 for local LLMs, real files, projects, reusable skills, and approval-gated
 tools.
 
-> Current milestone: **LlamaBoss Beta v0.1.0**
+> Current milestone: **LlamaBoss Beta v0.1.9**
 
 <p align="center">
-  <img src="screenshot_beta_v0.1.0.jpg" alt="LlamaBoss Beta v0.1.0 screenshot" width="100%">
+  <img src="screenshot_beta_v0.1.0.jpg" alt="LlamaBoss Beta v0.1.9 screenshot (app UI)" width="100%">
 </p>
 
 LlamaBoss is designed for people who want an AI assistant that can help with
@@ -17,20 +17,34 @@ while keeping control on the local machine.
 ## What LlamaBoss does
 
 - Runs as a native Windows desktop app built with C++ and wxWidgets
-- Uses a local llama.cpp-style model/server workflow
-- Chats with local GGUF models
-- Imports and works with local files
+- Uses an app-owned local llama.cpp-style model service (bundled runtimes in
+  release builds)
+- Supports multiple independent chat windows that can share one local-model
+  service
+- Chats with local GGUF models and configurable model folders
+- Supports OpenAI-compatible remote endpoints and Connections when you choose
+  to use them
+- Imports and works with local files, including PDF, DOCX, spreadsheet, CSV,
+  ZIP, and general document workflows
 - Creates per-chat workflow folders for generated artifacts
 - Supports long-lived Projects with their own files, notes, sources,
   templates, outputs, and workflows
 - Supports reusable global Skills for cross-project procedures
+- Includes Agent Mode with readable approval controls for tool actions
+- Includes Goals with multi-step progress and verification
 - Uses approval cards before risky actions such as script creation, script
   execution, deletion, package installation, and other controlled write
   operations
 - Provides helper tools for common office-style work: CSV, XLSX, PDF, DOCX,
   Python scripts, notes, and file operations
 
+## Download and docs
+
+- Website / installer: [https://llamaboss.com/](https://llamaboss.com/)
+- Product documentation: [https://llamaboss.com/docs/](https://llamaboss.com/docs/)
+
 ## Beta status
+
 
 LlamaBoss is currently beta software. The core direction is stable, but feature
 names, workflows, file handling, installer behavior, and UI details may change
@@ -45,10 +59,12 @@ copies of important documents.
 ### Local chat
 
 - Native desktop chat UI
+- Multiple independent windows sharing one local-model service
 - Streaming responses
-- Conversation history
+- Conversation history and search
 - Markdown-style rendering
-- File attachment support
+- File and vision/image attachment support
+- Context controls and KV-cache options
 - Per-chat workspace folders
 - Conversation deletion with associated workflow-folder cleanup
 
@@ -92,6 +108,18 @@ projects, such as:
 - Office automation patterns
 - Reusable prompts and tool procedures
 
+### Goals
+
+Goals let you track multi-step work with progress and verification instead of
+treating every request as a one-off chat turn.
+
+### Remote endpoints and Connections
+
+When you explicitly configure them, LlamaBoss can use OpenAI-compatible remote
+endpoints and Connections. Local-model conversations can remain on your
+computer; remote endpoints transmit the selected data needed for those
+requests.
+
 ### Notes
 
 LlamaBoss has both global notes and project notes.
@@ -105,6 +133,8 @@ LlamaBoss has both global notes and project notes.
 ### Tools and approvals
 
 LlamaBoss includes a structured tool system with approval-aware execution.
+Agent Mode can auto-run safer read-style actions while still requiring
+approval for higher-impact operations.
 
 Tool areas include:
 
@@ -236,7 +266,11 @@ Longer-term ideas:
 ## Privacy and safety direction
 
 LlamaBoss is designed around local-first operation, user-visible files, and
-approval-based actions. The goal is to make useful local automation approachable
+approval-based actions. Local-model conversations can remain on the computer.
+Remote endpoints and other explicit network features transmit selected data
+as required for those features. In the current version, direct Connection
+secrets are stored in a user-restricted local secrets file; environment-variable
+references are recommended when possible. The goal is useful local automation
 without hiding what the assistant is doing.
 
 ## License

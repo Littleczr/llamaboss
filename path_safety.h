@@ -64,4 +64,11 @@ std::string SanitizeFilename(const std::string& raw,
 std::wstring Utf8ToWide(const std::string& in);
 std::string  WideToUtf8(const std::wstring& in);
 
+// Normalized filesystem-path comparison for model/settings paths.
+// On Windows the comparison is case-insensitive; on other platforms it
+// remains case-sensitive. Empty paths never compare equal, so callers
+// do not accidentally treat two missing settings as a real model match.
+std::string NormalizeModelPathForCompare(const std::string& path);
+bool SameModelPath(const std::string& a, const std::string& b);
+
 } // namespace path_safety

@@ -41,8 +41,16 @@ struct ReviewChar {
 // make a simplistic allowlist checker unsafe.  They are still not
 // eligible for silent auto-run, but they now route to approval instead
 // of being blocked outright.
-constexpr std::array<ReviewChar, 8> kReviewOutsideQuotes = {{
-    { ';', "statement separator ';'" },
+//
+// NOTE: ';' used to live in this list (flagged unconditionally as a
+// "statement separator").  It has been promoted to a real statement
+// boundary — see ScanAndSplitStages — because reflexively gating every
+// semicolon punished the extremely common pattern of chaining several
+// already-read-only diagnostic commands (e.g. a preference assignment
+// followed by two Get- calls). Each ';'-separated statement is still
+// independently required to be read-only-safe; nothing about that
+// change widens what a single statement is allowed to do.
+constexpr std::array<ReviewChar, 7> kReviewOutsideQuotes = {{
     { '&', "call/background operator '&'" },
     { '>', "redirection '>'" },
     { '<', "redirection '<'" },
@@ -58,11 +66,34 @@ constexpr std::array<const char*, 3> kReviewDigraphs = {
     "@{"    // hashtable / expression-property literal
 };
 
+// ─── Narrow calculated-property allowance ───────────────────────
+// A Select-Object / Format-Table "calculated property" is a hashtable
+// literal shaped like:
+//     @{ N='Label' ; E={ <expression> } }
+// (N/Name/L/Label may be used interchangeably, as may E/Expression).
+// This is one of the most common PowerShell idioms for producing
+// readable diagnostic output (disk space in GB, file size in MB,
+// etc.) and models reach for it constantly on ordinary read-only
+// inspection tasks. TryConsumeCalculatedProperty recognizes ONLY this
+// exact narrow shape, with the expression body restricted to a small
+// safe grammar (property access off $_, numeric literals with PS size
+// suffixes, arithmetic, and a short allowlist of static math methods).
+// Anything that doesn't match this shape falls straight back to the
+// original behavior of gating on '@{' and the individual braces —
+// this is purely additive, never a relaxation for anything else.
+constexpr std::array<const char*, 4> kCalcPropNameKeys = { "N", "Name", "L", "Label" };
+constexpr std::array<const char*, 2> kCalcPropExprKeys = { "E", "Expression" };
+constexpr std::array<const char*, 1> kSafeStaticTypes   = { "math" };
+constexpr std::array<const char*, 4> kSafeStaticMethods = { "Round", "Floor", "Ceiling", "Truncate" };
+constexpr std::array<const char*, 5> kSizeSuffixes      = { "KB", "MB", "GB", "TB", "PB" };
+
 struct ScanResult {
-    bool                     ok = false;
-    bool                     requiresApproval = false;
-    std::string              reason;
-    std::vector<std::string> stages;
+    bool                                   ok = false;
+    bool                                   requiresApproval = false;
+    std::string                            reason;
+    // Top-level ';'-separated statements; each is itself a list of
+    // '|'-separated pipeline stages.
+    std::vector<std::vector<std::string>>  statements;
 };
 
 // ─── Helpers ────────────────────────────────────────────────────
@@ -86,6 +117,12 @@ bool EqualsCi(const std::string& s, const char* other) {
         ++i;
     }
     return other[i] == '\0' && i == s.size();
+}
+
+template <size_t N>
+bool CiInArray(const std::string& v, const std::array<const char*, N>& arr) {
+    for (const char* item : arr) if (EqualsCi(v, item)) return true;
+    return false;
 }
 
 std::string Trim(const std::string& s) {
@@ -164,8 +201,266 @@ void MarkApproval(ScanResult& out, const std::string& reason) {
     }
 }
 
+// ─── Safe-expression micro-grammar (calculated-property bodies) ──
+
+bool IsIdentStartChar(char c) { return std::isalpha((unsigned char)c) || c == '_'; }
+bool IsIdentChar(char c)      { return std::isalnum((unsigned char)c) || c == '_'; }
+
+void SkipWs(const std::string& s, size_t& i) {
+    while (i < s.size() && (s[i] == ' ' || s[i] == '\t' || s[i] == '\r' || s[i] == '\n')) ++i;
+}
+
+std::string ReadIdent(const std::string& s, size_t& i) {
+    size_t start = i;
+    if (i < s.size() && IsIdentStartChar(s[i])) {
+        ++i;
+        while (i < s.size() && IsIdentChar(s[i])) ++i;
+    }
+    return s.substr(start, i - start);
+}
+
+// A single- or double-quoted string literal. Double-quoted strings
+// containing '$' are rejected outright (interpolation risk) rather
+// than partially matched.
+bool TryMatchSafeStringLiteral(const std::string& s, size_t& i) {
+    size_t j = i;
+    if (j >= s.size()) return false;
+    if (s[j] == '\'') {
+        ++j;
+        while (j < s.size()) {
+            if (s[j] == '\'') {
+                if (j + 1 < s.size() && s[j + 1] == '\'') { j += 2; continue; }
+                ++j; i = j; return true;
+            }
+            ++j;
+        }
+        return false; // unterminated
+    }
+    if (s[j] == '"') {
+        ++j;
+        while (j < s.size()) {
+            if (s[j] == '"') { ++j; i = j; return true; }
+            if (s[j] == '$') return false; // interpolation risk
+            ++j;
+        }
+        return false; // unterminated
+    }
+    return false;
+}
+
+// $_.Prop.Prop... property-access chain.
+bool TryMatchDollarUnderscoreChain(const std::string& s, size_t& i) {
+    if (i + 1 >= s.size() || s[i] != '$' || s[i + 1] != '_') return false;
+    size_t j = i + 2;
+    while (j < s.size() && s[j] == '.') {
+        size_t k = j + 1;
+        std::string ident = ReadIdent(s, k);
+        if (ident.empty()) return false;
+        j = k;
+    }
+    i = j;
+    return true;
+}
+
+// Numeric literal with an optional PowerShell size suffix (1GB, 2.5MB).
+bool TryMatchNumberLiteral(const std::string& s, size_t& i) {
+    size_t j = i;
+    bool any = false;
+    while (j < s.size() && std::isdigit((unsigned char)s[j])) { ++j; any = true; }
+    if (j < s.size() && s[j] == '.') {
+        size_t k = j + 1;
+        bool anyFrac = false;
+        while (k < s.size() && std::isdigit((unsigned char)s[k])) { ++k; anyFrac = true; }
+        if (anyFrac) { j = k; any = true; }
+    }
+    if (!any) return false;
+
+    for (const char* suf : kSizeSuffixes) {
+        const size_t n = std::char_traits<char>::length(suf);
+        if (j + n <= s.size()) {
+            bool matched = true;
+            for (size_t t = 0; t < n; ++t) {
+                if (std::tolower((unsigned char)s[j + t]) != std::tolower((unsigned char)suf[t])) {
+                    matched = false;
+                    break;
+                }
+            }
+            if (matched && !(j + n < s.size() && IsIdentChar(s[j + n]))) {
+                i = j + n;
+                return true;
+            }
+        }
+    }
+    i = j;
+    return true;
+}
+
+bool TryMatchSafeExpr(const std::string& s, size_t& i);
+
+// [math]::Round( <safe expr>, ... )  — allowlisted type + method only.
+bool TryMatchStaticCall(const std::string& s, size_t& i) {
+    size_t j = i;
+    if (j >= s.size() || s[j] != '[') return false;
+    ++j;
+    std::string type = ReadIdent(s, j);
+    if (type.empty() || !CiInArray(type, kSafeStaticTypes)) return false;
+    if (j >= s.size() || s[j] != ']') return false;
+    ++j;
+    if (j + 1 >= s.size() || s[j] != ':' || s[j + 1] != ':') return false;
+    j += 2;
+    std::string method = ReadIdent(s, j);
+    if (method.empty() || !CiInArray(method, kSafeStaticMethods)) return false;
+    SkipWs(s, j);
+    if (j >= s.size() || s[j] != '(') return false;
+    ++j;
+    SkipWs(s, j);
+    if (j < s.size() && s[j] != ')') {
+        for (;;) {
+            if (!TryMatchSafeExpr(s, j)) return false;
+            SkipWs(s, j);
+            if (j < s.size() && s[j] == ',') { ++j; SkipWs(s, j); continue; }
+            break;
+        }
+    }
+    if (j >= s.size() || s[j] != ')') return false;
+    ++j;
+    i = j;
+    return true;
+}
+
+bool TryMatchSafeTerm(const std::string& s, size_t& i) {
+    SkipWs(s, i);
+    size_t j = i;
+    if (j < s.size() && s[j] == '(') {
+        ++j;
+        if (!TryMatchSafeExpr(s, j)) return false;
+        SkipWs(s, j);
+        if (j >= s.size() || s[j] != ')') return false;
+        ++j;
+        i = j;
+        return true;
+    }
+    if (TryMatchStaticCall(s, j))            { i = j; return true; }
+    if (TryMatchDollarUnderscoreChain(s, j)) { i = j; return true; }
+    if (TryMatchNumberLiteral(s, j))         { i = j; return true; }
+    return false;
+}
+
+// term ( (+|-|*|/|%) term )*
+bool TryMatchSafeExpr(const std::string& s, size_t& i) {
+    size_t j = i;
+    if (!TryMatchSafeTerm(s, j)) return false;
+    for (;;) {
+        SkipWs(s, j);
+        if (j < s.size() && (s[j] == '+' || s[j] == '-' || s[j] == '*' || s[j] == '/' || s[j] == '%')) {
+            ++j;
+            if (!TryMatchSafeTerm(s, j)) return false;
+            continue;
+        }
+        break;
+    }
+    i = j;
+    return true;
+}
+
+// @{ N='Label' ; E={ <safe expr> } }  (N/E in either order, either key alias).
+// Requires exactly one name-like key and one expression-like key; anything
+// else (unknown keys, duplicates, missing piece) fails closed.
+bool TryConsumeCalculatedProperty(const std::string& cmd, size_t& i) {
+    size_t j = i;
+    if (j + 1 >= cmd.size() || cmd[j] != '@' || cmd[j + 1] != '{') return false;
+    j += 2;
+
+    bool sawName = false, sawExpr = false;
+    int pairs = 0;
+    for (;;) {
+        SkipWs(cmd, j);
+        std::string key = ReadIdent(cmd, j);
+        if (key.empty()) return false;
+        SkipWs(cmd, j);
+        if (j >= cmd.size() || cmd[j] != '=') return false;
+        ++j;
+        SkipWs(cmd, j);
+
+        const bool isNameKey = CiInArray(key, kCalcPropNameKeys);
+        const bool isExprKey = CiInArray(key, kCalcPropExprKeys);
+
+        if (isNameKey && !sawName) {
+            if (!TryMatchSafeStringLiteral(cmd, j)) return false;
+            sawName = true;
+        } else if (isExprKey && !sawExpr) {
+            if (j >= cmd.size() || cmd[j] != '{') return false;
+            ++j;
+            if (!TryMatchSafeExpr(cmd, j)) return false;
+            SkipWs(cmd, j);
+            if (j >= cmd.size() || cmd[j] != '}') return false;
+            ++j;
+            sawExpr = true;
+        } else {
+            return false; // unknown key, or this key already used once
+        }
+
+        ++pairs;
+        SkipWs(cmd, j);
+        if (j < cmd.size() && cmd[j] == ';') {
+            if (pairs >= 4) return false; // defensive bound, shouldn't trigger
+            ++j;
+            continue;
+        }
+        break;
+    }
+
+    SkipWs(cmd, j);
+    if (j >= cmd.size() || cmd[j] != '}') return false;
+    ++j;
+
+    if (!sawName || !sawExpr) return false;
+
+    i = j;
+    return true;
+}
+
+// $Identifier = <literal>  — the whole statement, nothing else.  Covers
+// the extremely common `$ErrorActionPreference='SilentlyContinue'` /
+// `$ProgressPreference='SilentlyContinue'` idiom models chain in front
+// of read-only diagnostic calls. RHS is restricted to $true/$false, a
+// plain integer, or a quoted literal (no interpolation, no
+// subexpressions) — assigning a local session variable has no side
+// effect beyond that assignment itself.
+bool IsSafeSimpleAssignment(const std::string& stmt) {
+    size_t i = 0;
+    SkipWs(stmt, i);
+    if (i >= stmt.size() || stmt[i] != '$') return false;
+    ++i;
+    std::string name = ReadIdent(stmt, i);
+    if (name.empty()) return false;
+    SkipWs(stmt, i);
+    if (i >= stmt.size() || stmt[i] != '=') return false;
+    if (i + 1 < stmt.size() && stmt[i + 1] == '=') return false; // not '=='
+    ++i;
+    SkipWs(stmt, i);
+
+    if (stmt.compare(i, 5, "$true") == 0 && i + 5 == stmt.size()) {
+        i += 5;
+    } else if (stmt.compare(i, 6, "$false") == 0 && i + 6 == stmt.size()) {
+        i += 6;
+    } else if (i < stmt.size() && (stmt[i] == '\'' || stmt[i] == '"')) {
+        if (!TryMatchSafeStringLiteral(stmt, i)) return false;
+    } else {
+        size_t start = i;
+        while (i < stmt.size() && std::isdigit((unsigned char)stmt[i])) ++i;
+        if (i == start) return false;
+    }
+
+    SkipWs(stmt, i);
+    return i == stmt.size();
+}
+
 // Scan once, respecting quotes:
-//   * split pipeline stages only on | outside quotes
+//   * recognize the narrow calculated-property shape and skip over it
+//     wholesale, without flagging its internal braces/parens
+//   * split top-level statements on ';' and pipeline stages on '|',
+//     both outside quotes and outside a consumed calculated property
 //   * mark broader shell syntax as approval-required instead of rejecting it
 //   * reject only quote drift that makes the scanner unable to classify command text
 //
@@ -178,6 +473,7 @@ ScanResult ScanAndSplitStages(const std::string& cmd) {
     bool inDouble = false;
 
     size_t stageStart = 0;
+    std::vector<std::string> curStatementStages;
 
     for (size_t i = 0; i < cmd.size(); ++i) {
         const char c = cmd[i];
@@ -228,6 +524,18 @@ ScanResult ScanAndSplitStages(const std::string& cmd) {
             continue;
         }
 
+        // Narrow calculated-property allowance: try to consume the
+        // whole "@{ N=...; E={...} }" span before it can trip the
+        // generic '@{' digraph / brace checks below. Falls through
+        // unchanged (still flagged) if it doesn't match that exact shape.
+        if (c == '@' && i + 1 < cmd.size() && cmd[i + 1] == '{') {
+            size_t newI = i;
+            if (TryConsumeCalculatedProperty(cmd, newI)) {
+                i = newI - 1; // for-loop's ++i lands exactly past the span
+                continue;
+            }
+        }
+
         const char* digraph = nullptr;
         if (HasReviewDigraphAt(cmd, i, digraph)) {
             MarkApproval(out, std::string("PowerShell expression syntax '") + digraph + "' requires approval");
@@ -239,8 +547,17 @@ ScanResult ScanAndSplitStages(const std::string& cmd) {
         }
 
         if (c == '|') {
-            out.stages.push_back(cmd.substr(stageStart, i - stageStart));
+            curStatementStages.push_back(cmd.substr(stageStart, i - stageStart));
             stageStart = i + 1;
+            continue;
+        }
+
+        if (c == ';') {
+            curStatementStages.push_back(cmd.substr(stageStart, i - stageStart));
+            out.statements.push_back(curStatementStages);
+            curStatementStages.clear();
+            stageStart = i + 1;
+            continue;
         }
     }
 
@@ -253,7 +570,8 @@ ScanResult ScanAndSplitStages(const std::string& cmd) {
         return out;
     }
 
-    out.stages.push_back(cmd.substr(stageStart));
+    curStatementStages.push_back(cmd.substr(stageStart));
+    out.statements.push_back(curStatementStages);
     out.ok = true;
     return out;
 }
@@ -283,13 +601,25 @@ PolicyDecision EvaluatePowerShellCommand(const std::string& cmdIn) {
         return out;
     }
 
-    for (size_t i = 0; i < scan.stages.size(); ++i) {
-        std::string head = FirstToken(scan.stages[i]);
-        std::string reason;
-        if (!HeadVerbAutoAllowed(head, reason)) {
-            out.requiresApproval = true;
-            out.reason = "stage " + std::to_string(i + 1) + ": " + reason;
-            return out;
+    for (size_t s = 0; s < scan.statements.size(); ++s) {
+        const std::vector<std::string>& stages = scan.statements[s];
+
+        // A whole statement that is exactly a safe simple assignment
+        // (e.g. $ErrorActionPreference='SilentlyContinue') is allowed
+        // without going through the cmdlet-head check.
+        if (stages.size() == 1 && IsSafeSimpleAssignment(Trim(stages[0]))) {
+            continue;
+        }
+
+        for (size_t i = 0; i < stages.size(); ++i) {
+            std::string head = FirstToken(stages[i]);
+            std::string reason;
+            if (!HeadVerbAutoAllowed(head, reason)) {
+                out.requiresApproval = true;
+                out.reason = "statement " + std::to_string(s + 1) +
+                             ", stage " + std::to_string(i + 1) + ": " + reason;
+                return out;
+            }
         }
     }
 

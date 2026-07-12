@@ -187,6 +187,63 @@ std::string ElapsedChip(
 
 } // anonymous namespace
 
+namespace {
+
+// Conversation Scripts-lane fallback for read (2026-06-12 transcript):
+// python_create_script puts runnable .py artifacts in the conversation
+// Scripts folder — a SIBLING of the default Workspace cwd — and models
+// routinely try to read their own script back with `read name.py` right
+// after creating or running it.  The cwd-resolved path then misses,
+// costing one failed tool step plus a full-path retry.  Reading is
+// side-effect free, so resolve the miss instead of coaching it — under
+// strict conditions so /cd'ed workspaces and projects are unaffected:
+//   * the requested path is a bare filename or the explicit lane form
+//     Scripts\name / Scripts/name (no other separators, no "..");
+//   * the cwd basename is "Workspace" (the conversation default; a
+//     /cd'ed cwd has no meaningful Scripts sibling);
+//   * the cwd-resolved path does not exist, so the Workspace always
+//     wins on a name collision and existing behavior never changes;
+//   * the sibling Scripts file actually exists.
+// Returns the resolved Scripts-lane path, or empty when any condition
+// fails.
+std::string TryResolveConversationScriptsFallback(const std::string& inputPath,
+                                                  const ToolContext& ctx)
+{
+    if (ctx.cwd.empty()) return std::string();
+
+    auto isSep = [](char c) { return c == '\\' || c == '/'; };
+
+    // Strip an optional explicit "Scripts\" / "Scripts/" lane prefix.
+    std::string name = inputPath;
+    if (name.size() > 8 &&
+        (name.compare(0, 8, "Scripts\\") == 0 ||
+         name.compare(0, 8, "Scripts/") == 0)) {
+        name = name.substr(8);
+    }
+
+    if (name.empty()) return std::string();
+    for (char c : name) {
+        if (isSep(c)) return std::string();   // nested paths: not eligible
+    }
+    if (name.find("..") != std::string::npos) return std::string();
+
+    // cwd basename must be the conversation default "Workspace".
+    size_t cut = ctx.cwd.find_last_not_of("\\/");
+    if (cut == std::string::npos) return std::string();
+    std::string trimmedCwd = ctx.cwd.substr(0, cut + 1);
+
+    size_t lastSep = trimmedCwd.find_last_of("\\/");
+    if (lastSep == std::string::npos) return std::string();
+    if (trimmedCwd.substr(lastSep + 1) != "Workspace") return std::string();
+
+    std::string scriptsPath =
+        trimmedCwd.substr(0, lastSep + 1) + "Scripts\\" + name;
+    if (!IsFile(scriptsPath)) return std::string();
+    return scriptsPath;
+}
+
+} // anonymous namespace
+
 ReadResult ReadFile(const std::string& inputPath, const ToolContext& ctx)
 {
     ReadResult r;
@@ -203,14 +260,27 @@ ReadResult ReadFile(const std::string& inputPath, const ToolContext& ctx)
 
     // ── Existence / type check ───────────────────────────────────
     if (!IsFile(resolved)) {
-        r.chips.push_back("failed");
-        if (IsDirectory(resolved)) {
-            r.errorBody = "Not a file (is a directory): " + resolved;
-        } else {
-            r.errorBody = "File not found: " + resolved;
+        // Side-effect-free fallback: bare filenames that miss the
+        // Workspace but exist in the conversation Scripts lane resolve
+        // there (see TryResolveConversationScriptsFallback).
+        std::string scriptsFallback;
+        if (!IsDirectory(resolved)) {
+            scriptsFallback =
+                TryResolveConversationScriptsFallback(inputPath, ctx);
         }
-        r.chips.push_back(ElapsedChip(t0));
-        return r;
+        if (!scriptsFallback.empty()) {
+            resolved = scriptsFallback;
+            r.chips.push_back("scripts lane");
+        } else {
+            r.chips.push_back("failed");
+            if (IsDirectory(resolved)) {
+                r.errorBody = "Not a file (is a directory): " + resolved;
+            } else {
+                r.errorBody = "File not found: " + resolved;
+            }
+            r.chips.push_back(ElapsedChip(t0));
+            return r;
+        }
     }
 
     // ── Size check (ate + tellg) ─────────────────────────────────
@@ -321,14 +391,27 @@ ReadResult ReadFileHead(const std::string& inputPath,
     }
 
     if (!IsFile(resolved)) {
-        r.chips.push_back("failed");
-        if (IsDirectory(resolved)) {
-            r.errorBody = "Not a file (is a directory): " + resolved;
-        } else {
-            r.errorBody = "File not found: " + resolved;
+        // Side-effect-free fallback: bare filenames that miss the
+        // Workspace but exist in the conversation Scripts lane resolve
+        // there (see TryResolveConversationScriptsFallback).
+        std::string scriptsFallback;
+        if (!IsDirectory(resolved)) {
+            scriptsFallback =
+                TryResolveConversationScriptsFallback(inputPath, ctx);
         }
-        r.chips.push_back(ElapsedChip(t0));
-        return r;
+        if (!scriptsFallback.empty()) {
+            resolved = scriptsFallback;
+            r.chips.push_back("scripts lane");
+        } else {
+            r.chips.push_back("failed");
+            if (IsDirectory(resolved)) {
+                r.errorBody = "Not a file (is a directory): " + resolved;
+            } else {
+                r.errorBody = "File not found: " + resolved;
+            }
+            r.chips.push_back(ElapsedChip(t0));
+            return r;
+        }
     }
 
     std::ifstream f(path_safety::Utf8ToWide(resolved), std::ios::binary | std::ios::ate);

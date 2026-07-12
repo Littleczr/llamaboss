@@ -25,12 +25,18 @@ struct ThemeData;
 class ModelManagerDialog : public wxDialog
 {
 public:
-    ModelManagerDialog(wxWindow* parent, const ThemeData* theme = nullptr);
+    ModelManagerDialog(wxWindow* parent,
+                       const ThemeData* theme = nullptr,
+                       std::string loadedModelPath = {},
+                       std::string configuredModelPath = {});
     ~ModelManagerDialog() = default;
 
 private:
     void CreateControls();
     void RefreshModelList();
+    std::string SelectedModelPath() const;
+    bool IsLoadedModelPath(const std::string& path) const;
+    bool IsConfiguredModelPath(const std::string& path) const;
 
     // Event handlers
     void OnDeleteClicked(wxCommandEvent& ev);
@@ -45,6 +51,8 @@ private:
     wxStaticText* m_statusText    = nullptr;
 
     const ThemeData* m_theme;
+    std::string m_loadedModelPath;      // Currently running llama-server model, if any
+    std::string m_configuredModelPath;  // App/deferred model selection, if any
 
     // Parallel to list rows: full GGUF paths
     std::vector<std::string> m_modelPaths;

@@ -10,6 +10,7 @@
 #include <fstream>
 #include <sstream>
 #include <algorithm>
+#include <cassert>
 #include <cctype>
 #include <initializer_list>
 
@@ -24,6 +25,8 @@
 // Use wxFileName only for lightweight path queries (extension, existence, size).
 // No other wx UI dependency.
 #include <wx/filename.h>
+#include <wx/filefn.h>
+#include <wx/strconv.h>   // wxMBConvUTF16LE/BE — text attachment normalization
 
 
 namespace {
@@ -36,40 +39,68 @@ std::string LowerAscii(std::string s)
     return s;
 }
 
-bool ContainsAny(const std::string& haystack,
-                 std::initializer_list<const char*> needles)
+bool IsAsciiWordChar(char ch)
+{
+    unsigned char u = static_cast<unsigned char>(ch);
+    return std::isalnum(u) != 0 || ch == '_';
+}
+
+bool ContainsBoundedPhrase(const std::string& haystack, const char* needle)
+{
+    const std::string phrase(needle ? needle : "");
+    if (phrase.empty())
+        return false;
+
+    size_t pos = 0;
+    while ((pos = haystack.find(phrase, pos)) != std::string::npos) {
+        const bool leftOk = (pos == 0) || !IsAsciiWordChar(haystack[pos - 1]);
+        const size_t after = pos + phrase.size();
+        const bool rightOk = (after >= haystack.size()) || !IsAsciiWordChar(haystack[after]);
+        if (leftOk && rightOk)
+            return true;
+        ++pos;
+    }
+    return false;
+}
+
+bool ContainsAnyBounded(const std::string& haystack,
+                        std::initializer_list<const char*> needles)
 {
     for (const char* n : needles) {
-        if (haystack.find(n) != std::string::npos)
+        if (ContainsBoundedPhrase(haystack, n))
             return true;
     }
     return false;
+}
+
+std::string FenceForContent(const std::string& content)
+{
+    size_t longest = 0;
+    size_t run = 0;
+    for (char ch : content) {
+        if (ch == '`') {
+            ++run;
+            longest = std::max(longest, run);
+        } else {
+            run = 0;
+        }
+    }
+    return std::string(std::max<size_t>(longest + 1, 3), '`');
 }
 
 bool LooksLikePdfFormFillRequest(const std::string& userText)
 {
     const std::string t = LowerAscii(userText);
 
-    // High-confidence form-fill verbs. These should route attached PDFs to
-    // pdf_inspect_form -> pdf_fill_form, not to text extraction / drafting.
-    if (ContainsAny(t, {
-            "fill", "filled", "fill in", "complete this form",
-            "complete the form", "populate", "put this into the pdf",
-            "put it into the pdf", "pdf form", "form template"})) {
-        return true;
-    }
-
-    // Common disciplinary-template language Cesar uses with blank Allied forms.
-    // With an attached PDF, these usually mean "create the completed notice in
-    // the PDF", not "stop after a text draft".
-    if (ContainsAny(t, {
-            "write up", "write-up", "disciplinary notice", "disciplinary form",
-            "coaching", "counseling", "final warning", "written warning",
-            "facts", "expectation", "corrective action"})) {
-        return true;
-    }
-
-    return false;
+    // Keep this heuristic deliberately narrow and product-neutral.  Project-
+    // specific form routing vocabulary belongs in project/workflow guidance,
+    // not in the core attachment manager.  Word-boundary matching avoids
+    // accidental hits such as "fulfill" -> "fill" or "artifacts" -> "facts".
+    return ContainsAnyBounded(t, {
+        "fill", "filled", "fill in", "complete this form",
+        "complete the form", "populate", "put this into the pdf",
+        "put it into the pdf", "pdf form", "form template"
+    });
 }
 
 } // namespace
@@ -91,6 +122,9 @@ bool AttachmentManager::AttachImageFromFile(const std::string& filePath)
     if (!fname.FileExists()) return false;
 
     wxULongLong fileSize = fname.GetSize();
+    if (fileSize == wxInvalidSize || fileSize.GetValue() > kMaxImageBytes)
+        return false;
+
     std::string base64 = FileToBase64(filePath);
     if (base64.empty()) return false;
 
@@ -120,6 +154,11 @@ bool AttachmentManager::AttachImageFromBase64(const std::string& base64,
     if (m_pending.size() >= kMaxAttachments) return false;
     if (base64.empty()) return false;
 
+    // Clipboard images arrive already encoded.  Approximate the decoded-size
+    // cap before storing/copying a huge base64 blob through the request path.
+    const size_t maxBase64Bytes = ((kMaxImageBytes + 2) / 3) * 4 + 16;
+    if (base64.size() > maxBase64Bytes) return false;
+
     PendingAttachment item;
     item.type         = PendingAttachment::Type::Image;
     item.data         = base64;
@@ -148,13 +187,42 @@ bool AttachmentManager::AttachTextFile(const std::string& filePath)
     if (fileSize == wxInvalidSize || fileSize.GetValue() > kMaxTextFileBytes)
         return false;
 
-    std::ifstream ifs(path_safety::Utf8ToWide(filePath), std::ios::in);
+    std::ifstream ifs(path_safety::Utf8ToWide(filePath), std::ios::binary);
     if (!ifs.is_open()) return false;
 
     std::ostringstream oss;
     oss << ifs.rdbuf();
     std::string content = oss.str();
-    if (content.empty()) return false;
+
+    // ── Encoding normalization ───────────────────────────────────
+    // Notepad-era .txt/.log files are frequently UTF-16.  Raw UTF-16
+    // bytes baked into the request become invalid UTF-8 on the wire
+    // (server rejection or mojibake).  Detect a BOM and convert to
+    // UTF-8 before storing.  A UTF-8 BOM is stripped so it doesn't
+    // render as garbage at the top of the code fence.
+    if (content.size() >= 2) {
+        const unsigned char b0 = static_cast<unsigned char>(content[0]);
+        const unsigned char b1 = static_cast<unsigned char>(content[1]);
+        const bool utf16le = (b0 == 0xFF && b1 == 0xFE);
+        const bool utf16be = (b0 == 0xFE && b1 == 0xFF);
+        if (utf16le || utf16be) {
+            wxMBConvUTF16LE convLE;
+            wxMBConvUTF16BE convBE;
+            wxString decoded(content.data() + 2,
+                             utf16le ? static_cast<wxMBConv&>(convLE)
+                                     : static_cast<wxMBConv&>(convBE),
+                             content.size() - 2);
+            if (!decoded.empty()) {
+                const wxScopedCharBuffer utf8 = decoded.ToUTF8();
+                if (utf8.data())
+                    content.assign(utf8.data(), utf8.length());
+            }
+        }
+        else if (content.size() >= 3 && b0 == 0xEF && b1 == 0xBB &&
+                 static_cast<unsigned char>(content[2]) == 0xBF) {
+            content.erase(0, 3);  // strip UTF-8 BOM
+        }
+    }
 
     PendingAttachment item;
     item.type         = PendingAttachment::Type::TextFile;
@@ -269,6 +337,74 @@ bool AttachmentManager::AttachDocxFile(const std::string& filePath,
     return true;
 }
 
+bool AttachmentManager::AttachCsvFile(const std::string& filePath,
+                                      const std::string& toolRelativePath)
+{
+    if (m_pending.size() >= kMaxAttachments) return false;
+
+    wxFileName fname(wxString::FromUTF8(filePath));
+    if (!fname.FileExists()) return false;
+    if (fname.GetExt().Lower() != "csv") return false;
+
+    wxULongLong fileSize = fname.GetSize();
+
+    PendingAttachment item;
+    item.type         = PendingAttachment::Type::CsvFile;
+    // For CSVs, data is the safe relative tool arg for csv_inspect,
+    // prepared by MyFrame after importing to the cwd.  Mirrors the
+    // xlsx/pdf/docx flow — the raw rows are deliberately NOT baked
+    // into the message.
+    item.data         = toolRelativePath.empty()
+                      ? std::string(fname.GetFullName().ToUTF8().data())
+                      : toolRelativePath;
+    item.name         = std::string(fname.GetFullName().ToUTF8().data());
+    item.originalSize = (fileSize != wxInvalidSize)
+                      ? static_cast<size_t>(fileSize.GetValue()) : 0;
+    m_pending.push_back(std::move(item));
+
+    if (m_logger)
+        m_logger->information("CSV attached: " + m_pending.back().name +
+            " -> csv tool arg: " + m_pending.back().data +
+            " [" + std::to_string(m_pending.size()) + " pending]");
+
+    NotifyChanged();
+    return true;
+}
+
+bool AttachmentManager::AttachZipFile(const std::string& filePath,
+                                      const std::string& toolRelativePath)
+{
+    if (m_pending.size() >= kMaxAttachments) return false;
+
+    wxFileName fname(wxString::FromUTF8(filePath));
+    if (!fname.FileExists()) return false;
+    if (fname.GetExt().Lower() != "zip") return false;
+
+    wxULongLong fileSize = fname.GetSize();
+
+    PendingAttachment item;
+    item.type         = PendingAttachment::Type::ZipFile;
+    // For ZIPs, data is the safe relative tool arg for zip_inspect,
+    // prepared by MyFrame after importing to the cwd.  Mirrors the
+    // csv/xlsx/pdf/docx flow — the archive is never decompressed and
+    // its contents are deliberately NOT baked into the message.
+    item.data         = toolRelativePath.empty()
+                      ? std::string(fname.GetFullName().ToUTF8().data())
+                      : toolRelativePath;
+    item.name         = std::string(fname.GetFullName().ToUTF8().data());
+    item.originalSize = (fileSize != wxInvalidSize)
+                      ? static_cast<size_t>(fileSize.GetValue()) : 0;
+    m_pending.push_back(std::move(item));
+
+    if (m_logger)
+        m_logger->information("ZIP attached: " + m_pending.back().name +
+            " -> zip tool arg: " + m_pending.back().data +
+            " [" + std::to_string(m_pending.size()) + " pending]");
+
+    NotifyChanged();
+    return true;
+}
+
 // ═══════════════════════════════════════════════════════════════════
 //  Remove / Clear
 // ═══════════════════════════════════════════════════════════════════
@@ -336,6 +472,20 @@ bool AttachmentManager::HasDocxFile() const
     return false;
 }
 
+bool AttachmentManager::HasCsvFile() const
+{
+    for (const auto& item : m_pending)
+        if (item.type == PendingAttachment::Type::CsvFile) return true;
+    return false;
+}
+
+bool AttachmentManager::HasZipFile() const
+{
+    for (const auto& item : m_pending)
+        if (item.type == PendingAttachment::Type::ZipFile) return true;
+    return false;
+}
+
 std::string AttachmentManager::GetDisplayLabel() const
 {
     if (m_pending.empty()) return "";
@@ -343,24 +493,30 @@ std::string AttachmentManager::GetDisplayLabel() const
     if (m_pending.size() == 1) {
         const auto& item = m_pending[0];
         if (item.type == PendingAttachment::Type::Image)
-            return "  \xF0\x9F\x96\xBC  " + item.name;   // 🖼
+            return "  [img]  " + item.name;
         if (item.type == PendingAttachment::Type::SpreadsheetFile)
-            return "  \xF0\x9F\x93\x8A  " + item.name;   // 📊
+            return "  [xlsx] " + item.name;
         if (item.type == PendingAttachment::Type::PdfFile)
-            return "  \xF0\x9F\x93\x84  " + item.name;   // 📄
+            return "  [pdf]  " + item.name;
         if (item.type == PendingAttachment::Type::DocxFile)
-            return "  \xF0\x9F\x93\x84  " + item.name;   // 📄
-        return "  \xF0\x9F\x93\x84  " + item.name;       // 📄
+            return "  [docx] " + item.name;
+        if (item.type == PendingAttachment::Type::CsvFile)
+            return "  [csv]  " + item.name;
+        if (item.type == PendingAttachment::Type::ZipFile)
+            return "  [zip]  " + item.name;
+        return "  [file] " + item.name;
     }
 
-    // Multiple items — show paperclip + count + abbreviated file list
-    // 📎 U+1F4CE
-    std::string label = "  \xF0\x9F\x93\x8E  "
+    // Multiple items — show count plus a short file preview.
+    std::string label = "  [files] "
         + std::to_string(m_pending.size()) + " files: ";
-    for (size_t i = 0; i < m_pending.size(); ++i) {
+    const size_t shown = std::min<size_t>(m_pending.size(), 3);
+    for (size_t i = 0; i < shown; ++i) {
         if (i > 0) label += ", ";
         label += m_pending[i].name;
     }
+    if (m_pending.size() > shown)
+        label += " +" + std::to_string(m_pending.size() - shown) + " more";
     return label;
 }
 
@@ -388,6 +544,10 @@ std::vector<AttachmentInfo> AttachmentManager::GetAttachmentInfo() const
             info.kind = AttachmentInfo::Kind::SpreadsheetFile;
         else if (item.type == PendingAttachment::Type::DocxFile)
             info.kind = AttachmentInfo::Kind::DocxFile;
+        else if (item.type == PendingAttachment::Type::CsvFile)
+            info.kind = AttachmentInfo::Kind::CsvFile;
+        else if (item.type == PendingAttachment::Type::ZipFile)
+            info.kind = AttachmentInfo::Kind::ZipFile;
         else
             info.kind = AttachmentInfo::Kind::TextFile;
         info.filename = item.name;
@@ -411,8 +571,9 @@ std::string AttachmentManager::BakeTextFilesIntoMessage(const std::string& userT
 
     for (const auto& item : m_pending) {
         if (item.type != PendingAttachment::Type::TextFile) continue;
+        const std::string fence = FenceForContent(item.data);
         baked += "[File: " + item.name + "]\n"
-                 "```\n" + item.data + "\n```\n\n";
+              + fence + "\n" + item.data + "\n" + fence + "\n\n";
     }
 
     if (baked.empty()) return userText;
@@ -443,10 +604,11 @@ std::string AttachmentManager::BakePdfFilesIntoMessage(const std::string& userTe
             if (likelyFormFill) {
                 baked += "This appears to be a PDF form-fill request. First call "
                          "pdf_inspect_form with exactly this args value: " + item.data + "\n";
-                baked += "After pdf_inspect_form returns exact field names, call "
-                         "pdf_fill_form using this PDF path on the first line and a JSON "
-                         "field map on the remaining lines. Do not create an intermediate "
-                         ".txt draft, do not ask the user to review before filling, and do "
+                baked += "After pdf_inspect_form returns exact field names, prefer "
+                         "calling pdf_fill_form using this PDF path on the first line and "
+                         "a JSON field map on the remaining lines. Do not create an "
+                         "intermediate .txt draft. Ask the user a concise clarification "
+                         "only if required fields or intended values are missing, and do "
                          "not stop after pdf_extract_text unless the PDF has no fillable "
                          "AcroForm fields.\n";
             } else {
@@ -545,9 +707,85 @@ std::string AttachmentManager::BakeDocxFilesIntoMessage(const std::string& userT
     return baked + userText;
 }
 
+std::string AttachmentManager::BakeCsvFilesIntoMessage(const std::string& userText,
+                                                       bool agentModeEnabled) const
+{
+    // CSVs should feel like xlsx attachments in the composer: the user sees
+    // a chip/filename, not a wall of raw rows.  The model gets a safe tool
+    // route to inspect the data only when needed.  Baking raw CSV inline
+    // both floods small-model context and, when paired with a tool path the
+    // workspace can't satisfy, tempts the model into re-writing the entire
+    // file through the write tool — minutes of useless token generation.
+    std::string baked;
+
+    for (const auto& item : m_pending) {
+        if (item.type != PendingAttachment::Type::CsvFile) continue;
+
+        baked += "[Attached CSV: " + item.name + "]\n";
+        baked += "Safe csv_inspect tool argument: " + item.data + "\n";
+        baked += "Do not claim you have read this CSV until it has been inspected.\n";
+        baked += "This file already exists in the workspace. Never reconstruct or "
+                 "re-write its contents with the write tool.\n";
+
+        if (agentModeEnabled) {
+            baked += "When the user's request depends on this CSV's contents, "
+                     "call the csv_inspect tool with exactly this args value before "
+                     "answering: " + item.data + "\n";
+            baked += "Use csv_to_xlsx when the user wants this data as an Excel/xlsx "
+                     "file, and csv_report only when the user specifically asks for "
+                     "a Markdown report/artifact.\n";
+        } else {
+            baked += "CSV data is not embedded in this non-agent request. If the user "
+                     "needs the contents, tell them to enable Agent mode or run: "
+                     "/csv_inspect " + item.data + "\n";
+        }
+
+        baked += "\n";
+    }
+
+    if (baked.empty()) return userText;
+    return baked + userText;
+}
+
+std::string AttachmentManager::BakeZipFilesIntoMessage(const std::string& userText,
+                                                       bool agentModeEnabled) const
+{
+    // ZIPs should feel like the other document attachments in the
+    // composer: the user sees a chip/filename, not a decompressed dump.
+    // The model gets a safe, read-only tool route to inspect the
+    // archive's manifest.  The archive is never extracted at attach time.
+    std::string baked;
+
+    for (const auto& item : m_pending) {
+        if (item.type != PendingAttachment::Type::ZipFile) continue;
+
+        baked += "[Attached ZIP archive: " + item.name + "]\n";
+        baked += "Safe zip_inspect tool argument: " + item.data + "\n";
+        baked += "Do not claim you know the archive's contents until it has been inspected.\n";
+        baked += "zip_inspect is read-only: it lists the manifest without decompressing or "
+                 "extracting any entry. Heed its safety_flags before suggesting extraction.\n";
+
+        if (agentModeEnabled) {
+            baked += "When the user's request depends on what this archive contains, "
+                     "call the zip_inspect tool with exactly this args value before "
+                     "answering: " + item.data + "\n";
+        } else {
+            baked += "Archive contents are not embedded in this non-agent request. If the user "
+                     "needs them, tell them to enable Agent mode or run: "
+                     "/zip_inspect " + item.data + "\n";
+        }
+
+        baked += "\n";
+    }
+
+    if (baked.empty()) return userText;
+    return baked + userText;
+}
+
 std::string AttachmentManager::InjectImagesIntoRequest(const std::string& requestJson) const
 {
-    // Count pending images — bail early if none
+    // Count pending images — bail early if none.  The request format here is
+    // the OpenAI-compatible image_url data-URI shape used by llama.cpp server.
     bool anyImages = false;
     for (const auto& item : m_pending)
         if (item.type == PendingAttachment::Type::Image) { anyImages = true; break; }
@@ -557,54 +795,67 @@ std::string AttachmentManager::InjectImagesIntoRequest(const std::string& reques
         Poco::JSON::Parser parser;
         auto root = parser.parse(requestJson).extract<Poco::JSON::Object::Ptr>();
         auto messages = root->getArray("messages");
+        if (!messages || messages->size() == 0)
+            return requestJson;
 
-        if (messages && messages->size() > 0) {
-            // Find the last user message
-            for (int i = static_cast<int>(messages->size()) - 1; i >= 0; --i) {
-                auto msg = messages->getObject(i);
-                if (msg->getValue<std::string>("role") == "user") {
-                    // Defensive: only inject if content is still a plain
-                    // string. If something upstream already converted it
-                    // to an array (e.g. a future caller), bail out with a
-                    // log rather than throwing from getValue<string>.
-                    if (!msg->has("content") || msg->isNull("content")) {
-                        if (m_logger)
-                            m_logger->warning("InjectImagesIntoRequest: user message has no content; skipping injection");
-                        break;
-                    }
-                    auto contentVar = msg->get("content");
-                    if (!contentVar.isString()) {
-                        if (m_logger)
-                            m_logger->warning("InjectImagesIntoRequest: user content is not a string (already structured?); skipping injection");
-                        break;
-                    }
-                    std::string textContent = contentVar.convert<std::string>();
+        bool injected = false;
 
-                    // Build OpenAI-style content array with all images + text.
-                    Poco::JSON::Array::Ptr contentArray = new Poco::JSON::Array;
+        // Find the last user message
+        for (int i = static_cast<int>(messages->size()) - 1; i >= 0; --i) {
+            auto msg = messages->getObject(i);
+            if (!msg || msg->getValue<std::string>("role") != "user")
+                continue;
 
-                    for (const auto& item : m_pending) {
-                        if (item.type != PendingAttachment::Type::Image) continue;
-
-                        std::string mime = GuessMimeType(item.name);
-                        Poco::JSON::Object::Ptr imagePart = new Poco::JSON::Object;
-                        imagePart->set("type", "image_url");
-                        Poco::JSON::Object::Ptr imageUrl = new Poco::JSON::Object;
-                        imageUrl->set("url", "data:" + mime + ";base64," + item.data);
-                        imagePart->set("image_url", imageUrl);
-                        contentArray->add(imagePart);
-                    }
-
-                    Poco::JSON::Object::Ptr textPart = new Poco::JSON::Object;
-                    textPart->set("type", "text");
-                    textPart->set("text", textContent);
-                    contentArray->add(textPart);
-
-                    msg->set("content", contentArray);
-                    break;
-                }
+            // Defensive: only inject if content is still a plain string. If
+            // something upstream already converted it to an array (e.g. a
+            // future caller), return the original JSON byte-for-byte rather
+            // than re-stringifying a large request we did not modify.
+            if (!msg->has("content") || msg->isNull("content")) {
+                if (m_logger)
+                    m_logger->warning("InjectImagesIntoRequest: user message has no content; skipping injection");
+                return requestJson;
             }
+            auto contentVar = msg->get("content");
+            if (!contentVar.isString()) {
+                // Expected path since ChatHistory::BuildChatRequestJson
+                // learned to project persisted images itself (Phase 1c
+                // image carrier): the last user message already carries
+                // the multimodal content array.  Nothing to do here —
+                // this injector remains as the fallback for callers
+                // that build request bodies without the carrier pass.
+                if (m_logger)
+                    m_logger->debug("InjectImagesIntoRequest: content already structured (carrier projection); skipping");
+                return requestJson;
+            }
+            std::string textContent = contentVar.convert<std::string>();
+
+            // Build OpenAI-style content array with all images + text.
+            Poco::JSON::Array::Ptr contentArray = new Poco::JSON::Array;
+
+            for (const auto& item : m_pending) {
+                if (item.type != PendingAttachment::Type::Image) continue;
+
+                std::string mime = GuessMimeType(item.name);
+                Poco::JSON::Object::Ptr imagePart = new Poco::JSON::Object;
+                imagePart->set("type", "image_url");
+                Poco::JSON::Object::Ptr imageUrl = new Poco::JSON::Object;
+                imageUrl->set("url", "data:" + mime + ";base64," + item.data);
+                imagePart->set("image_url", imageUrl);
+                contentArray->add(imagePart);
+            }
+
+            Poco::JSON::Object::Ptr textPart = new Poco::JSON::Object;
+            textPart->set("type", "text");
+            textPart->set("text", textContent);
+            contentArray->add(textPart);
+
+            msg->set("content", contentArray);
+            injected = true;
+            break;
         }
+
+        if (!injected)
+            return requestJson;
 
         std::ostringstream oss;
         Poco::JSON::Stringifier::stringify(root, oss);
@@ -613,6 +864,11 @@ std::string AttachmentManager::InjectImagesIntoRequest(const std::string& reques
     catch (const Poco::Exception& ex) {
         if (m_logger)
             m_logger->error("Failed to inject images: " + ex.displayText());
+        return requestJson;
+    }
+    catch (const std::exception& ex) {
+        if (m_logger)
+            m_logger->error("Failed to inject images: " + std::string(ex.what()));
         return requestJson;
     }
 }
@@ -626,10 +882,25 @@ bool AttachmentManager::SaveImagesToDisk(const std::string& attachDir,
                                           size_t messageIndex,
                                           std::vector<AttachmentInfo>& infoVec) const
 {
-    // Create the sidecar directory if it doesn't exist
+    // SaveImagesToDisk is index-parallel with GetAttachmentInfo(): each
+    // pending item maps to the same index in infoVec, even when only images
+    // are persisted.  Do not pass a filtered metadata vector here.
+    assert(infoVec.size() == m_pending.size());
+    if (infoVec.size() != m_pending.size()) {
+        if (m_logger)
+            m_logger->error("SaveImagesToDisk: AttachmentInfo vector is not index-parallel with pending attachments");
+        return false;
+    }
+
+    // Create the sidecar directory if it doesn't exist.
     wxFileName dirPath(wxString::FromUTF8(attachDir) + wxFileName::GetPathSeparator());
-    if (!dirPath.DirExists())
-        dirPath.Mkdir(wxS_DIR_DEFAULT, wxPATH_MKDIR_FULL);
+    if (!dirPath.DirExists()) {
+        if (!dirPath.Mkdir(wxS_DIR_DEFAULT, wxPATH_MKDIR_FULL) && !dirPath.DirExists()) {
+            if (m_logger)
+                m_logger->error("Cannot create attachment directory: " + attachDir);
+            return false;
+        }
+    }
 
     bool allOk = true;
 
@@ -638,7 +909,7 @@ bool AttachmentManager::SaveImagesToDisk(const std::string& attachDir,
     // dragged from different folders).
     std::vector<std::string> usedFilenames;
 
-    for (size_t i = 0; i < m_pending.size() && i < infoVec.size(); ++i) {
+    for (size_t i = 0; i < m_pending.size(); ++i) {
         const auto& item = m_pending[i];
         if (item.type != PendingAttachment::Type::Image) continue;
 
@@ -693,6 +964,14 @@ bool AttachmentManager::SaveImagesToDisk(const std::string& attachDir,
                       std::ostreambuf_iterator<char>(outFile));
             outFile.close();
 
+            if (!outFile) {
+                allOk = false;
+                wxRemoveFile(wxString::FromUTF8(fullPath));
+                if (m_logger)
+                    m_logger->error("Write failed while persisting image: " + fullPath);
+                continue;
+            }
+
             // Store relative path (forward slashes for portability)
             infoVec[i].storagePath = relativePrefix + "/" + filename;
 
@@ -702,6 +981,7 @@ bool AttachmentManager::SaveImagesToDisk(const std::string& attachDir,
         }
         catch (const std::exception& ex) {
             allOk = false;
+            wxRemoveFile(wxString::FromUTF8(fullPath));
             if (m_logger)
                 m_logger->error("Failed to persist image: " + std::string(ex.what()));
         }
@@ -739,18 +1019,36 @@ bool AttachmentManager::IsDocxFile(const std::string& path)
     return ext == "docx" || ext == "docm";
 }
 
+bool AttachmentManager::IsCsvFile(const std::string& path)
+{
+    wxString ext = wxFileName(wxString::FromUTF8(path)).GetExt().Lower();
+    return ext == "csv";
+}
+
+bool AttachmentManager::IsZipFile(const std::string& path)
+{
+    wxString ext = wxFileName(wxString::FromUTF8(path)).GetExt().Lower();
+    return ext == "zip";
+}
+
 bool AttachmentManager::IsTextFile(const std::string& path)
 {
     wxFileName fn(wxString::FromUTF8(path));
     wxString ext = fn.GetExt().Lower();
 
     // ── Extension-based match ─────────────────────────────────────
+    // NOTE: "csv" is intentionally ABSENT — CSV routes through
+    // IsCsvFile/AttachCsvFile (workspace import + csv_inspect hint),
+    // not the inline text bake.  Classify with IsCsvFile first.
     if (ext == "txt" || ext == "md"   || ext == "json" ||
         ext == "cpp" || ext == "h"    || ext == "hpp"  ||
+        ext == "c"   || ext == "cc"   || ext == "cxx"  ||
+        ext == "hh"  || ext == "hxx"  ||
+        ext == "ps1" || ext == "psm1" ||
         ext == "py"  || ext == "js"   || ext == "ts"   ||
         ext == "css" || ext == "html" || ext == "xml"  ||
         ext == "yaml"|| ext == "yml"  || ext == "toml" ||
-        ext == "csv" || ext == "log"  || ext == "ini"  ||
+        ext == "log" || ext == "ini"  ||
         ext == "cfg" || ext == "sh"   || ext == "bat"  ||
         // Additional language / framework extensions
         ext == "tsx" || ext == "jsx"  ||
@@ -775,14 +1073,22 @@ bool AttachmentManager::IsTextFile(const std::string& path)
 
 std::string AttachmentManager::GuessMimeType(const std::string& filename)
 {
+    std::string lowerName = LowerAscii(filename);
+    size_t slash = lowerName.find_last_of("/\\");
+    std::string base = (slash == std::string::npos) ? lowerName : lowerName.substr(slash + 1);
+
+    if (base == ".env" || base == ".gitignore" || base == "dockerfile")
+        return "text/plain";
+
     // Extract extension
-    size_t dot = filename.rfind('.');
+    size_t dot = base.rfind('.');
     if (dot == std::string::npos) return "application/octet-stream";
-    std::string ext = filename.substr(dot + 1);
-    for (auto& c : ext) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    std::string ext = base.substr(dot + 1);
 
     if (ext == "pdf")                return "application/pdf";
     if (ext == "xlsx")               return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+    if (ext == "docx")               return "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+    if (ext == "docm")               return "application/vnd.ms-word.document.macroEnabled.12";
 
     // Images
     if (ext == "png")                return "image/png";
@@ -803,10 +1109,22 @@ std::string AttachmentManager::GuessMimeType(const std::string& filename)
     if (ext == "toml")               return "text/plain";
     if (ext == "ini" || ext == "cfg") return "text/plain";
     if (ext == "sh" || ext == "bat") return "text/plain";
-    if (ext == "cpp" || ext == "h" || ext == "hpp") return "text/x-c++src";
+    if (ext == "cpp" || ext == "h" || ext == "hpp" ||
+        ext == "cc"  || ext == "cxx" ||
+        ext == "hh"  || ext == "hxx") return "text/x-c++src";
+    if (ext == "c")                  return "text/x-csrc";
+    if (ext == "ps1" || ext == "psm1") return "text/plain";
     if (ext == "py")                 return "text/x-python";
     if (ext == "js"  || ext == "jsx") return "text/javascript";
     if (ext == "ts"  || ext == "tsx") return "text/typescript";
+    if (ext == "rs")                 return "text/x-rust";
+    if (ext == "go")                 return "text/x-go";
+    if (ext == "java")               return "text/x-java-source";
+    if (ext == "kt")                 return "text/x-kotlin";
+    if (ext == "swift")              return "text/x-swift";
+    if (ext == "rb")                 return "text/x-ruby";
+    if (ext == "php")                return "application/x-httpd-php";
+    if (ext == "sql")                return "application/sql";
 
     return "application/octet-stream";
 }

@@ -15,13 +15,25 @@
     </Filter>
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="pch.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="LlamaBoss.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="app_state.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="app.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="model_service.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="chat_client.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="lb_ssl.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="chat_display.cpp">
@@ -51,6 +63,9 @@
     <ClCompile Include="server_manager.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="update_checker.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="ui_builder.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -75,7 +90,13 @@
     <ClCompile Include="secrets_store.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="endpoint_store.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="connections_dialog.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="endpoints_dialog.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="tool_path.cpp">
@@ -156,6 +177,15 @@
     <ClCompile Include="goal_prompt_builder.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="goal_controller.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="skill_draft_controller.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="project_controller.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="agent_prompt_builder.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -171,12 +201,54 @@
     <ClCompile Include="drop_import_controller.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="lb_string_utils.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="lb_update_ui.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="lb_project_ui_actions.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="lb_modal_scrim.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="tool_result_controller.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="project_context_builder.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="lb_input_parsers.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="lb_themed_dialogs.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="pch.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="app_state.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="app.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="conversation_registry.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="model_service.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="chat_client.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="inference_target.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="lb_ssl.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="chat_display.h">
@@ -207,6 +279,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="server_manager.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="update_checker.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="widgets.h">
@@ -245,7 +320,13 @@
     <ClInclude Include="secrets_store.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="endpoint_store.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="connections_dialog.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="endpoints_dialog.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="tool_context.h">
@@ -344,6 +425,15 @@
     <ClInclude Include="goal_prompt_builder.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="goal_controller.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="skill_draft_controller.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="project_controller.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="agent_prompt_builder.h">
       <Filter>Header Files</Filter>
     </ClInclude>
@@ -357,6 +447,27 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="drop_import_controller.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="lb_update_ui.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="lb_project_ui_actions.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="lb_modal_scrim.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="tool_result_controller.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="project_context_builder.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="lb_input_parsers.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="lb_themed_dialogs.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>
