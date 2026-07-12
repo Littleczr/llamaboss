@@ -7,7 +7,7 @@ tools.
 > Current milestone: **LlamaBoss Beta v0.1.9**
 
 <p align="center">
-  <img src="screenshot_beta_v0.1.0.jpg" alt="LlamaBoss Beta v0.1.9 screenshot (app UI)" width="100%">
+  <img src="screenshot_beta_v0.1.9.png" alt="LlamaBoss Beta v0.1.9 screenshot (app UI)" width="100%">
 </p>
 
 LlamaBoss is designed for people who want an AI assistant that can help with

@@ -22,6 +22,7 @@
 
 #include "ps_command_hints.h"
 #include "workspace_delta.h"
+#include "command_policy.h"   // LintPowerShellHazards (advisory)
 
 // wx
 #include <wx/log.h>
@@ -113,17 +114,60 @@ std::string Base64EncodeUtf16LE(const std::wstring& w) {
 // than continuing.  For Phase 1 user-typed one-liners, this is correct —
 // you want to see the error and know it failed.  Users who need partial-
 // success can pass `-ErrorAction SilentlyContinue` on the offending cmdlet.
+// Escape a UTF-8 string for embedding inside a PowerShell single-quoted
+// literal: the only special character is the single quote, doubled.
+std::string EscapePsSingleQuoted(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    for (char c : s) {
+        out += c;
+        if (c == '\'') out += '\'';
+    }
+    return out;
+}
+
 std::wstring BuildPowerShellPayload(const std::string& userCommand) {
     const std::string prefix =
         "$ProgressPreference = 'SilentlyContinue';"
         "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8;"
         "$OutputEncoding = [System.Text.Encoding]::UTF8;"
+        // Default every text-file cmdlet to UTF-8.  Windows PowerShell
+        // 5.1 otherwise READS as ANSI and WRITES UTF-16LE (Out-File) /
+        // ANSI (Set-Content, Add-Content), which double-encodes any
+        // UTF-8 file the agent itself wrote on a read-modify-write
+        // cycle (em-dashes -> mojibake).  Per-call -Encoding still
+        // overrides.  PS 5.1 'UTF8' WRITES include a BOM; the agent
+        // prompt directs no-BOM writes through
+        // [System.IO.File]::WriteAllText + UTF8Encoding($false).
+        // Select-String is deliberately absent: it has no -Encoding
+        // parameter in 5.1, and a $PSDefaultParameterValues entry for
+        // a nonexistent parameter errors at invocation.
+        "$PSDefaultParameterValues['Get-Content:Encoding']='UTF8';"
+        "$PSDefaultParameterValues['Set-Content:Encoding']='UTF8';"
+        "$PSDefaultParameterValues['Add-Content:Encoding']='UTF8';"
+        "$PSDefaultParameterValues['Out-File:Encoding']='utf8';"
+        "$PSDefaultParameterValues['Import-Csv:Encoding']='UTF8';"
+        "$PSDefaultParameterValues['Export-Csv:Encoding']='UTF8';"
         "$ErrorActionPreference = 'Stop';"
         "trap { "
             "[Console]::Error.WriteLine($_.ToString()); "
             "exit 1 "
         "}\r\n";
-    return Utf8ToWide(prefix + userCommand);
+
+    // Advisory lint (command_policy.cpp): surface hazardous-but-legal
+    // string constructs at the top of stdout so the model sees them
+    // alongside its own output and self-corrects on the next call.
+    // Injected as Write-Output lines so warnings ride the existing
+    // async result plumbing with zero changes to result assembly.
+    std::string lintBlock;
+    for (const std::string& w : LintPowerShellHazards(userCommand)) {
+        lintBlock += "Write-Output '"
+                   + EscapePsSingleQuoted("lint: " + w)
+                   + "';";
+    }
+    if (!lintBlock.empty()) lintBlock += "\r\n";
+
+    return Utf8ToWide(prefix + lintBlock + userCommand);
 }
 
 // Resolve %USERPROFILE% for CWD; fall back to empty (= inherit parent CWD)
