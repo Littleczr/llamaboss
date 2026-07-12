@@ -62,6 +62,24 @@ public:
     bool Save();
 
     // ── Per-secret access ────────────────────────────────────────
+    // Semantic view of one configured entry.  For direct values, value
+    // is the stored secret.  For env refs, value is the env-var name.
+    struct SecretEntry {
+        bool        isEnvRef = false;
+        std::string value;
+    };
+
+    // True when the provider/key exists in the in-memory store, even if
+    // the value cannot be decoded.  Useful for overwrite checks.
+    bool HasSecret(const std::string& provider,
+                   const std::string& key) const;
+
+    // Reads the configured entry without resolving env refs and without
+    // depending on any list-view presentation text.
+    bool TryGetSecretEntry(const std::string& provider,
+                           const std::string& key,
+                           SecretEntry& out) const;
+
     // Resolves $env / raw / (future) $file references.  Returns the
     // empty string when no secret is configured or the indirection
     // points at a missing env var.

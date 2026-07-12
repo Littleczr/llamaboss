@@ -92,8 +92,12 @@ bool LbTryParseNaturalLanguageGoalControl(const std::string& userInput,
 std::string LbCompactGoalStripText(std::string s, size_t maxBytes);
 
 // Clip a long body of text to at most `maxBytes` bytes for inclusion
-// in verifier prompts.  Keeps the head and tail with a "[middle
-// truncated]" marker between, since both ends typically carry the
-// most informative context (framing at head, most recent activity
-// at tail).
+// in prompts.  Keeps the head and tail with a "[middle truncated]"
+// marker between, since both ends typically carry the most informative
+// context (framing at head, most recent activity at tail).  UTF-8
+// boundaries are preserved so prompt JSON serialization never receives
+// an invalid sequence from this helper.
+std::string LbClipForPrompt(const std::string& text, size_t maxBytes);
+
+// Compatibility wrapper for Goal code that still uses the older name.
 std::string LbClipForGoalVerifier(const std::string& text, size_t maxBytes);

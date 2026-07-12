@@ -8,6 +8,7 @@
 #include <vector>
 #include <functional>
 #include <memory>
+#include <atomic>
 
 // Forward declarations
 class AppState;
@@ -30,6 +31,13 @@ public:
         // every existing UpdateWindowTitle() call site automatically
         // keeps the strip in sync.
         std::function<void()>  onProjectStateChanged;
+
+        // Fired at the top of LoadConversationFromPath(), before the new
+        // conversation replaces the current one.  The frame uses this to
+        // drop cross-chat transient state (queued sends behind deferred model
+        // loads, pending Skill authoring sessions, etc.) so old-chat state
+        // cannot leak into the newly-loaded chat.  Optional.
+        std::function<void()>  cancelPendingSend;
     };
 
     ConversationController(wxFrame& frame,
@@ -40,7 +48,9 @@ public:
                            ConversationSidebar& sidebar,
                            ServerManager& serverManager,
                            ModelSwitcher& modelSwitcher,
-                           StatusDot* statusDot);
+                           StatusDot* statusDot,
+                           std::weak_ptr<std::atomic<bool>> aliveToken);
+    ~ConversationController();
 
     void SetCallbacks(Callbacks cb) { m_cb = std::move(cb); }
 
@@ -49,10 +59,17 @@ public:
     void OnLoadConversation();
 
     // ── Automatic save (no dialog) ───────────────────────────────
-    void AutoSaveConversation(bool refreshSidebar = true);
+    // durable=false (the default) snapshots the conversation and queues JSON
+    // construction + staged atomic replacement on the controller's serialized
+    // persistence worker.  Bursty saves are coalesced by conversation path.
+    // Pass durable=true when history is about to be cleared or replaced
+    // (window close, New Chat, conversation switch, model/folder change): the
+    // queue is drained first, then the final write is synchronously flushed.
+    void AutoSaveConversation(bool refreshSidebar = true, bool durable = false);
 
     // ── Batch delete ─────────────────────────────────────────────
-    void DeleteConversations(const std::vector<std::string>& filePaths);
+    // Paths open in another window are skipped (Phase 3b guard).
+    void DeleteConversations(const std::vector<std::string>& requestedPaths);
 
     // ── Load a specific file (also used by sidebar click) ────────
     bool LoadConversationFromPath(const std::string& path);
@@ -64,6 +81,10 @@ public:
     void UpdateWindowTitle();
 
 private:
+    class AsyncSaveState;
+    void OnAsyncSaveComplete(wxCommandEvent& evt);
+    void WaitForPendingSaves();
+
     wxFrame&                        m_frame;
     AppState&                       m_appState;
     std::unique_ptr<ChatHistory>&   m_chatHistory;
@@ -75,4 +96,5 @@ private:
     StatusDot*                      m_statusDot;
 
     Callbacks                       m_cb;
+    std::unique_ptr<AsyncSaveState> m_asyncSave;
 };

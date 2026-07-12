@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
+#include <set>
 
 namespace {
 
@@ -323,6 +324,45 @@ bool SecretsStore::Save()
 
 // ─── Per-secret access ──────────────────────────────────────────
 
+bool SecretsStore::HasSecret(const std::string& provider,
+                             const std::string& key) const
+{
+    auto pit = m_providers.find(provider);
+    if (pit == m_providers.end()) return false;
+    return pit->second.find(key) != pit->second.end();
+}
+
+bool SecretsStore::TryGetSecretEntry(const std::string& provider,
+                                     const std::string& key,
+                                     SecretEntry& out) const
+{
+    out = SecretEntry();
+
+    auto pit = m_providers.find(provider);
+    if (pit == m_providers.end()) return false;
+
+    auto kit = pit->second.find(key);
+    if (kit == pit->second.end()) return false;
+
+    const std::string& jsonText = kit->second;
+
+    std::string envName;
+    if (TryParseEnvRefJson(jsonText, envName)) {
+        out.isEnvRef = true;
+        out.value = std::move(envName);
+        return true;
+    }
+
+    std::string decodedString;
+    if (TryDecodeJsonStringLiteral(jsonText, decodedString)) {
+        out.isEnvRef = false;
+        out.value = std::move(decodedString);
+        return true;
+    }
+
+    return false;
+}
+
 std::string SecretsStore::GetSecret(const std::string& provider,
                                     const std::string& key) const
 {
@@ -425,6 +465,8 @@ std::vector<std::pair<std::string, std::string>>
 SecretsStore::BuildEnvInjections() const
 {
     std::vector<std::pair<std::string, std::string>> out;
+    std::set<std::string> emittedEnvNames;
+
     for (const auto& [provider, kvs] : m_providers) {
         for (const auto& [k, _] : kvs) {
             std::string value = GetSecret(provider, k);
@@ -432,6 +474,12 @@ SecretsStore::BuildEnvInjections() const
 
             std::string envName = BuildInjectedEnvName(provider, k);
             if (envName.empty()) continue;
+
+            if (!emittedEnvNames.insert(envName).second) {
+                wxLogWarning("SecretsStore: duplicate injected env var '%s' from %s.%s skipped.",
+                             envName.c_str(), provider.c_str(), k.c_str());
+                continue;
+            }
 
             out.emplace_back(std::move(envName), std::move(value));
         }

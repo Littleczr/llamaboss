@@ -80,6 +80,10 @@
       <PreprocessorDefinitions>WIN32;_DEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp17</LanguageStandard>
+      <PrecompiledHeader>Use</PrecompiledHeader>
+      <PrecompiledHeaderFile>pch.h</PrecompiledHeaderFile>
+      <ForcedIncludeFiles>pch.h</ForcedIncludeFiles>
+      <MultiProcessorCompilation>true</MultiProcessorCompilation>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
@@ -95,6 +99,10 @@
       <PreprocessorDefinitions>WIN32;NDEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp17</LanguageStandard>
+      <PrecompiledHeader>Use</PrecompiledHeader>
+      <PrecompiledHeaderFile>pch.h</PrecompiledHeaderFile>
+      <ForcedIncludeFiles>pch.h</ForcedIncludeFiles>
+      <MultiProcessorCompilation>true</MultiProcessorCompilation>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
@@ -110,6 +118,10 @@
       <PreprocessorDefinitions>_DEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp17</LanguageStandard>
+      <PrecompiledHeader>Use</PrecompiledHeader>
+      <PrecompiledHeaderFile>pch.h</PrecompiledHeaderFile>
+      <ForcedIncludeFiles>pch.h</ForcedIncludeFiles>
+      <MultiProcessorCompilation>true</MultiProcessorCompilation>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
@@ -125,6 +137,10 @@
       <PreprocessorDefinitions>NDEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp17</LanguageStandard>
+      <PrecompiledHeader>Use</PrecompiledHeader>
+      <PrecompiledHeaderFile>pch.h</PrecompiledHeaderFile>
+      <ForcedIncludeFiles>pch.h</ForcedIncludeFiles>
+      <MultiProcessorCompilation>true</MultiProcessorCompilation>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
@@ -134,8 +150,17 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClCompile Include="pch.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">Create</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">Create</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">Create</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">Create</PrecompiledHeader>
+    </ClCompile>
     <ClCompile Include="app_state.cpp" />
+    <ClCompile Include="app.cpp" />
+    <ClCompile Include="model_service.cpp" />
     <ClCompile Include="chat_client.cpp" />
+    <ClCompile Include="lb_ssl.cpp" />
     <ClCompile Include="chat_display.cpp" />
     <ClCompile Include="attachment_manager.cpp" />
     <ClCompile Include="chat_history.cpp" />
@@ -143,7 +168,9 @@
     <ClCompile Include="python_runner.cpp" />
     <ClCompile Include="python_arg_policy.cpp" />
     <ClCompile Include="secrets_store.cpp" />
+    <ClCompile Include="endpoint_store.cpp" />
     <ClCompile Include="connections_dialog.cpp" />
+    <ClCompile Include="endpoints_dialog.cpp" />
     <ClCompile Include="tool_path.cpp" />
     <ClCompile Include="tool_read.cpp" />
     <ClCompile Include="tool_ls.cpp" />
@@ -170,10 +197,14 @@
     <ClCompile Include="theme.cpp" />
     <ClCompile Include="model_manager.cpp" />
     <ClCompile Include="server_manager.cpp" />
+    <ClCompile Include="update_checker.cpp" />
     <ClCompile Include="ui_builder.cpp" />
     <ClCompile Include="model_switcher.cpp" />
     <ClCompile Include="model_downloader.cpp" />
     <ClCompile Include="conversation_controller.cpp" />
+    <ClCompile Include="goal_controller.cpp" />
+    <ClCompile Include="skill_draft_controller.cpp" />
+    <ClCompile Include="project_controller.cpp" />
     <ClCompile Include="path_safety.cpp" />
     <ClCompile Include="project_manager.cpp" />
     <ClCompile Include="project_attach_dialog.cpp" />
@@ -186,10 +217,24 @@
     <ClCompile Include="python_package_recovery.cpp" />
     <ClCompile Include="artifact_presentation.cpp" />
     <ClCompile Include="drop_import_controller.cpp" />
+    <ClCompile Include="lb_string_utils.cpp" />
+    <ClCompile Include="lb_update_ui.cpp" />
+    <ClCompile Include="lb_project_ui_actions.cpp" />
+    <ClCompile Include="lb_modal_scrim.cpp" />
+    <ClCompile Include="tool_result_controller.cpp" />
+    <ClCompile Include="project_context_builder.cpp" />
+    <ClCompile Include="lb_input_parsers.cpp" />
+    <ClCompile Include="lb_themed_dialogs.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="pch.h" />
     <ClInclude Include="app_state.h" />
+    <ClInclude Include="app.h" />
+    <ClInclude Include="conversation_registry.h" />
+    <ClInclude Include="model_service.h" />
     <ClInclude Include="chat_client.h" />
+    <ClInclude Include="inference_target.h" />
+    <ClInclude Include="lb_ssl.h" />
     <ClInclude Include="chat_display.h" />
     <ClInclude Include="attachment_manager.h" />
     <ClInclude Include="chat_history.h" />
@@ -198,7 +243,9 @@
     <ClInclude Include="python_runner.h" />
     <ClInclude Include="python_arg_policy.h" />
     <ClInclude Include="secrets_store.h" />
+    <ClInclude Include="endpoint_store.h" />
     <ClInclude Include="connections_dialog.h" />
+    <ClInclude Include="endpoints_dialog.h" />
     <ClInclude Include="tool_context.h" />
     <ClInclude Include="tool_path.h" />
     <ClInclude Include="tool_read.h" />
@@ -229,6 +276,7 @@
     <ClInclude Include="theme.h" />
     <ClInclude Include="model_manager.h" />
     <ClInclude Include="server_manager.h" />
+    <ClInclude Include="update_checker.h" />
     <ClInclude Include="widgets.h" />
     <ClInclude Include="ui_event_post.h" />
     <ClInclude Include="chat_input_ctrl.h" />
@@ -237,6 +285,9 @@
     <ClInclude Include="model_switcher.h" />
     <ClInclude Include="model_downloader.h" />
     <ClInclude Include="conversation_controller.h" />
+    <ClInclude Include="goal_controller.h" />
+    <ClInclude Include="skill_draft_controller.h" />
+    <ClInclude Include="project_controller.h" />
     <ClInclude Include="path_safety.h" />
     <ClInclude Include="project_manager.h" />
     <ClInclude Include="project_attach_dialog.h" />
@@ -250,6 +301,13 @@
     <ClInclude Include="python_package_recovery.h" />
     <ClInclude Include="artifact_presentation.h" />
     <ClInclude Include="drop_import_controller.h" />
+    <ClInclude Include="lb_update_ui.h" />
+    <ClInclude Include="lb_project_ui_actions.h" />
+    <ClInclude Include="lb_modal_scrim.h" />
+    <ClInclude Include="tool_result_controller.h" />
+    <ClInclude Include="project_context_builder.h" />
+    <ClInclude Include="lb_input_parsers.h" />
+    <ClInclude Include="lb_themed_dialogs.h" />
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="LlamaBoss.rc" />

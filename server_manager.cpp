@@ -10,6 +10,10 @@
 
 #include <Poco/URI.h>
 #include <Poco/Net/HTTPClientSession.h>
+#include <thread>
+#include <mutex>
+#include <deque>
+#include <algorithm>
 #include <Poco/Net/HTTPRequest.h>
 #include <Poco/Net/HTTPResponse.h>
 #include <Poco/StreamCopier.h>
@@ -81,6 +85,46 @@ static bool ContainsAny(const std::string& haystack,
     return false;
 }
 
+static std::string WxToUtf8String(const wxString& s)
+{
+    wxCharBuffer buf = s.ToUTF8();
+    return buf.data() ? std::string(buf.data()) : std::string();
+}
+
+static wxString ModelFolderForGgufPath(const std::string& ggufPath)
+{
+    wxFileName modelFn(wxString::FromUTF8(ggufPath.c_str()));
+    return modelFn.GetPath();
+}
+
+static bool IsBundledModelFolder(const wxString& modelFolder)
+{
+    if (modelFolder.IsEmpty())
+        return false;
+
+    wxString modelsRoot = wxString::FromUTF8(ServerManager::GetModelsDir().c_str());
+    if (modelsRoot.IsEmpty())
+        return false;
+
+    const std::string folderUtf8 = WxToUtf8String(modelFolder);
+    const std::string rootUtf8   = WxToUtf8String(modelsRoot);
+
+    // Bundled means: the GGUF lives in a direct child of the models root,
+    // not in the root itself and not nested deeper. Use normalized path
+    // comparison so Windows casing/separator differences from settings,
+    // scans, or saved conversations do not silently disable mmproj pairing.
+    if (path_safety::SameModelPath(folderUtf8, rootUtf8))
+        return false;
+
+    wxString parentFolder = wxFileName(modelFolder).GetPath();
+    return path_safety::SameModelPath(WxToUtf8String(parentFolder), rootUtf8);
+}
+
+static bool IsBundledModelPath(const std::string& ggufPath)
+{
+    return IsBundledModelFolder(ModelFolderForGgufPath(ggufPath));
+}
+
 // Phase 3 stabilization: only the specific "retry without --jinja"
 // recovery path should use MaybeRetryWithoutJinja(). Earlier builds
 // retried on every server-start failure, which could hide unrelated
@@ -110,14 +154,6 @@ static bool LooksLikeJinjaOrTemplateFailure(const std::string& error)
     return false;
 }
 
-static bool SameServerConfig(const ServerConfig& a, const ServerConfig& b)
-{
-    return a.port == b.port &&
-           a.gpuLayers == b.gpuLayers &&
-           a.ctxSize == b.ctxSize &&
-           a.threads == b.threads &&
-           a.flashAttn == b.flashAttn;
-}
 // ═══════════════════════════════════════════════════════════════════
 
 ServerHealthThread::ServerHealthThread(wxEvtHandler* handler,
@@ -128,6 +164,7 @@ ServerHealthThread::ServerHealthThread(wxEvtHandler* handler,
                                        HANDLE processHandle,
 #endif
                                        const std::string& logPath,
+                                       ServerLaunchGeneration generation,
                                        int timeoutMs)
     : wxThread(wxTHREAD_DETACHED)
     , m_handler(handler)
@@ -138,6 +175,7 @@ ServerHealthThread::ServerHealthThread(wxEvtHandler* handler,
     , m_processHandle(INVALID_HANDLE_VALUE)
 #endif
     , m_logPath(logPath)
+    , m_generation(generation)
     , m_timeoutMs(timeoutMs)
 {
 #ifdef __WXMSW__
@@ -156,6 +194,9 @@ ServerHealthThread::ServerHealthThread(wxEvtHandler* handler,
 
 bool ServerHealthThread::SafePost(wxCommandEvent* ev)
 {
+    // Fast cancellation guard. StopServer() can still set the flag after this
+    // check but before wx queues the event; the launch-generation stamp is the
+    // authoritative guard for that remaining TOCTOU window.
     if (m_cancelFlag->load()) {
         delete ev;
         return false;
@@ -181,6 +222,7 @@ wxThread::ExitCode ServerHealthThread::Entry()
                 msg += "\n\nSee log: " + m_logPath;
 
             auto* ev = new wxCommandEvent(wxEVT_SERVER_ERROR);
+            SetServerEventGeneration(*ev, m_generation);
             ev->SetString(wxString::FromUTF8(msg));
             SafePost(ev);
 #ifdef __WXMSW__
@@ -205,6 +247,7 @@ wxThread::ExitCode ServerHealthThread::Entry()
             if (!tail.empty()) msg += "\n\nLast log output:\n" + tail;
 
             auto* ev = new wxCommandEvent(wxEVT_SERVER_ERROR);
+            SetServerEventGeneration(*ev, m_generation);
             ev->SetString(wxString::FromUTF8(msg));
             SafePost(ev);
             CloseHandle(m_processHandle);
@@ -232,6 +275,7 @@ wxThread::ExitCode ServerHealthThread::Entry()
 
             if (resp.getStatus() == Poco::Net::HTTPResponse::HTTP_OK) {
                 auto* ev = new wxCommandEvent(wxEVT_SERVER_READY);
+                SetServerEventGeneration(*ev, m_generation);
                 SafePost(ev);
 #ifdef __WXMSW__
                 if (m_processHandle != INVALID_HANDLE_VALUE)
@@ -261,6 +305,42 @@ wxThread::ExitCode ServerHealthThread::Entry()
 //  ServerManager
 // ═══════════════════════════════════════════════════════════════════
 
+// ── Serialized slot-action worker ────────────────────────────────
+//
+// Slot actions must reach llama-server in dispatch order.  The server
+// serializes tasks once they are ENQUEUED on the slot, but it cannot
+// order two clients racing to connect.  A conversation switch fires
+// save-away(A) then restore-in(B) back-to-back; with one detached
+// thread per action those two POSTs raced, and when the restore won,
+// the slot held B's KV by the time the save executed — serializing
+// B's state under A's filename.  Benign at restore time (the token
+// prefix mismatches and llama-server falls back to full reprocess)
+// but it silently defeated the fast path on exactly the rapid-switch
+// pattern it was built for, at the cost of a multi-GB wasted write.
+//
+// Fix: one FIFO queue drained by at most one worker thread.  Callers
+// keep fire-and-forget semantics — enqueue is a mutex push, never a
+// network wait.  The queue block is shared_ptr-owned by ServerManager
+// AND the worker, so app shutdown never joins: the destructor flips
+// `stop` and the worker exits after its in-flight action instead of
+// POSTing to a server StopServer just killed.  The worker exits when
+// the queue drains (no idle thread); a later enqueue spawns a fresh
+// one.  Overlap is impossible because `workerRunning` only flips
+// under the same mutex that guards the queue.
+
+struct SlotAction {
+    std::string baseUrl;
+    std::string action;     // "save" | "restore"
+    std::string filename;
+};
+
+struct SlotActionQueue {
+    std::mutex             mutex;
+    std::deque<SlotAction> items;
+    bool                   workerRunning = false;
+    bool                   stop          = false;   // set by ~ServerManager
+};
+
 ServerManager::ServerManager(wxEvtHandler* eventHandler,
                              std::weak_ptr<std::atomic<bool>> aliveToken,
                              Poco::Logger* logger)
@@ -272,12 +352,235 @@ ServerManager::ServerManager(wxEvtHandler* eventHandler,
 
 ServerManager::~ServerManager()
 {
+    // Tell a pending slot-action worker to exit after its in-flight
+    // action instead of POSTing queued actions to the server that
+    // StopServer() is about to kill.  No join — the worker owns a
+    // shared_ptr to the queue block, so this never blocks the UI
+    // thread on a network timeout.
+    if (m_slotQueue) {
+        std::lock_guard<std::mutex> lock(m_slotQueue->mutex);
+        m_slotQueue->stop = true;
+    }
+
     StopServer();
 }
 
 std::string ServerManager::GetBaseUrl() const
 {
     return "http://127.0.0.1:" + std::to_string(m_port);
+}
+
+// ═════════════════════════════════════════════════════════════════
+//  KV SLOT STATE — instant conversation switching
+// ═════════════════════════════════════════════════════════════════
+
+// Defined below beside GetCacheDir(); forward-declared because the
+// slot helpers here precede the directory-accessor cluster.
+static std::string GetKvSlotCacheDir();
+
+// Cache filename for a (model, conversation) pair.  Keyed by BOTH so
+// a conversation reopened under a different model simply finds no
+// state file — restoring KV serialized by another model into the
+// running one would be undefined behavior at best.  Sanitized to
+// [A-Za-z0-9._-] because llama-server treats the filename as a path
+// component under --slot-save-path.
+static std::string SlotCacheFilenameFor(const std::string& modelGgufPath,
+                                        const std::string& conversationPath)
+{
+    if (modelGgufPath.empty() || conversationPath.empty()) return "";
+
+    auto stem = [](const std::string& path) -> std::string {
+        wxFileName fn(wxString::FromUTF8(path));
+        std::string out = fn.GetName().ToUTF8().data();
+        for (char& c : out) {
+            const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                            (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-';
+            if (!ok) c = '-';
+        }
+        if (out.size() > 60) out.resize(60);
+        return out;
+    };
+
+    std::string m = stem(modelGgufPath);
+    std::string c = stem(conversationPath);
+    if (m.empty() || c.empty()) return "";
+    return m + "__" + c + ".kvbin";
+}
+
+// Blocking POST /slots/0?action=<save|restore>.  Runs on the worker
+// thread only.  Value copies, no UI, no ServerManager member access —
+// the worker can outlive the object.  Failures are swallowed: server
+// gone, action rejected, timeout are all equivalent to "no fast path
+// this time", and the status quo (full reprocess) is the fallback.
+static void ExecuteSlotAction(const SlotAction& a)
+{
+    try {
+        Poco::URI uri(a.baseUrl + "/slots/0?action=" + a.action);
+        Poco::Net::HTTPClientSession sess(uri.getHost(), uri.getPort());
+        sess.setTimeout(Poco::Timespan(120, 0));   // multi-GB states take seconds
+
+        const std::string body = "{\"filename\":\"" + a.filename + "\"}";
+
+        Poco::Net::HTTPRequest req(Poco::Net::HTTPRequest::HTTP_POST,
+                                   uri.getPathAndQuery(),
+                                   Poco::Net::HTTPMessage::HTTP_1_1);
+        req.setContentType("application/json");
+        req.setContentLength((int)body.size());
+        sess.sendRequest(req) << body;
+
+        Poco::Net::HTTPResponse resp;
+        std::istream& in = sess.receiveResponse(resp);
+        std::string drain;
+        Poco::StreamCopier::copyToString(in, drain);
+        (void)resp;
+    } catch (...) {
+        // Nothing to unwind.
+    }
+}
+
+void ServerManager::EnqueueSlotAction(const std::string& action,
+                                      const std::string& filename)
+{
+    if (m_logger)
+        m_logger->information("kvslot: dispatch " + action + " \"" + filename + "\"");
+
+    if (!m_slotQueue)
+        m_slotQueue = std::make_shared<SlotActionQueue>();
+
+    std::shared_ptr<SlotActionQueue> q = m_slotQueue;
+
+    bool spawnWorker = false;
+    {
+        std::lock_guard<std::mutex> lock(q->mutex);
+        q->items.push_back({ GetBaseUrl(), action, filename });
+        if (!q->workerRunning) {
+            q->workerRunning = true;
+            spawnWorker = true;
+        }
+    }
+
+    if (spawnWorker) {
+        std::thread([q]() {
+            for (;;) {
+                SlotAction a;
+                {
+                    std::lock_guard<std::mutex> lock(q->mutex);
+                    if (q->stop || q->items.empty()) {
+                        q->workerRunning = false;
+                        return;
+                    }
+                    a = std::move(q->items.front());
+                    q->items.pop_front();
+                }
+                ExecuteSlotAction(a);
+            }
+        }).detach();
+    }
+}
+
+// Keep the newest few state files; each can run to gigabytes.  Runs
+// on the UI thread before a save dispatch — directory enumeration of
+// a handful of files is instant, and doing it here (not in the
+// detached thread) keeps filesystem mutation single-threaded.
+static void PruneKvSlotCacheDir(Poco::Logger* logger)
+{
+    const size_t kKeep = 5;   // +1 about to be written = 6 on disk
+
+    wxString root = wxString::FromUTF8(GetKvSlotCacheDir());
+    wxDir dir(root);
+    if (!dir.IsOpened()) return;
+
+    std::vector<std::pair<time_t, wxString>> files;
+    wxString name;
+    bool found = dir.GetFirst(&name, "*.kvbin", wxDIR_FILES);
+    while (found) {
+        wxFileName fn(root, name);
+        wxDateTime mtime;
+        if (fn.GetTimes(nullptr, &mtime, nullptr))
+            files.push_back({ mtime.GetTicks(), name });
+        found = dir.GetNext(&name);
+    }
+    if (files.size() <= kKeep) return;
+
+    std::sort(files.begin(), files.end());   // oldest first
+    const size_t doomed = files.size() - kKeep;
+    for (size_t i = 0; i < doomed; ++i) {
+        wxFileName fn(root, files[i].second);
+        if (wxRemoveFile(fn.GetFullPath()) && logger)
+            logger->information("kvslot: pruned \"" +
+                std::string(files[i].second.ToUTF8().data()) + "\"");
+    }
+}
+
+void ServerManager::NoteSlotOwner(const std::string& conversationPath)
+{
+    if (m_loadedModel.empty()) return;   // remote lane / no server
+
+    const std::string fname =
+        SlotCacheFilenameFor(m_loadedModel, conversationPath);
+    if (fname.empty()) return;
+
+    m_slotOwner = fname;
+    m_slotDirty = true;
+}
+
+void ServerManager::InvalidateSlotOwner()
+{
+    // Called at the dispatch of any generation that runs against the
+    // local slot with a throwaway history (goal contract builder,
+    // goal verifier, Skill draft builder).  The slot's KV is about to
+    // hold content belonging to no conversation; forgetting the owner
+    // makes the next switch-away skip its save instead of serializing
+    // that state under the active conversation's filename.  Stamped
+    // ownership returns naturally on the next real conversation
+    // request via NoteSlotOwner.
+    if (m_slotOwner.empty() && !m_slotDirty) return;
+
+    m_slotOwner.clear();
+    m_slotDirty = false;
+
+    if (m_logger)
+        m_logger->information(
+            "kvslot: ownership invalidated (out-of-conversation generation)");
+}
+
+void ServerManager::SaveSlotStateForConversation(const std::string& conversationPath)
+{
+    if (m_loadedModel.empty()) return;
+
+    const std::string fname =
+        SlotCacheFilenameFor(m_loadedModel, conversationPath);
+    if (fname.empty()) return;
+
+    // The slot must verifiably hold THIS conversation's KV, and a
+    // generation must have run since the last save/restore.  Anything
+    // else is either a stale slot (would save the wrong conversation's
+    // state under this name) or a redundant rewrite of what a restore
+    // just loaded.
+    if (m_slotOwner != fname || !m_slotDirty) return;
+
+    PruneKvSlotCacheDir(m_logger);
+    EnqueueSlotAction("save", fname);
+    m_slotDirty = false;
+}
+
+void ServerManager::RestoreSlotStateForConversation(const std::string& conversationPath)
+{
+    if (m_loadedModel.empty()) return;
+
+    const std::string fname =
+        SlotCacheFilenameFor(m_loadedModel, conversationPath);
+    if (fname.empty()) return;
+
+    // Client-side existence check — no state file means a first visit
+    // (or a different model last time); skip the round-trip entirely.
+    wxFileName fn(wxString::FromUTF8(GetKvSlotCacheDir()),
+                  wxString::FromUTF8(fname));
+    if (!fn.FileExists()) return;
+
+    EnqueueSlotAction("restore", fname);
+    m_slotOwner = fname;
+    m_slotDirty = false;
 }
 
 std::string ServerManager::ModelDisplayName(const std::string& ggufPath)
@@ -288,15 +591,10 @@ std::string ServerManager::ModelDisplayName(const std::string& ggufPath)
     // ("gemma-3-27b-it-abliterated-q4_k_m"). For loose files (power
     // mode, or dropped into the default folder without a bundle),
     // fall back to the .gguf filename stem — matches legacy behavior.
-    wxFileName fn(ggufPath);
+    wxFileName fn(wxString::FromUTF8(ggufPath.c_str()));
     wxString modelFolder = fn.GetPath();
-    wxString modelsRoot  = wxString::FromUTF8(GetModelsDir());
 
-    bool isBundled = !modelFolder.IsEmpty() &&
-                     (modelFolder != modelsRoot) &&
-                     (wxFileName(modelFolder).GetPath() == modelsRoot);
-
-    if (isBundled) {
+    if (IsBundledModelPath(ggufPath)) {
         // Return the last path component (the bundle folder name).
         wxFileName folderFn = wxFileName::DirName(modelFolder);
         const wxArrayString& dirs = folderFn.GetDirs();
@@ -418,6 +716,7 @@ std::string ServerManager::GetLogsDir()           { return GetDataDir() + std::s
 std::string ServerManager::GetConfigDir()         { return GetDataDir() + std::string(1, wxFILE_SEP_PATH) + "config"; }
 std::string ServerManager::GetConversationsDir()  { return GetDataDir() + std::string(1, wxFILE_SEP_PATH) + "conversations"; }
 std::string ServerManager::GetCacheDir()          { return GetDataDir() + std::string(1, wxFILE_SEP_PATH) + "cache"; }
+static std::string GetKvSlotCacheDir()            { return ServerManager::GetCacheDir() + std::string(1, wxFILE_SEP_PATH) + "kvslots"; }
 
 void ServerManager::EnsureDataDirs()
 {
@@ -427,6 +726,7 @@ void ServerManager::EnsureDataDirs()
     wxFileName::Mkdir(GetConfigDir(),        wxS_DIR_DEFAULT, wxPATH_MKDIR_FULL);
     wxFileName::Mkdir(GetConversationsDir(), wxS_DIR_DEFAULT, wxPATH_MKDIR_FULL);
     wxFileName::Mkdir(GetCacheDir(),         wxS_DIR_DEFAULT, wxPATH_MKDIR_FULL);
+    wxFileName::Mkdir(GetKvSlotCacheDir(),   wxS_DIR_DEFAULT, wxPATH_MKDIR_FULL);
 
     // Workspace lives outside %LOCALAPPDATA% (under Documents) so the
     // user can find it from File Explorer. Created here at startup
@@ -480,6 +780,86 @@ std::string ServerManager::GetDefaultWorkspaceDir()
     // Active default working directory for tools. Future document lanes
     // are created beside it by EnsureWorkspaceDir().
     return JoinPath(GetDefaultWorkspaceRootDir(), "Workspace");
+}
+
+// ─── Conversation lane layout ─────────────────────────────────────
+// Single source of truth for recognizing the per-conversation folder
+// shape created by ChatHistory::EnsureWorkflowDir():
+//   %USERPROFILE%\LlamaBoss\Workflows\chat_xxxxxxxx\Workspace
+// python_runner.cpp and agent_controller.cpp both delegate here; see
+// the header comment for why the duplication was a safety hazard.
+
+namespace {
+
+std::string LaneTrimTrailingSeparators(std::string s)
+{
+    while (!s.empty() && (s.back() == '/' || s.back() == '\\')) s.pop_back();
+    return s;
+}
+
+std::string LaneParentDirOf(const std::string& path)
+{
+    std::string s = LaneTrimTrailingSeparators(path);
+    size_t pos = s.find_last_of("/\\");
+    if (pos == std::string::npos) return std::string();
+    return s.substr(0, pos);
+}
+
+std::string LaneBaseNameOf(const std::string& path)
+{
+    std::string s = LaneTrimTrailingSeparators(path);
+    size_t pos = s.find_last_of("/\\");
+    return (pos == std::string::npos) ? s : s.substr(pos + 1);
+}
+
+std::string LaneLowerAscii(std::string s)
+{
+    for (char& ch : s) {
+        if (ch >= 'A' && ch <= 'Z') ch = static_cast<char>(ch + 32);
+    }
+    return s;
+}
+
+} // namespace
+
+std::string ServerManager::GetLlamaBossRootDir()
+{
+    // Identical by construction to ParentDirOf(GetDefaultWorkspaceDir())
+    // — GetDefaultWorkspaceDir is GetDefaultWorkspaceRootDir() +
+    // "\Workspace" — but skips the string round-trip.
+    return GetDefaultWorkspaceRootDir();
+}
+
+std::string ServerManager::ConversationWorkflowRootFromCwd(const std::string& cwd)
+{
+    std::string clean = LaneTrimTrailingSeparators(cwd);
+    if (clean.empty()) return std::string();
+
+    if (LaneLowerAscii(LaneBaseNameOf(clean)) != "workspace") return std::string();
+
+    std::string chatRoot      = LaneParentDirOf(clean);     // ...\chat_xxxxxxxx
+    std::string workflowsRoot = LaneParentDirOf(chatRoot);  // ...\Workflows
+    if (chatRoot.empty() || workflowsRoot.empty()) return std::string();
+
+    std::string chatBase = LaneLowerAscii(LaneBaseNameOf(chatRoot));
+    if (chatBase.rfind("chat_", 0) != 0) return std::string();
+    if (LaneLowerAscii(LaneBaseNameOf(workflowsRoot)) != "workflows") return std::string();
+
+    return chatRoot;
+}
+
+std::string ServerManager::ConversationLaneDirForCwd(const std::string& cwd,
+                                                     const std::string& lane)
+{
+    std::string root = ConversationWorkflowRootFromCwd(cwd);
+    if (root.empty()) root = GetLlamaBossRootDir();
+    if (root.empty()) return std::string();
+    return JoinPath(root, lane);
+}
+
+std::string ServerManager::ConversationScriptsDirForCwd(const std::string& cwd)
+{
+    return ConversationLaneDirForCwd(cwd, "Scripts");
 }
 
 std::string ServerManager::GetWorkspaceDirOverride()
@@ -573,6 +953,12 @@ static bool IsMmprojFilename(const wxString& filename)
     return filename.Lower().Contains("mmproj");
 }
 
+// ── Internal: is this filename a speculative draft model? ────────
+static bool IsDraftFilename(const wxString& filename)
+{
+    return filename.Lower().Contains("draft");
+}
+
 // ── Internal: collect bundle-local mmproj candidates ──────────────
 // wxDir enumeration order is not a stable user-facing choice. Keep the
 // collection sorted so diagnostics are repeatable, but do not use sorting
@@ -645,6 +1031,52 @@ static std::string ResolveBundleMmproj(const wxString& bundleDir,
     return "";
 }
 
+// ── Internal: resolve a bundle's speculative draft model ─────────
+// Mirrors ResolveBundleMmproj exactly: a single *draft*.gguf in the
+// bundle pairs automatically; zero means no speculative decoding;
+// more than one is ambiguous and skipped with a warning.  Filesystem
+// structure as configuration — no UI, same guarantee as mmproj.
+static std::string ResolveBundleDraft(const wxString& bundleDir,
+                                      Poco::Logger* logger = nullptr)
+{
+    std::vector<wxString> drafts;
+    {
+        wxDir dir(bundleDir);
+        if (dir.IsOpened()) {
+            wxString filename;
+            bool found = dir.GetFirst(&filename, "*.gguf", wxDIR_FILES);
+            while (found) {
+                if (IsDraftFilename(filename) && !IsMmprojFilename(filename))
+                    drafts.push_back(filename);
+                found = dir.GetNext(&filename);
+            }
+            std::sort(drafts.begin(), drafts.end());
+        }
+    }
+
+    const std::string bundlePath = bundleDir.ToUTF8().data();
+
+    if (drafts.empty()) return "";
+
+    if (drafts.size() == 1) {
+        std::string result = JoinBundleFileUtf8(bundleDir, drafts[0]);
+        if (logger)
+            logger->information("draft: bundled pair \"" + result + "\"");
+        return result;
+    }
+
+    if (logger) {
+        logger->warning(
+            "draft: multiple draft files found in bundle \"" + bundlePath +
+            "\"; skipping speculative pairing until only one remains");
+        for (const wxString& d : drafts) {
+            logger->warning(
+                "draft:   candidate \"" + JoinBundleFileUtf8(bundleDir, d) + "\"");
+        }
+    }
+    return "";
+}
+
 // ── Internal: scan a single bundle subfolder ─────────────────────
 // Returns a ModelEntry if the folder contains exactly one non-mmproj
 // .gguf. Returns an empty entry (ggufPath empty) otherwise — skip it.
@@ -662,7 +1094,11 @@ static ServerManager::ModelEntry ScanBundle(const wxString& bundleDir,
     wxString filename;
     bool found = dir.GetFirst(&filename, "*.gguf", wxDIR_FILES);
     while (found) {
-        if (!IsMmprojFilename(filename))
+        // mmproj and *draft* files are bundle companions, not weights —
+        // without the draft exclusion, dropping a speculative draft into
+        // a bundle would make the bundle read as "two weights, ambiguous"
+        // and the model would vanish from the list.
+        if (!IsMmprojFilename(filename) && !IsDraftFilename(filename))
             weights.push_back(filename);
         found = dir.GetNext(&filename);
     }
@@ -793,7 +1229,7 @@ static const std::set<std::string> kNoiseTokens = {
     // K-quant suffix letters (from Q3_K_M, Q4_K_S, Q5_K_L etc.)
     "k", "m", "s", "l",
     // Imatrix quant tiers & suffixes
-    "iq1", "iq2", "iq3", "iq4",
+    "i1", "iq1", "iq2", "iq3", "iq4",
     "xxs", "xs", "nl",
     // Unsloth dynamic quants
     "ud", "xl",
@@ -898,24 +1334,40 @@ std::string ServerManager::FindMatchingMmproj(const std::string& modelGgufPath,
         }
     }
 
-    // ── Single candidate → use it unconditionally ──────────────────
-    // Common case: user has one mmproj file named generically
-    // (e.g. "mmproj-F16.gguf") with no model-identity tokens.
-    // No ambiguity to resolve, so just use it.
+    // ── Single candidate → use only when generic or actually matching ─
+    // Common legitimate case: one projector named generically
+    // (e.g. "mmproj-F16.gguf") with no model-identity tokens after
+    // noise stripping. Pair that. But if the sole projector has identity
+    // tokens and zero overlap, it likely belongs to a different model;
+    // skipping text-only is safer than force-pairing the wrong CLIP.
     if (candidates.size() == 1) {
+        wxFileName candFn(candidates[0].fullPath);
+        std::set<std::string> candTokens =
+            TokeniseFilename(candFn.GetFullName());
+
         std::string result = candidates[0].fullPath.ToUTF8().data();
-        if (logger) {
-            if (bestScore > 0)
-                logger->information(
-                    "mmproj: matched \"" + result +
-                    "\" (score " + std::to_string(bestScore) + "/" +
-                    std::to_string(modelTokens.size()) + ")");
-            else
-                logger->information(
-                    "mmproj: using sole projector \"" + result +
-                    "\" (no token overlap — single candidate, no ambiguity)");
+        if (bestScore > 0 || candTokens.empty()) {
+            if (logger) {
+                if (bestScore > 0)
+                    logger->information(
+                        "mmproj: matched \"" + result +
+                        "\" (score " + std::to_string(bestScore) + "/" +
+                        std::to_string(modelTokens.size()) + ")");
+                else
+                    logger->information(
+                        "mmproj: using generic sole projector \"" + result +
+                        "\" (no model-identity tokens after noise stripping)");
+            }
+            return result;
         }
-        return result;
+
+        if (logger) {
+            logger->information(
+                "mmproj: sole projector \"" + result +
+                "\" has model-identity tokens but zero overlap with "
+                "the selected model — skipping projector pairing");
+        }
+        return "";
     }
 
     // ── Multiple candidates but no token overlap → ambiguous, skip ──
@@ -955,6 +1407,29 @@ std::string ServerManager::FindMatchingMmproj(const std::string& modelGgufPath,
 
 // ── Start server ─────────────────────────────────────────────────
 
+// True if anything HTTP answers GET /health on our port right now.
+// 250ms timeout: this runs on the UI thread just before a spawn, and
+// on localhost a live server answers in microseconds — if nothing is
+// listening, connect fails instantly (ECONNREFUSED), so the timeout
+// is only ever felt in pathological half-open states.
+bool ServerManager::IsPortAnswering() const
+{
+    try {
+        Poco::Net::HTTPClientSession sess("127.0.0.1", m_port);
+        sess.setTimeout(Poco::Timespan(0, 250 * 1000));
+        Poco::Net::HTTPRequest req(Poco::Net::HTTPRequest::HTTP_GET, "/health");
+        sess.sendRequest(req);
+        Poco::Net::HTTPResponse resp;
+        std::istream& in = sess.receiveResponse(resp);
+        std::string body;
+        Poco::StreamCopier::copyToString(in, body);
+        return true;   // any HTTP response at all means the port is taken
+    }
+    catch (...) {
+        return false;  // connection refused / timeout — port is free
+    }
+}
+
 bool ServerManager::StartServer(const std::string& ggufPath, const ServerConfig& config)
 {
 #ifdef __WXMSW__
@@ -966,14 +1441,51 @@ bool ServerManager::StartServer(const std::string& ggufPath, const ServerConfig&
         m_jinjaForceOff &&
         m_jinjaRetryAttempted &&
         ggufPath == m_lastGgufPath &&
-        SameServerConfig(config, m_lastConfig);
+        config == m_lastConfig;
 
     if (!retryingWithoutJinja) {
         ResetJinjaRetryState();
     }
 
-    // Stop any existing server first
-    StopServer();
+    // Invalidate every older queued lifecycle event immediately, before any
+    // preflight work for this attempt.  The old process is stopped below after
+    // the foreign-port guard, preserving the original guard behavior.
+    const ServerLaunchGeneration launchGeneration = AdvanceLaunchGeneration();
+    m_launchStartedAt = std::chrono::steady_clock::now();
+
+    // ── Foreign-server guard ─────────────────────────────────────
+    // If something is already answering on our port and WE did not
+    // spawn it, refuse to start.  Without this check the spawn below
+    // fails on the bind conflict, but the health thread's first
+    // /health probe gets a 200 from the *other* process's server
+    // before our dead child is noticed — so this instance would
+    // declare ready and silently chat against whatever model the
+    // other instance has loaded.  One LlamaBoss window talking to
+    // another LlamaBoss's server (with no ownership of its lifetime
+    // or its KV slots) is never a state we want to be in silently.
+    //
+    // IsProcessRunning() distinguishes "our own server from a prior
+    // load" (normal switch path — StopServer below handles it) from
+    // "a server we never launched" (foreign).
+    if (!IsProcessRunning() && IsPortAnswering()) {
+        const std::string msg =
+            "Another LlamaBoss instance is already running a local "
+            "server on port " + std::to_string(m_port) + ".\n\n"
+            "Close the other LlamaBoss window (or use remote "
+            "endpoints in this one) and try again.";
+        if (m_logger)
+            m_logger->error("StartServer refused: foreign server "
+                            "detected on port " + std::to_string(m_port));
+        auto* ev = new wxCommandEvent(wxEVT_SERVER_ERROR);
+        SetServerEventGeneration(*ev, launchGeneration);
+        ev->SetString(wxString::FromUTF8(msg));
+        LbQueueEventIfAlive(m_eventHandler, m_aliveToken, ev);
+        return false;
+    }
+
+    // Stop any existing server first.  The new generation was already
+    // allocated above, so cleanup must not advance it again.
+    StopServerInternal(false);
 
     // Cache the launch args so MaybeRetryWithoutJinja() can re-invoke
     // us with the same (model, config) minus the --jinja flag.
@@ -983,8 +1495,6 @@ bool ServerManager::StartServer(const std::string& ggufPath, const ServerConfig&
     // Capture the launch mode before any later retry-state cleanup.
     // This is the truth for the server process we are about to start.
     const bool launchJinjaEnabled = !m_jinjaForceOff;
-
-    m_port = config.port;
 
     // Detect backend and find binary
     Backend backend = DetectBackend();
@@ -1007,6 +1517,7 @@ bool ServerManager::StartServer(const std::string& ggufPath, const ServerConfig&
             m_logger->error("llama-server binary not found in any search path");
 
         auto* ev = new wxCommandEvent(wxEVT_SERVER_ERROR);
+        SetServerEventGeneration(*ev, launchGeneration);
         ev->SetString("llama-server.exe not found.\n\n"
                       "Download llama.cpp release binaries from:\n"
                       "https://github.com/ggml-org/llama.cpp/releases\n\n"
@@ -1023,6 +1534,7 @@ bool ServerManager::StartServer(const std::string& ggufPath, const ServerConfig&
             m_logger->error("GGUF model not found: " + ggufPath);
 
         auto* ev = new wxCommandEvent(wxEVT_SERVER_ERROR);
+        SetServerEventGeneration(*ev, launchGeneration);
         ev->SetString("Model file not found:\n" + ggufPath);
         LbQueueEventIfAlive(m_eventHandler, m_aliveToken, ev);
         return false;
@@ -1033,6 +1545,7 @@ bool ServerManager::StartServer(const std::string& ggufPath, const ServerConfig&
             std::string(backend == Backend::CUDA12 ? "CUDA12" : "CPU") +
             " model=" + ggufPath +
             " port=" + std::to_string(config.port) +
+            " generation=" + std::to_string(launchGeneration) +
             " jinja=" + std::string(launchJinjaEnabled ? "on" : "off"));
     }
 
@@ -1062,6 +1575,15 @@ bool ServerManager::StartServer(const std::string& ggufPath, const ServerConfig&
     if (config.flashAttn)
         cmd << " --flash-attn on";
 
+    // ── KV cache quantization ────────────────────────────────────
+    // q8_0 K/V halves KV-cache memory — roughly double the usable
+    // context per GiB of VRAM — with no quality loss measurable in
+    // practice.  Quantized V requires flash attention, hence the
+    // double gate: flashAttn is always true today, but the pair must
+    // stay coupled if that ever changes.
+    if (config.flashAttn && config.kvCacheQ8)
+        cmd << " -ctk q8_0 -ctv q8_0";
+
     if (config.threads > 0)
         cmd << " -t " << config.threads;
 
@@ -1079,19 +1601,9 @@ bool ServerManager::StartServer(const std::string& ggufPath, const ServerConfig&
     {
         std::string mmproj;
 
-        wxFileName modelFn(wxString::FromUTF8(ggufPath));
-        wxString modelFolder = modelFn.GetPath();
-        wxString modelsRoot  = wxString::FromUTF8(GetModelsDir());
+        wxString modelFolder = ModelFolderForGgufPath(ggufPath);
 
-        // A model path is "bundled" when its containing folder is a
-        // direct subfolder of the scan root (not the root itself and
-        // not nested deeper). This catches both real bundles and
-        // honors the user's intent if they manually organized their
-        // custom folder into subfolders.
-        bool isBundled = (modelFolder != modelsRoot) &&
-                         (wxFileName(modelFolder).GetPath() == modelsRoot);
-
-        if (isBundled) {
+        if (IsBundledModelFolder(modelFolder)) {
             // Bundle layout is intentionally strict: exactly one projector
             // in the model folder pairs automatically; zero launches
             // text-only; more than one is ambiguous and skipped.
@@ -1111,6 +1623,45 @@ bool ServerManager::StartServer(const std::string& ggufPath, const ServerConfig&
         // actually running.
         launchMmproj = mmproj;
     }
+
+    // ── --cache-reuse (KV chunk reuse) ───────────────────────────
+    // Reuses cached prompt/KV chunks via KV shifting after mid-prompt
+    // edits — tool-result elision and agent-step trailer stripping in
+    // BuildChatRequestJson both rewrite earlier messages, which would
+    // otherwise invalidate the prompt cache from the edit point onward.
+    //
+    // Gated on text-only launches: llama-server disables context
+    // shifting when a multimodal projector is loaded, so the flag is
+    // inert there at best and a startup error on some builds at worst.
+    // Placed after mmproj resolution because the pairing decision is
+    // what determines eligibility.
+    if (launchMmproj.empty())
+        cmd << " --cache-reuse 256";
+
+    // ── Speculative-decoding draft (bundle convention) ────────────
+    // A single *draft*.gguf in the model's bundle attaches as the
+    // speculative draft, fully offloaded.  llama-server's own draft
+    // defaults govern acceptance windows.  Gated like cache-reuse:
+    // speculative decoding and a multimodal projector are mutually
+    // unsupported.  A vocab-incompatible draft fails the launch with
+    // a clear server error (the health thread surfaces the log tail);
+    // removing or renaming the draft file is the fix.  Bundle layout
+    // only — flat/power folders have no ownership structure to pair by.
+    if (launchMmproj.empty()) {
+        wxString bundleFolder = ModelFolderForGgufPath(ggufPath);
+        if (IsBundledModelFolder(bundleFolder)) {
+            std::string draft = ResolveBundleDraft(bundleFolder, m_logger);
+            if (!draft.empty())
+                cmd << " -md \"" << draft << "\" -ngld 99";
+        }
+    }
+
+    // ── KV slot state persistence ────────────────────────────────
+    // Always armed: --slot-save-path enables POST /slots/0?action=
+    // save|restore (used by the conversation-switch fast path) and
+    // --slots enables the read-only slot listing for diagnostics.
+    // Costs nothing when unused.
+    cmd << " --slots --slot-save-path \"" << GetKvSlotCacheDir() << "\"";
 
     std::string cmdLine = cmd.str();
 
@@ -1160,6 +1711,20 @@ bool ServerManager::StartServer(const std::string& ggufPath, const ServerConfig&
         NULL
     );
 
+    // If log redirection cannot be opened, do not let the health thread
+    // attach a stale server.log from a previous run to this run's failure.
+    std::string healthLogPath = logPath;
+    if (hLogFile == INVALID_HANDLE_VALUE) {
+        DWORD err = GetLastError();
+        healthLogPath.clear();
+        if (m_logger) {
+            m_logger->warning(
+                "Could not open server.log for redirection (Windows error " +
+                std::to_string(err) + "); this launch will not include "
+                "llama-server stdout/stderr in readiness errors");
+        }
+    }
+
     // Set up process creation
     STARTUPINFOW si = {};
     si.cb = sizeof(si);
@@ -1208,6 +1773,7 @@ bool ServerManager::StartServer(const std::string& ggufPath, const ServerConfig&
             m_logger->error("CreateProcess failed, error=" + std::to_string(err));
 
         auto* ev = new wxCommandEvent(wxEVT_SERVER_ERROR);
+        SetServerEventGeneration(*ev, launchGeneration);
         ev->SetString("Failed to start llama-server (Windows error " +
                       std::to_string(err) + ")");
         LbQueueEventIfAlive(m_eventHandler, m_aliveToken, ev);
@@ -1262,6 +1828,7 @@ bool ServerManager::StartServer(const std::string& ggufPath, const ServerConfig&
         CloseHandle(pi.hProcess);
 
         auto* ev = new wxCommandEvent(wxEVT_SERVER_ERROR);
+        SetServerEventGeneration(*ev, launchGeneration);
         ev->SetString("Failed to resume llama-server (Windows error " +
                       std::to_string(err) + ")");
         LbQueueEventIfAlive(m_eventHandler, m_aliveToken, ev);
@@ -1272,13 +1839,17 @@ bool ServerManager::StartServer(const std::string& ggufPath, const ServerConfig&
     m_threadHandle        = pi.hThread;
     m_jobHandle           = jobHandle;
     m_processId           = pi.dwProcessId;
+    m_port                = config.port;
     m_loadedModel         = ggufPath;
+    m_slotOwner.clear();       // fresh process, fresh (empty) slot
+    m_slotDirty = false;
     m_loadedMmproj        = launchMmproj;
     m_currentJinjaEnabled = launchJinjaEnabled;
 
     if (m_logger)
         m_logger->information("llama-server started, PID=" +
-                              std::to_string(m_processId));
+                              std::to_string(m_processId) +
+                              " generation=" + std::to_string(launchGeneration));
 
     // Start health-check thread (polls /health until 200 or timeout).
     // wxThread requires Create() before Run(); if either step fails, do not
@@ -1287,7 +1858,7 @@ bool ServerManager::StartServer(const std::string& ggufPath, const ServerConfig&
     m_healthCancelFlag = std::make_shared<std::atomic<bool>>(false);
     auto* healthThread = new ServerHealthThread(
         m_eventHandler, GetBaseUrl(), m_healthCancelFlag, m_aliveToken,
-        m_processHandle, logPath, 120000); // 2min timeout
+        m_processHandle, healthLogPath, launchGeneration, 120000); // 2min timeout
 
     auto failHealthMonitorStart = [&](const std::string& detail) -> bool {
         if (m_logger)
@@ -1296,9 +1867,10 @@ bool ServerManager::StartServer(const std::string& ggufPath, const ServerConfig&
         // The server process is alive, but without the readiness monitor the
         // UI cannot reliably leave the loading state. Tear it down and surface
         // the real failure instead of silently returning success.
-        StopServer();
+        StopServerInternal(false);
 
         auto* ev = new wxCommandEvent(wxEVT_SERVER_ERROR);
+        SetServerEventGeneration(*ev, launchGeneration);
         ev->SetString("Failed to start llama-server readiness monitor.\n\n"
                       "The server was stopped so LlamaBoss does not stay "
                       "stuck loading.\n\n"
@@ -1331,9 +1903,37 @@ bool ServerManager::StartServer(const std::string& ggufPath, const ServerConfig&
 
 // ── Stop server ──────────────────────────────────────────────────
 
-void ServerManager::StopServer()
+ServerLaunchGeneration ServerManager::AdvanceLaunchGeneration()
 {
-    // Cancel health check thread first
+    // wxCommandEvent::ExtraLong is a signed long (32-bit on Windows), so keep
+    // generations in its positive range and reserve 0 for unstamped events.
+    const auto maxEventGeneration = static_cast<ServerLaunchGeneration>(
+        std::numeric_limits<long>::max());
+    if (m_launchGeneration >= maxEventGeneration)
+        m_launchGeneration = 1;
+    else
+        ++m_launchGeneration;
+    return m_launchGeneration;
+}
+
+long long ServerManager::GetCurrentLaunchElapsedMs() const
+{
+    if (m_launchStartedAt == std::chrono::steady_clock::time_point{})
+        return -1;
+
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - m_launchStartedAt).count();
+}
+
+void ServerManager::StopServerInternal(bool invalidateGeneration)
+{
+    if (invalidateGeneration) {
+        AdvanceLaunchGeneration();
+        m_launchStartedAt = std::chrono::steady_clock::time_point{};
+    }
+
+    // Cancel health check thread first.  Any event that already crossed its
+    // cancellation check is still harmless: the generation no longer matches.
     if (m_healthCancelFlag) {
         m_healthCancelFlag->store(true);
         m_healthCancelFlag.reset();
@@ -1343,6 +1943,13 @@ void ServerManager::StopServer()
     m_loadedModel.clear();
     m_loadedMmproj.clear();
     m_currentJinjaEnabled = false;
+    m_slotOwner.clear();
+    m_slotDirty = false;
+}
+
+void ServerManager::StopServer()
+{
+    StopServerInternal(true);
 }
 
 // ── --jinja retry (Phase 3a) ────────────────────────────────────

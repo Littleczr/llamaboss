@@ -195,10 +195,36 @@ public:
                           const std::string& cwd,
                           unsigned long      timeoutMs = kDefaultTimeoutMs);
 
+    // Starts the fixed zip_inspect helper.  It reads one .zip archive
+    // inside `cwd` and returns a JSON manifest of its central directory:
+    // entry/file/dir counts, compressed and uncompressed totals,
+    // compression ratios, top-level entries, an extension histogram, a
+    // capped per-entry list, and safety_flags (encrypted / symlink /
+    // path-traversal / executable entries, high compression ratio).
+    // Read-only: it never decompresses or extracts any entry, never
+    // writes a file, and needs no approval.  Standard library only.
+    bool StartZipInspect(const std::string& pathArg,
+                         const std::string& cwd,
+                         unsigned long      timeoutMs = kDefaultTimeoutMs);
+
+    // Starts the fixed zip_extract helper.  Extracts one .zip archive into
+    // a per-archive subfolder of the conversation "Extracted" lane.  It is
+    // a two-pass, hard-fail extractor: pass 1 audits the central directory
+    // and refuses the WHOLE archive (no writes) on any Zip-Slip path
+    // traversal, symlink entry, encrypted entry, or over-ratio entry;
+    // pass 2 streams each entry with a running byte cap that aborts on a
+    // size-lying zip bomb.  Moderate risk (writes files); approval-gated.
+    bool StartZipExtract(const std::string& pathArg,
+                         const std::string& cwd,
+                         unsigned long      timeoutMs = kDefaultTimeoutMs);
+
     // Runs one existing .py script from the fixed conversation Scripts lane,
-    // or (when a project is active) from that project's Workflows lane.
-    // The script reference is data, not a shell command: filename only, no
-    // paths, no command-line arguments in this first phase. The process
+    // or (when a project is active) from that project's Workflows lane, or
+    // from the global Skills lane.  Bare names resolve in Scripts -> project
+    // Workflows -> Skills order; Workflows\foo.py and Skills\foo.py pin a
+    // lane explicitly.  The script reference is data, not a shell command;
+    // optional argv values are passed through normal CreateProcess argv
+    // quoting rather than a shell. The process
     // runs with the current LlamaBoss workspace as its cwd, captures
     // stdout/stderr/exit code/runtime, supports timeout/cancel through
     // the same job-object path, and reports newly-created files under

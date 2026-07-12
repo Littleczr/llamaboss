@@ -7,6 +7,8 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
+#include <wx/filename.h>
+
 namespace path_safety {
 
 namespace {
@@ -210,6 +212,45 @@ std::string WideToUtf8(const std::wstring& in)
     ::WideCharToMultiByte(CP_UTF8, 0, in.data(), (int)in.size(),
                           &out[0], n, nullptr, nullptr);
     return out;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Model/settings path normalization
+// ═══════════════════════════════════════════════════════════════════
+
+static std::string WxToUtf8String(const wxString& s)
+{
+    wxCharBuffer buf = s.ToUTF8();
+    return buf.data() ? std::string(buf.data()) : std::string();
+}
+
+std::string NormalizeModelPathForCompare(const std::string& path)
+{
+    if (path.empty())
+        return {};
+
+    wxString wxPath = wxString::FromUTF8(path.c_str());
+    wxFileName fn(wxPath);
+
+    if (fn.IsOk()) {
+        fn.Normalize(wxPATH_NORM_DOTS |
+                     wxPATH_NORM_ABSOLUTE |
+                     wxPATH_NORM_TILDE);
+        wxPath = fn.GetFullPath();
+    }
+
+#ifdef __WXMSW__
+    wxPath.MakeLower();
+#endif
+
+    return WxToUtf8String(wxPath);
+}
+
+bool SameModelPath(const std::string& a, const std::string& b)
+{
+    std::string na = NormalizeModelPathForCompare(a);
+    std::string nb = NormalizeModelPathForCompare(b);
+    return !na.empty() && na == nb;
 }
 
 } // namespace path_safety

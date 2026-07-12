@@ -20,6 +20,7 @@
 //   wxEVT_GREP_COMPLETE       → HandleGrepComplete()
 //   wxEVT_CMD_COMPLETE        → HandleCmdComplete()
 //   wxEVT_PYTHON_COMPLETE     → HandlePythonComplete()
+//   wxEVT_TOOL_WORKER_COMPLETE→ HandleToolWorkerComplete()
 //
 // MyFrame's normal handlers for these events check IsAgentActive()
 // and route through us first; we decide whether to swallow the
@@ -85,8 +86,10 @@ class AppState;
 class GrepExecutor;
 class CmdExecutor;
 class PythonRunner;
+class WebFetchExecutor;
 struct CmdResult;
 struct PythonRunResult;
+struct WebFetchResult;
 
 class AgentController {
 public:
@@ -100,6 +103,25 @@ public:
     // most recent window, stop the loop before dispatch.
     static constexpr int kLoopGuardWindow          = 5;
     static constexpr int kLoopGuardRepeatThreshold = 3;
+
+    // Phase 7c: cycle guard for A/B/C/A/B/C-style loops that never
+    // repeat one exact signature enough times to trip the exact-repeat
+    // guard but are still visibly stuck.
+    static constexpr int kCycleGuardWindow      = 6;
+    static constexpr int kCycleGuardMaxDistinct = 3;
+    static constexpr int kCycleGuardMinRepeats  = 2;
+
+    // Phase 10: multi-tool dispatch.  Hard ceiling on how many native
+    // tool calls from one assistant turn are queued for sequential
+    // execution.  Anything past the ceiling is dropped from the
+    // persisted tool_calls sidecar and reported to the model via a
+    // soft-hint notice so it can re-issue the remainder next turn.
+    static constexpr int kMaxNativeCallsPerTurn = 8;
+
+    // Bounds for the user-configurable tool-step cap (see
+    // SetMaxToolSteps).  kMaxIterations stays as the default.
+    static constexpr int kMinConfigurableToolSteps = 4;
+    static constexpr int kMaxConfigurableToolSteps = 60;
 
     // Logic-only callbacks.  Phase 5 stripped the UI-shaped entries
     // (beginNextIteration, onLoopEnd) — those moved to
@@ -144,7 +166,9 @@ public:
                     AppState*       appState,
                     GrepExecutor*   grepExec,
                     CmdExecutor*    cmdExec,
-                    PythonRunner*   pythonRunner);
+                    PythonRunner*   pythonRunner,
+                    WebFetchExecutor* webFetchExec,
+                    ToolWorkerExecutor* toolWorker);
     ~AgentController() = default;
 
     void SetCallbacks(Callbacks cb) { m_cb = std::move(cb); }
@@ -157,6 +181,14 @@ public:
     // reply as iteration 1.  Phase 5: also fires
     // OnAgentLoopBegin() so the frame can hook loop-scoped UI.
     void Begin();
+
+    // Phase 10: user-configurable tool-step cap.  Clamped to
+    // [kMinConfigurableToolSteps, kMaxConfigurableToolSteps]; takes
+    // effect on the NEXT cap comparison, so raising it mid-loop
+    // extends the current loop and lowering it can stop the loop at
+    // the next fed result.  Persisted by AppState; wired by MyFrame.
+    void SetMaxToolSteps(int steps);
+    int  GetMaxToolSteps() const { return m_maxToolSteps; }
 
     // True iff a loop is in progress.  MyFrame uses this to
     // decide whether to route events through us.
@@ -210,6 +242,11 @@ public:
     bool HandleGrepComplete(const struct GrepResult& grepResult);
     bool HandleCmdComplete(const CmdResult& cmdResult);
     bool HandlePythonComplete(const PythonRunResult& pythonResult);
+    bool HandleWebFetchComplete(const WebFetchResult& webResult);
+    bool HandleToolWorkerComplete(const ToolWorkerResult& workerResult);
+    bool HandleCmdError(const std::string& errorText);
+    bool HandlePythonError(const std::string& errorText);
+    bool HandleWebFetchError(const std::string& errorText);
     bool HandleAssistantError(const std::string& errorText);
 
 private:
@@ -227,9 +264,55 @@ private:
     bool DispatchApprovedAndContinue(const ToolInvocation& inv,
                                      const ToolContext&    ctx);
 
-    // Render result + append to history, then fire next request.
-    // Shared between sync dispatch and async completion.
-    void FeedResultAndIterate(const ToolInvocationResult& r);
+    // Shared result handling for ordinary synchronous dispatches and
+    // ToolWorkerExecutor completions.  Preserves the create-script
+    // one-shot approval and standalone-write terminal heuristics.
+    bool FinishDispatchedInvocation(const ToolInvocation& inv,
+                                    const ToolContext&    ctx,
+                                    const DispatchOutcome& out);
+
+    // Render result + append to history, then continue the loop
+    // (next queued batch call, or next model request).  Shared
+    // between sync dispatch and async completion.  Phase 10 split
+    // the body into FeedResultOnly + ContinueLoop so the deny path
+    // can interleave a batch drain between the two halves.
+    void FeedResultAndIterate(const ToolInvocationResult& r,
+                              bool countTowardIterationCap = true);
+
+    // First half: render the result, round-trip it to history with
+    // the step trailer, consume m_currentToolCallId, and advance the
+    // iteration counter when counted.
+    void FeedResultOnly(const ToolInvocationResult& r,
+                        bool countTowardIterationCap);
+
+    // Second half: cap / cancel checks (draining any queued batch
+    // calls before ending), then either dispatch the next queued
+    // invocation or fire the next model request.
+    void ContinueLoop();
+
+    // ─── Phase 10: native multi-call batch queue ─────────────────
+    // Pops and dispatches the next queued invocation from the current
+    // assistant turn.  Returns the DispatchAndContinue result.
+    bool DispatchNextQueuedInvocation();
+
+    // Emits and stores a terminal "skipped" tool result (threaded with
+    // each call's tool_call_id so native transcript pairing survives)
+    // for every still-queued invocation, then clears the queue.  Must
+    // run BEFORE any EndLoop that abandons a partially-executed batch.
+    void DrainQueuedInvocationsWithSkippedResults(const std::string& reason);
+
+    // Shared tail for every async tool completion.  The four
+    // HandleXxxComplete handlers used to each repeat the same
+    // cancel-vs-continue epilogue (render partial result, round-trip
+    // to history, EndLoop(Cancelled) — or FeedResultAndIterate).
+    // They now build their tool-specific ToolInvocationResult and
+    // delegate here, so the next async tool cannot add a fifth copy
+    // of the epilogue.  `cancelled` is (m_cancelled || worker reported
+    // cancelled); `inv` supplies the tool_call_id for the cancel-path
+    // history record.
+    bool FinishAsyncToolResult(const ToolInvocation&       inv,
+                               const ToolInvocationResult& r,
+                               bool                        cancelled);
 
     // Phase 7: build and track recent tool signatures so a small
     // model cannot spin forever on the same exact call.
@@ -237,12 +320,23 @@ private:
     bool WouldTripLoopGuard(const ToolInvocation& inv,
                             std::string&          signatureOut,
                             int&                  repeatCountOut) const;
+    bool WouldTripCycleGuard(const ToolInvocation& inv,
+                             std::string&          signatureOut,
+                             int&                  distinctCountOut) const;
     void RecordToolSignature(const std::string& signature);
 
-    // Phase 9: emit a non-rendered ToolCall AgentEvent before a
-    // valid invocation is approved/dispatched.  Useful for future
-    // sub-agent forwarders, logging, and tests.
-    void EmitToolCallEvent(const ToolInvocation& inv);
+    // Phase 7d: called when a dispatched invocation's result lands.
+    // Marks the most recent matching record's outcome; on success,
+    // purges earlier FAILED records of the same signature (see the
+    // ToolSignatureRecord comment for the rationale).
+    void ResolveToolSignatureOutcome(const ToolInvocation& inv,
+                                     bool                  failed);
+
+    // Phase 9/Phase 3 trace: emit a non-rendered ToolCall AgentEvent
+    // at the approved dispatch point.  Useful for sub-agent forwarders,
+    // logging, and tests.
+    void EmitToolCallEvent(const ToolInvocation& inv,
+                           const std::string&   signature);
 
     // Render + persist a terminal tool-style result without asking
     // the model for another iteration.  Used by cancellation,
@@ -308,6 +402,8 @@ private:
     GrepExecutor*   m_grepExec;
     CmdExecutor*    m_cmdExec;
     PythonRunner*   m_pythonRunner;
+    WebFetchExecutor* m_webFetchExec;
+    ToolWorkerExecutor* m_toolWorker;
 
     Callbacks m_cb;
 
@@ -316,20 +412,44 @@ private:
     bool          m_cancelled            = false;
     int           m_iterationsUsed       = 0;
     int           m_consecutiveMalformed = 0;
-    std::vector<std::string> m_recentToolSignatures;
 
-    // Phase 7b: soft-hint nudge.  When WouldTripLoopGuard reports a
-    // repeatCount one short of the kill threshold, the dispatch site
-    // stores a notice here.  FeedResultAndIterate appends it to the
-    // upcoming tool result body (one-shot) so the model has a chance
-    // to break the pattern before the hard stop on the next iteration.
-    // Cleared on Begin() and EndLoop() so it never leaks across loops.
+    // Phase 7/7d: rolling window of recently DISPATCHED tool signatures,
+    // used by the exact-repeat and cycle guards.  Phase 7d added the
+    // outcome flag: when a previously-failing call later SUCCEEDS, its
+    // earlier failed records are purged, because the success proves the
+    // blocking state changed (e.g. run(missing) -> create_script ->
+    // run(ok)) and the past failures no longer indicate a stuck loop.
+    // Successful repeats still accumulate, so identical-successful-call
+    // doom loops (the original Phase 7 motivation) remain guarded.
+    struct ToolSignatureRecord {
+        std::string signature;
+        bool        failed = false;   // set when the call's result lands
+    };
+    std::vector<ToolSignatureRecord> m_recentToolSignatures;
+
+    // Phase 10: user-configurable tool-step cap.  Defaults to the
+    // historical constant; AppState persists the user's value and
+    // MyFrame pushes it here at startup and on /agent_steps.
+    int           m_maxToolSteps = kMaxIterations;
+
+    // Phase 10: remaining native tool calls from the current assistant
+    // turn, executed sequentially after the first.  Non-empty only
+    // between HandleAssistantComplete and the moment the last batched
+    // result has been fed back; always empty while a model request is
+    // in flight.  Begin() and EndLoop() clear it defensively.
+    std::vector<ToolInvocation> m_queuedInvocations;
+
+    // Pending model-facing notice appended to the next real tool result.
+    // Used for the one-step-early loop warning and for native multi-call
+    // truncation notices. Cleared on Begin(), Deny/Cancel approval, and
+    // EndLoop() so it cannot leak onto unrelated results.
     std::string   m_pendingSoftHint;
 
     // When the current iteration triggered an async tool call, we
     // stash the invocation here so HandleGrepComplete can build the
     // ToolBlock and round-trip it to history properly.
     ToolInvocation m_pendingAsyncInvocation;
+    ToolContext    m_pendingAsyncContext;
     bool           m_awaitingAsyncResult = false;
 
     // Phase 6: single pending approval slot for the agent path.
@@ -353,6 +473,7 @@ private:
     // rename occurs (foo.py -> foo_2.py). The bypass must apply only to
     // the script artifact the user just reviewed and approved for create.
     std::vector<std::string> m_oneShotApprovedScriptRun;
+    int m_oneShotApprovedScriptRunBeginCredits = 0;
 
     // Phase 3c-ii: tool_call_id of the currently-dispatching
     // invocation, threaded into AddToolResultMessage so the next

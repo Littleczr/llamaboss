@@ -20,9 +20,11 @@
 #include <wx/filename.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cctype>
 #include <cstring>
+#include <cwchar>
 #include <fstream>
 #include <iterator>
 #include <mutex>
@@ -52,70 +54,173 @@ std::string WideToUtf8(const std::wstring& s)
     return path_safety::WideToUtf8(s);
 }
 
+// Strict UTF-8 probe used by NormalizeProcessOutputUtf8().
+bool IsStrictUtf8(const std::string& bytes)
+{
+    if (bytes.empty()) return true;
+    const int inputLen = static_cast<int>(bytes.size());
+    return ::MultiByteToWideChar(CP_UTF8,
+                                 MB_ERR_INVALID_CHARS,
+                                 bytes.data(),
+                                 inputLen,
+                                 nullptr,
+                                 0) > 0;
+}
+
+size_t CountValidUtf8MultibyteSequences(const std::string& bytes)
+{
+    size_t count = 0;
+    size_t i = 0;
+    while (i < bytes.size()) {
+        unsigned char c0 = static_cast<unsigned char>(bytes[i]);
+        if (c0 < 0x80) {
+            ++i;
+            continue;
+        }
+
+        size_t len = 0;
+        if (c0 >= 0xC2 && c0 <= 0xDF) {
+            len = 2;
+        } else if (c0 >= 0xE0 && c0 <= 0xEF) {
+            len = 3;
+        } else if (c0 >= 0xF0 && c0 <= 0xF4) {
+            len = 4;
+        } else {
+            ++i;
+            continue;
+        }
+
+        if (i + len > bytes.size()) break;
+
+        unsigned char c1 = static_cast<unsigned char>(bytes[i + 1]);
+        if ((c1 & 0xC0) != 0x80) {
+            ++i;
+            continue;
+        }
+
+        bool valid = true;
+        if (len >= 3) {
+            unsigned char c2 = static_cast<unsigned char>(bytes[i + 2]);
+            if ((c2 & 0xC0) != 0x80) valid = false;
+
+            // Reject overlong forms and UTF-16 surrogate halves.
+            if (valid && c0 == 0xE0 && c1 < 0xA0) valid = false;
+            if (valid && c0 == 0xED && c1 >= 0xA0) valid = false;
+        }
+        if (valid && len == 4) {
+            unsigned char c3 = static_cast<unsigned char>(bytes[i + 3]);
+            if ((c3 & 0xC0) != 0x80) valid = false;
+
+            // Reject overlong 4-byte forms and values above U+10FFFF.
+            if (valid && c0 == 0xF0 && c1 < 0x90) valid = false;
+            if (valid && c0 == 0xF4 && c1 > 0x8F) valid = false;
+        }
+
+        if (valid) {
+            ++count;
+            i += len;
+        } else {
+            ++i;
+        }
+    }
+    return count;
+}
+
+std::string DecodeWithCodePageToUtf8(UINT codePage,
+                                     DWORD flags,
+                                     const std::string& bytes)
+{
+    if (bytes.empty()) return bytes;
+
+    const int inputLen = static_cast<int>(bytes.size());
+    int wideLen = ::MultiByteToWideChar(codePage,
+                                        flags,
+                                        bytes.data(),
+                                        inputLen,
+                                        nullptr,
+                                        0);
+    if (wideLen <= 0) return std::string();
+
+    std::wstring wide(static_cast<size_t>(wideLen), L'\0');
+    if (::MultiByteToWideChar(codePage,
+                              flags,
+                              bytes.data(),
+                              inputLen,
+                              wide.data(),
+                              wideLen) <= 0) {
+        return std::string();
+    }
+
+    return WideToUtf8(wide);
+}
+
+std::string DropTrailingIncompleteUtf8Codepoint(const std::string& bytes)
+{
+    if (bytes.empty()) return bytes;
+
+    const size_t n = bytes.size();
+    size_t lead = n - 1;
+
+    while (lead > 0) {
+        unsigned char ch = static_cast<unsigned char>(bytes[lead]);
+        if ((ch & 0xC0) != 0x80)
+            break;
+        --lead;
+    }
+
+    unsigned char first = static_cast<unsigned char>(bytes[lead]);
+    size_t expected = 0;
+    if ((first & 0x80) == 0x00) expected = 1;
+    else if (first >= 0xC2 && first <= 0xDF) expected = 2;
+    else if (first >= 0xE0 && first <= 0xEF) expected = 3;
+    else if (first >= 0xF0 && first <= 0xF4) expected = 4;
+    else return bytes;
+
+    const size_t have = n - lead;
+    if (expected > 1 && have < expected) {
+        return bytes.substr(0, lead);
+    }
+    return bytes;
+}
+
 // Python helpers and user Python scripts are expected to speak UTF-8 back
 // to the model.  On Windows, however, a subprocess can still inherit a legacy
 // console/text encoding and return bytes such as CP-1252 smart punctuation.
 // Those bytes are harmless for the UI, but they make the JSON request sent to
 // llama-server invalid and can poison the rest of the chat transcript.
 //
-// Keep already-valid UTF-8 untouched.  If the byte stream is not valid UTF-8,
-// first interpret it using the active Windows ANSI code page (the common case
-// for legacy Python stdout) and re-encode as UTF-8.  If that does not work,
-// use Windows' forgiving UTF-8 conversion as a final "always return valid text"
-// fallback so malformed process output cannot brick a model request.
+// Keep already-valid UTF-8 untouched.  If the stream was captured exactly at
+// the byte cap, ReaderLoop may have split the final UTF-8 code point; try that
+// one safe trim.  If the capture contains valid multibyte UTF-8 plus damage,
+// preserve the UTF-8 and replace only the bad spans.  CP_ACP is reserved for
+// legacy-ANSI-looking captures with no valid multibyte UTF-8 at all; decoding
+// the whole stream as ANSI after one corrupt byte would mojibake otherwise-clean
+// UTF-8 output.
 std::string NormalizeProcessOutputUtf8(const std::string& bytes)
 {
     if (bytes.empty()) return bytes;
 
-    const int inputLen = static_cast<int>(bytes.size());
-
-    int utf8WideLen = ::MultiByteToWideChar(CP_UTF8,
-                                            MB_ERR_INVALID_CHARS,
-                                            bytes.data(),
-                                            inputLen,
-                                            nullptr,
-                                            0);
-    if (utf8WideLen > 0) {
+    if (IsStrictUtf8(bytes)) {
         return bytes;
     }
 
-    int ansiWideLen = ::MultiByteToWideChar(CP_ACP,
-                                            0,
-                                            bytes.data(),
-                                            inputLen,
-                                            nullptr,
-                                            0);
-    if (ansiWideLen > 0) {
-        std::wstring wide(static_cast<size_t>(ansiWideLen), L'\0');
-        if (::MultiByteToWideChar(CP_ACP,
-                                  0,
-                                  bytes.data(),
-                                  inputLen,
-                                  wide.data(),
-                                  ansiWideLen) > 0) {
-            std::string recoded = WideToUtf8(wide);
-            if (!recoded.empty()) return recoded;
-        }
+    std::string trimmed = DropTrailingIncompleteUtf8Codepoint(bytes);
+    if (trimmed.size() != bytes.size() && IsStrictUtf8(trimmed)) {
+        return trimmed;
     }
 
-    int forgivingWideLen = ::MultiByteToWideChar(CP_UTF8,
-                                                  0,
-                                                  bytes.data(),
-                                                  inputLen,
-                                                  nullptr,
-                                                  0);
-    if (forgivingWideLen > 0) {
-        std::wstring wide(static_cast<size_t>(forgivingWideLen), L'\0');
-        if (::MultiByteToWideChar(CP_UTF8,
-                                  0,
-                                  bytes.data(),
-                                  inputLen,
-                                  wide.data(),
-                                  forgivingWideLen) > 0) {
-            std::string recoded = WideToUtf8(wide);
-            if (!recoded.empty()) return recoded;
-        }
+    const bool looksLikeDamagedUtf8 = CountValidUtf8MultibyteSequences(bytes) > 0;
+
+    if (looksLikeDamagedUtf8) {
+        std::string recoded = DecodeWithCodePageToUtf8(CP_UTF8, 0, bytes);
+        if (!recoded.empty()) return recoded;
     }
+
+    std::string ansiRecoded = DecodeWithCodePageToUtf8(CP_ACP, 0, bytes);
+    if (!ansiRecoded.empty()) return ansiRecoded;
+
+    std::string forgivingRecoded = DecodeWithCodePageToUtf8(CP_UTF8, 0, bytes);
+    if (!forgivingRecoded.empty()) return forgivingRecoded;
 
     // Extremely defensive last resort.  This branch should be practically
     // unreachable, but ASCII replacement still guarantees the downstream JSON
@@ -127,7 +232,6 @@ std::string NormalizeProcessOutputUtf8(const std::string& bytes)
     }
     return safe;
 }
-
 double NowSec()
 {
     using namespace std::chrono;
@@ -172,9 +276,10 @@ std::string BuiltInHelperScriptsDir()
 
 std::string LlamaBossRootDir()
 {
-    std::string root = ParentDirOf(ServerManager::GetDefaultWorkspaceDir());
-    if (root.empty()) root = ParentDirOf(ServerManager::GetWorkspaceDir());
-    return root;
+    // Delegates to the shared layout owner.  agent_controller.cpp's
+    // one-shot-bypass shadow check resolves the SAME lanes through the
+    // SAME ServerManager functions, so the two can no longer diverge.
+    return ServerManager::GetLlamaBossRootDir();
 }
 
 std::string TrimTrailingSeparators(std::string s)
@@ -190,37 +295,23 @@ std::string PathBaseNameLocal(const std::string& path)
     return (pos == std::string::npos) ? s : s.substr(pos + 1);
 }
 
-bool StartsWithLocal(const std::string& s, const std::string& prefix)
-{
-    return s.size() >= prefix.size() && s.compare(0, prefix.size(), prefix) == 0;
-}
+// (StartsWithLocal was removed: its only consumer, the local
+// WorkflowRootFromCwd recognizer body, now delegates to
+// ServerManager::ConversationWorkflowRootFromCwd.)
 
 std::string WorkflowRootFromCwd(const std::string& cwd)
 {
-    // Recognize the per-conversation folder layout created by
-    // ChatHistory::EnsureWorkflowDir():
+    // Shared recognizer for the per-conversation folder layout created
+    // by ChatHistory::EnsureWorkflowDir():
     //   %USERPROFILE%\LlamaBoss\Workflows\chat_xxxxxxxx\Workspace
-    std::string clean = TrimTrailingSeparators(cwd);
-    if (clean.empty()) return std::string();
-
-    std::string base = PathBaseNameLocal(clean);
-    if (LowerLocal(base) != "workspace") return std::string();
-
-    std::string parent = ParentDirOf(clean);        // ...\chat_xxxxxxxx
-    std::string workflows = ParentDirOf(parent);    // ...\Workflows
-    if (parent.empty() || workflows.empty()) return std::string();
-
-    if (!StartsWithLocal(PathBaseNameLocal(parent), "chat_")) return std::string();
-    if (LowerLocal(PathBaseNameLocal(workflows)) != "workflows") return std::string();
-
-    return parent;
+    // Implementation lives on ServerManager so this file and
+    // agent_controller.cpp resolve lanes identically by construction.
+    return ServerManager::ConversationWorkflowRootFromCwd(cwd);
 }
 
 std::string LaneDirForCwd(const std::string& cwd, const std::string& lane)
 {
-    std::string workflowRoot = WorkflowRootFromCwd(cwd);
-    std::string root = workflowRoot.empty() ? LlamaBossRootDir() : workflowRoot;
-    return JoinPath(root, lane);
+    return ServerManager::ConversationLaneDirForCwd(cwd, lane);
 }
 
 std::string DocumentsDirForCwd(const std::string& cwd)
@@ -248,6 +339,11 @@ std::string FilledFormsDirForCwd(const std::string& cwd)
     return LaneDirForCwd(cwd, "Filled Forms");
 }
 
+std::string ExtractedDirForCwd(const std::string& cwd)
+{
+    return LaneDirForCwd(cwd, "Extracted");
+}
+
 std::string UserScriptsDirForCwd(const std::string& cwd)
 {
     return LaneDirForCwd(cwd, "Scripts");
@@ -264,6 +360,185 @@ bool FileExistsRegular(const std::string& path)
     DWORD attrs = GetFileAttributesW(Utf8ToWide(path).c_str());
     return attrs != INVALID_FILE_ATTRIBUTES &&
            (attrs & FILE_ATTRIBUTE_DIRECTORY) == 0;
+}
+
+
+std::string UniqueSidecarPathNear(const std::string& targetPath,
+                                  const std::string& suffix)
+{
+    static std::atomic<unsigned long> s_counter{0};
+
+    std::string dir = ParentDirOf(targetPath);
+    std::string base = PathBaseNameLocal(targetPath);
+    if (dir.empty() || base.empty()) return std::string();
+
+    for (int i = 0; i < 100; ++i) {
+        unsigned long n = ++s_counter;
+        std::ostringstream name;
+        name << base << ".tmp."
+             << GetCurrentProcessId() << "."
+             << GetTickCount64() << "."
+             << n << suffix;
+        std::string candidate = JoinPath(dir, name.str());
+        if (!FileExistsRegular(candidate))
+            return candidate;
+    }
+    return std::string();
+}
+
+bool CreateUniqueSidecarForWrite(const std::string& targetPath,
+                                 const std::string& suffix,
+                                 const std::string& purpose,
+                                 std::string& pathOut,
+                                 HANDLE& handleOut,
+                                 std::string& errorOut)
+{
+    pathOut.clear();
+    handleOut = INVALID_HANDLE_VALUE;
+
+    constexpr DWORD attrs = FILE_ATTRIBUTE_TEMPORARY | FILE_ATTRIBUTE_NOT_CONTENT_INDEXED;
+    for (int attempt = 0; attempt < 100; ++attempt) {
+        std::string candidate = UniqueSidecarPathNear(targetPath, suffix);
+        if (candidate.empty()) {
+            errorOut = "Could not allocate temporary path for " + purpose + ": " + targetPath;
+            return false;
+        }
+
+        HANDLE h = CreateFileW(Utf8ToWide(candidate).c_str(),
+                               GENERIC_WRITE,
+                               0,
+                               nullptr,
+                               CREATE_NEW,
+                               attrs,
+                               nullptr);
+        if (h != INVALID_HANDLE_VALUE) {
+            pathOut = std::move(candidate);
+            handleOut = h;
+            return true;
+        }
+
+        DWORD err = GetLastError();
+        if (err == ERROR_FILE_EXISTS || err == ERROR_ALREADY_EXISTS) {
+            continue;  // check-to-create race; try another sidecar name
+        }
+
+        errorOut = "Could not create temporary file for " + purpose + ": " +
+                   targetPath + ", error=" + std::to_string(err);
+        return false;
+    }
+
+    errorOut = "Could not create a unique temporary file for " + purpose +
+               " after multiple attempts: " + targetPath;
+    return false;
+}
+
+bool WriteBytesAtomic(const std::string& targetPath,
+                      const char* data,
+                      size_t size,
+                      std::string& errorOut)
+{
+    std::string tmpPath;
+    HANDLE h = INVALID_HANDLE_VALUE;
+    if (!CreateUniqueSidecarForWrite(targetPath,
+                                     ".tmp",
+                                     "atomic write",
+                                     tmpPath,
+                                     h,
+                                     errorOut)) {
+        return false;
+    }
+
+    bool ok = true;
+    size_t offset = 0;
+    while (offset < size) {
+        DWORD chunk = static_cast<DWORD>(std::min<size_t>(size - offset, 1024 * 1024));
+        DWORD written = 0;
+        if (!WriteFile(h, data + offset, chunk, &written, nullptr) || written != chunk) {
+            ok = false;
+            errorOut = "Failed while writing temporary file for: " + targetPath +
+                       ", error=" + std::to_string(GetLastError());
+            break;
+        }
+        offset += written;
+    }
+
+    if (ok && !FlushFileBuffers(h)) {
+        ok = false;
+        errorOut = "Failed to flush temporary file for: " + targetPath +
+                   ", error=" + std::to_string(GetLastError());
+    }
+
+    CloseHandle(h);
+
+    if (!ok) {
+        DeleteFileW(Utf8ToWide(tmpPath).c_str());
+        return false;
+    }
+
+    if (!MoveFileExW(Utf8ToWide(tmpPath).c_str(),
+                     Utf8ToWide(targetPath).c_str(),
+                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        DWORD err = GetLastError();
+        DeleteFileW(Utf8ToWide(tmpPath).c_str());
+        errorOut = "Could not install file atomically: " + targetPath +
+                   ", error=" + std::to_string(err);
+        return false;
+    }
+
+    return true;
+}
+
+bool WriteUtf8ArgTempFile(const std::string& prefix,
+                          const std::string& content,
+                          std::string& pathOut,
+                          std::string& errorOut)
+{
+    std::string argDir = JoinPath(BuiltInHelperScriptsDir(), "Args");
+    wxFileName::Mkdir(wxString::FromUTF8(argDir.c_str()),
+                      wxS_DIR_DEFAULT,
+                      wxPATH_MKDIR_FULL);
+
+    std::string target = JoinPath(argDir, prefix + ".json");
+    HANDLE h = INVALID_HANDLE_VALUE;
+    if (!CreateUniqueSidecarForWrite(target,
+                                     ".json",
+                                     "helper-argument file",
+                                     pathOut,
+                                     h,
+                                     errorOut)) {
+        pathOut.clear();
+        return false;
+    }
+
+    bool ok = true;
+    size_t offset = 0;
+    while (offset < content.size()) {
+        DWORD chunk = static_cast<DWORD>(std::min<size_t>(content.size() - offset, 1024 * 1024));
+        DWORD written = 0;
+        if (!WriteFile(h, content.data() + offset, chunk, &written, nullptr) || written != chunk) {
+            ok = false;
+            errorOut = "Failed while writing helper-argument file: " + pathOut +
+                       ", error=" + std::to_string(GetLastError());
+            break;
+        }
+        offset += written;
+    }
+
+    if (ok && !FlushFileBuffers(h)) {
+        ok = false;
+        errorOut = "Failed to flush helper-argument file: " + pathOut +
+                   ", error=" + std::to_string(GetLastError());
+    }
+
+    CloseHandle(h);
+
+    if (!ok) {
+        DeleteFileW(Utf8ToWide(pathOut).c_str());
+        pathOut.clear();
+        return false;
+    }
+
+    return true;
 }
 
 std::string LowerLocal(std::string s)
@@ -444,11 +719,29 @@ std::string TrimArtifactValue(const std::string& raw)
     s = s.substr(a, b - a + 1);
 
     // Keep a plain path if a script prints a Markdown-ish label like:
-    // ARTIFACT: Outputs\file.md (ready)
-    // Do not split drive letters such as C:\.
-    if (s.size() >= 3 && s[1] == ':' && (s[2] == '\\' || s[2] == '/')) {
-        return s;
+    //   ARTIFACT: Outputs\file.md (ready)
+    // The suffix is UI prose, not part of the path.  Strip only a trailing
+    // parenthesized status token after a space so filenames such as
+    // "report (final).md" remain untouched.
+    if (!s.empty() && s.back() == ')') {
+        size_t open = s.find_last_of('(');
+        if (open != std::string::npos && open > 0 && s[open - 1] == ' ') {
+            std::string token = s.substr(open + 1, s.size() - open - 2);
+            std::string key = LowerLocal(token);
+            bool statusLike = !key.empty() && key.size() <= 32;
+            for (char ch : key) {
+                if (!((ch >= 'a' && ch <= 'z') || ch == ' ' || ch == '-' || ch == '_')) {
+                    statusLike = false;
+                    break;
+                }
+            }
+            if (statusLike) {
+                s = s.substr(0, open - 1);
+                while (!s.empty() && (s.back() == ' ' || s.back() == '\t')) s.pop_back();
+            }
+        }
     }
+
     return s;
 }
 
@@ -582,20 +875,7 @@ bool WriteHelperScript(const std::string& helperName,
                           wxS_DIR_DEFAULT,
                           wxPATH_MKDIR_FULL);
 
-        try {
-            std::ofstream f(path_safety::Utf8ToWide(scriptPathOut),
-                            std::ios::binary | std::ios::trunc);
-            if (!f) {
-                errorOut = "Could not write helper script: " + scriptPathOut;
-                return false;
-            }
-            f.write(script, static_cast<std::streamsize>(std::strlen(script)));
-            if (!f.good()) {
-                errorOut = "Failed while writing helper script: " + scriptPathOut;
-                return false;
-            }
-        } catch (...) {
-            errorOut = "Exception while writing helper script: " + scriptPathOut;
+        if (!WriteBytesAtomic(scriptPathOut, script, std::strlen(script), errorOut)) {
             return false;
         }
 
@@ -632,6 +912,7 @@ bool EnsureCsvInspectScript(std::string& scriptPathOut,
 {
     const char* script =
         "import csv\n"
+        "import io\n"
         "import json\n"
         "import sys\n"
         "from pathlib import Path\n"
@@ -656,6 +937,43 @@ bool EnsureCsvInspectScript(std::string& scriptPathOut,
         "            pass\n"
         "    return raw.decode('utf-8', errors='replace'), 'utf-8-replace', len(raw)\n"
         "\n"
+        "def cell_looks_like_data(cell):\n"
+        "    c = cell.strip()\n"
+        "    if not c:\n"
+        "        return False\n"
+        "    parts = c.split('/')\n"
+        "    if len(parts) == 3 and all(p.strip().isdigit() for p in parts):\n"
+        "        return True\n"
+        "    c2 = c.replace('$', '').replace(',', '').replace('%', '').strip()\n"
+        "    if c2.count('.') <= 1 and c2.replace('.', '').isdigit():\n"
+        "        return True\n"
+        "    return False\n"
+        "\n"
+        "def header_score(row):\n"
+        "    nonempty = [c for c in row if c.strip()]\n"
+        "    if not nonempty:\n"
+        "        return -1000\n"
+        "    data_cells = sum(1 for c in row if cell_looks_like_data(c))\n"
+        "    uniq = len(set(' '.join(c.split()).lower() for c in nonempty))\n"
+        "    score = len(nonempty) - 3 * data_cells\n"
+        "    if uniq == len(nonempty):\n"
+        "        score += 1\n"
+        "    return score\n"
+        "\n"
+        "def guess_col_type(values):\n"
+        "    vals = [v.strip() for v in values if v.strip()]\n"
+        "    if not vals:\n"
+        "        return 'empty'\n"
+        "    kinds = set()\n"
+        "    for v in vals:\n"
+        "        if cell_looks_like_data(v):\n"
+        "            kinds.add('date' if v.count('/') == 2 else 'number')\n"
+        "        else:\n"
+        "            kinds.add('text')\n"
+        "    if len(kinds) == 1:\n"
+        "        return kinds.pop()\n"
+        "    return 'mixed'\n"
+        "\n"
         "def main():\n"
         "    if len(sys.argv) != 2:\n"
         "        emit({'ok': False, 'helper': 'csv_inspect', 'error': 'csv_inspect expects exactly one file path argument'}, 2)\n"
@@ -666,7 +984,6 @@ bool EnsureCsvInspectScript(std::string& scriptPathOut,
         "    if not target.is_absolute():\n"
         "        target = cwd / target\n"
         "    target = target.resolve()\n"
-        "\n"
         "\n"
         "    if target.suffix.lower() not in ('.csv', '.tsv'):\n"
         "        emit({'ok': False, 'helper': 'csv_inspect', 'error': 'Only .csv and .tsv files are supported in this first data helper', 'path': str(target)}, 4)\n"
@@ -695,10 +1012,10 @@ bool EnsureCsvInspectScript(std::string& scriptPathOut,
         "    row_count = 0\n"
         "    max_rows_to_scan = 100000\n"
         "    try:\n"
-        "        reader = csv.reader(text.splitlines(), delimiter=delimiter)\n"
+        "        reader = csv.reader(io.StringIO(text), delimiter=delimiter)\n"
         "        for row in reader:\n"
         "            row_count += 1\n"
-        "            if len(rows) < 6:\n"
+        "            if len(rows) < 12:\n"
         "                rows.append(row)\n"
         "            if row_count >= max_rows_to_scan:\n"
         "                warnings.append('Stopped counting at 100000 rows.')\n"
@@ -706,12 +1023,40 @@ bool EnsureCsvInspectScript(std::string& scriptPathOut,
         "    except Exception as ex:\n"
         "        emit({'ok': False, 'helper': 'csv_inspect', 'error': 'CSV parse failed: ' + str(ex), 'path': str(target)}, 6)\n"
         "\n"
-        "    header = rows[0] if rows else []\n"
-        "    sample_rows = rows[1:6] if len(rows) > 1 else []\n"
+        "    # Header detection: Excel-exported reports often carry metadata rows\n"
+        "    # (titles, totals, font notes) ABOVE the real header.  Blindly calling\n"
+        "    # rows[0] the header poisons every downstream consumer.  Score the\n"
+        "    # first rows and pick the most header-like one: many non-empty,\n"
+        "    # unique, non-data-looking cells.\n"
+        "    scan = rows[:10]\n"
+        "    header_idx = 0\n"
+        "    if scan:\n"
+        "        best = max(range(len(scan)), key=lambda i: header_score(scan[i]))\n"
+        "        if header_score(scan[best]) > header_score(scan[0]):\n"
+        "            header_idx = best\n"
+        "\n"
+        "    header = rows[header_idx] if rows else []\n"
+        "    preamble_rows = rows[:header_idx]\n"
+        "    sample_rows = rows[header_idx + 1: header_idx + 6]\n"
+        "    data_row_count = max(0, row_count - header_idx - 1)\n"
         "    width = max((len(r) for r in rows), default=0)\n"
         "    ragged = any(len(r) != width for r in rows) if rows else False\n"
         "    if ragged:\n"
         "        warnings.append('Sample rows have inconsistent column counts.')\n"
+        "\n"
+        "    multiline_headers = any('\\n' in c or '\\r' in c for c in header)\n"
+        "    parse_hints = []\n"
+        "    if header_idx > 0:\n"
+        "        warnings.append('File has ' + str(header_idx) + ' metadata row(s) ABOVE the real header. Row index ' + str(header_idx) + ' (0-based) is the header. Do not treat row 0 as the header.')\n"
+        "        parse_hints.append(\"pandas: pd.read_csv(path, skiprows=\" + str(header_idx) + \")\")\n"
+        "    if multiline_headers:\n"
+        "        warnings.append('Some header names contain embedded newlines (shown as \\\\n in the columns list). Match on normalized names.')\n"
+        "        parse_hints.append(\"normalize headers: df.columns = [' '.join(str(c).split()) for c in df.columns]\")\n"
+        "\n"
+        "    columns_sample_types = [\n"
+        "        guess_col_type([r[ci] for r in sample_rows if ci < len(r)])\n"
+        "        for ci in range(len(header))\n"
+        "    ]\n"
         "\n"
         "    emit({\n"
         "        'ok': True,\n"
@@ -725,8 +1070,14 @@ bool EnsureCsvInspectScript(std::string& scriptPathOut,
         "        'rows_scanned': row_count,\n"
         "        'row_count_exact': row_count < max_rows_to_scan,\n"
         "        'column_count_sample': width,\n"
+        "        'header_row_index': header_idx,\n"
+        "        'preamble_rows': preamble_rows,\n"
         "        'columns': header,\n"
+        "        'column_types_from_sample': columns_sample_types,\n"
+        "        'data_row_count': data_row_count,\n"
         "        'sample_rows': sample_rows,\n"
+        "        'sample_note': 'sample_rows shows only the first ' + str(len(sample_rows)) + ' of ' + str(data_row_count) + ' data rows. Do NOT analyze, count, filter, or summarize the dataset from this sample; any dataset-level conclusion (totals, who matches a condition, expirations, etc.) requires processing the FULL file, e.g. with a Python script.',\n"
+        "        'parse_hints': parse_hints,\n"
         "        'warnings': warnings,\n"
         "    })\n"
         "\n"
@@ -2411,7 +2762,15 @@ def main():
     if len(sys.argv) != 3:
         emit({'ok': False, 'helper': 'xlsx_create_workbook', 'error': 'xlsx_create_workbook expects exactly two internal arguments: JSON workbook spec and fixed output directory'}, 2)
 
-    raw_spec = sys.argv[1]
+    raw_spec_arg = sys.argv[1]
+    if raw_spec_arg.startswith('@'):
+        try:
+            raw_spec = Path(raw_spec_arg[1:]).read_text(encoding='utf-8')
+        except Exception as ex:
+            emit({'ok': False, 'helper': 'xlsx_create_workbook', 'error': 'Could not read JSON spec file: ' + str(ex)}, 3)
+    else:
+        raw_spec = raw_spec_arg
+
     out_dir = Path(sys.argv[2]).resolve()
     if len(raw_spec.encode('utf-8', errors='replace')) > 256 * 1024:
         emit({'ok': False, 'helper': 'xlsx_create_workbook', 'error': 'JSON spec is larger than the first-phase 256 KB safety cap'}, 3)
@@ -3752,7 +4111,14 @@ R"PY(def main():
 
     cwd = Path.cwd().resolve()
     raw_path_arg = sys.argv[1]
-    raw_json_arg = sys.argv[2]
+    raw_json_arg_in = sys.argv[2]
+    if raw_json_arg_in.startswith('@'):
+        try:
+            raw_json_arg = Path(raw_json_arg_in[1:]).read_text(encoding='utf-8')
+        except Exception as ex:
+            emit({'ok': False, 'helper': 'pdf_fill_form', 'error': 'Could not read field-map JSON file: ' + str(ex)}, 12)
+    else:
+        raw_json_arg = raw_json_arg_in
     out_dir = Path(sys.argv[3]).resolve()
 
     target = Path(raw_path_arg)
@@ -4814,6 +5180,464 @@ if __name__ == '__main__':
     return WriteHelperScript("docx_inspect", script, scriptPathOut, errorOut);
 }
 
+
+bool EnsureZipInspectScript(std::string& scriptPathOut,
+                            std::string& errorOut)
+{
+    const char* script = R"PY(
+import json
+import sys
+import zipfile
+import posixpath
+from pathlib import Path
+
+
+def emit(obj, code=0):
+    print(json.dumps(obj, indent=2, ensure_ascii=False))
+    raise SystemExit(code)
+
+
+METHOD_NAMES = {
+    0: 'store', 8: 'deflate', 9: 'deflate64', 12: 'bzip2',
+    14: 'lzma', 99: 'aes',
+}
+
+EXEC_EXTS = {
+    '.exe', '.dll', '.bat', '.cmd', '.com', '.scr', '.msi',
+    '.ps1', '.psm1', '.vbs', '.vbe', '.js', '.jse', '.jar',
+    '.sh', '.app', '.lnk',
+}
+
+
+def looks_like_traversal(name):
+    # The ZIP spec mandates forward slashes, but hostile archives embed
+    # backslashes to dodge naive checks; normalize both. Flag absolute
+    # paths, Windows drive roots, and any '..' path component (Zip Slip).
+    n = name.replace('\\', '/')
+    if n.startswith('/'):
+        return True
+    if len(n) >= 2 and n[1] == ':' and n[0].isalpha():
+        return True
+    parts = n.split('/')
+    return any(p == '..' for p in parts)
+
+
+def is_symlink(info):
+    # Unix mode lives in the high 16 bits of external_attr.
+    mode = (info.external_attr >> 16) & 0o170000
+    return mode == 0o120000
+
+
+def main():
+    if len(sys.argv) != 2:
+        emit({'ok': False, 'helper': 'zip_inspect',
+              'error': 'zip_inspect expects exactly one internal argument: input path'}, 2)
+
+    cwd = Path.cwd().resolve()
+    raw_arg = sys.argv[1]
+    target = Path(raw_arg)
+    if not target.is_absolute():
+        target = cwd / target
+    target = target.resolve()
+
+    if target.suffix.lower() != '.zip':
+        emit({'ok': False, 'helper': 'zip_inspect',
+              'error': 'Only .zip files are supported by zip_inspect',
+              'path': str(target)}, 4)
+
+    if not target.exists() or not target.is_file():
+        emit({'ok': False, 'helper': 'zip_inspect',
+              'error': 'File not found', 'path': str(target)}, 5)
+
+    size_bytes = target.stat().st_size
+    max_file_bytes = 1024 * 1024 * 1024  # 1 GB cap on the archive file itself
+    if size_bytes > max_file_bytes:
+        emit({'ok': False, 'helper': 'zip_inspect',
+              'error': 'Archive is larger than the 1 GB inspection cap',
+              'path': str(target), 'file_size_bytes': size_bytes}, 7)
+
+    if not zipfile.is_zipfile(target):
+        emit({'ok': False, 'helper': 'zip_inspect',
+              'error': 'Not a valid ZIP archive (bad signature or unsupported variant)',
+              'path': str(target), 'file_size_bytes': size_bytes}, 6)
+
+    # This helper only reads central-directory metadata via infolist();
+    # it never calls .read()/.extract*(), so no entry is decompressed and
+    # a zip bomb cannot detonate at inspection time.
+    ENTRY_SCAN_CAP = 50000   # stop walking pathological entry counts
+    ENTRY_DETAIL_CAP = 500   # entries returned verbatim in the manifest
+
+    entries = []
+    file_count = 0
+    dir_count = 0
+    total_uncompressed = 0
+    total_compressed = 0
+    encrypted_count = 0
+    traversal_suspects = []
+    symlink_suspects = []
+    executable_entries = []
+    top_level = set()
+    max_depth = 0
+    max_entry_ratio = 0.0
+    ext_hist = {}
+    warnings = []
+
+    try:
+        with zipfile.ZipFile(target, 'r') as zf:
+            comment = zf.comment.decode('utf-8', 'replace') if zf.comment else ''
+            infos = zf.infolist()
+            scanned = 0
+            for info in infos:
+                scanned += 1
+                if scanned > ENTRY_SCAN_CAP:
+                    warnings.append('Stopped scanning at ' + str(ENTRY_SCAN_CAP) + ' entries.')
+                    break
+
+                name = info.filename
+                norm = name.replace('\\', '/')
+                is_dir = info.is_dir()
+                comp = info.compress_size
+                uncomp = info.file_size
+                encrypted = bool(info.flag_bits & 0x1) or info.compress_type == 99
+                sym = is_symlink(info)
+
+                if is_dir:
+                    dir_count += 1
+                else:
+                    file_count += 1
+                    total_uncompressed += uncomp
+                    total_compressed += comp
+                    ext = posixpath.splitext(norm)[1].lower()
+                    if ext:
+                        ext_hist[ext] = ext_hist.get(ext, 0) + 1
+                        if ext in EXEC_EXTS and len(executable_entries) < 100:
+                            executable_entries.append(name)
+                    ratio = (uncomp / comp) if comp > 0 else 0.0
+                    if ratio > max_entry_ratio:
+                        max_entry_ratio = ratio
+
+                if encrypted:
+                    encrypted_count += 1
+                if sym and len(symlink_suspects) < 100:
+                    symlink_suspects.append(name)
+                if looks_like_traversal(name) and len(traversal_suspects) < 100:
+                    traversal_suspects.append(name)
+
+                stripped = norm.strip('/')
+                if stripped:
+                    top_level.add(stripped.split('/')[0])
+                    depth = stripped.count('/') + 1
+                    if depth > max_depth:
+                        max_depth = depth
+
+                if len(entries) < ENTRY_DETAIL_CAP:
+                    dt = info.date_time
+                    modified = '%04d-%02d-%02d %02d:%02d:%02d' % dt if dt and dt[0] >= 1980 else ''
+                    entries.append({
+                        'name': name,
+                        'is_dir': is_dir,
+                        'size_bytes': uncomp,
+                        'compressed_bytes': comp,
+                        'method': METHOD_NAMES.get(info.compress_type, str(info.compress_type)),
+                        'encrypted': encrypted,
+                        'modified': modified,
+                    })
+    except zipfile.BadZipFile as ex:
+        emit({'ok': False, 'helper': 'zip_inspect',
+              'error': 'Corrupt or unreadable ZIP central directory: ' + str(ex),
+              'path': str(target)}, 6)
+    except Exception as ex:
+        emit({'ok': False, 'helper': 'zip_inspect',
+              'error': 'Could not read ZIP: ' + str(ex),
+              'path': str(target)}, 6)
+
+    entry_count = file_count + dir_count
+    overall_ratio = (total_uncompressed / total_compressed) if total_compressed > 0 else 0.0
+
+    # Compression-ratio heuristic: a normal archive sits well under ~100x.
+    # A wildly higher ratio is the classic zip-bomb signature. We only
+    # FLAG it here (inspection never extracts); a future zip_extract must
+    # enforce real caps before writing anything.
+    suspicious_ratio = overall_ratio >= 200.0 or max_entry_ratio >= 1000.0
+
+    top_sorted = sorted(top_level)
+    single_root = len(top_sorted) == 1
+    ext_top = sorted(ext_hist.items(), key=lambda kv: (-kv[1], kv[0]))[:20]
+
+    safety_flags = []
+    if encrypted_count:
+        safety_flags.append('encrypted_entries')
+    if traversal_suspects:
+        safety_flags.append('path_traversal_suspects')
+    if symlink_suspects:
+        safety_flags.append('symlink_entries')
+    if executable_entries:
+        safety_flags.append('executable_entries')
+    if suspicious_ratio:
+        safety_flags.append('high_compression_ratio')
+
+    emit({
+        'ok': True,
+        'helper': 'zip_inspect',
+        'input_path': str(target),
+        'cwd': str(cwd),
+        'file_size_bytes': size_bytes,
+        'comment': comment,
+        'entry_count': entry_count,
+        'file_count': file_count,
+        'dir_count': dir_count,
+        'total_uncompressed_bytes': total_uncompressed,
+        'total_compressed_bytes': total_compressed,
+        'overall_compression_ratio': round(overall_ratio, 2),
+        'max_entry_compression_ratio': round(max_entry_ratio, 2),
+        'top_level_entries': top_sorted[:100],
+        'single_root_folder': single_root,
+        'max_path_depth': max_depth,
+        'extension_histogram': [{'ext': e, 'count': c} for e, c in ext_top],
+        'encrypted_entry_count': encrypted_count,
+        'has_encrypted_entries': encrypted_count > 0,
+        'path_traversal_suspects': traversal_suspects,
+        'symlink_entries': symlink_suspects,
+        'executable_entries': executable_entries,
+        'high_compression_ratio': suspicious_ratio,
+        'safety_flags': safety_flags,
+        'entries': entries,
+        'entries_truncated': entry_count > len(entries),
+        'entry_detail_cap': ENTRY_DETAIL_CAP,
+        'note': 'Read-only manifest. No entry was decompressed or written to disk. '
+                'Before extracting, heed safety_flags: encrypted/symlink/traversal/executable '
+                'entries and high compression ratios all warrant caution.',
+        'warnings': warnings,
+    })
+
+
+if __name__ == '__main__':
+    main()
+)PY";
+
+    return WriteHelperScript("zip_inspect", script, scriptPathOut, errorOut);
+}
+
+bool EnsureZipExtractScript(std::string& scriptPathOut,
+                            std::string& errorOut)
+{
+    const char* script = R"PY(
+import json
+import os
+import sys
+import zipfile
+import posixpath
+from pathlib import Path
+
+
+def emit(obj, code=0):
+    print(json.dumps(obj, indent=2, ensure_ascii=False))
+    raise SystemExit(code)
+
+
+EXEC_EXTS = {
+    '.exe', '.dll', '.bat', '.cmd', '.com', '.scr', '.msi',
+    '.ps1', '.psm1', '.vbs', '.vbe', '.js', '.jse', '.jar',
+    '.sh', '.app', '.lnk',
+}
+
+# Enforcement caps (the real teeth zip_inspect could only flag).
+MAX_ARCHIVE_BYTES   = 1024 * 1024 * 1024          # 1 GB archive file
+MAX_TOTAL_UNCOMP    = 2 * 1024 * 1024 * 1024       # 2 GB written total
+MAX_ENTRY_COUNT     = 20000
+MAX_ENTRY_RATIO     = 1000.0                        # per-entry declared ratio
+CHUNK               = 1024 * 1024                   # 1 MB streaming chunks
+
+
+def fail(msg, path, code=8, **extra):
+    obj = {'ok': False, 'helper': 'zip_extract', 'error': msg, 'path': path}
+    obj.update(extra)
+    emit(obj, code)
+
+
+def is_symlink(info):
+    mode = (info.external_attr >> 16) & 0o170000
+    return mode == 0o120000
+
+
+def is_encrypted(info):
+    return bool(info.flag_bits & 0x1) or info.compress_type == 99
+
+
+def unique_dir(base):
+    if not base.exists():
+        return base
+    i = 1
+    while True:
+        cand = base.with_name(base.name + ' (' + str(i) + ')')
+        if not cand.exists():
+            return cand
+        i += 1
+
+
+def safe_target(dest_root, entry_name):
+    # Compute our OWN target path; never trust zipfile.extract() with the
+    # raw name. Normalize separators, strip leading slashes/drive, then
+    # confirm the resolved path stays under dest_root (defense in depth).
+    norm = entry_name.replace('\\', '/')
+    norm = norm.lstrip('/')
+    if len(norm) >= 2 and norm[1] == ':' and norm[0].isalpha():
+        return None
+    parts = [p for p in norm.split('/') if p not in ('', '.')]
+    if any(p == '..' for p in parts):
+        return None
+    target = (dest_root / Path(*parts)) if parts else dest_root
+    try:
+        target_res = target.resolve()
+        root_res = dest_root.resolve()
+    except Exception:
+        return None
+    if target_res != root_res and root_res not in target_res.parents:
+        return None
+    return target
+
+
+def main():
+    if len(sys.argv) != 3:
+        emit({'ok': False, 'helper': 'zip_extract',
+              'error': 'zip_extract expects exactly two internal arguments: <input.zip> <extracted_lane_dir>'}, 2)
+
+    cwd = Path.cwd().resolve()
+    raw_arg = sys.argv[1]
+    lane_dir = Path(sys.argv[2])
+
+    target = Path(raw_arg)
+    if not target.is_absolute():
+        target = cwd / target
+    target = target.resolve()
+
+    if target.suffix.lower() != '.zip':
+        fail('Only .zip files are supported by zip_extract', str(target), 4)
+    if not target.exists() or not target.is_file():
+        fail('File not found', str(target), 5)
+
+    size_bytes = target.stat().st_size
+    if size_bytes > MAX_ARCHIVE_BYTES:
+        fail('Archive is larger than the 1 GB extraction cap', str(target), 7,
+             file_size_bytes=size_bytes)
+    if not zipfile.is_zipfile(target):
+        fail('Not a valid ZIP archive (bad signature or unsupported variant)',
+             str(target), 6, file_size_bytes=size_bytes)
+
+    dest_root = unique_dir(lane_dir / target.stem)
+
+    # PASS 1: central-directory audit. NO decompression. Refuse the whole
+    # archive on any security violation before writing a byte.
+    refusals = []
+    encrypted_entries = []
+    executable_entries = []
+    declared_total = 0
+    file_entries = []
+    try:
+        with zipfile.ZipFile(target, 'r') as zf:
+            infos = zf.infolist()
+            if len(infos) > MAX_ENTRY_COUNT:
+                fail('Archive exceeds the entry-count cap (' + str(MAX_ENTRY_COUNT) + ')',
+                     str(target), 9, entry_count=len(infos))
+            for info in infos:
+                name = info.filename
+                if is_symlink(info):
+                    refusals.append({'name': name, 'reason': 'symlink entry'})
+                    continue
+                if is_encrypted(info):
+                    encrypted_entries.append(name)
+                    continue
+                if info.is_dir():
+                    continue
+                if safe_target(dest_root, name) is None:
+                    refusals.append({'name': name, 'reason': 'path escapes extraction root'})
+                    continue
+                declared_total += info.file_size
+                if info.compress_size > 0:
+                    ratio = info.file_size / info.compress_size
+                    if ratio > MAX_ENTRY_RATIO:
+                        refusals.append({'name': name,
+                                         'reason': 'compression ratio %.0fx exceeds cap' % ratio})
+                        continue
+                ext = posixpath.splitext(name.replace('\\', '/'))[1].lower()
+                if ext in EXEC_EXTS:
+                    executable_entries.append(name)
+                file_entries.append(info)
+
+            if refusals:
+                fail('Refused: ' + str(len(refusals)) + ' entry(ies) failed security checks. '
+                     'No files were extracted.', str(target), 10, refused=refusals)
+            if encrypted_entries:
+                fail('Archive contains encrypted entries; zip_extract will not extract '
+                     'encrypted archives. No files were extracted.', str(target), 11,
+                     encrypted_entries=encrypted_entries[:50])
+            if declared_total > MAX_TOTAL_UNCOMP:
+                fail('Declared uncompressed size exceeds the 2 GB cap. No files were extracted.',
+                     str(target), 12, declared_total_bytes=declared_total)
+
+            # PASS 2: extract, streaming, with a hard written-bytes cap that
+            # catches archives lying about their declared sizes.
+            dest_root.mkdir(parents=True, exist_ok=True)
+            written_total = 0
+            extracted = []
+            for info in file_entries:
+                tgt = safe_target(dest_root, info.filename)
+                if tgt is None:   # paranoia; pass 1 already checked
+                    fail('Internal: path check failed during extraction. Partial output may exist.',
+                         str(target), 13)
+                tgt.parent.mkdir(parents=True, exist_ok=True)
+                entry_cap = max(info.file_size * 2, 4096)   # tolerance over declared
+                entry_written = 0
+                with zf.open(info, 'r') as src, open(tgt, 'wb') as dst:
+                    while True:
+                        chunk = src.read(CHUNK)
+                        if not chunk:
+                            break
+                        entry_written += len(chunk)
+                        written_total += len(chunk)
+                        if written_total > MAX_TOTAL_UNCOMP:
+                            dst.close()
+                            fail('Aborted: total extracted bytes exceeded the 2 GB cap '
+                                 '(possible zip bomb). Partial output remains in the '
+                                 'destination folder.', str(target), 14,
+                                 destination=str(dest_root), bytes_written=written_total)
+                        if entry_written > entry_cap:
+                            dst.close()
+                            fail('Aborted: entry "' + info.filename + '" produced far more '
+                                 'data than its declared size (possible zip bomb). Partial '
+                                 'output remains in the destination folder.', str(target), 15,
+                                 destination=str(dest_root), entry=info.filename)
+                        dst.write(chunk)
+                extracted.append({'name': info.filename, 'bytes': entry_written})
+    except zipfile.BadZipFile as ex:
+        fail('Corrupt or unreadable ZIP: ' + str(ex), str(target), 6)
+    except Exception as ex:
+        fail('Could not extract ZIP: ' + str(ex), str(target), 6)
+
+    emit({
+        'ok': True,
+        'helper': 'zip_extract',
+        'input_path': str(target),
+        'destination': str(dest_root),
+        'extracted_count': len(extracted),
+        'total_bytes_written': written_total,
+        'executable_entries': executable_entries,
+        'note': 'Extraction confined to the destination folder. All entry paths were '
+                'validated against Zip Slip before writing; symlink, encrypted, and '
+                'over-ratio entries are rejected. Executable entries (if any) were '
+                'extracted but are listed above for your awareness.',
+        'extracted': extracted[:200],
+        'extracted_truncated': len(extracted) > 200,
+    })
+
+
+if __name__ == '__main__':
+    main()
+)PY";
+
+    return WriteHelperScript("zip_extract", script, scriptPathOut, errorOut);
+}
+
 bool JsonStringField(const std::string& json,
                      const std::string& field,
                      std::string& out)
@@ -5302,19 +6126,209 @@ bool ResolveRunnableScriptPath(const std::string& requested,
     }
     name = name.substr(a, b - a + 1);
 
-    // Friendly project-relative form: Workflows\helper.py means the
-    // same thing as helper.py for active project workflow scripts.  Keep
-    // this narrow: no nested paths and no arbitrary directory prefixes.
+    // Friendly project-relative form: Workflows\helper.py pins the active
+    // project's Workflows lane.  Do not strip this to a bare filename, because
+    // bare-name lookup checks the conversation Scripts lane first; stripping
+    // would let Scripts\helper.py shadow the project workflow the caller
+    // explicitly requested.
     {
         std::string pathish = name;
         std::replace(pathish.begin(), pathish.end(), '/', '\\');
         std::string key = LowerLocal(pathish);
         const std::string p1 = "workflows\\";
         const std::string p2 = "project\\workflows\\";
+
+        size_t prefixLen = std::string::npos;
         if (key.rfind(p1, 0) == 0) {
-            name = pathish.substr(p1.size());
+            prefixLen = p1.size();
         } else if (key.rfind(p2, 0) == 0) {
-            name = pathish.substr(p2.size());
+            prefixLen = p2.size();
+        }
+
+        if (prefixLen != std::string::npos) {
+            if (activeProjectRoot.empty()) {
+                errorOut = "python_run_script Workflows\\... paths require an active project.";
+                return false;
+            }
+
+            std::string workflowName = pathish.substr(prefixLen);
+            size_t wa = workflowName.find_first_not_of(" \t\r\n");
+            size_t wb = workflowName.find_last_not_of(" \t\r\n");
+            if (wa == std::string::npos) {
+                errorOut = "python_run_script Workflows\\... path must include a script filename.";
+                return false;
+            }
+            workflowName = workflowName.substr(wa, wb - wa + 1);
+
+            // Prefix form is a lane selector, not an arbitrary nested path.
+            if (workflowName.find('\\') != std::string::npos ||
+                workflowName.find('/')  != std::string::npos ||
+                workflowName.find(':')  != std::string::npos) {
+                errorOut = "python_run_script Workflows\\... accepts a single .py filename only.";
+                return false;
+            }
+
+            size_t dot = workflowName.find_last_of('.');
+            if (dot == std::string::npos) {
+                workflowName += ".py";
+            } else if (LowerLocal(workflowName.substr(dot)) != ".py") {
+                errorOut = "python_run_script Workflows\\... paths must point to a .py file.";
+                return false;
+            }
+
+            std::string safe = path_safety::SanitizeFilename(workflowName, "");
+            if (safe.empty() || safe != workflowName) {
+                errorOut = "Unsafe Python workflow script filename: " + workflowName;
+                return false;
+            }
+            if (python_arg_policy::IsReservedBuiltInPythonHelperName(workflowName)) {
+                errorOut = "Reserved Python helper filename: " + workflowName +
+                           ". Built-in helpers are run through their tool names, not through python_run_script.";
+                return false;
+            }
+
+            ProjectWorkflowScriptInfo script;
+            std::string projectError;
+            if (!ProjectManager::ResolveProjectWorkflowScript(activeProjectRoot, workflowName, script, projectError)) {
+                errorOut = projectError.empty()
+                    ? ("Python project workflow script not found: " + workflowName)
+                    : projectError;
+                return false;
+            }
+
+            pathOut = script.path;
+            displayNameOut = script.name;
+            return true;
+        }
+    }
+
+    // Friendly global-skill form: Skills\helper.py pins the LlamaBoss Skills
+    // lane.  This mirrors Workflows\helper.py so a same-named conversation
+    // script cannot shadow a skill the caller explicitly requested.
+    {
+        std::string pathish = name;
+        std::replace(pathish.begin(), pathish.end(), '/', '\\');
+        std::string key = LowerLocal(pathish);
+        const std::string p1 = "skills\\";
+
+        if (key.rfind(p1, 0) == 0) {
+            std::string skillName = pathish.substr(p1.size());
+            size_t sa = skillName.find_first_not_of(" \t\r\n");
+            size_t sb = skillName.find_last_not_of(" \t\r\n");
+            if (sa == std::string::npos) {
+                errorOut = "python_run_script Skills\\... path must include a script filename.";
+                return false;
+            }
+            skillName = skillName.substr(sa, sb - sa + 1);
+
+            // Prefix form is a lane selector, not an arbitrary nested path.
+            if (skillName.find('\\') != std::string::npos ||
+                skillName.find('/')  != std::string::npos ||
+                skillName.find(':')  != std::string::npos) {
+                errorOut = "python_run_script Skills\\... accepts a single .py filename only.";
+                return false;
+            }
+
+            size_t dot = skillName.find_last_of('.');
+            if (dot == std::string::npos) {
+                skillName += ".py";
+            } else if (LowerLocal(skillName.substr(dot)) != ".py") {
+                errorOut = "python_run_script Skills\\... paths must point to a .py file.";
+                return false;
+            }
+
+            std::string safe = path_safety::SanitizeFilename(skillName, "");
+            if (safe.empty() || safe != skillName) {
+                errorOut = "Unsafe Python skill script filename: " + skillName;
+                return false;
+            }
+            if (python_arg_policy::IsReservedBuiltInPythonHelperName(skillName)) {
+                errorOut = "Reserved Python helper filename: " + skillName +
+                           ". Built-in helpers are run through their tool names, not through python_run_script.";
+                return false;
+            }
+
+            SkillScriptInfo script;
+            std::string globalError;
+            if (!ProjectManager::ResolveSkillScript(skillName, script, globalError)) {
+                errorOut = globalError.empty()
+                    ? ("Python skill script not found: " + skillName)
+                    : globalError;
+                return false;
+            }
+
+            pathOut = script.path;
+            displayNameOut = script.name;
+            return true;
+        }
+    }
+
+    // Friendly conversation-lane form: Scripts\helper.py pins the
+    // conversation Scripts lane.  This is the lane python_create_script
+    // writes to and the one models most naturally name — observed
+    // 2026-06-11: gemma-4-e4b emitted Scripts\cli_downloader.py, which
+    // passed shape validation, then died in the path-shaped branch below
+    // because relative paths resolve against the cwd (the Workspace
+    // folder) while the Scripts lane is the Workspace's SIBLING.  The
+    // selector mirrors Workflows\ and Skills\ exactly.
+    {
+        std::string pathish = name;
+        std::replace(pathish.begin(), pathish.end(), '/', '\\');
+        std::string key = LowerLocal(pathish);
+        const std::string p1 = "scripts\\";
+
+        if (key.rfind(p1, 0) == 0) {
+            std::string scriptName = pathish.substr(p1.size());
+            size_t ca = scriptName.find_first_not_of(" \t\r\n");
+            size_t cb = scriptName.find_last_not_of(" \t\r\n");
+            if (ca == std::string::npos) {
+                errorOut = "python_run_script Scripts\\... path must include a script filename.";
+                return false;
+            }
+            scriptName = scriptName.substr(ca, cb - ca + 1);
+
+            // Prefix form is a lane selector, not an arbitrary nested path.
+            if (scriptName.find('\\') != std::string::npos ||
+                scriptName.find('/')  != std::string::npos ||
+                scriptName.find(':')  != std::string::npos) {
+                errorOut = "python_run_script Scripts\\... accepts a single .py filename only.";
+                return false;
+            }
+
+            size_t dot = scriptName.find_last_of('.');
+            if (dot == std::string::npos) {
+                scriptName += ".py";
+            } else if (LowerLocal(scriptName.substr(dot)) != ".py") {
+                errorOut = "python_run_script Scripts\\... paths must point to a .py file.";
+                return false;
+            }
+
+            std::string safe = path_safety::SanitizeFilename(scriptName, "");
+            if (safe.empty() || safe != scriptName) {
+                errorOut = "Unsafe Python script filename: " + scriptName;
+                return false;
+            }
+            if (python_arg_policy::IsReservedBuiltInPythonHelperName(scriptName)) {
+                errorOut = "Reserved Python helper filename: " + scriptName +
+                           ". Built-in helpers are run through their tool names, not through python_run_script.";
+                return false;
+            }
+
+            const std::string scriptsRoot = UserScriptsDirForCwd(cwd);
+            if (scriptsRoot.empty()) {
+                errorOut = "Conversation Scripts folder could not be resolved.";
+                return false;
+            }
+            std::string fullPath = JoinPath(scriptsRoot, scriptName);
+            if (!FileExistsRegular(fullPath)) {
+                errorOut = "Python script not found in the conversation Scripts folder: " +
+                           scriptName;
+                return false;
+            }
+
+            pathOut = fullPath;
+            displayNameOut = scriptName;
+            return true;
         }
     }
 
@@ -5354,15 +6368,32 @@ bool ResolveRunnableScriptPath(const std::string& requested,
             : ProjectManager::ProjectWorkflowsPath(activeProjectRoot);
         const std::string skillsRoot = ProjectManager::GetSkillsDir();
 
+        // ResolveToolPath already canonicalizes . and .. segments; use the
+        // local canonicalizing comparator here too so path-shaped
+        // python_run_script requests share one containment rule with Python
+        // artifact attachment below.
         const bool inScripts = !scriptsRoot.empty() &&
-            tool_path_safety::IsUnderCwd(resolved, scriptsRoot);
+            IsPathUnderRootForCompare(resolved, scriptsRoot);
         const bool inProjectWorkflows = !projectWorkflowRoot.empty() &&
-            tool_path_safety::IsUnderCwd(resolved, projectWorkflowRoot);
+            IsPathUnderRootForCompare(resolved, projectWorkflowRoot);
         const bool inSkills = !skillsRoot.empty() &&
-            tool_path_safety::IsUnderCwd(resolved, skillsRoot);
+            IsPathUnderRootForCompare(resolved, skillsRoot);
 
         if (!inScripts && !inProjectWorkflows && !inSkills) {
-            errorOut = "python_run_script only runs .py files from the conversation Scripts folder, the active project Workflows folder, or the LlamaBoss Skills folder.";
+            // Common model recovery seam: write/overwrite_file create files
+            // in the conversation Workspace (cwd), while python_run_script
+            // intentionally runs only reviewed script lanes.  If the requested
+            // path exists in the Workspace, say that explicitly so the model
+            // repairs by recreating it with python_create_script instead of
+            // repeating the same failing run.
+            if (!cwd.empty() &&
+                IsPathUnderRootForCompare(resolved, cwd) &&
+                FileExistsRegular(resolved)) {
+                errorOut = "Python script exists in the conversation Workspace, but python_run_script does not run Workspace files created by write/overwrite_file. Recreate the runnable script with python_create_script, then run python_run_script with that script filename. Workspace path: " + resolved;
+                return false;
+            }
+
+            errorOut = "python_run_script only runs .py files from the conversation Scripts folder, the active project Workflows folder, or the LlamaBoss Skills folder. Use the bare filename (e.g. report.py), or pin a lane with Scripts\\name.py, Workflows\\name.py (active project), or Skills\\name.py.";
             return false;
         }
         if (!FileExistsRegular(resolved)) {
@@ -5379,7 +6410,7 @@ bool ResolveRunnableScriptPath(const std::string& requested,
     if (dot == std::string::npos) {
         name += ".py";
     } else if (LowerLocal(name.substr(dot)) != ".py") {
-        errorOut = "python_run_script only runs .py files from the conversation Scripts folder, the active project Workflows folder, or the LlamaBoss Skills folder.";
+        errorOut = "python_run_script only runs .py files from the conversation Scripts folder, the active project Workflows folder, or the LlamaBoss Skills folder. Use the bare filename (e.g. report.py), or pin a lane with Scripts\\name.py, Workflows\\name.py (active project), or Skills\\name.py.";
         return false;
     }
 
@@ -5425,6 +6456,20 @@ bool ResolveRunnableScriptPath(const std::string& requested,
             pathOut = script.path;
             displayNameOut = script.name;
             return true;
+        }
+    }
+
+    // If the model wrote the file with write/overwrite_file, it will be in
+    // the Workspace cwd rather than the Scripts lane.  Keep the safety
+    // boundary, but make the recovery action model-visible.
+    {
+        const std::string workspacePath = JoinPath(cwd, name);
+        if (!cwd.empty() && FileExistsRegular(workspacePath)) {
+            errorOut = "Python script not found in runnable script lanes. A file named " + name +
+                       " exists in the conversation Workspace, but python_run_script does not run Workspace files created by write/overwrite_file. Recreate the runnable script with python_create_script " + name +
+                       ", then run python_run_script with that filename. Workspace path: " + workspacePath +
+                       ". Conversation Scripts path checked: " + fullPath;
+            return false;
         }
     }
 
@@ -5507,13 +6552,22 @@ void AttachNewFilesUnderLlamaBoss(PythonRunResult& result,
 
     int attached = 0;
     int extra = 0;
+    size_t createdTotal = 0;
     constexpr int kMaxAttach = 12;
     constexpr size_t kMaxFileBytes = 25 * 1024 * 1024;
+    constexpr size_t kMaxManifestListed = 12;
+    std::string manifestLines;
 
     for (const auto& path : after) {
         if (before.find(path) != before.end()) continue;
 
+        ++createdTotal;
         size_t size = FileSizeBytes(path);
+
+        if (createdTotal <= kMaxManifestListed) {
+            manifestLines += "created: " + path + "\r\n";
+        }
+
         if (size == 0 || size > kMaxFileBytes) continue;
 
         if (attached >= kMaxAttach) {
@@ -5530,6 +6584,34 @@ void AttachNewFilesUnderLlamaBoss(PythonRunResult& result,
             result.stderrText += "\r\n";
         result.stderrText += "[LlamaBoss detected additional created files but only attached the first " +
                              std::to_string(kMaxAttach) + " artifact cards.]\r\n";
+    }
+
+    // Workspace-change manifest, INCLUDING the explicit negative.
+    // This function only runs when the script exited 0 and printed no
+    // explicit ARTIFACT: line — exactly the situation where a small
+    // model is most tempted to claim an output file exists anyway.
+    // Stating "no new files" outright leaves it no room to confabulate
+    // one (companion to the PowerShell manifest in cmd_executor.cpp).
+    if (!result.stdoutText.empty() && result.stdoutText.back() != '\n')
+        result.stdoutText += "\r\n";
+    if (!result.stdoutText.empty()) result.stdoutText += "\r\n";
+    result.stdoutText += "[workspace changes]\r\n";
+    if (createdTotal == 0) {
+        result.stdoutText +=
+            "no new files were detected in the conversation workspace after "
+            "this run. If this script was supposed to create a file in the "
+            "workspace, it did not. Files written to directories outside the "
+            "workspace are not tracked by this manifest; if the script's own "
+            "output above names a destination path it wrote to, trust that "
+            "printed path instead of spending another tool call re-checking "
+            "it.\r\n";
+    } else {
+        result.stdoutText += manifestLines;
+        if (createdTotal > kMaxManifestListed) {
+            result.stdoutText += "...and " +
+                std::to_string(createdTotal - kMaxManifestListed) +
+                " more created file(s)\r\n";
+        }
     }
 }
 
@@ -5648,10 +6730,11 @@ std::vector<PythonCandidate> BuildCandidates(const std::string& scriptPath,
 std::vector<PythonCandidate> BuildPipInstallCandidates(const std::string& packageName)
 {
     const std::wstring pkg = QuoteArg(Utf8ToWide(packageName));
-    const std::wstring common = L" -B -m pip install --user --disable-pip-version-check " + pkg;
+    const std::wstring pyCommon = L" -3 -X utf8 -B -m pip install --user --disable-pip-version-check " + pkg;
+    const std::wstring common   = L" -X utf8 -B -m pip install --user --disable-pip-version-check " + pkg;
 
     return {
-        { "py -3",   L"py.exe -3" + common },
+        { "py -3",   L"py.exe" + pyCommon },
         { "python",  L"python.exe" + common },
         { "python3", L"python3.exe" + common },
     };
@@ -5707,6 +6790,17 @@ private:
     {
         std::string scriptPath, scriptError;
         std::vector<std::string> helperArgs;
+        // Must live outside the python_run_script branch because the
+        // post-run argparse recovery hint is emitted after the process exits.
+        std::vector<std::string> pythonRunScriptArgvForHint;
+        std::vector<std::string> tempArgFiles;
+        auto cleanupTempArgFiles = [&]() {
+            for (const auto& path : tempArgFiles) {
+                DeleteFileW(Utf8ToWide(path).c_str());
+            }
+            tempArgFiles.clear();
+        };
+
         const bool isPackageInstall = (m_helperName == "python_install_package");
         std::set<std::string> beforeFiles;
 
@@ -5764,7 +6858,19 @@ private:
                 result.exitCode = -1;
                 return;
             }
-            helperArgs.push_back(m_helperArg);
+            std::string specArg = m_helperArg;
+            if (specArg.size() > 24 * 1024) {
+                std::string argFile;
+                if (!WriteUtf8ArgTempFile("xlsx_create_workbook_spec", specArg, argFile, scriptError)) {
+                    result.stderrText = scriptError;
+                    result.exitCode = -1;
+                    cleanupTempArgFiles();
+                    return;
+                }
+                tempArgFiles.push_back(argFile);
+                specArg = "@" + argFile;
+            }
+            helperArgs.push_back(specArg);
             helperArgs.push_back(SpreadsheetsDirForCwd(m_cwd));
             result.commandEcho = "xlsx_create_workbook";
         } else if (m_helperName == "xlsx_inspect") {
@@ -5844,6 +6950,18 @@ private:
             if (ps != std::string::npos && ps > 0)
                 pathPart = pathPart.substr(ps);
 
+            if (jsonPart.size() > 24 * 1024) {
+                std::string argFile;
+                if (!WriteUtf8ArgTempFile("pdf_fill_form_fields", jsonPart, argFile, scriptError)) {
+                    result.stderrText = scriptError;
+                    result.exitCode = -1;
+                    cleanupTempArgFiles();
+                    return;
+                }
+                tempArgFiles.push_back(argFile);
+                jsonPart = "@" + argFile;
+            }
+
             helperArgs.push_back(pathPart);
             helperArgs.push_back(jsonPart);
             helperArgs.push_back(FilledFormsDirForCwd(m_cwd));
@@ -5874,10 +6992,35 @@ private:
             result.commandEcho = m_helperArg.empty()
                 ? std::string("docx_inspect")
                 : std::string("docx_inspect ") + m_helperArg;
+        } else if (m_helperName == "zip_inspect") {
+            if (!EnsureZipInspectScript(scriptPath, scriptError)) {
+                result.stderrText = scriptError;
+                result.exitCode = -1;
+                return;
+            }
+            helperArgs.push_back(m_helperArg);
+            // No output directory argument: zip_inspect is read-only,
+            // sibling to docx_inspect / pdf_inspect_form / csv_inspect.
+            result.commandEcho = m_helperArg.empty()
+                ? std::string("zip_inspect")
+                : std::string("zip_inspect ") + m_helperArg;
+        } else if (m_helperName == "zip_extract") {
+            if (!EnsureZipExtractScript(scriptPath, scriptError)) {
+                result.stderrText = scriptError;
+                result.exitCode = -1;
+                return;
+            }
+            helperArgs.push_back(m_helperArg);
+            // Output directory: the conversation "Extracted" lane.  The
+            // helper creates a per-archive subfolder under it and confines
+            // every extracted entry beneath that subfolder.
+            helperArgs.push_back(ExtractedDirForCwd(m_cwd));
+            result.commandEcho = m_helperArg.empty()
+                ? std::string("zip_extract")
+                : std::string("zip_extract ") + m_helperArg;
         } else if (m_helperName == "python_run_script") {
             std::string scriptRequest;
-            std::vector<std::string> scriptArgv;
-            SplitPythonRunScriptInvocation(m_helperArg, scriptRequest, scriptArgv);
+            SplitPythonRunScriptInvocation(m_helperArg, scriptRequest, pythonRunScriptArgvForHint);
 
             std::string displayName;
             if (!ResolveRunnableScriptPath(scriptRequest, m_cwd, m_activeProjectRoot, scriptPath, displayName, scriptError)) {
@@ -5886,13 +7029,15 @@ private:
                 return;
             }
 
-            helperArgs.insert(helperArgs.end(), scriptArgv.begin(), scriptArgv.end());
+            helperArgs.insert(helperArgs.end(),
+                              pythonRunScriptArgvForHint.begin(),
+                              pythonRunScriptArgvForHint.end());
             result.commandEcho = displayName.empty()
                 ? std::string("python_run_script")
                 : std::string("python_run_script ") + displayName;
-            if (!scriptArgv.empty()) {
-                result.commandEcho += "  ·  " + std::to_string(scriptArgv.size()) +
-                    (scriptArgv.size() == 1 ? " arg" : " args");
+            if (!pythonRunScriptArgvForHint.empty()) {
+                result.commandEcho += "  ·  " + std::to_string(pythonRunScriptArgvForHint.size()) +
+                    (pythonRunScriptArgvForHint.size() == 1 ? " arg" : " args");
             }
             beforeFiles = SnapshotPythonRunArtifactFiles(m_cwd, m_activeProjectRoot);
         } else {
@@ -5933,15 +7078,53 @@ private:
                 } else if (m_helperName == "docx_extract_text") {
                     AttachDocxExtractTextArtifact(attempt);
                 } else if (m_helperName == "python_run_script") {
-                    if (!AttachExplicitPythonRunArtifacts(attempt, m_cwd, m_activeProjectRoot)) {
+                    const bool completedSuccessfully =
+                        attempt.exitCode == 0 && !attempt.timedOut && !attempt.cancelled;
+                    if (completedSuccessfully &&
+                        !AttachExplicitPythonRunArtifacts(attempt, m_cwd, m_activeProjectRoot)) {
                         AttachNewFilesUnderLlamaBoss(attempt, beforeFiles, m_cwd, m_activeProjectRoot);
+                    }
+
+                    // Deterministic recovery hint for the most common argv
+                    // mistake: a flag and its value on ONE args line, which
+                    // the one-token-per-line contract passes to the script as
+                    // a single argv element ("--format-index 1").  argparse
+                    // then rejects the call with a usage error the model
+                    // cannot diagnose, and small models retry the identical
+                    // call until the loop guard stops the agent (observed
+                    // 2026-06-11 with gemma-4-e4b).  Name the exact bad token
+                    // and both accepted fixes so one retry can succeed.
+                    if (!completedSuccessfully &&
+                        !attempt.cancelled && !attempt.timedOut) {
+                        std::string suspicious;
+                        for (const std::string& tok : pythonRunScriptArgvForHint) {
+                            if (tok.size() > 1 && tok[0] == '-' &&
+                                tok.find_first_of(" \t") != std::string::npos) {
+                                suspicious = tok;
+                                break;
+                            }
+                        }
+                        if (!suspicious.empty()) {
+                            if (!attempt.stderrText.empty() &&
+                                attempt.stderrText.back() != '\n') {
+                                attempt.stderrText += "\n";
+                            }
+                            attempt.stderrText +=
+                                "[hint] Each python_run_script args line is passed to the "
+                                "script as ONE argv token. The line \"" + suspicious +
+                                "\" became a single token, which argument parsers reject. "
+                                "Put the flag and its value on separate lines, or write "
+                                "it as one token with '=' (e.g. --flag=value).";
+                        }
                     }
                 }
                 result = std::move(attempt);
+                cleanupTempArgFiles();
                 return;
             }
         }
 
+        cleanupTempArgFiles();
         result.stderrText =
             "Could not start Python. Tried py -3, python, and python3.\n" +
             startErrors.str();
@@ -5953,6 +7136,16 @@ private:
                     PythonRunResult& result,
                     std::ostringstream& startErrors)
     {
+        constexpr size_t kMaxWindowsCommandLineChars = 32767;
+        size_t cmdChars = cmdLine ? std::wcslen(cmdLine) : 0;
+        if (cmdChars >= kMaxWindowsCommandLineChars) {
+            startErrors << result.pythonCommand
+                        << ": command line too long (" << cmdChars
+                        << " UTF-16 chars). Large helper JSON is normally passed through a temp file; "
+                           "if this was python_run_script, reduce argv size or write arguments to a file.\n";
+            return false;
+        }
+
         SECURITY_ATTRIBUTES sa = {};
         sa.nLength = sizeof(sa);
         sa.bInheritHandle = TRUE;
@@ -6194,17 +7387,36 @@ private:
         result.stderrText = NormalizeProcessOutputUtf8(result.stderrText);
 
         DWORD code = 0;
-        if (GetExitCodeProcess(proc.h, &code))
-            result.exitCode = static_cast<int>(code);
-        else
+        if (GetExitCodeProcess(proc.h, &code)) {
+            if (code == STILL_ACTIVE) {
+                result.exitCode = -1;
+                if (!result.stderrText.empty() && result.stderrText.back() != '\n')
+                    result.stderrText += "\r\n";
+                result.stderrText += "[process did not exit after the kill request]\r\n";
+            } else {
+                result.exitCode = static_cast<int>(code);
+            }
+        } else {
             result.exitCode = -1;
+        }
 
         result.truncated = truncated.load();
 
         if (result.cancelled && result.stderrText.empty())
             result.stderrText = "[cancelled by user]\r\n";
         else if (result.timedOut && result.stderrText.empty())
-            result.stderrText = "[timed out]\r\n";
+            result.stderrText =
+                "[timed out after " + std::to_string(m_timeoutMs / 1000) +
+                "s" +
+                (result.stdoutText.empty()
+                     ? " with no output. The script printed nothing before "
+                       "the deadline. When scanning or zipping directories, "
+                       "exclude build/IDE folders such as .vs, .git, x64, "
+                       "Debug, Release, node_modules, __pycache__, and print "
+                       "progress as the script works so partial output "
+                       "survives a timeout"
+                     : "") +
+                "]\r\n";
 
         return true;
     }
@@ -6388,6 +7600,20 @@ bool PythonRunner::StartDocxInspect(const std::string& pathArg,
                                     unsigned long      timeoutMs)
 {
     return StartWorker("docx_inspect", pathArg, cwd, timeoutMs);
+}
+
+bool PythonRunner::StartZipInspect(const std::string& pathArg,
+                                   const std::string& cwd,
+                                   unsigned long      timeoutMs)
+{
+    return StartWorker("zip_inspect", pathArg, cwd, timeoutMs);
+}
+
+bool PythonRunner::StartZipExtract(const std::string& pathArg,
+                                   const std::string& cwd,
+                                   unsigned long      timeoutMs)
+{
+    return StartWorker("zip_extract", pathArg, cwd, timeoutMs);
 }
 
 bool PythonRunner::StartPythonRunScript(const std::string& scriptArg,

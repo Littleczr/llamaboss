@@ -8,10 +8,13 @@
 #include <vector>
 #include <functional>
 #include <memory>
-#include <unordered_map>
+#include <utility>
+
+#include "tool_protocol.h"   // ToolProtocol (for the remote-activated callback)
 
 // Forward declarations
 class AppState;
+class ModelService;
 class ServerManager;
 class ChatDisplay;
 class ChatHistory;
@@ -27,9 +30,20 @@ public:
         std::function<bool()>  isBusy;
         std::function<void()>  autoSave;
         std::function<void()>  updateWindowTitle;
+
+        // Invoked after a remote model is activated (no server spawn).
+        // MyFrame uses it to apply the frame-owned ready effects it
+        // normally does in OnServerReady: apply the endpoint's configured
+        // tool protocol and refresh the protocol chip.
+        std::function<void(ToolProtocol)> onRemoteActivated;
     };
 
-    ModelSwitcher(AppState& appState,
+    // Takes both the service and its ServerManager (the latter is
+    // always service.Server()) so the dozens of existing
+    // m_serverManager call sites stay untouched; the service handle
+    // is for the shared readiness flag.
+    ModelSwitcher(ModelService& service,
+                  AppState& appState,
                   ServerManager& serverManager,
                   ChatDisplay* chatDisplay,
                   std::unique_ptr<ChatHistory>& chatHistory,
@@ -50,17 +64,100 @@ public:
     // ── Core switch ──────────────────────────────────────────────
     void SwitchToModel(const std::string& newModel);
 
-    // ── Server event handlers (called from MyFrame) ──────────────
+    // ── Server/service event handlers (called from MyFrame) ──────
     void OnServerReady();
     void OnServerError(const std::string& error);
+    void OnServiceStateChanged();
+
+    // ── Per-conversation model preference ────────────────────────
+    // A saved conversation's preferred model belongs to this frame, not to
+    // the app-global service.  selectionKey is a local GGUF path or a
+    // "remote:<endpoint>/<model>" key; modelForSave is the value written to
+    // the conversation file (local path or remote wire model id).
+    void SetConversationPreferredLocalModel(const std::string& modelPath);
+    void SetConversationPreferredRemoteModel(const std::string& selectionKey,
+                                              const std::string& wireModel);
+    // Resolve the model value persisted in a conversation. Local GGUF paths
+    // remain paths; a remote wire-model id is mapped to the active/unique
+    // configured endpoint without changing the shared target.
+    bool SetConversationPreferredSavedModel(const std::string& savedModel);
+    void AdoptActiveTargetForConversation();
+    void ClearConversationPreference();
+    std::string GetConversationModelForSave() const;
+    bool IsConversationTargetActive() const;
+    bool NeedsRemoteActivationForConversation() const;
+    bool ActivateConversationPreferredRemoteTarget();
 
     // ── Shared helper ────────────────────────────────────────────
     void UpdateModelLabel();
 
-    // Server readiness — read/written by MyFrame and ConversationController
-    bool m_serverReady = false;
+    // Ready from this frame's perspective: the shared target is usable AND
+    // it is the target preferred by this conversation.
+    bool IsServerReady() const;
+
+    // ── KV slot ownership forwarding ─────────────────────────────
+    // GoalController and SkillDraftController hold a ModelSwitcher&
+    // but not a ServerManager&; these thin pass-throughs let them
+    // participate in KV slot ownership tracking without growing a
+    // new dependency.  See ServerManager for semantics.
+    //
+    // InvalidateKvSlotOwner: call at the dispatch of a generation
+    // that runs against the local slot with a throwaway history
+    // (goal contract builder, goal verifier, Skill draft builder) —
+    // the slot is about to hold state belonging to no conversation.
+    //
+    // NoteKvSlotOwner: call at the dispatch of a generation that
+    // extends a real conversation (goal auto-continuation) —
+    // mirrors the main chat send path's NoteSlotOwner stamp.
+    void InvalidateKvSlotOwner();
+    void NoteKvSlotOwner(const std::string& conversationPath);
+    void MarkServerNotReady();
+
+    // Deferred-model slot used by lazy conversation loading.
+    const std::string& PendingDeferredModel() const
+    {
+        return m_pendingDeferredModel;
+    }
+
+    void SetPendingDeferredModel(std::string modelPath)
+    {
+        m_pendingDeferredModel = std::move(modelPath);
+    }
+
+    std::string TakePendingDeferredModel()
+    {
+        std::string modelPath = std::move(m_pendingDeferredModel);
+        m_pendingDeferredModel.clear();
+        return modelPath;
+    }
+
+    void ClearPendingDeferredModel()
+    {
+        m_pendingDeferredModel.clear();
+    }
 
 private:
+    // Lazy model loading.  When the user opens a saved conversation whose
+    // model isn't the one the running server has, we DON'T reload the model
+    // immediately — browsing between different-model conversations would
+    // otherwise force a full VRAM swap on every click.  Instead the
+    // conversation's .gguf path is parked here and the first prompt the user
+    // sends triggers the load (MyFrame::OnSendMessage).  Empty = nothing
+    // deferred.  Set by ConversationController::LoadConversationFromPath;
+    // cleared by explicit switches/reloads or by the send path when it
+    // consumes the deferred intent.
+    std::string m_pendingDeferredModel;
+
+    // ── Remote endpoint activation ───────────────────────────────
+    // Handles a remote model selection (a "remote:<endpoint>/<model>"
+    // key). Resolves the endpoint + API key, then asks ModelService to
+    // install the non-managed target and synthesize ready state without
+    // spawning or health-checking a llama-server.
+    // Returns true if the remote model was activated; false if the
+    // endpoint is unknown or has no configured API key (so startup can
+    // fall back to a local model).
+    bool ActivateRemoteModel(const std::string& remoteKey);
+
     void ShowModelPickerMenu(wxWindow* anchor,
                              const std::vector<std::string>& ggufPaths);
 
@@ -76,6 +173,11 @@ private:
     // model pill so they can reopen the downloader without hunting.
     void ShowFirstRunDismissedMessage();
 
+    // Shared target/readiness truth lives on ModelService.  This per-frame
+    // coordinator only projects that snapshot through the current
+    // conversation's preferred target.
+    ModelService&                   m_service;
+
     AppState&                       m_appState;
     ServerManager&                  m_serverManager;
     ChatDisplay*                    m_chatDisplay;
@@ -86,8 +188,13 @@ private:
     wxWindow*                       m_parentFrame;  // Owner for modal dialogs
 
     Callbacks                       m_cb;
-    std::vector<std::string>        m_pickerModels;
-    std::unordered_map<int,size_t>  m_menuIdMap;  // maps wxNewId() → m_pickerModels index
+
+    // Per-frame conversation preference. Empty means "adopt the current
+    // service target" (fresh window/chat).  Keeping this out of AppState
+    // prevents opening a saved chat in one window from changing every other
+    // window's active model metadata or readiness.
+    std::string m_conversationSelectionKey;
+    std::string m_conversationModelForSave;
 
     // True between "first-run download succeeded, server is loading"
     // and "server became ready." Gates the one-shot MarkFirstRunComplete

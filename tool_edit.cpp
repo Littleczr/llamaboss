@@ -33,7 +33,7 @@ constexpr size_t kEditMaxBytes      = 1 * 1024 * 1024;  // 1 MiB
 constexpr size_t kDiffContextLines  = 3;
 
 // Maximum lines of changed content (-/+) shown inline before we
-// truncate with a "[... N more lines unchanged ...]" marker.
+// truncate with a "[... N more lines omitted ...]" marker.
 // Generous enough that most real edits show in full; tight enough
 // that a 200-line replacement doesn't dominate the chat.
 constexpr size_t kMaxChangedLines   = 20;
@@ -322,7 +322,9 @@ std::string ToCrlf(const std::string& s)
 std::string MakeDiff(const std::string& fileLf,
                      size_t             matchPos,
                      size_t             oldLen,
-                     const std::string& newStringLf)
+                     const std::string& newStringLf,
+                     size_t*            oldLineCountOut,
+                     size_t*            newLineCountOut)
 {
     // Locate the line containing the match start.
     size_t lineStart = (matchPos == 0)
@@ -334,7 +336,6 @@ std::string MakeDiff(const std::string& fileLf,
     const size_t matchEnd = matchPos + oldLen;
     size_t lineEnd = fileLf.find('\n', matchEnd);
     if (lineEnd == std::string::npos) lineEnd = fileLf.size();
-    else                              lineEnd = lineEnd;  // exclude '\n' for now
 
     // The OLD lines: full lines covering [lineStart, lineEnd).
     std::string oldLines = fileLf.substr(lineStart, lineEnd - lineStart);
@@ -414,6 +415,9 @@ std::string MakeDiff(const std::string& fileLf,
     auto aboveVec = split(aboveCtx);
     auto belowVec = split(belowCtx);
 
+    if (oldLineCountOut) *oldLineCountOut = oldVec.size();
+    if (newLineCountOut) *newLineCountOut = newVec.size();
+
     // Truncate runs longer than kMaxChangedLines symmetrically.
     auto cap = [](std::vector<std::string>& v) -> std::string {
         if (v.size() <= kMaxChangedLines) return {};
@@ -421,7 +425,7 @@ std::string MakeDiff(const std::string& fileLf,
         const size_t tail = kMaxChangedLines - head;
         std::ostringstream marker;
         marker << "[... " << (v.size() - head - tail)
-               << " more lines unchanged ...]";
+               << " more lines omitted ...]";
         std::string m = marker.str();
         std::vector<std::string> out;
         out.reserve(head + 1 + tail);
@@ -671,10 +675,15 @@ EditResult EditFile(const std::string& argsBlob,
         newLf +
         fileLf.substr(matchPos + oldLf.size());
 
-    if (editedLf.size() > kEditMaxBytes) {
+    // ── Restore native line ending and enforce the on-disk size cap ─
+    std::string outputBytes = (native == LineEnding::Crlf)
+                                  ? ToCrlf(editedLf)
+                                  : editedLf;
+
+    if (outputBytes.size() > kEditMaxBytes) {
         r.chips.push_back("too large");
         r.errorBody = "Result of edit would exceed cap: " +
-                      HumanBytes(editedLf.size()) +
+                      HumanBytes(outputBytes.size()) +
                       " (max " + HumanBytes(kEditMaxBytes) + ").";
         r.chips.push_back(ElapsedChip(t0));
         return r;
@@ -684,29 +693,21 @@ EditResult EditFile(const std::string& argsBlob,
     // If the write fails we still want the user to see what change
     // we attempted; the diff is a function of the LF content we
     // already have in memory.
-    std::string diffBody = MakeDiff(fileLf, matchPos, oldLf.size(), newLf);
-
-    // Count plus/minus lines for the chip pair.  Walk the diff
-    // body once -- cheap, and avoids a second split.
     size_t minusLines = 0;
     size_t plusLines  = 0;
-    {
-        size_t i = 0;
-        while (i < diffBody.size()) {
-            char c = diffBody[i];
-            if      (c == '-') ++minusLines;
-            else if (c == '+') ++plusLines;
-            // skip to next line
-            size_t nl = diffBody.find('\n', i);
-            if (nl == std::string::npos) break;
-            i = nl + 1;
-        }
-    }
+    std::string diffBody = MakeDiff(fileLf,
+                                    matchPos,
+                                    oldLf.size(),
+                                    newLf,
+                                    &minusLines,
+                                    &plusLines);
 
-    // ── Restore native line ending and write atomically ──────────
-    std::string outputBytes = (native == LineEnding::Crlf)
-                                  ? ToCrlf(editedLf)
-                                  : editedLf;
+    auto attachAttemptedDiff = [&]() {
+        r.body     = diffBody;
+        r.bodyLang = "diff";
+    };
+
+    // ── Write atomically ─────────────────────────────────────────
 
     tool_staged_write::StagedTempFile tmp =
         tool_staged_write::CreateStagedTempFile(resolved);
@@ -742,6 +743,7 @@ EditResult EditFile(const std::string& argsBlob,
                 r.chips.push_back("failed");
                 r.errorBody = "WriteFile failed (Win32 error " +
                               std::to_string(err) + ").";
+                attachAttemptedDiff();
                 r.chips.push_back(ElapsedChip(t0));
                 return r;
             }
@@ -750,12 +752,25 @@ EditResult EditFile(const std::string& argsBlob,
         }
     }
 
+    if (!::FlushFileBuffers(hFile)) {
+        DWORD err = ::GetLastError();
+        ::CloseHandle(hFile);
+        ::DeleteFileW(wTmp.c_str());
+        r.chips.push_back("failed");
+        r.errorBody = "FlushFileBuffers on tmp failed (Win32 error " +
+                      std::to_string(err) + ").";
+        attachAttemptedDiff();
+        r.chips.push_back(ElapsedChip(t0));
+        return r;
+    }
+
     if (!::CloseHandle(hFile)) {
         DWORD err = ::GetLastError();
         r.chips.push_back("failed");
         r.errorBody = "CloseHandle on tmp failed (Win32 error " +
                       std::to_string(err) +
                       "); tmp file preserved at: " + tmpPath;
+        attachAttemptedDiff();
         r.chips.push_back(ElapsedChip(t0));
         return r;
     }
@@ -776,6 +791,7 @@ EditResult EditFile(const std::string& argsBlob,
                       std::to_string(err) +
                       ").\nThe edited content is preserved at: " +
                       tmpPath;
+        attachAttemptedDiff();
         r.chips.push_back(ElapsedChip(t0));
         return r;
     }

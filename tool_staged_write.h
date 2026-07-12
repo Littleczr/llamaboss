@@ -6,7 +6,7 @@
 //   1. Open a unique sibling temp file with CREATE_NEW (never clobber
 //      an existing user-owned file).
 //   2. Write the payload in chunks.
-//   3. CloseHandle.
+//   3. FlushFileBuffers, then CloseHandle.
 //   4. MoveFileExW with MOVEFILE_WRITE_THROUGH (and, for tool_edit,
 //      MOVEFILE_REPLACE_EXISTING) to atomically promote the temp to
 //      the final path.

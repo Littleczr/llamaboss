@@ -22,6 +22,11 @@
 // preempts parallel-call ambiguity until we add real tool
 // parallelism.
 //
+// Important limitation: this is an in-band protocol. A model that emits
+// a well-formed literal example of the protocol can be indistinguishable
+// from an intentional tool call. Approval gates and tool risk tiers are
+// the safety layer above this parser.
+//
 // ─── Two parse modes ─────────────────────────────────────────────
 // Batch  : ParseAssistantResponse() — take a complete string,
 //          return prose + first invocation + all malformed blocks.
@@ -82,6 +87,15 @@ struct ParsedAssistantResponse {
 // on any structural issue, returns a best-effort result with
 // malformed entries populated.
 ParsedAssistantResponse ParseAssistantResponse(const std::string& text);
+
+// Head+tail diagnostic preview of a (possibly large) tool-call block.
+// Small blocks pass through unchanged. Use this for any malformed-call
+// text that will be echoed back into the model context: feeding a
+// small local model a multi-KB verbatim copy of its own broken block
+// reinforces the broken pattern and produces identical retries until
+// the malformed cap trips. Head AND tail are kept because for
+// wrong-closer mistakes the evidence is at the end of the block.
+std::string MakeToolCallDiagnosticPreview(const std::string& raw);
 
 // True if text contains a recognized tool-call opening marker. Used
 // by streaming UI cleanup to avoid flushing partial tool-call syntax.

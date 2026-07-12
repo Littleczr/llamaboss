@@ -5,7 +5,8 @@
 //
 // WriteNewFile creates a NEW file at a path resolved against ctx.cwd.
 // It refuses every overwrite, every escape from ctx.cwd, every risky
-// executable / scriptable extension, and every input whose basename
+// executable / scriptable extension (use write_powershell_script for
+// approved .ps1 project scripts), and every input whose basename
 // does not survive path_safety::SanitizeFilename intact.  The model
 // never gets to bypass these checks via prompt -- they live in this
 // file, not in the system prompt.
@@ -132,3 +133,17 @@ WriteResult WriteNewFile(const std::string& argsBlob,
 // existing regular files are replaced. Directories are never overwritten.
 WriteResult OverwriteFileContent(const std::string& argsBlob,
                                  const ToolContext& ctx);
+
+// Creates or atomically replaces a PowerShell .ps1 script after the
+// caller has routed the invocation through the approval-card layer.
+// This is intentionally separate from write/overwrite_file: ordinary
+// file writes still block executable/scriptable extensions, while this
+// approved path supports project build/run scripts without forcing the
+// model to create them through ad-hoc PowerShell Set-Content commands.
+//
+// Safety gates are the same as overwrite_file (cwd/project containment,
+// basename sanitization, parent must exist, directory targets refused),
+// plus an explicit .ps1-only extension check. The file is written but
+// never executed by this function.
+WriteResult WritePowerShellScriptFile(const std::string& argsBlob,
+                                      const ToolContext& ctx);

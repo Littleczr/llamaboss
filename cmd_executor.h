@@ -40,6 +40,8 @@ struct CmdResult {
     double      elapsedSec = 0.0;
     bool        timedOut   = false;
     bool        truncated  = false;   // true if either stream hit the byte cap
+    bool        stdoutTruncated = false;
+    bool        stderrTruncated = false;
     bool        cancelled  = false;   // true if the user cancelled
 
     // Large-output UX: if stdout/stderr would flood the chat, the

@@ -115,6 +115,19 @@ bool HasPythonExtension(const std::string& absPath)
             (lower.size() >= 4 && lower.rfind(".pyw") == lower.size() - 4));
 }
 
+bool HasPowerShellScriptExtension(const std::string& absPath)
+{
+    std::string lower = absPath;
+    std::transform(lower.begin(), lower.end(), lower.begin(),
+                   [](unsigned char c){ return static_cast<char>(std::tolower(c)); });
+    return lower.size() >= 4 && lower.rfind(".ps1") == lower.size() - 4;
+}
+
+enum class WriteRiskMode {
+    NormalTextOnly,
+    ApprovedPowerShellScript,
+};
+
 // Shared implementation behind WriteNewFile / OverwriteFileContent.
 // Lives in the anonymous namespace (internal linkage): only the two
 // public wrappers below call it, and it is not declared in
@@ -122,7 +135,8 @@ bool HasPythonExtension(const std::string& absPath)
 // leaked an undeclared external symbol.
 WriteResult WriteFileContent(const std::string& argsBlob,
                              const ToolContext& ctx,
-                             bool overwriteExisting)
+                             bool overwriteExisting,
+                             WriteRiskMode riskMode = WriteRiskMode::NormalTextOnly)
 {
     WriteResult r;
     auto t0 = std::chrono::steady_clock::now();
@@ -202,11 +216,25 @@ WriteResult WriteFileContent(const std::string& argsBlob,
     // Reuses the open tool's kill-list (.exe / .bat / .ps1 / .reg
     // / .lnk / .vbs / macro Office / etc.) so write and open agree
     // on what's dangerous.  TextLike and Safe both pass.
-    if (ClassifyForOpen(resolved) == FileRisk::Risky) {
+    //
+    // Project-generation workflows still need reviewable build/run
+    // scripts.  Those do NOT bypass the normal write/overwrite_file
+    // block; they enter through write_powershell_script, which routes
+    // through approval first and then lands here with the explicit
+    // ApprovedPowerShellScript mode.  Keep that lane narrow: .ps1 only,
+    // no .bat/.cmd/.exe or generic risky extension pass-through.
+    if (riskMode == WriteRiskMode::ApprovedPowerShellScript) {
+        if (!HasPowerShellScriptExtension(resolved)) {
+            r.chips.push_back("blocked");
+            r.errorBody = "write_powershell_script only creates or replaces .ps1 files.";
+            r.chips.push_back(ElapsedChip(t0));
+            return r;
+        }
+    } else if (ClassifyForOpen(resolved) == FileRisk::Risky) {
         r.chips.push_back("blocked");
         r.errorBody = overwriteExisting
-            ? "Refuses to overwrite files with executable or scriptable extensions. If the user wants this, they can edit the file manually."
-            : "Refuses to create files with executable or scriptable extensions. If the user wants this, they can drop the file in manually.";
+            ? "Refuses to overwrite files with executable or scriptable extensions. Use write_powershell_script for approved .ps1 project scripts, or edit the file manually."
+            : "Refuses to create files with executable or scriptable extensions. Use write_powershell_script for approved .ps1 project scripts, or drop the file in manually.";
         r.chips.push_back(ElapsedChip(t0));
         return r;
     }
@@ -302,8 +330,19 @@ WriteResult WriteFileContent(const std::string& argsBlob,
         }
     }
 
+    if (!::FlushFileBuffers(hFile)) {
+        DWORD err = ::GetLastError();
+        ::CloseHandle(hFile);
+        ::DeleteFileW(wTmp.c_str()); // best-effort cleanup
+        r.chips.push_back("failed");
+        r.errorBody = "FlushFileBuffers on tmp failed (Win32 error " +
+                      std::to_string(err) + ").";
+        r.chips.push_back(ElapsedChip(t0));
+        return r;
+    }
+
     if (!::CloseHandle(hFile)) {
-        // Close failure post-write: contents are likely fine but the
+        // Close failure post-write: contents were flushed, but the
         // handle disposition is undefined.  Be honest about it; the
         // .tmp is still on disk for inspection.
         DWORD err = ::GetLastError();
@@ -396,4 +435,11 @@ WriteResult OverwriteFileContent(const std::string& argsBlob,
                                  const ToolContext& ctx)
 {
     return WriteFileContent(argsBlob, ctx, true);
+}
+
+WriteResult WritePowerShellScriptFile(const std::string& argsBlob,
+                                      const ToolContext& ctx)
+{
+    return WriteFileContent(argsBlob, ctx, true,
+                            WriteRiskMode::ApprovedPowerShellScript);
 }

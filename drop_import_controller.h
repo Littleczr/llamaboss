@@ -1,10 +1,10 @@
 #pragma once
 
 // ─── drop_import_controller.h ──────────────────────────────────────
-// Drag-and-drop import coordinator for PDF, spreadsheet, and DOCX
-// attachments.  LlamaBoss.cpp still owns the frame and drop target;
-// this helper owns the shared "copy into cwd if needed, attach a chip,
-// and show import status" workflow.
+// Drag-and-drop import coordinator for PDF, spreadsheet, DOCX, and
+// CSV attachments.  LlamaBoss.cpp still owns the frame and drop
+// target; this helper owns the shared "copy into cwd if needed,
+// attach a chip, and show import status" workflow.
 //
 // The controller stays UI-light through callbacks so it does not need
 // to know about MyFrame, ChatDisplay, or AttachmentManager directly.
@@ -24,6 +24,10 @@ struct DropImportControllerCallbacks {
                        const std::string& relPath)> attachSpreadsheetFile;
     std::function<bool(const std::string& absPath,
                        const std::string& relPath)> attachDocxFile;
+    std::function<bool(const std::string& absPath,
+                       const std::string& relPath)> attachCsvFile;
+    std::function<bool(const std::string& absPath,
+                       const std::string& relPath)> attachZipFile;
 };
 
 class DropImportController
@@ -34,6 +38,8 @@ public:
     bool QueuePdfAttachmentFromDrop(const std::string& filePath) const;
     bool QueueSpreadsheetAttachmentFromDrop(const std::string& filePath) const;
     bool QueueDocxAttachmentFromDrop(const std::string& filePath) const;
+    bool QueueCsvAttachmentFromDrop(const std::string& filePath) const;
+    bool QueueZipAttachmentFromDrop(const std::string& filePath) const;
 
     void NotifyDocmDropRejected(const std::string& filePath) const;
 

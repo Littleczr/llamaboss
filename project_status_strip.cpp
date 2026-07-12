@@ -23,7 +23,7 @@ std::string PluralSuffix(int n)
 std::string BuildProjectStateText(const ProjectStatusStrip::State& s)
 {
     if (!s.hasProject) {
-        return "No project attached";
+        return "";
     }
 
     std::string out = "Project: ";
@@ -51,20 +51,22 @@ std::string BuildProjectStateText(const ProjectStatusStrip::State& s)
 
 // Builds the project-side affordance label.  Brackets are part of the
 // label so the visual reads as a terminal-style clickable token.
-std::string BuildProjectActionText(const ProjectStatusStrip::State& s)
+std::string BuildProjectActionText(const ProjectStatusStrip::State& /*s*/)
 {
-    return s.hasProject
-        ? std::string("[ \xE2\x8B\xAF ]")        // [ ⋯ ]
-        : std::string("[ + attach ]");
+    // "\xE2\x96\xBE" == U+25BE down-triangle, signalling a dropdown.  Both
+    // states open the project menu on click (mirroring [ Skills v ]), so the
+    // label is identical whether or not a project is attached; only the menu
+    // contents differ -- New/Load/Delete when empty, full actions when set.
+    return std::string("[ Project \xE2\x96\xBE ]");
 }
 
-// The no-project row keeps the Skill shortcut beside [ + attach ].
-// It intentionally remains a project-menu shortcut for now so this
-// pass adds the missing attach affordance without changing the current
-// New Skill behavior.
-std::string BuildNoProjectSkillActionText()
+// Skill shortcut shown beside the project action in both empty and
+// attached-project states.
+std::string BuildSkillActionText()
 {
-    return "[ + New Skill ]";
+    // Opens the Skills dropdown (New / Open / Open Folder), so it reads as
+    // a menu token rather than a single "new" verb.
+    return "[ Skills \xE2\x96\xBE ]";
 }
 
 // ── Goal formatters ─────────────────────────────────────────────────
@@ -89,11 +91,12 @@ std::string BuildGoalStateText(const ProjectStatusStrip::State& s)
 // Builds the goal-side affordance label.  Empty state surfaces the
 // slash-command name to keep it discoverable; populated state opens
 // the detail card.
-std::string BuildGoalActionText(const ProjectStatusStrip::State& s)
+std::string BuildGoalActionText(const ProjectStatusStrip::State& /*s*/)
 {
-    return s.hasGoal
-        ? std::string("[ details ]")
-        : std::string("[ /goal ]");
+    // "\xE2\x96\xBE" == U+25BE down-triangle.  Like [ Project v ] / [ Skills v ],
+    // the goal affordance is a dropdown in every state; the menu adapts its
+    // contents to none / active / paused.
+    return std::string("[ Goal \xE2\x96\xBE ]");
 }
 
 } // namespace
@@ -133,9 +136,9 @@ void ProjectStatusStrip::BuildContent()
 
     // Padding constants for the row.  Tight (4 px) between a state
     // label and its own action chip.  In the no-project state, the
-    // [ + New Skill ] shortcut sits just after [ + attach ].  The
-    // project pair stays anchored to the left edge while the goal pair
-    // is pushed to the far right, leaving the center of the strip
+    // [ Skills v ] shortcut sits just after [ Project v ].
+    // The project pair stays anchored to the left edge while the goal
+    // pair is pushed to the far right, leaving the center of the strip
     // visually quiet.
     const int kEdgePad        = 6;
     const int kVerticalPad    = 6;
@@ -163,9 +166,8 @@ void ProjectStatusStrip::BuildContent()
     rowSizer->Add(m_actionLabel, 0,
                   wxALIGN_CENTER_VERTICAL | wxTOP | wxBOTTOM, kVerticalPad);
 
-    // No-project shortcut.  This preserves the existing visible
-    // [ + New Skill ] affordance while restoring [ + attach ] as the
-    // actual project-side action beside "No project attached".
+    // Skill shortcut.  Keep this visible in both empty and attached
+    // project states so Skill creation remains one click away.
     m_skillActionLabel = new wxStaticText(m_row, wxID_ANY, "");
     m_skillActionLabel->SetForegroundColour(m_mutedColor);
     m_skillActionLabel->SetFont(monoFont);
@@ -210,9 +212,9 @@ void ProjectStatusStrip::BuildContent()
     m_panel->SetSizer(outerSizer);
 
     // ── Mouse routing ────────────────────────────────────────────
-    // Project action: [ ⋯ ] opens the project popup menu when a
-    // project is attached; [ + attach ] routes directly into the frame's
-    // existing attach-project flow when none is attached.  Right-click
+    // Project action: [ Project v ] opens the project popup menu in both
+    // states (the menu adapts its contents to whether a project is
+    // attached).  Right-click
     // anywhere on the strip (outside the goal action) still opens the
     // project menu -- a holdover from the pre-goal layout where the whole
     // row was the project surface.  We keep the right-click-anywhere
@@ -235,9 +237,9 @@ void ProjectStatusStrip::BuildContent()
         e.Skip();
     });
 
-    // No-project Skill shortcut.  Preserve the current visible entry
-    // point by keeping it menu-backed, but route it separately so the
-    // popup can prioritize Skill actions above Project actions.
+    // Skill shortcut.  Preserve the current visible entry point by
+    // keeping it menu-backed, but route it separately so the popup can
+    // prioritize Skill actions above Project actions.
     BindSkillActionEvents(m_skillActionLabel);
 
     m_skillActionLabel->Bind(wxEVT_ENTER_WINDOW, [this](wxMouseEvent& e) {
@@ -289,15 +291,13 @@ void ProjectStatusStrip::BuildContent()
 
 void ProjectStatusStrip::BindProjectActionEvents(wxWindow* w)
 {
+    // Both states open the project popup, consistent with the Skills
+    // affordance.  The no-project menu offers New Project / Load-Attach /
+    // Delete; the attached menu offers the full project actions.  (The
+    // onAttachRequested callback is no longer fired from here -- loading is
+    // now reached via the menu's "Load / Attach Project..." item.)
     w->Bind(wxEVT_LEFT_UP, [this](wxMouseEvent&) {
-        if (!m_state.hasProject && m_callbacks.onAttachRequested) {
-            m_callbacks.onAttachRequested();
-            return;
-        }
-
-        if (m_callbacks.onMenuRequested) {
-            m_callbacks.onMenuRequested(m_actionLabel);
-        }
+        if (m_callbacks.onMenuRequested) m_callbacks.onMenuRequested(m_actionLabel);
     });
     w->Bind(wxEVT_RIGHT_UP, [this](wxMouseEvent&) {
         if (m_callbacks.onMenuRequested) m_callbacks.onMenuRequested(m_actionLabel);
@@ -324,11 +324,13 @@ void ProjectStatusStrip::BindSkillActionEvents(wxWindow* w)
 
 void ProjectStatusStrip::BindGoalActionEvents(wxWindow* w)
 {
+    // Opens the state-aware goal popup, consistent with the project and
+    // skill affordances.  Right-click mirrors left-click.
     w->Bind(wxEVT_LEFT_UP, [this](wxMouseEvent&) {
-        if (m_callbacks.onGoalActionClicked) m_callbacks.onGoalActionClicked();
+        if (m_callbacks.onGoalMenuRequested) m_callbacks.onGoalMenuRequested(m_goalActionLabel);
     });
     w->Bind(wxEVT_RIGHT_UP, [this](wxMouseEvent&) {
-        if (m_callbacks.onGoalActionClicked) m_callbacks.onGoalActionClicked();
+        if (m_callbacks.onGoalMenuRequested) m_callbacks.onGoalMenuRequested(m_goalActionLabel);
     });
 }
 
@@ -341,16 +343,16 @@ void ProjectStatusStrip::RelayoutCurrentState()
 
     // ── Project labels ───────────────────────────────────────────
     m_stateLabel->SetLabel(wxString::FromUTF8(BuildProjectStateText(m_state).c_str()));
+    m_stateLabel->Show(m_state.hasProject);
 
     {
         const std::string actionText = BuildProjectActionText(m_state);
         m_actionLabel->SetLabel(wxString::FromUTF8(actionText.c_str()));
         m_actionLabel->SetForegroundColour(m_mutedColor);
 
-        // Defensive sizing for the affordance.  Keep the attached
-        // token compact ("[ ⋯ ]"), but leave enough room for the
-        // no-project "[ + attach ]" token.
-        const int floorWidth = m_state.hasProject ? 56 : 92;
+        // Defensive sizing for the affordance.  Both states show
+        // "[ Project v ]" now, so a single floor covers them.
+        const int floorWidth = 108;
         const wxSize measured = m_actionLabel->GetTextExtent(m_actionLabel->GetLabel());
         const int actionWidth = std::max(floorWidth, measured.GetWidth() + 12);
         m_actionLabel->SetMinSize(wxSize(actionWidth, -1));
@@ -358,10 +360,10 @@ void ProjectStatusStrip::RelayoutCurrentState()
     }
 
     {
-        const std::string skillActionText = BuildNoProjectSkillActionText();
+        const std::string skillActionText = BuildSkillActionText();
         m_skillActionLabel->SetLabel(wxString::FromUTF8(skillActionText.c_str()));
         m_skillActionLabel->SetForegroundColour(m_mutedColor);
-        m_skillActionLabel->Show(!m_state.hasProject);
+        m_skillActionLabel->Show(true);
 
         const wxSize measured =
             m_skillActionLabel->GetTextExtent(m_skillActionLabel->GetLabel());
@@ -378,9 +380,9 @@ void ProjectStatusStrip::RelayoutCurrentState()
         m_goalActionLabel->SetLabel(wxString::FromUTF8(actionText.c_str()));
         m_goalActionLabel->SetForegroundColour(m_mutedColor);
 
-        // Mirror the project-side dynamic min-size logic: attached
-        // ("[ details ]") ~88 px, empty ("[ /goal ]") ~78 px.
-        const int floorWidth = m_state.hasGoal ? 88 : 78;
+        // Both states show "[ Goal v ]" now, so a single floor covers them;
+        // measured width still wins when larger.
+        const int floorWidth = 88;
         const wxSize measured = m_goalActionLabel->GetTextExtent(m_goalActionLabel->GetLabel());
         const int actionWidth = std::max(floorWidth, measured.GetWidth() + 12);
         m_goalActionLabel->SetMinSize(wxSize(actionWidth, -1));

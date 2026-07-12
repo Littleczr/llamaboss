@@ -11,6 +11,42 @@
 
 namespace {
 
+bool LbIsUtf8ContinuationByte(unsigned char c)
+{
+    return (c & 0xC0) == 0x80;
+}
+
+size_t LbUtf8SafePrefixLen(const std::string& text, size_t maxBytes)
+{
+    if (maxBytes >= text.size()) return text.size();
+
+    size_t cut = maxBytes;
+    while (cut > 0 &&
+           LbIsUtf8ContinuationByte(
+               static_cast<unsigned char>(text[cut]))) {
+        --cut;
+    }
+    return cut;
+}
+
+size_t LbUtf8SafeSuffixStart(const std::string& text, size_t maxBytes)
+{
+    if (maxBytes >= text.size()) return 0;
+
+    size_t start = text.size() - maxBytes;
+    while (start < text.size() &&
+           LbIsUtf8ContinuationByte(
+               static_cast<unsigned char>(text[start]))) {
+        ++start;
+    }
+    return start;
+}
+
+std::string LbUtf8SafePrefix(const std::string& text, size_t maxBytes)
+{
+    return text.substr(0, LbUtf8SafePrefixLen(text, maxBytes));
+}
+
 // Keep the command recognizer conservative while still accepting
 // everyday polite wrappers such as "please continue the goal" or
 // "can you verify the goal?".  The remainder still has to match one
@@ -53,8 +89,9 @@ void LbAppendGoalContractDraftItem(std::vector<std::string>& target,
     if (item.empty() || target.size() >= maxItems) return;
 
     constexpr size_t kMaxItemBytes = 320;
-    if (item.size() > kMaxItemBytes)
-        item = item.substr(0, kMaxItemBytes - 3) + "...";
+    if (item.size() > kMaxItemBytes) {
+        item = LbUtf8SafePrefix(item, kMaxItemBytes - 3) + "...";
+    }
 
     target.push_back(std::move(item));
 }
@@ -86,26 +123,31 @@ std::string LbCompactGoalStripText(std::string s, size_t maxBytes)
 
     collapsed = LbTrimAscii(std::move(collapsed));
     if (collapsed.size() <= maxBytes) return collapsed;
-    if (maxBytes <= 3) return collapsed.substr(0, maxBytes);
-    return collapsed.substr(0, maxBytes - 3) + "...";
+    if (maxBytes <= 3) return LbUtf8SafePrefix(collapsed, maxBytes);
+    return LbUtf8SafePrefix(collapsed, maxBytes - 3) + "...";
 }
 
-std::string LbClipForGoalVerifier(const std::string& text, size_t maxBytes)
+std::string LbClipForPrompt(const std::string& text, size_t maxBytes)
 {
     if (text.size() <= maxBytes) return text;
 
     const std::string marker = "\n... [middle truncated] ...\n";
     if (maxBytes <= marker.size() + 2) {
-        return text.substr(0, maxBytes);
+        return LbUtf8SafePrefix(text, maxBytes);
     }
 
     const size_t keepBytes = maxBytes - marker.size();
     const size_t headBytes = (keepBytes * 2) / 3;
     const size_t tailBytes = keepBytes - headBytes;
 
-    return text.substr(0, headBytes)
+    return text.substr(0, LbUtf8SafePrefixLen(text, headBytes))
         + marker
-        + text.substr(text.size() - tailBytes);
+        + text.substr(LbUtf8SafeSuffixStart(text, tailBytes));
+}
+
+std::string LbClipForGoalVerifier(const std::string& text, size_t maxBytes)
+{
+    return LbClipForPrompt(text, maxBytes);
 }
 
 // ─── Natural-language goal control recognizers ─────────────────────

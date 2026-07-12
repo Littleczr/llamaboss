@@ -22,6 +22,7 @@ struct TopBarWidgets {
     wxStaticText*  modelPillRightBracket;  // "]" — recolored on hover
     StatusDot*     statusDot;
     wxStaticText*  protocolChip;  // Phase 3b: "native" / "xml" / hidden
+    wxStaticText*  ctxMeter;      // context occupancy readout ("ctx 18.2k/32k")
     wxButton*      sidebarToggle;
     wxButton*      newChatButton;
     wxButton*      settingsButton;

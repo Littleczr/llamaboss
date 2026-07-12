@@ -32,7 +32,8 @@ private:
     void OnItemActivated(wxListEvent& evt);
     void OnSelectionChanged(wxListEvent& evt);
 
-    void RebuildList();
+    void RebuildList(const wxString& selectProvider = wxEmptyString,
+                     const wxString& selectKey = wxEmptyString);
     void UpdateButtonState();
     void ApplyTheme();
 
@@ -44,7 +45,8 @@ private:
                              wxString& ioProvider,
                              wxString& ioKey,
                              wxString& ioValue,
-                             bool&     ioIsEnvRef);
+                             bool&     ioIsEnvRef,
+                             bool      allowEmptyDirectValue = false);
 
     SecretsStore*   m_store   = nullptr;
     const ThemeData* m_theme  = nullptr;

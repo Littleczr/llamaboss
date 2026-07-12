@@ -14,6 +14,11 @@
 #include <cctype>
 #include <string>
 
+// Human-readable byte formatter used by project/source prompt summaries.
+// Kept out of LlamaBoss.cpp so extracted controllers can share it without
+// depending on frame-local anonymous-namespace helpers.
+std::string ProjectSource_HumanBytes(unsigned long long bytes);
+
 inline std::string LbLowerAscii(std::string s)
 {
     for (char& ch : s)

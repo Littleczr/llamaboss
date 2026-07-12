@@ -12,6 +12,9 @@
 // Poco headers
 #include <Poco/Logger.h>
 
+// Inference target descriptor (transport URL/path/tls/auth/protocol).
+#include "inference_target.h"
+
 // Custom events for thread communication
 wxDECLARE_EVENT(wxEVT_ASSISTANT_DELTA, wxCommandEvent);
 wxDECLARE_EVENT(wxEVT_ASSISTANT_COMPLETE, wxCommandEvent);
@@ -35,26 +38,59 @@ wxDECLARE_EVENT(wxEVT_ASSISTANT_ERROR, wxCommandEvent);
 class AssistantCompletePayload : public wxClientData
 {
 public:
-    explicit AssistantCompletePayload(std::string toolCallsJson)
-        : m_toolCallsJson(std::move(toolCallsJson)) {}
+    explicit AssistantCompletePayload(std::string toolCallsJson,
+                                      long promptTokens     = -1,
+                                      long completionTokens = -1,
+                                      std::vector<std::string> imageDataUrls = {})
+        : m_toolCallsJson(std::move(toolCallsJson))
+        , m_promptTokens(promptTokens)
+        , m_completionTokens(completionTokens)
+        , m_imageDataUrls(std::move(imageDataUrls)) {}
 
     const std::string& ToolCallsJson() const { return m_toolCallsJson; }
 
+    // Generated images from an image-output model (OpenRouter
+    // chat-completions image generation).  Each entry is a base64
+    // data URL exactly as it arrived on the stream's `images` field
+    // ("data:image/png;base64,....").  Decoding and disk persistence
+    // happen on the UI thread — the workflow folder is keyed on the
+    // conversation's file path, which only the frame knows (and may
+    // have to create via autosave first).  Empty for text turns.
+    const std::vector<std::string>& ImageDataUrls() const
+    { return m_imageDataUrls; }
+
+    // Exact token usage reported by the server for this turn, taken
+    // from the SSE stream's `usage` object (llama-server includes it
+    // on the final chunk; OpenAI-compatible providers include it on a
+    // trailing usage chunk when requested, and some — e.g. OpenRouter —
+    // by default).  -1 when the stream carried no usage object; the
+    // context meter falls back to its byte heuristic in that case.
+    long PromptTokens()     const { return m_promptTokens; }
+    long CompletionTokens() const { return m_completionTokens; }
+
 private:
     std::string m_toolCallsJson;
+    long m_promptTokens     = -1;
+    long m_completionTokens = -1;
+    std::vector<std::string> m_imageDataUrls;
 };
 
 // Forward declarations
 class ChatClient;
 
 // Thread class for handling HTTP requests
+//
+// The worker no longer takes a bare (model, apiUrl) pair. It takes a
+// fully-resolved InferenceTarget describing the endpoint URL, path,
+// TLS requirement, and auth/extra headers. The request body still
+// carries the wire "model" field, so the target's modelId is purely
+// informational at the transport layer.
 class ChatWorkerThread : public wxThread
 {
 public:
     ChatWorkerThread(wxEvtHandler* eventHandler,
-        const std::string& model,
-        const std::string& apiUrl,
-        const std::string& requestBody,
+        InferenceTarget target,
+        std::string requestBody,
         std::shared_ptr<std::atomic<bool>> cancelFlag,
         std::weak_ptr<std::atomic<bool>> aliveToken,
         unsigned long generationId);
@@ -64,8 +100,7 @@ protected:
 
 private:
     wxEvtHandler* m_eventHandler;
-    std::string m_model;
-    std::string m_apiUrl;
+    InferenceTarget m_target;
     std::string m_requestBody;
     std::shared_ptr<std::atomic<bool>> m_cancelFlag;
     std::weak_ptr<std::atomic<bool>> m_aliveToken;
@@ -74,7 +109,8 @@ private:
     bool SafeQueueEvent(wxCommandEvent* event);
 };
 
-// Chat client class for managing HTTP communication with llama-server
+// Chat client class for managing HTTP communication with an
+// OpenAI-compatible endpoint (local llama-server or a remote provider).
 class ChatClient
 {
 public:
@@ -82,7 +118,17 @@ public:
                std::weak_ptr<std::atomic<bool>> aliveToken);
     ~ChatClient();
 
-    // Start a chat request (non-blocking, uses threading)
+    // Start a chat request against a resolved target (non-blocking,
+    // uses threading). This is the primary entry point; callers that
+    // support remote endpoints build the target upstream.
+    bool SendMessage(const InferenceTarget& target,
+        const std::string& requestBody,
+        unsigned long generationId);
+
+    // Back-compat overload. Builds a default LOCAL target (plain http,
+    // no auth, OpenAI-compatible path) from (model, apiUrl) and
+    // forwards to the target-based overload. Existing call sites that
+    // pass a model + base URL keep their exact current behavior.
     bool SendMessage(const std::string& model,
         const std::string& apiUrl,
         const std::string& requestBody,

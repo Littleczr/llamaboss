@@ -32,6 +32,7 @@
 #include <chrono>
 #include <cctype>
 #include <cstdint>
+#include <cassert>
 #include <mutex>
 #include <sstream>
 #include <vector>
@@ -267,7 +268,9 @@ std::string ResolveProjectFolderAliasForPathTool(const std::string& args,
     if (key == "skills" || key == "skill" ||
         key == "global skills" || key == "global skill" ||
         key == "llamaboss skills") {
-        ProjectManager::EnsureSkillsRoot();
+        // ls is registered as read-only. Do not call EnsureSkillsRoot() here;
+        // let ListDirectory report "not found" if the user has not created
+        // the Skills folder yet.
         return ProjectManager::GetSkillsDir();
     }
 
@@ -342,6 +345,7 @@ ToolSafetyProfile MutatingCwdSafety(const std::string& summary)
     // (delete, overwrite_file when no staged backup is retained)
     // override to Irreversible at their registration site.
     safety.reversibility       = Reversibility::Reversible;
+    safety.dispatchOnWorker    = true;
     safety.summary             = summary;
     return safety;
 }
@@ -412,7 +416,19 @@ DispatchOutcome PreFill(const ToolInvocation& inv,
     out.status = DispatchStatus::Completed;
     out.result.toolTag       = toolTag;
     out.result.invocationRaw = inv.rawBlock;
-    out.result.toolName      = toolName;
+
+    // Presentation comes from the spec's kPresentation row when one
+    // exists; the literal passed by the call site is the fallback.
+    // (The per-body `out.result.iconUtf8 = ...` lines that follow
+    // some PreFill calls are now redundant identical overrides and
+    // can be deleted in a later mechanical sweep.)
+    const ToolSpec* spec = GetGlobalRouter().Find(toolTag);
+    out.result.toolName = (spec && !spec->displayName.empty())
+                              ? spec->displayName
+                              : std::string(toolName);
+    if (spec && !spec->iconUtf8.empty()) {
+        out.result.iconUtf8 = spec->iconUtf8;
+    }
     return out;
 }
 
@@ -441,7 +457,8 @@ DispatchOutcome DoRead(const ToolInvocation& inv,
 
 void ParseReadHeadArgs(const std::string& args,
                        std::string&       pathOut,
-                       size_t&            linesOut)
+                       size_t&            linesOut,
+                       const ToolContext* ctx = nullptr)
 {
     std::string s = Trim(args);
     linesOut = 40;
@@ -502,6 +519,20 @@ void ParseReadHeadArgs(const std::string& args,
         std::string rest  = Trim(s.substr(sp + 1));
         size_t parsedLines = 40;
         if (parseLines(first, parsedLines)) {
+            // Avoid silently eating numeric-leading filenames such as
+            // "2024 budget.xlsx". If the whole one-line argument resolves to
+            // an existing path and the remainder does not, treat the whole
+            // string as the path instead of interpreting the first token as a
+            // line count. The structured "<lines>\n<path>" form remains
+            // unambiguous and is unaffected.
+            if (ctx) {
+                const bool wholeExists = ExistingPathAsGivenOrCwdRelative(s, *ctx);
+                const bool restExists  = ExistingPathAsGivenOrCwdRelative(rest, *ctx);
+                if (wholeExists && !restExists) {
+                    pathOut = s;
+                    return;
+                }
+            }
             linesOut = parsedLines;
             pathOut = rest;
             return;
@@ -520,7 +551,7 @@ DispatchOutcome DoReadHead(const ToolInvocation& inv,
 
     std::string rawPath;
     size_t lines = 40;
-    ParseReadHeadArgs(inv.args, rawPath, lines);
+    ParseReadHeadArgs(inv.args, rawPath, lines, &ctx);
     const std::string toolArgs = ResolveProjectFileArgForSinglePathTool(rawPath, ctx);
     out.result.commandEcho = "/read_head " + std::to_string(lines) + " " + toolArgs;
 
@@ -576,21 +607,31 @@ DispatchOutcome DoGrep(const ToolInvocation& inv,
         return out;
     }
 
-    // Same arg-parsing rule as HandleSlashGrep: first whitespace token
-    // is the pattern, rest is path.
+    // Legacy XML/old-native form: one line, first whitespace token is
+    // the pattern and the rest is the path. Native structured form is
+    // flattened by ProjectStructuredArgs as "pattern\npath", which lets
+    // literal search patterns contain spaces without being split into a
+    // fake path.
     std::string pattern, rawPath;
     {
-        const std::string& s = inv.args;
-        size_t sep = s.find_first_of(" \t");
-        if (sep == std::string::npos) {
-            pattern = s;
+        const std::string s = Trim(inv.args);
+        size_t nl = s.find_first_of("\r\n");
+        if (nl != std::string::npos) {
+            pattern = Trim(s.substr(0, nl));
+            size_t restStart = nl;
+            while (restStart < s.size() &&
+                   (s[restStart] == '\r' || s[restStart] == '\n')) {
+                ++restStart;
+            }
+            rawPath = Trim(restStart < s.size() ? s.substr(restStart) : std::string());
         } else {
-            pattern = s.substr(0, sep);
-            rawPath = s.substr(sep + 1);
-            size_t a = rawPath.find_first_not_of(" \t\r\n");
-            size_t b = rawPath.find_last_not_of(" \t\r\n");
-            if (a == std::string::npos) rawPath.clear();
-            else                        rawPath = rawPath.substr(a, b - a + 1);
+            size_t sep = s.find_first_of(" \t");
+            if (sep == std::string::npos) {
+                pattern = Trim(s);
+            } else {
+                pattern = Trim(s.substr(0, sep));
+                rawPath = Trim(s.substr(sep + 1));
+            }
         }
     }
 
@@ -714,24 +755,25 @@ inline std::string PowerShellRejectionHint(const std::string& cmdRaw)
 
     // ── Tier 4: cmd-style mutation commands ─────────────────────
     if (head == "mkdir" || head == "md") {
-        return "\n\nHint: PowerShell is read-only here. Use "
+        return "\n\nHint: Use "
                "<name>mkdir</name><args>relative/path</args> to create a directory "
-               "inside the working directory or active project root.";
+               "inside the working directory or active project root. Mutating shell commands "
+               "may require approval instead of running directly.";
     }
     if (head == "rm"    || head == "del" || head == "erase" ||
         head == "rmdir" || head == "rd") {
-        return "\n\nHint: PowerShell is read-only here. Use "
+        return "\n\nHint: Use "
                "<name>delete</name><args>relative/path</args>. Files are removed; "
                "non-empty directories are refused -- list with ls and delete entries "
-               "individually if needed. Approval-gated.";
+               "individually if needed. Broader shell automation may require approval.";
     }
     if (head == "cp"  || head == "copy" ||
         head == "mv"  || head == "move" ||
         head == "ren" || head == "rename") {
-        return "\n\nHint: PowerShell is read-only here. To produce a new file with "
+        return "\n\nHint: To produce a new file with "
                "specific content, use <name>write</name>. There is no native copy/move "
                "tool; if you need to duplicate an existing file, read its contents and "
-               "write them to the new path.";
+               "write them to the new path. Broader shell automation may require approval.";
     }
     if (head == "cd" || head == "chdir" || head == "set-location") {
         return "\n\nHint: The working directory is per-conversation and tools cannot "
@@ -825,6 +867,10 @@ DispatchOutcome DoPowerShell(const ToolInvocation& inv,
     }
 
 
+    // Broader PowerShell commands with decision.requiresApproval are gated
+    // by the caller before this point (agent approval card, or slash/user-
+    // typed command as self-approved). Once DoPowerShell is reached, dispatch
+    // is intentional.
     if (!deps.cmdExec->Start(inv.args, ctx.cwd, ctx.timeoutMs)) {
         out.status            = DispatchStatus::Invalid;
         out.result.errorBody  = "Could not start PowerShell "
@@ -1215,6 +1261,69 @@ DispatchOutcome DoDocxInspect(const ToolInvocation& inv,
 }
 
 
+DispatchOutcome DoZipInspect(const ToolInvocation& inv,
+                             const ToolContext&    ctx,
+                             const DispatchDeps&   deps)
+{
+    DispatchOutcome out;
+    out.result.toolTag       = tool_names::kZipInspect;
+    out.result.invocationRaw = inv.rawBlock;
+    out.result.iconUtf8      = "\xF0\x9F\x93\xA6";   // 📦
+    out.result.toolName      = "ZIP Inspect";
+    const std::string toolArgs = ResolveProjectSourceArgForSinglePathTool(inv.args, ctx);
+    out.result.commandEcho   = MakeCommandEcho("zip_inspect", toolArgs);
+    out.result.bodyLang      = "json";
+
+    if (!deps.pythonRunner) {
+        out.status           = DispatchStatus::Invalid;
+        out.result.errorBody = "Python runner not available in this context.";
+        out.result.chips     = { "error" };
+        return out;
+    }
+
+    if (!deps.pythonRunner->StartZipInspect(toolArgs, ctx.cwd, ctx.timeoutMs)) {
+        out.status           = DispatchStatus::Invalid;
+        out.result.errorBody = "Could not start ZIP inspect helper (another Python helper is already running?).";
+        out.result.chips     = { "error" };
+        return out;
+    }
+
+    out.status = DispatchStatus::Async;
+    return out;
+}
+
+DispatchOutcome DoZipExtract(const ToolInvocation& inv,
+                             const ToolContext&    ctx,
+                             const DispatchDeps&   deps)
+{
+    DispatchOutcome out;
+    out.result.toolTag       = tool_names::kZipExtract;
+    out.result.invocationRaw = inv.rawBlock;
+    out.result.iconUtf8      = "\xF0\x9F\x93\xA4";   // 📤
+    out.result.toolName      = "ZIP Extract";
+    const std::string toolArgs = ResolveProjectSourceArgForSinglePathTool(inv.args, ctx);
+    out.result.commandEcho   = MakeCommandEcho("zip_extract", toolArgs);
+    out.result.bodyLang      = "json";
+
+    if (!deps.pythonRunner) {
+        out.status           = DispatchStatus::Invalid;
+        out.result.errorBody = "Python runner not available in this context.";
+        out.result.chips     = { "error" };
+        return out;
+    }
+
+    if (!deps.pythonRunner->StartZipExtract(toolArgs, ctx.cwd, ctx.timeoutMs)) {
+        out.status           = DispatchStatus::Invalid;
+        out.result.errorBody = "Could not start ZIP extract helper (another Python helper is already running?).";
+        out.result.chips     = { "error" };
+        return out;
+    }
+
+    out.status = DispatchStatus::Async;
+    return out;
+}
+
+
 // ─── python_create_script ───────────────────────────────────────
 // Synchronous, approval-gated artifact creator.  It does NOT run
 // Python.  It creates a .py script in the conversation Scripts
@@ -1276,7 +1385,7 @@ std::string WorkflowRootFromCwdTool(const std::string& cwd)
     std::string workflows = ParentDirOfPath(parent);
     if (parent.empty() || workflows.empty()) return std::string();
 
-    if (!StartsWithTool(PathBaseNameTool(parent), "chat_")) return std::string();
+    if (!StartsWithTool(Lower(PathBaseNameTool(parent)), "chat_")) return std::string();
     if (Lower(PathBaseNameTool(workflows)) != "workflows") return std::string();
     return parent;
 }
@@ -1288,6 +1397,7 @@ std::string LlamaBossScriptsDir(const std::string& cwd = std::string())
 
     std::string root = ParentDirOfPath(ServerManager::GetDefaultWorkspaceDir());
     if (root.empty()) root = ParentDirOfPath(ServerManager::GetWorkspaceDir());
+    if (root.empty()) return std::string();
     return JoinToolPath(root, "Scripts");
 }
 
@@ -1475,19 +1585,47 @@ bool NormalizePythonRunScriptFilename(const std::string& requested,
         return false;
     }
 
-    // Friendly project-relative form: Workflows\helper.py means the
-    // same thing as helper.py for active project workflow scripts.  Keep
-    // this narrow: no nested paths and no arbitrary directory prefixes.
+    // Friendly project-relative forms such as Workflows\helper.py and
+    // Project\Workflows\helper.py are intentionally preserved here. The
+    // runtime resolver uses these prefixes to pin the active-project
+    // Workflows lane instead of reducing them to a bare filename that could
+    // be shadowed by the conversation Scripts lane.
     {
         std::string pathish = name;
         std::replace(pathish.begin(), pathish.end(), '/', '\\');
         std::string key = Lower(pathish);
         const std::string p1 = "workflows\\";
         const std::string p2 = "project\\workflows\\";
+
+        size_t prefixLen = std::string::npos;
         if (key.rfind(p1, 0) == 0) {
-            name = pathish.substr(p1.size());
+            prefixLen = p1.size();
         } else if (key.rfind(p2, 0) == 0) {
-            name = pathish.substr(p2.size());
+            prefixLen = p2.size();
+        }
+
+        if (prefixLen != std::string::npos) {
+            std::string workflowName = Trim(pathish.substr(prefixLen));
+            if (workflowName.empty()) {
+                errorOut = "python_run_script Workflows\\... path must include a script filename.";
+                return false;
+            }
+            if (workflowName.find('\\') != std::string::npos ||
+                workflowName.find('/')  != std::string::npos ||
+                workflowName.find(':')  != std::string::npos) {
+                errorOut = "python_run_script Workflows\\... accepts a single .py filename only.";
+                return false;
+            }
+
+            size_t dot = workflowName.find_last_of('.');
+            if (dot == std::string::npos) {
+                workflowName += ".py";
+            } else if (Lower(workflowName.substr(dot)) != ".py") {
+                errorOut = "python_run_script Workflows\\... paths must point to a .py file.";
+                return false;
+            }
+
+            name = pathish.substr(0, prefixLen) + workflowName;
         }
     }
 
@@ -1527,29 +1665,93 @@ bool NormalizePythonRunScriptFilename(const std::string& requested,
     return true;
 }
 
-std::string UniqueScriptPath(const std::string& dir,
-                             const std::string& filename,
-                             std::string&       finalNameOut)
+std::string TempScriptPathForFinal(const std::string& dir,
+                                   const std::string& finalName,
+                                   int attempt)
 {
-    size_t dot = filename.find_last_of('.');
-    std::string stem = (dot == std::string::npos) ? filename : filename.substr(0, dot);
-    std::string ext  = (dot == std::string::npos) ? std::string() : filename.substr(dot);
+    // Same-directory temp file keeps the final rename on the same volume so
+    // MoveFileExW is atomic. Put .tmp before .py so py_compile still sees a
+    // Python-like filename during the preflight syntax check.
+    size_t dot = finalName.find_last_of('.');
+    std::string stem = (dot == std::string::npos) ? finalName : finalName.substr(0, dot);
+    std::string ext  = (dot == std::string::npos) ? std::string(".py") : finalName.substr(dot);
 
-    if (stem.empty()) stem = "script";
+    std::ostringstream name;
+    name << stem
+         << ".llamaboss_tmp_"
+         << static_cast<unsigned long>(::GetCurrentProcessId())
+         << "_"
+         << static_cast<unsigned long long>(::GetTickCount64())
+         << "_"
+         << attempt
+         << ext;
+    return JoinToolPath(dir, name.str());
+}
 
-    for (int i = 0; i < 1000; ++i) {
-        std::string candidateName = (i == 0)
-            ? filename
-            : (stem + "_" + std::to_string(i + 1) + ext);
-        std::string candidatePath = JoinToolPath(dir, candidateName);
-        if (!IsFile(candidatePath) && !IsDirectory(candidatePath)) {
-            finalNameOut = candidateName;
-            return candidatePath;
-        }
+bool WriteAllBytesToNewFileFlushed(const std::string& path,
+                                   const std::string& bytes,
+                                   std::string&       errorOut)
+{
+    std::wstring wPath = path_safety::Utf8ToWide(path);
+    if (wPath.empty()) {
+        errorOut = "Path conversion failed: " + path;
+        return false;
     }
 
-    finalNameOut.clear();
-    return std::string();
+    HANDLE hFile = ::CreateFileW(
+        wPath.c_str(),
+        GENERIC_WRITE,
+        0,
+        nullptr,
+        CREATE_NEW,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr);
+
+    if (hFile == INVALID_HANDLE_VALUE) {
+        DWORD winErr = ::GetLastError();
+        errorOut = "Could not create temp Python script: " + path +
+                   " (Win32 error " + std::to_string(winErr) + ")";
+        return false;
+    }
+
+    const char* data = bytes.data();
+    size_t remain = bytes.size();
+    while (remain > 0) {
+        DWORD chunk = (remain > 0x40000000U)
+            ? 0x40000000U
+            : static_cast<DWORD>(remain);
+        DWORD written = 0;
+        BOOL ok = ::WriteFile(hFile, data, chunk, &written, nullptr);
+        if (!ok || written == 0) {
+            DWORD winErr = ::GetLastError();
+            ::CloseHandle(hFile);
+            ::DeleteFileW(wPath.c_str());
+            errorOut = "Failed while writing temp Python script: " + path +
+                       " (Win32 error " + std::to_string(winErr) + ")";
+            return false;
+        }
+        data += written;
+        remain -= written;
+    }
+
+    if (!::FlushFileBuffers(hFile)) {
+        DWORD winErr = ::GetLastError();
+        ::CloseHandle(hFile);
+        ::DeleteFileW(wPath.c_str());
+        errorOut = "Failed while flushing temp Python script: " + path +
+                   " (Win32 error " + std::to_string(winErr) + ")";
+        return false;
+    }
+
+    if (!::CloseHandle(hFile)) {
+        DWORD winErr = ::GetLastError();
+        ::DeleteFileW(wPath.c_str());
+        errorOut = "Failed while closing temp Python script after write: " +
+                   path + " (Win32 error " + std::to_string(winErr) + ")";
+        return false;
+    }
+
+    return true;
 }
 
 PythonCreateScriptResult CreatePythonScriptArtifact(const std::string& argsBlob,
@@ -1605,72 +1807,81 @@ PythonCreateScriptResult CreatePythonScriptArtifact(const std::string& argsBlob,
                       wxPATH_MKDIR_FULL);
 
     std::string finalName;
-    std::string outPath = UniqueScriptPath(scriptsDir, filename, finalName);
-    if (outPath.empty()) {
-        r.chips = { "failed", ElapsedChipLocal(t0) };
-        r.errorBody = "Could not find a collision-safe filename in: " + scriptsDir;
-        return r;
-    }
+    std::string outPath;
 
-    std::wstring wOut = path_safety::Utf8ToWide(outPath);
-    if (wOut.empty()) {
-        r.chips = { "failed", ElapsedChipLocal(t0) };
-        r.errorBody = "Path conversion failed: " + outPath;
-        return r;
-    }
+    bool created = false;
+    std::string lastError;
 
-    HANDLE hFile = ::CreateFileW(
-        wOut.c_str(),
-        GENERIC_WRITE,
-        0,
-        nullptr,
-        CREATE_NEW,
-        FILE_ATTRIBUTE_NORMAL,
-        nullptr);
+    // Stage into a same-directory temp file, flush it, syntax-check the temp,
+    // then atomically rename it into the executable lane. This prevents a crash
+    // or power loss from leaving a truncated .py at the final runnable path.
+    size_t baseDot = filename.find_last_of('.');
+    std::string baseStem = (baseDot == std::string::npos) ? filename : filename.substr(0, baseDot);
+    std::string baseExt  = (baseDot == std::string::npos) ? std::string(".py") : filename.substr(baseDot);
+    if (baseStem.empty()) baseStem = "script";
 
-    if (hFile == INVALID_HANDLE_VALUE) {
+    for (int i = 0; i < 1000 && !created; ++i) {
+        std::string candidateName = (i == 0)
+            ? filename
+            : (baseStem + "_" + std::to_string(i + 1) + baseExt);
+
+        std::string candidatePath = JoinToolPath(scriptsDir, candidateName);
+        if (IsFile(candidatePath) || IsDirectory(candidatePath)) {
+            continue;
+        }
+
+        std::string tempPath = TempScriptPathForFinal(scriptsDir, candidateName, i);
+        std::string writeError;
+        if (!WriteAllBytesToNewFileFlushed(tempPath, content, writeError)) {
+            lastError = writeError;
+            continue;
+        }
+
+        tool_python_syntax::SyntaxCheckResult syntax =
+            tool_python_syntax::CheckFile(tempPath);
+        if (!syntax.ok) {
+            std::wstring wTemp = path_safety::Utf8ToWide(tempPath);
+            if (!wTemp.empty()) ::DeleteFileW(wTemp.c_str());
+            r.chips = { "failed", "syntax error", ElapsedChipLocal(t0) };
+            r.errorBody = "Python syntax check failed; the script was not created.\n\n" + syntax.message;
+            return r;
+        }
+
+        std::wstring wTemp = path_safety::Utf8ToWide(tempPath);
+        std::wstring wFinal = path_safety::Utf8ToWide(candidatePath);
+        if (wTemp.empty() || wFinal.empty()) {
+            if (!wTemp.empty()) ::DeleteFileW(wTemp.c_str());
+            lastError = "Path conversion failed while finalizing Python script: " + candidatePath;
+            continue;
+        }
+
+        if (::MoveFileExW(wTemp.c_str(),
+                          wFinal.c_str(),
+                          MOVEFILE_WRITE_THROUGH)) {
+            finalName = candidateName;
+            outPath = candidatePath;
+            created = true;
+            break;
+        }
+
         DWORD winErr = ::GetLastError();
+        ::DeleteFileW(wTemp.c_str());
+        if (winErr == ERROR_FILE_EXISTS || winErr == ERROR_ALREADY_EXISTS) {
+            lastError = "Collision while finalizing Python script; retrying.";
+            continue;
+        }
+
         r.chips = { "failed", ElapsedChipLocal(t0) };
-        r.errorBody = "Could not create Python script: " + outPath +
+        r.errorBody = "Could not finalize Python script atomically: " + candidatePath +
                       " (Win32 error " + std::to_string(winErr) + ")";
         return r;
     }
 
-    const char* data = content.data();
-    size_t remain = content.size();
-    while (remain > 0) {
-        DWORD chunk = (remain > 0x40000000U)
-            ? 0x40000000U
-            : static_cast<DWORD>(remain);
-        DWORD written = 0;
-        BOOL ok = ::WriteFile(hFile, data, chunk, &written, nullptr);
-        if (!ok || written == 0) {
-            DWORD winErr = ::GetLastError();
-            ::CloseHandle(hFile);
-            ::DeleteFileW(wOut.c_str());
-            r.chips = { "failed", ElapsedChipLocal(t0) };
-            r.errorBody = "Failed while writing Python script: " + outPath +
-                          " (Win32 error " + std::to_string(winErr) + ")";
-            return r;
-        }
-        data += written;
-        remain -= written;
-    }
-
-    if (!::CloseHandle(hFile)) {
-        DWORD winErr = ::GetLastError();
+    if (!created) {
         r.chips = { "failed", ElapsedChipLocal(t0) };
-        r.errorBody = "Failed while closing Python script after write: " +
-                      outPath + " (Win32 error " + std::to_string(winErr) + ")";
-        return r;
-    }
-
-    tool_python_syntax::SyntaxCheckResult syntax =
-        tool_python_syntax::CheckFile(outPath);
-    if (!syntax.ok) {
-        ::DeleteFileW(wOut.c_str());
-        r.chips = { "failed", "syntax error", ElapsedChipLocal(t0) };
-        r.errorBody = "Python syntax check failed; the script was not created.\n\n" + syntax.message;
+        r.errorBody = lastError.empty()
+            ? "Could not find a collision-safe filename in: " + scriptsDir
+            : lastError;
         return r;
     }
 
@@ -1688,7 +1899,23 @@ PythonCreateScriptResult CreatePythonScriptArtifact(const std::string& argsBlob,
                  ? "Created Python project workflow script at "
                  : "Created Python script artifact at ") + outPath +
              "\n\nFinal filename: " + finalName +
-             "\n\nNEXT STEP FOR THE ASSISTANT: If the user asked for a finished file, report, document, spreadsheet, chart, conversion, or transformed output, immediately call python_run_script with this exact final filename next. Do not ask the user for another approval; the approval for python_create_script carries forward to one immediate run of this exact script.\n";
+             // The run instruction MUST use the bare final filename, not the
+             // full path.  AgentController's one-shot approval carry-forward
+             // (NormalizeScriptNameForOneShotApproval) deliberately rejects
+             // path-shaped python_run_script requests so a stale same-named
+             // script in a higher-priority lane cannot ride the bypass.  A
+             // model instructed to run the full path therefore missed the
+             // bypass and hit a SECOND approval card — the exact double
+             // prompt the carry-forward exists to remove — while this text
+             // simultaneously promised no re-approval.  Filename-only keeps
+             // the instruction and the bypass contract aligned; the lane
+             // shadowing edge (project workflow shadowed by a conversation
+             // script) is already handled on the controller side by skipping
+             // the bypass grant, in which case the normal card appears.
+             "\n\nNEXT STEP FOR THE ASSISTANT: If the user asked for a finished file, report, document, spreadsheet, chart, conversion, or transformed output, immediately call python_run_script with this exact created filename next:\n" +
+             finalName +
+             "\nUse the bare filename exactly as shown, NOT a path -- the carried-forward approval matches the filename only, and a path-shaped request will ask the user for another approval."
+             "\nDo not ask the user for another approval; the approval for python_create_script carries forward to one immediate run of this exact script.\n";
     return r;
 }
 
@@ -1865,6 +2092,34 @@ DispatchOutcome DoOverwriteFile(const ToolInvocation& inv,
     return out;
 }
 
+
+DispatchOutcome DoWritePowerShellScript(const ToolInvocation& inv,
+                                        const ToolContext&    ctx,
+                                        const DispatchDeps&   /*deps*/)
+{
+    DispatchOutcome out = PreFill(inv, tool_names::kWritePowerShellScript, "PowerShell Script");
+    out.result.iconUtf8    = "\xF0\x9F\x93\x9D";   // 📝
+    out.result.commandEcho = FirstLineEcho("write_powershell_script", inv.args);
+
+    WriteResult r = WritePowerShellScriptFile(inv.args, ctx);
+    out.result.chips     = r.chips;
+    out.result.body      = r.body;
+    out.result.errorBody = r.errorBody;
+    out.result.bodyLang  = r.bodyLang;
+
+    if (!r.createdPath.empty()) {
+        PresentedFile file;
+        file.displayName = r.displayName.empty() ? std::string("PowerShell script")
+                                                 : r.displayName;
+        file.diskPath    = r.createdPath;
+        file.sizeBytes   = r.sizeBytes;
+        file.lineCount   = r.lineCount;
+        out.result.presentedFiles.push_back(std::move(file));
+    }
+
+    return out;
+}
+
 DispatchOutcome DoMkdir(const ToolInvocation& inv,
                         const ToolContext&    ctx,
                         const DispatchDeps&   /*deps*/)
@@ -2021,7 +2276,7 @@ bool ValLs(const std::string&, std::string&) {
 }
 bool ValGrep(const std::string& a, std::string& r) {
     return ValRequireNonEmpty(a, r,
-        "grep requires args in the form '<pattern> [path]'");
+        "grep requires a non-empty pattern; native mode uses {pattern, optional path}");
 }
 bool ValPwd(const std::string&, std::string&) {
     return true;   // args ignored
@@ -2143,6 +2398,26 @@ bool ValDocxInspect(const std::string& a, std::string& r) {
     }
     return true;
 }
+bool ValZipInspect(const std::string& a, std::string& r) {
+    if (!ValRequireNonEmpty(a, r,
+            "zip_inspect requires a .zip file path in args"))
+        return false;
+    if (a.find('\n') != std::string::npos || a.find('\r') != std::string::npos) {
+        r = "zip_inspect accepts one file path only; no multi-line args";
+        return false;
+    }
+    return true;
+}
+bool ValZipExtract(const std::string& a, std::string& r) {
+    if (!ValRequireNonEmpty(a, r,
+            "zip_extract requires a .zip file path in args"))
+        return false;
+    if (a.find('\n') != std::string::npos || a.find('\r') != std::string::npos) {
+        r = "zip_extract accepts one file path only; no multi-line args";
+        return false;
+    }
+    return true;
+}
 bool ValPdfFillForm(const std::string& a, std::string& r) {
     if (!ValRequireNonEmpty(a, r,
             "pdf_fill_form requires a .pdf file path on the first line of args and a JSON {field: value} object on the remaining lines"))
@@ -2184,7 +2459,9 @@ bool ValPythonCreateScript(const std::string& a, std::string& r) {
 
 bool ValPythonRunScript(const std::string& a, std::string& r) {
     if (!ValRequireNonEmpty(a, r,
-            "python_run_script requires a .py filename or an in-lane .py path from the conversation Scripts folder, the active project Workflows folder, or the LlamaBoss Skills folder"))
+            "python_run_script requires a script on args line 1: a bare .py filename (e.g. report.py), "
+            "or a lane selector Scripts\\name.py (conversation scripts), Workflows\\name.py (active project), "
+            "or Skills\\name.py (LlamaBoss Skills). Later args lines are passed as one argv token each."))
         return false;
 
     std::string scriptRequest;
@@ -2232,6 +2509,10 @@ bool ValWrite(const std::string& a, std::string& r) {
 bool ValOverwriteFile(const std::string& a, std::string& r) {
     return ValRequireNonEmpty(a, r,
         "overwrite_file requires a path on the first line of args, with file content on subsequent lines");
+}
+bool ValWritePowerShellScript(const std::string& a, std::string& r) {
+    return ValRequireNonEmpty(a, r,
+        "write_powershell_script requires a .ps1 path on the first line of args, with script content on subsequent lines");
 }
 bool ValMkdir(const std::string& a, std::string& r) {
     return ValRequireNonEmpty(a, r,
@@ -2303,41 +2584,28 @@ bool ValWebFetchUrl(const std::string& a, std::string& r) {
 
 DispatchOutcome DoWebFetchUrl(const ToolInvocation& inv,
                               const ToolContext&    ctx,
-                              const DispatchDeps&   /*deps*/)
+                              const DispatchDeps&   deps)
 {
     DispatchOutcome out = PreFill(inv, tool_names::kWebFetchUrl, "Web Page Inspect");
     out.result.iconUtf8    = "\xF0\x9F\x8C\x90";   // 🌐
     out.result.commandEcho = MakeCommandEcho("web_fetch_url", inv.args);
     out.result.bodyLang    = "markdown";
 
-    WebFetchResult r = FetchWebPageUrl(inv.args, ctx);
-    out.result.chips     = r.chips;
-    out.result.body      = r.body;
-    out.result.errorBody = r.errorBody;
-    out.result.bodyLang  = r.bodyLang;
-
-    if (!r.textPath.empty()) {
-        PresentedFile textFile;
-        textFile.displayName = r.textDisplayName.empty() ? std::string("webpage_text.md")
-                                                         : r.textDisplayName;
-        textFile.language    = "markdown";
-        textFile.diskPath    = r.textPath;
-        textFile.sizeBytes   = r.textBytes;
-        textFile.lineCount   = r.textLineCount;
-        out.result.presentedFiles.push_back(std::move(textFile));
+    if (!deps.webFetchExec) {
+        out.status = DispatchStatus::Invalid;
+        out.result.chips = { "failed" };
+        out.result.errorBody = "Internal error: web_fetch_url executor is not available.";
+        return out;
     }
 
-    if (!r.rawHtmlPath.empty()) {
-        PresentedFile htmlFile;
-        htmlFile.displayName = r.rawHtmlDisplayName.empty() ? std::string("webpage_raw.html")
-                                                            : r.rawHtmlDisplayName;
-        htmlFile.language    = "html";
-        htmlFile.diskPath    = r.rawHtmlPath;
-        htmlFile.sizeBytes   = r.htmlBytes;
-        htmlFile.lineCount   = 0;
-        out.result.presentedFiles.push_back(std::move(htmlFile));
+    if (!deps.webFetchExec->Start(inv.args, out.result.commandEcho, ctx)) {
+        out.status = DispatchStatus::Invalid;
+        out.result.chips = { "failed" };
+        out.result.errorBody = "Could not start web_fetch_url worker. Another web fetch may already be running.";
+        return out;
     }
 
+    out.status = DispatchStatus::Async;
     return out;
 }
 
@@ -2361,14 +2629,14 @@ DispatchOutcome DoWebFetchUrl(const ToolInvocation& inv,
 
 constexpr const char* kSchemaRead = R"({
 "type":"object",
-"properties":{"args":{"type":"string","description":"File path to read for read-only inspection. Relative paths resolve against the conversation working directory; absolute local paths outside it are allowed when readable."}},
-"required":["args"]
+"properties":{"path":{"type":"string","description":"File path to read for read-only inspection. Relative project paths such as PROJECT.md, src/main.cpp, Workflows/script.py, and Outputs/... resolve to the active project root when attached; absolute local paths outside it are allowed when readable."}},
+"required":["path"]
 })";
 
 constexpr const char* kSchemaReadHead = R"({
 "type":"object",
 "properties":{
-"path":{"type":"string","description":"File path to preview. Relative project paths such as PROJECT.md, requirements.txt, Inputs\file.txt, Workflows\script.py, and Outputs\... resolve to the active project root when attached."},
+"path":{"type":"string","description":"File path to preview. Relative project paths such as PROJECT.md, requirements.txt, Inputs/file.txt, Workflows/script.py, and Outputs/... resolve to the active project root when attached."},
 "lines":{"type":"integer","description":"Number of leading lines to read. Defaults to 40. Maximum 500."}
 },
 "required":["path"]
@@ -2386,8 +2654,11 @@ constexpr const char* kSchemaPwd = R"({
 
 constexpr const char* kSchemaGrep = R"({
 "type":"object",
-"properties":{"args":{"type":"string","description":"<pattern> [path]. First whitespace-separated token is the pattern; rest is the path. Empty path searches the working directory recursively; absolute local paths are allowed for read-only search."}},
-"required":["args"]
+"properties":{
+"pattern":{"type":"string","description":"Literal text pattern to search for. Spaces are allowed and are matched literally; this is not a regex."},
+"path":{"type":"string","description":"Optional file or directory to search. Empty or omitted searches the current working directory recursively. Absolute local paths are allowed for read-only search."}
+},
+"required":["pattern"]
 })";
 
 constexpr const char* kSchemaPowerShell = R"({
@@ -2434,7 +2705,7 @@ constexpr const char* kSchemaXlsxReport = R"({
 
 constexpr const char* kSchemaXlsxCreateWorkbook = R"({
 "type":"object",
-"properties":{"args":{"type":"string","description":"JSON workbook spec for the fixed xlsx_create_workbook helper. Writes one .xlsx workbook to the conversation Spreadsheets folder. Use this instead of python_create_script when creating a new formatted Excel workbook from structured data. Required JSON shape (put \"rows\" LAST in each sheet object so you can close the sheet with } immediately after the row data): {\"filename\":\"report.xlsx\",\"allow_formulas\":false,\"sheets\":[{\"name\":\"Sheet\",\"title\":\"Optional title\",\"headers\":[\"A\",\"B\"],\"currency_columns\":[\"Amount\"],\"number_columns\":[\"Hours\"],\"percent_columns\":[\"Completion %\"],\"integer_columns\":[\"Count\"],\"date_columns\":[\"Review Date\"],\"freeze_top_row\":true,\"auto_filter\":true,\"table\":true,\"rows\":[[1,2]]}]}. Percent columns expect the decimal form (0.92 = 92%); whole-number values greater than 1 are auto-divided by 100 with a logged adjustment. Date columns accept yyyy-mm-dd, m/d/yyyy, or m/d/yy and are parsed to true Excel dates. Per-cell formatting for mixed Metric/Value summary sheets can use \"cell_formats\":{\"B5\":\"currency\",\"B7\":\"percent\"} with named formats currency / number / integer / percent / date. Formula safety: formulas are treated as text unless the user explicitly asks to allow formulas. If the user says allow formulas / enable formulas / formulas are allowed, include top-level \"allow_formulas\":true and pass formula cells as normal strings like \"=A2+B2\" with no leading apostrophe."}},
+"properties":{"args":{"type":"string","description":"JSON workbook spec for the fixed xlsx_create_workbook helper. Writes one .xlsx workbook to the conversation Spreadsheets folder. Use this only for SMALL workbooks you are composing by hand (data you can type accurately, roughly under 30 rows). If the data was just produced or printed by a Python script, do NOT re-enter it here — re-typing datasets into JSON is error-prone; instead extend that script to write the .xlsx itself with openpyxl via python_create_script/python_run_script. Required JSON shape (put \"rows\" LAST in each sheet object so you can close the sheet with } immediately after the row data): {\"filename\":\"report.xlsx\",\"allow_formulas\":false,\"sheets\":[{\"name\":\"Sheet\",\"title\":\"Optional title\",\"headers\":[\"A\",\"B\"],\"currency_columns\":[\"Amount\"],\"number_columns\":[\"Hours\"],\"percent_columns\":[\"Completion %\"],\"integer_columns\":[\"Count\"],\"date_columns\":[\"Review Date\"],\"freeze_top_row\":true,\"auto_filter\":true,\"table\":true,\"rows\":[[1,2]]}]}. Percent columns expect the decimal form (0.92 = 92%); whole-number values greater than 1 are auto-divided by 100 with a logged adjustment. Date columns accept yyyy-mm-dd, m/d/yyyy, or m/d/yy and are parsed to true Excel dates. Per-cell formatting for mixed Metric/Value summary sheets can use \"cell_formats\":{\"B5\":\"currency\",\"B7\":\"percent\"} with named formats currency / number / integer / percent / date. Formula safety: formulas are treated as text unless the user explicitly asks to allow formulas. If the user says allow formulas / enable formulas / formulas are allowed, include top-level \"allow_formulas\":true and pass formula cells as normal strings like \"=A2+B2\" with no leading apostrophe."}},
 "required":["args"]
 })";
 
@@ -2468,6 +2739,18 @@ constexpr const char* kSchemaDocxInspect = R"({
 "required":["args"]
 })";
 
+constexpr const char* kSchemaZipExtract = R"({
+"type":"object",
+"properties":{"args":{"type":"string","description":"Path to a local .zip archive; absolute paths outside the working directory are allowed for reading. The fixed Python helper extracts the archive into a per-archive subfolder of the conversation Extracted folder. It is a two-pass, hard-fail extractor: pass 1 audits the central directory and refuses the WHOLE archive with no writes if any entry is a Zip Slip path traversal, an absolute path, a symlink, encrypted, or exceeds the per-entry compression-ratio cap; pass 2 streams each entry with a running byte cap that aborts on a size-lying zip bomb. Executable entries are extracted but reported. Always call zip_inspect first to see the manifest and safety_flags before extracting. Writes files: this is an approval-gated tool."}},
+"required":["args"]
+})";
+
+constexpr const char* kSchemaZipInspect = R"({
+"type":"object",
+"properties":{"args":{"type":"string","description":"Path to a local .zip archive; absolute paths outside the working directory are allowed for reading. The fixed Python helper reads only the central directory (it never decompresses or extracts any entry) and returns a JSON manifest: entry/file/dir counts, total compressed and uncompressed bytes, overall and max-entry compression ratios, top-level entries, single_root_folder, an extension histogram, a capped per-entry list, and safety_flags for encrypted entries, path-traversal (Zip Slip) suspects, symlink entries, executable entries, and abnormally high compression ratios. Read-only: no files are created or modified. Call this before extracting so you know what the archive contains and whether it is safe."}},
+"required":["args"]
+})";
+
 constexpr const char* kSchemaPythonCreateScript = R"({
 "type":"object",
 "properties":{
@@ -2479,8 +2762,11 @@ constexpr const char* kSchemaPythonCreateScript = R"({
 
 constexpr const char* kSchemaPythonRunScript = R"({
 "type":"object",
-"properties":{"args":{"type":"string","description":"Filename of an existing .py script in the fixed conversation Scripts folder, an optional .py helper script in the active project's Workflows folder, or a Skill helper script in the LlamaBoss Skills folder. A full .py path inside one of those script lanes is also accepted. Preferred argument contract: put the script filename/path on the first line, then put each optional command-line argument on its own later line. A simple one-line 'script.py ARG' form is also accepted as one argument when unambiguous. Runs locally with stdout/stderr/exit code captured."}},
-"required":["args"]
+"properties":{
+"script":{"type":"string","description":"Filename or full .py path for an existing script in the conversation Scripts folder, the active project's Workflows folder, or the LlamaBoss Skills folder. Lane selectors are accepted: Scripts\\name.py, Workflows\\name.py, or Skills\\name.py."},
+"argv":{"type":"array","items":{"type":"string"},"description":"Optional command-line argv tokens to pass to the script. Put each flag and each value as its own array element, e.g. [\"--format-index\",\"1\"], or use one element with '=' such as \"--format-index=1\"."}
+},
+"required":["script"]
 })";
 
 constexpr const char* kSchemaPythonInstallPackage = R"({
@@ -2516,15 +2802,24 @@ constexpr const char* kSchemaWrite = R"({
 constexpr const char* kSchemaOverwriteFile = R"({
 "type":"object",
 "properties":{
-"path":{"type":"string","description":"File path to create or replace. Restricted to the working directory, or the active project root when a project is attached. Use this for full-file replacement such as PROJECT.md, requirements.txt, input files, and generated project workflow scripts."},
+"path":{"type":"string","description":"File path to create or replace. Restricted to the working directory, or the active project root when a project is attached. Use this for full-file replacement such as PROJECT.md, requirements.txt, and non-executable generated files. Executable/scriptable extensions are blocked; use write_powershell_script for approved .ps1 project scripts."},
 "content":{"type":"string","description":"Full file contents to write. Existing regular files are atomically replaced. Directories are never overwritten. Python files are syntax-checked before commit when Python is available."}
+},
+"required":["path","content"]
+})";
+
+constexpr const char* kSchemaWritePowerShellScript = R"({
+"type":"object",
+"properties":{
+"path":{"type":"string","description":"PowerShell .ps1 path to create or replace. Restricted to the working directory, or the active project root when a project is attached. Requires approval and never executes the script."},
+"content":{"type":"string","description":"Full PowerShell script contents to write. The script source is shown in the approval card before writing. The file is written but not run."}
 },
 "required":["path","content"]
 })";
 
 constexpr const char* kSchemaMkdir = R"({
 "type":"object",
-"properties":{"args":{"type":"string","description":"Directory path to create. Single level only; parent must exist. Restricted to the working directory, or the active project root when a project is attached."}},
+"properties":{"args":{"type":"string","description":"Directory path to create. Missing intermediate directories are created safely. Restricted to the working directory, or the active project root when a project is attached."}},
 "required":["args"]
 })";
 
@@ -2587,7 +2882,7 @@ constexpr const char* kSchemaWebFetchUrl = R"({
 std::vector<ToolSpec> BuildBuiltinSpecs()
 {
     std::vector<ToolSpec> specs;
-    specs.reserve(36);
+    specs.reserve(37);
 
     auto add = [&](const char* name,
                    const char* description,
@@ -2606,23 +2901,38 @@ std::vector<ToolSpec> BuildBuiltinSpecs()
         specs.push_back(std::move(s));
     };
 
-    add(tool_names::kRead,
-        "Read a text or code file into the conversation.",
-        kSchemaRead,
-        ReadOnlySafety("Read-only file inspection. Absolute local paths outside the cwd may be inspected when readable."),
-        ValRead, DoRead);
+    {
+        ToolSafetyProfile readSafety = ReadOnlySafety(
+            "Read-only file inspection. Absolute local paths outside the cwd may be inspected when readable.");
+        readSafety.dispatchOnWorker = true;
+        add(tool_names::kRead,
+            "Read a text or code file into the conversation. Native args use {path}; legacy/XML args may still be just the path string.",
+            kSchemaRead,
+            std::move(readSafety),
+            ValRead, DoRead);
+    }
 
-    add(tool_names::kReadHead,
-        "Preview the first N lines of a text/code file without reading the whole file. Prefer this before editing or inspecting large source files.",
-        kSchemaReadHead,
-        ReadOnlySafety("Read-only file preview/head inspection. Absolute local paths outside the cwd may be inspected when readable."),
-        ValReadHead, DoReadHead);
+    {
+        ToolSafetyProfile readHeadSafety = ReadOnlySafety(
+            "Read-only file preview/head inspection. Absolute local paths outside the cwd may be inspected when readable.");
+        readHeadSafety.dispatchOnWorker = true;
+        add(tool_names::kReadHead,
+            "Preview the first N lines of a text/code file without reading the whole file. Prefer this before editing or inspecting large source files.",
+            kSchemaReadHead,
+            std::move(readHeadSafety),
+            ValReadHead, DoReadHead);
+    }
 
-    add(tool_names::kLs,
-        "List the contents of a directory.",
-        kSchemaLs,
-        ReadOnlySafety("Read-only directory listing. Absolute local paths outside the cwd may be inspected when readable."),
-        ValLs, DoLs);
+    {
+        ToolSafetyProfile lsSafety = ReadOnlySafety(
+            "Read-only directory listing. Absolute local paths outside the cwd may be inspected when readable.");
+        lsSafety.dispatchOnWorker = true;
+        add(tool_names::kLs,
+            "List the contents of a directory.",
+            kSchemaLs,
+            std::move(lsSafety),
+            ValLs, DoLs);
+    }
 
     add(tool_names::kPwd,
         "Show the current conversation working directory.",
@@ -2634,7 +2944,7 @@ std::vector<ToolSpec> BuildBuiltinSpecs()
         ToolSafetyProfile grepSafety = ReadOnlySafety("Read-only literal text search. Absolute local paths outside the cwd may be searched when readable.");
         grepSafety.isAsync = true;
         add(tool_names::kGrep,
-            "Search files for a literal text pattern.",
+            "Search files for a literal text pattern. Native args use {pattern, optional path}; XML/legacy args still accept '<pattern> [path]'.",
             kSchemaGrep,
             std::move(grepSafety),
             ValGrep, DoGrep);
@@ -2821,12 +3131,42 @@ std::vector<ToolSpec> BuildBuiltinSpecs()
     }
 
     {
+        ToolSafetyProfile zipInspectSafety;
+        zipInspectSafety.tier                 = RiskTier::Safe;
+        zipInspectSafety.readOnly             = true;
+        zipInspectSafety.mayInspectOutsideCwd = true;
+        zipInspectSafety.isAsync              = true;
+        zipInspectSafety.summary = "Runs only the fixed zip_inspect helper against a local .zip archive. Reads only the central directory via Python's zipfile.infolist(); never decompresses, extracts, or writes any entry, so a zip bomb cannot detonate at inspection time. Returns a read-only JSON manifest plus safety_flags (encrypted/symlink/path-traversal/executable entries, high compression ratio). Does not create or modify files. Standard library only; no package installs.";
+        add(tool_names::kZipInspect,
+            "Inspect the contents of a local .zip archive using the fixed Python zip_inspect helper. Reads only the central directory (never decompresses or extracts) and returns a JSON manifest: entry/file/dir counts, compressed and uncompressed totals, compression ratios, top-level entries, an extension histogram, a capped per-entry list, and safety_flags for encrypted entries, Zip Slip path-traversal suspects, symlink entries, executable entries, and abnormally high compression ratios. Read-only and needs no approval. Call this first when the user shares or references a .zip so you can describe its contents and judge whether extracting it is safe.",
+            kSchemaZipInspect,
+            std::move(zipInspectSafety),
+            ValZipInspect, DoZipInspect);
+    }
+
+    {
+        ToolSafetyProfile zipExtractSafety;
+        zipExtractSafety.tier                 = RiskTier::Moderate;
+        zipExtractSafety.mutatesFiles         = true;
+        zipExtractSafety.mayInspectOutsideCwd = true;
+        zipExtractSafety.writesInsideCwdOnly  = false;  // writes to the fixed Extracted lane, not cwd
+        zipExtractSafety.isAsync              = true;
+        zipExtractSafety.summary = "Runs only the fixed zip_extract helper against a local .zip archive and extracts it into a per-archive subfolder of the conversation Extracted folder. Two-pass and hard-fail: pass 1 audits the central directory and refuses the WHOLE archive with no writes on any Zip Slip path traversal, absolute path, symlink entry, encrypted entry, or over-ratio entry; pass 2 streams every entry with a running byte cap that aborts on a size-lying zip bomb. Every target path is recomputed and confined under the extraction root (zipfile.extract is never trusted with raw names). Standard library only; no package installs or network access.";
+        add(tool_names::kZipExtract,
+            "Extract a local .zip archive using the fixed Python zip_extract helper. Extracts into a per-archive subfolder of the conversation Extracted folder. Hard-fail, two-pass safety: the whole archive is refused with no writes if any entry is a Zip Slip path traversal, an absolute path, a symlink, encrypted, or over the compression-ratio cap; extraction streams with a byte cap that aborts on a size-lying zip bomb. Executable entries are extracted but reported. Writes files and requires approval. Always call zip_inspect first to review the manifest and safety_flags before extracting.",
+            kSchemaZipExtract,
+            std::move(zipExtractSafety),
+            ValZipExtract, DoZipExtract);
+    }
+
+    {
         ToolSafetyProfile scriptSafety;
         scriptSafety.tier         = RiskTier::Dangerous;
         scriptSafety.mutatesFiles = true;
+        scriptSafety.dispatchOnWorker = true;
         scriptSafety.summary = "Creates a reviewable .py script artifact in the fixed conversation Scripts folder. In agent mode, approval carries forward to one immediate run of that exact created script; approve enables one-approval mode for this chat.";
         add(tool_names::kPythonCreateScript,
-            "Create a Python script artifact in the conversation Scripts folder from model-provided code. Returns an artifact card. In agent mode, immediately call python_run_script with the exact created filename next if the user's workflow requires an output file; do not ask for a second approval.",
+            "Create a Python script artifact in the conversation Scripts folder from model-provided code. Use this instead of write/overwrite_file for any Python script you intend to run with python_run_script; write/overwrite_file create ordinary Workspace files that python_run_script will not run. Returns an artifact card. In agent mode, immediately call python_run_script with the exact created filename next if the user's workflow requires an output file; do not ask for a second approval.",
             kSchemaPythonCreateScript,
             std::move(scriptSafety),
             ValPythonCreateScript, DoPythonCreateScript);
@@ -2837,9 +3177,9 @@ std::vector<ToolSpec> BuildBuiltinSpecs()
         runSafety.tier         = RiskTier::Moderate;
         runSafety.mutatesFiles = true;
         runSafety.isAsync      = true;
-        runSafety.summary = "Runs one existing .py script from the fixed conversation Scripts folder, an optional .py helper script from the active project Workflows folder, or a .py helper script from the LlamaBoss Skills folder. A full .py path inside one of those script lanes is also accepted. Optional command-line arguments may be supplied after the script line, one argument per later line. Captures stdout, stderr, exit code, runtime, and may attach newly-created files under the conversation workflow folder as artifact cards.";
+        runSafety.summary = "Runs one existing .py script from the fixed conversation Scripts folder, an optional .py helper script from the active project Workflows folder, or a .py helper script from the LlamaBoss Skills folder. It does not run ordinary Workspace .py files created by write/overwrite_file. A full .py path inside one of those script lanes is also accepted. Native mode supplies argv as a string array; XML/legacy mode supplies one argv token per line after the script. Captures stdout, stderr, exit code, runtime, and may attach newly-created files under the conversation workflow folder as artifact cards.";
         add(tool_names::kPythonRunScript,
-            "Run an existing Python script from the conversation Scripts folder, an optional Python helper script from the active project Workflows folder, or a Python helper script from the LlamaBoss Skills folder. Use a filename or a full .py path inside one of those script lanes. Preferred args contract: first line is the script filename/path; optional later lines are command-line arguments, one argument per line. A simple one-line 'script.py ARG' form is also accepted as one argument when unambiguous. Lookup order for bare filenames is conversation Scripts, then project Workflows (when a project is attached), then Skills -- so a project-scoped script with the same filename shadows a Skill one. Captures stdout/stderr/exit code. If the tool exits nonzero, do not claim success; fix the script or explain the failure.",
+            "Run an existing Python script from the conversation Scripts folder, an optional Python helper script from the active project's Workflows folder, or a Python helper script from the LlamaBoss Skills folder. Native args use {script, argv:[...]}; XML/legacy args still accept script on line 1 and one argv token per later line. Lookup order for bare filenames is conversation Scripts, then project Workflows (when a project is attached), then Skills -- so a project-scoped script with the same filename shadows a Skill one. This tool does not run ordinary Workspace .py files created by write/overwrite_file; create runnable scripts with python_create_script. Captures stdout/stderr/exit code. If the tool exits nonzero, do not claim success; fix the script or explain the failure.",
             kSchemaPythonRunScript,
             std::move(runSafety),
             ValPythonRunScript, DoPythonRunScript);
@@ -2872,15 +3212,25 @@ std::vector<ToolSpec> BuildBuiltinSpecs()
         ValWrite, DoWrite);
 
     add(tool_names::kOverwriteFile,
-        "Create or replace a whole file inside the working directory or active project root. Prefer this over edit for full-file replacement, project setup files, and generated scripts.",
+        "Create or replace a whole file inside the working directory or active project root. Prefer this over edit for full-file replacement and project setup files. Executable/scriptable extensions are blocked; use write_powershell_script for approved .ps1 project scripts.",
         kSchemaOverwriteFile,
-        MutatingCwdSafety("Creates or atomically replaces one whole file. Controlled write scoped to cwd or active project root. Python files are syntax-checked before commit when Python is available."),
+        MutatingCwdSafety("Creates or atomically replaces one whole non-executable file. Controlled write scoped to cwd or active project root. Python files are syntax-checked before commit when Python is available."),
         ValOverwriteFile, DoOverwriteFile);
 
+    {
+        ToolSafetyProfile psScriptSafety = MutatingCwdSafety("Creates or atomically replaces one PowerShell .ps1 script inside cwd or the active project root. Requires approval and does not execute the script.");
+        psScriptSafety.tier = RiskTier::Dangerous;
+        add(tool_names::kWritePowerShellScript,
+            "Create or replace a PowerShell .ps1 script inside the working directory or active project root after approval. Use this for generated build.ps1/run.ps1 project scripts. Shows the full script in the approval card and does not run it.",
+            kSchemaWritePowerShellScript,
+            std::move(psScriptSafety),
+            ValWritePowerShellScript, DoWritePowerShellScript);
+    }
+
     add(tool_names::kMkdir,
-        "Create a new directory inside the working directory or active project root.",
+        "Create a directory inside the working directory or active project root, including missing intermediate directories.",
         kSchemaMkdir,
-        MutatingCwdSafety("Creates a new directory. Controlled write scoped to cwd or active project root."),
+        MutatingCwdSafety("Creates directories recursively. Controlled write scoped to cwd or active project root."),
         ValMkdir, DoMkdir);
 
     add(tool_names::kEdit,
@@ -2988,12 +3338,78 @@ std::vector<ToolSpec> BuildBuiltinSpecs()
         webSafety.tier     = RiskTier::Safe;
         webSafety.readOnly = true;
         webSafety.network  = NetworkReach::PublicRead;
+        webSafety.isAsync  = true;
         webSafety.summary = "Read-only public webpage inspection using native WinHTTP. Supports http/https GET only, does not execute JavaScript, blocks local/private-network schemes and hosts, limits download size, and saves raw HTML plus extracted text artifacts in the conversation workspace.";
         add(tool_names::kWebFetchUrl,
             "Fetch a public webpage URL and extract readable text so you can summarize, explain, or answer questions about the site. Use when the user pastes a website link or asks what a page is about. Does not execute JavaScript or access logged-in browser sessions.",
             kSchemaWebFetchUrl,
             std::move(webSafety),
             ValWebFetchUrl, DoWebFetchUrl);
+    }
+
+    // ─── Presentation metadata ───────────────────────────────────
+    // Single authoritative icon + display-name table.  Values match
+    // the historical per-site assignments (PreFill calls in the
+    // dispatch bodies, tool_approval ladders, HandlePythonComplete's
+    // ternary ladder) so existing UI rendering is unchanged — the
+    // change is that those consumers now read THESE fields instead of
+    // maintaining their own copies.  When adding a tool, add one row
+    // here; nothing else needs to know about icons or display names.
+    struct ToolPresentationRow {
+        const char* name;
+        const char* icon;        // UTF-8 emoji bytes
+        const char* displayName;
+    };
+    static const ToolPresentationRow kPresentation[] = {
+        { tool_names::kRead,                 "\xF0\x9F\x93\x84", "Read" },                    // 📄
+        { tool_names::kReadHead,             "\xF0\x9F\x93\x84", "Read Head" },               // 📄
+        { tool_names::kLs,                   "\xF0\x9F\x93\x81", "List" },                    // 📁
+        { tool_names::kPwd,                  "\xE2\x9E\xA4",     "Pwd" },                     // ➤
+        { tool_names::kGrep,                 "\xF0\x9F\x94\x8D", "Grep" },                    // 🔍
+        { tool_names::kOpen,                 "\xE2\x96\xB6",     "Open" },                    // ▶
+        { tool_names::kPowerShell,           "\xE2\x9A\x99",     "PowerShell" },              // ⚙
+        { tool_names::kPythonHealth,         "\xF0\x9F\x90\x8D", "Python Health" },           // 🐍
+        { tool_names::kCsvInspect,           "\xF0\x9F\x93\x8A", "CSV Inspect" },             // 📊
+        { tool_names::kCsvReport,            "\xF0\x9F\x93\x9D", "CSV Report" },              // 📝
+        { tool_names::kCsvToXlsx,            "\xF0\x9F\x93\x97", "CSV to XLSX" },             // 📗
+        { tool_names::kXlsxInspect,          "\xF0\x9F\x93\x8A", "XLSX Inspect" },            // 📊
+        { tool_names::kXlsxReport,           "\xF0\x9F\x93\x97", "XLSX Report" },             // 📗
+        { tool_names::kXlsxCreateWorkbook,   "\xF0\x9F\x93\x97", "Create Workbook" },         // 📗
+        { tool_names::kPdfExtractText,       "\xF0\x9F\x93\x84", "PDF Extract Text" },        // 📄
+        { tool_names::kPdfInspectForm,       "\xF0\x9F\x93\x84", "PDF Inspect Form" },        // 📄
+        { tool_names::kPdfFillForm,          "\xF0\x9F\x93\x84", "PDF Fill Form" },           // 📄
+        { tool_names::kDocxExtractText,      "\xF0\x9F\x93\x84", "DOCX Extract Text" },       // 📄
+        { tool_names::kDocxInspect,          "\xF0\x9F\x93\x84", "DOCX Inspect" },            // 📄
+        { tool_names::kZipInspect,           "\xF0\x9F\x93\xA6", "ZIP Inspect" },             // 📦
+        { tool_names::kZipExtract,           "\xF0\x9F\x93\xA4", "ZIP Extract" },             // 📤
+        { tool_names::kPythonCreateScript,   "\xF0\x9F\x90\x8D", "Python Script" },           // 🐍
+        { tool_names::kPythonRunScript,      "\xF0\x9F\x90\x8D", "Python Run" },              // 🐍
+        { tool_names::kPythonInstallPackage, "\xF0\x9F\x90\x8D", "Install Python Package" },  // 🐍
+        { tool_names::kWrite,                "\xF0\x9F\x93\x9D", "Write" },                   // 📝
+        { tool_names::kOverwriteFile,        "\xE2\x99\xBB",     "Overwrite File" },          // ♻
+        { tool_names::kWritePowerShellScript,"\xF0\x9F\x93\x9D", "PowerShell Script" },       // 📝
+        { tool_names::kMkdir,                "\xE2\x9E\x95",     "Mkdir" },                   // ➕
+        { tool_names::kEdit,                 "\xE2\x9C\x8F",     "Edit" },                    // ✏
+        { tool_names::kDelete,               "\xF0\x9F\x97\x91", "Delete" },                  // 🗑
+        { tool_names::kNotesRead,            "\xF0\x9F\x93\x92", "Notes" },                   // 📒
+        { tool_names::kNotesAppend,          "\xF0\x9F\x93\x92", "Notes" },                   // 📒
+        { tool_names::kProjectNotesRead,     "\xF0\x9F\x93\x93", "Project Notes" },           // 📓
+        { tool_names::kProjectNotesAppend,   "\xF0\x9F\x93\x93", "Project Notes" },           // 📓
+        { tool_names::kWebFetchUrl,          "\xF0\x9F\x8C\x90", "Web Page Inspect" },        // 🌐
+    };
+
+    for (ToolSpec& s : specs) {
+        for (const ToolPresentationRow& row : kPresentation) {
+            if (s.name == row.name) {
+                s.iconUtf8    = row.icon;
+                s.displayName = row.displayName;
+                break;
+            }
+        }
+        // Debug-build tripwire: a registered tool without a
+        // presentation row renders with the warning-icon fallback.
+        assert(!s.displayName.empty() &&
+               "Tool registered without a row in kPresentation — add one.");
     }
 
     return specs;
@@ -3087,6 +3503,11 @@ std::string BuildToolsArrayJson(const ToolRouter& router)
                 auto var = p.parse(spec->parameters_json_schema);
                 params = var.extract<Poco::JSON::Object::Ptr>();
             } catch (...) {
+                // Schema parse failures mean one of our own kSchema* JSON
+                // constants is malformed.  Keep Release builds defensive by
+                // falling back to {}, but make Debug builds stop loudly so a
+                // bad schema cannot silently remove a tool's parameters.
+                assert(false && "Invalid built-in tool parameter schema JSON");
                 params = new Poco::JSON::Object;
                 params->set("type", std::string("object"));
             }
@@ -3116,6 +3537,36 @@ const std::string& GetCachedToolsArrayJson()
 
     std::call_once(initFlag, []() {
         cached = BuildToolsArrayJson(GetGlobalRouter());
+    });
+
+    return cached;
+}
+
+// ─── Prompt-facing tool name list ────────────────────────────────
+// Generated from the registry so the XML system prompt's canonical
+// "Available tool names:" line can never drift from the router.  The
+// hand-maintained predecessor of this line omitted read_head,
+// overwrite_file, and web_fetch_url while the same prompt's prose
+// instructed the model to use them — a contradiction that makes
+// literal-minded small models avoid working tools.
+std::string BuildToolNamesListText(const ToolRouter& router)
+{
+    std::string out;
+    for (const ToolSpec* spec : router.All()) {
+        if (!spec) continue;
+        if (!out.empty()) out += ", ";
+        out += spec->name;
+    }
+    return out;
+}
+
+const std::string& GetCachedToolNamesListText()
+{
+    static std::once_flag initFlag;
+    static std::string cached;
+
+    std::call_once(initFlag, []() {
+        cached = BuildToolNamesListText(GetGlobalRouter());
     });
 
     return cached;

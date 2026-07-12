@@ -15,6 +15,14 @@
 #include <string>
 #include <vector>
 
+// Header text shared with the context-block builders in LlamaBoss.cpp.
+// Keep these in one place so prompt policy and emitted section names do
+// not silently drift apart during future UI/prompt refactors.
+extern const char* const kGoalPromptProjectContextHeader;
+extern const char* const kGoalPromptSkillContextHeader;
+extern const char* const kGoalPromptPurposeContractDrafting;
+extern const char* const kGoalPromptPurposeVerification;
+
 struct GoalContractPromptInput {
     std::string skillContext;
     std::string projectContext;

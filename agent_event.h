@@ -20,7 +20,7 @@
 //
 // ─── Event taxonomy ─────────────────────────────────────────────
 // The enum is deliberately a little richer than today's UI needs:
-//   ToolCall           : model requested a tool; may still be approval-gated.
+//   ToolCall           : approved tool dispatch is starting.
 //   ToolOutput         : ordinary tool result card.
 //   ApprovalRequired   : risky invocation paused before execution.
 //   FileCreated        : specialized ToolOutput for write-created.
@@ -42,8 +42,8 @@
 // ─── End-reason taxonomy ─────────────────────────────────────────
 // Every loop ends for exactly one reason.  MyFrame uses the reason
 // to decide whether to show the controller-supplied user message
-// (Cancelled/IterationCap/MalformedCap/SendFailed/LoopGuard) or stay silent
-// (Normal/StreamError — MyFrame already surfaces error text in its
+// (Cancelled/IterationCap/MalformedCap/SendFailed/LoopGuard/ToolFailedStop)
+// or stay silent (Normal/StreamError — MyFrame already surfaces error text in its
 // own AssistantError handler before the loop unwinds).
 //
 #pragma once
@@ -86,6 +86,11 @@ enum class AgentEndReason {
     // too many times inside a small rolling window.  The loop stops
     // before dispatching the repeated call.
     LoopGuard,
+
+    // A tool result was terminal for this turn and intentionally stopped
+    // the loop instead of letting the model retry the same failing call.
+    // The terminal tool card contains the concrete failure details.
+    ToolFailedStop,
 };
 
 enum class AgentEventType {
@@ -120,6 +125,11 @@ struct AgentEvent {
     std::string commandEcho;
     std::string toolCallId;
 
+    // Normalized loop-guard signature for trace/log consumers.
+    // Empty for legacy observers or events that are not tied to a
+    // concrete tool dispatch.
+    std::string toolSignature;
+
     // LoopEnd payload.
     AgentEndReason endReason = AgentEndReason::Normal;
     std::string    userFacingMessage;
@@ -140,13 +150,15 @@ struct AgentEvent {
 
     static AgentEvent ToolCall(const std::string& name,
                                const std::string& echo,
-                               const std::string& callId)
+                               const std::string& callId,
+                               const std::string& signature = std::string())
     {
         AgentEvent e;
-        e.type        = AgentEventType::ToolCall;
-        e.toolName    = name;
-        e.commandEcho = echo;
-        e.toolCallId  = callId;
+        e.type          = AgentEventType::ToolCall;
+        e.toolName      = name;
+        e.commandEcho   = echo;
+        e.toolCallId    = callId;
+        e.toolSignature = signature;
         return e;
     }
 

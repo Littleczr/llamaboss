@@ -9,15 +9,19 @@
 //     CloseHandle() tears down the child AND any grandchildren cleanly
 //     (important — PowerShell readily spawns sub-processes).
 //   - Two anonymous pipes (one each for stdout and stderr) with the
-//     write ends marked inheritable; parent reads via two std::threads
+//     write ends explicitly whitelisted for inheritance via
+//     PROC_THREAD_ATTRIBUTE_HANDLE_LIST; parent reads via two std::threads
 //     so neither stream can block the child by filling a pipe buffer.
-//   - powershell.exe -NoProfile -NonInteractive
+//   - Fully-qualified Windows PowerShell 5.1 with -NoProfile -NonInteractive
 //                    -OutputFormat Text -EncodedCommand <b64>
 //     where the encoded payload is UTF-16LE of the UTF-8 console-encoding
 //     prefix plus the user's command.  Using -EncodedCommand makes
 //     quoting a non-issue for anything the user types.
 //
 #include "cmd_executor.h"
+
+#include "ps_command_hints.h"
+#include "workspace_delta.h"
 
 // wx
 #include <wx/log.h>
@@ -134,6 +138,22 @@ std::wstring ResolveUserProfileDir() {
     return buf;
 }
 
+// Resolve the intended system PowerShell executable once per launch.
+// Passing it as lpApplicationName avoids CreateProcessW's bare-name search
+// order (which can include the parent current directory / PATH shims).
+std::wstring ResolveSystemPowerShellExe()
+{
+    std::wstring sysDir(MAX_PATH, L'\0');
+    UINT n = GetSystemDirectoryW(sysDir.data(), static_cast<UINT>(sysDir.size()));
+    if (n == 0) return L"powershell.exe";
+    if (n >= sysDir.size()) {
+        sysDir.resize(n + 1, L'\0');
+        n = GetSystemDirectoryW(sysDir.data(), static_cast<UINT>(sysDir.size()));
+        if (n == 0) return L"powershell.exe";
+    }
+    sysDir.resize(n);
+    return sysDir + L"\\WindowsPowerShell\\v1.0\\powershell.exe";
+}
 
 std::string WideToUtf8(const std::wstring& in) {
     if (in.empty()) return std::string();
@@ -379,8 +399,81 @@ void ApplyLargeOutputHandlingLocal(CmdResult& result, const std::string& cwd)
     }
 
     std::string stem = SafeOutputStemLocal(result.command, "powershell_output");
-    ExternalizeOneStreamLocal(result, result.stdoutText, cwd, stem, "stdout", result.truncated);
-    ExternalizeOneStreamLocal(result, result.stderrText, cwd, stem, "stderr", result.truncated);
+    ExternalizeOneStreamLocal(result, result.stdoutText, cwd, stem, "stdout", result.stdoutTruncated);
+    ExternalizeOneStreamLocal(result, result.stderrText, cwd, stem, "stderr", result.stderrTruncated);
+}
+
+// ─── Workspace-delta support (see workspace_delta.h) ─────────────
+// PowerShell commands routinely create files (Compress-Archive,
+// Out-File, Copy-Item, redirects) but, unlike the write tool, never
+// attached the result as a card and never told the model whether the
+// file system actually changed.  Observed consequence (2026-06-11):
+// a silently-empty Get-ChildItem pipeline created nothing, exit 0,
+// and the model told the user the file was "attached above".
+
+std::string LanguageForCreatedFileLocal(const std::string& path)
+{
+    std::string name = LowerForOutputLocal(BaseNameLocal(path));
+    size_t dot = name.find_last_of('.');
+    if (dot == std::string::npos) return std::string();
+    std::string ext = name.substr(dot + 1);
+
+    if (ext == "ps1")  return "powershell";
+    if (ext == "py")   return "python";
+    if (ext == "cpp" || ext == "h" || ext == "hpp" || ext == "c")
+                       return "cpp";
+    if (ext == "md")   return "markdown";
+    if (ext == "json") return "json";
+    if (ext == "csv")  return "csv";
+    if (ext == "txt" || ext == "log") return "text";
+    if (ext == "html" || ext == "htm") return "html";
+    if (ext == "xml")  return "xml";
+    return std::string();   // binary / unknown: no language chip
+}
+
+bool IsBlankTextLocal(const std::string& s)
+{
+    for (char c : s) {
+        if (c != ' ' && c != '\t' && c != '\r' && c != '\n') return false;
+    }
+    return true;
+}
+
+// Attaches PresentedFile cards for files CREATED by the command and
+// returns the manifest text to append to stdout after externalization.
+// Modified files are reported by name only (no card) — re-attaching a
+// file the user already has open as a card on every touch is noise.
+std::string ApplyWorkspaceDeltaLocal(CmdResult&                       result,
+                                     const workspace_delta::Snapshot& before,
+                                     const std::string&               cwd)
+{
+    constexpr int    kMaxAttach    = 12;
+    constexpr size_t kMaxCardBytes = 25 * 1024 * 1024;   // mirror python_runner
+
+    workspace_delta::Snapshot after = workspace_delta::TakeSnapshot(cwd);
+    workspace_delta::Delta    delta = workspace_delta::Diff(before, after);
+
+    int attached = 0;
+    for (const std::string& path : delta.created) {
+        if (attached >= kMaxAttach) break;
+
+        auto it = after.files.find(path);
+        const unsigned long long size =
+            (it != after.files.end()) ? it->second.sizeBytes : 0;
+        if (size == 0 || size > kMaxCardBytes) continue;   // still listed in manifest
+
+        PresentedFile f;
+        f.displayName = BaseNameLocal(path);
+        f.language    = LanguageForCreatedFileLocal(path);
+        f.diskPath    = path;
+        f.sizeBytes   = static_cast<size_t>(size);
+        f.lineCount   = 0;   // size is shown on the chip; counting lines
+                             // would mean re-reading arbitrary files here
+        result.presentedFiles.push_back(std::move(f));
+        ++attached;
+    }
+
+    return workspace_delta::FormatManifest(delta, after, cwd);
 }
 
 // Monotonic clock snapshot in seconds since an arbitrary epoch.
@@ -426,10 +519,92 @@ struct HandleGuard {
     HANDLE release() { HANDLE r = h; h = nullptr; return r; }
 };
 
-// Pipe reader: drains `readEnd` into `dest` (under `mutex`), stopping
-// early after kMaxOutputBytes have been accepted (further bytes are
-// discarded but the pipe is still drained so the child doesn't block).
-void ReaderLoop(HANDLE readEnd, std::string& dest, std::mutex& destMutex,
+struct ProcThreadAttrGuard {
+    std::vector<BYTE> buffer;
+    LPPROC_THREAD_ATTRIBUTE_LIST attrs = nullptr;
+
+    ~ProcThreadAttrGuard() {
+        if (attrs) DeleteProcThreadAttributeList(attrs);
+    }
+
+    bool InitHandleList(HANDLE* handles, SIZE_T bytes, std::string& error) {
+        SIZE_T attrSize = 0;
+        InitializeProcThreadAttributeList(nullptr, 1, 0, &attrSize);
+        if (attrSize == 0) {
+            error = "InitializeProcThreadAttributeList(size) failed, error=" +
+                    std::to_string(GetLastError());
+            return false;
+        }
+
+        buffer.resize(attrSize);
+        attrs = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(buffer.data());
+        if (!InitializeProcThreadAttributeList(attrs, 1, 0, &attrSize)) {
+            error = "InitializeProcThreadAttributeList failed, error=" +
+                    std::to_string(GetLastError());
+            attrs = nullptr;
+            return false;
+        }
+
+        if (!UpdateProcThreadAttribute(attrs,
+                                       0,
+                                       PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                                       handles,
+                                       bytes,
+                                       nullptr,
+                                       nullptr)) {
+            error = "UpdateProcThreadAttribute(handle list) failed, error=" +
+                    std::to_string(GetLastError());
+            return false;
+        }
+        return true;
+    }
+};
+
+void TrimIncompleteUtf8Tail(std::string& s)
+{
+    if (s.empty()) return;
+
+    const size_t n = s.size();
+    size_t start = n - 1;
+    while (start > 0 &&
+           (static_cast<unsigned char>(s[start]) & 0xC0) == 0x80) {
+        --start;
+    }
+
+    unsigned char lead = static_cast<unsigned char>(s[start]);
+    size_t expected = 0;
+    if ((lead & 0x80) == 0x00) return;          // ASCII
+    else if ((lead & 0xE0) == 0xC0) expected = 2;
+    else if ((lead & 0xF0) == 0xE0) expected = 3;
+    else if ((lead & 0xF8) == 0xF0) expected = 4;
+    else {
+        // Invalid trailing byte sequence.  Since we only call this after
+        // a byte cap fired, prefer losing a few tail bytes over poisoning
+        // wxString::FromUTF8 for the whole captured stream.
+        s.resize(start);
+        return;
+    }
+
+    if (n - start < expected)
+        s.resize(start);
+}
+
+void CancelThreadSynchronousIoLocal(HANDLE threadHandle)
+{
+    if (!threadHandle) return;
+    using Fn = BOOL (WINAPI *)(HANDLE);
+    HMODULE kernel = GetModuleHandleW(L"kernel32.dll");
+    if (!kernel) return;
+    auto* fn = reinterpret_cast<Fn>(GetProcAddress(kernel, "CancelSynchronousIo"));
+    if (fn) fn(threadHandle);
+}
+
+// Pipe reader: drains `readEnd` into `dest`, stopping early after
+// kMaxOutputBytes have been accepted.  Further bytes are discarded but the
+// pipe is still drained so the child cannot block on a full pipe buffer.
+// Each stream has exactly one writer thread, and the worker reads `dest`
+// only after join(), so no per-stream mutex is needed.
+void ReaderLoop(HANDLE readEnd, std::string& dest,
                 std::atomic<bool>& truncatedFlag)
 {
     constexpr DWORD kChunk = 4096;
@@ -437,9 +612,8 @@ void ReaderLoop(HANDLE readEnd, std::string& dest, std::mutex& destMutex,
     for (;;) {
         DWORD got = 0;
         BOOL ok = ReadFile(readEnd, buf, kChunk, &got, nullptr);
-        if (!ok || got == 0) break;  // pipe closed or error -> done
+        if (!ok || got == 0) break;  // pipe closed/cancelled/error -> done
 
-        std::lock_guard<std::mutex> lk(destMutex);
         if (dest.size() < CmdExecutor::kMaxOutputBytes) {
             size_t room = CmdExecutor::kMaxOutputBytes - dest.size();
             size_t take = std::min<size_t>(got, room);
@@ -485,8 +659,9 @@ protected:
 
         // Clear running flag BEFORE posting event so that an event
         // handler that immediately tries to Start() another command
-        // sees us as idle.  This is safe because nobody else writes
-        // to this flag.
+        // sees us as idle.  A later completion event from run A can therefore
+        // arrive after run B has already started; UI handlers should consult
+        // IsRunning() rather than treating event arrival as an idle guarantee.
         if (m_runningFlag) m_runningFlag->store(false);
 
         PostCompletion(std::move(result));
@@ -513,8 +688,9 @@ private:
             return;
         }
         std::string b64 = Base64EncodeUtf16LE(payload);
+        std::wstring psExe = ResolveSystemPowerShellExe();
         std::wstring wCmdLine =
-            L"powershell.exe -NoProfile -NonInteractive "
+            L"\"" + psExe + L"\" -NoProfile -NonInteractive "
             L"-OutputFormat Text -EncodedCommand " +
             Utf8ToWide(b64);
 
@@ -566,12 +742,26 @@ private:
         }
 
         // 4. Spawn PowerShell (suspended), wire stdio, assign to job.
-        STARTUPINFOW si = {};
-        si.cb = sizeof(si);
-        si.dwFlags = STARTF_USESTDHANDLES;
-        si.hStdInput  = nullptr;             // no stdin for /cmd
-        si.hStdOutput = outW.h;
-        si.hStdError  = errW.h;
+        // The handle list keeps inheritance scoped to the two pipe write
+        // handles even though CreateProcessW still needs bInheritHandles=TRUE
+        // for STARTF_USESTDHANDLES to work.  This avoids cross-tool pipe
+        // leaks when another child process is spawned concurrently.
+        HANDLE inheritHandles[2] = { outW.h, errW.h };
+        ProcThreadAttrGuard attrList;
+        std::string attrError;
+        if (!attrList.InitHandleList(inheritHandles, sizeof(inheritHandles), attrError)) {
+            result.stderrText = attrError;
+            result.exitCode = -1;
+            return;
+        }
+
+        STARTUPINFOEXW si = {};
+        si.StartupInfo.cb = sizeof(si);
+        si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+        si.StartupInfo.hStdInput  = nullptr;             // no stdin for /cmd
+        si.StartupInfo.hStdOutput = outW.h;
+        si.StartupInfo.hStdError  = errW.h;
+        si.lpAttributeList = attrList.attrs;
 
         PROCESS_INFORMATION pi = {};
 
@@ -590,21 +780,32 @@ private:
         if (cwd.empty()) cwd = ResolveUserProfileDir();
         LPCWSTR cwdArg = cwd.empty() ? nullptr : cwd.c_str();
 
+        // Workspace-delta snapshot (see workspace_delta.h).  Taken only
+        // when a caller-provided CWD exists: agent/tool invocations pass
+        // the per-conversation Workspace folder, which is small and
+        // bounded.  The legacy empty-CWD path falls back to
+        // %USERPROFILE%, which is far too broad to scan — skip it there.
+        workspace_delta::Snapshot wsBefore;
+        const bool trackWorkspace = !m_cwd.empty();
+        if (trackWorkspace) {
+            wsBefore = workspace_delta::TakeSnapshot(m_cwd);
+        }
+
         BOOL ok = CreateProcessW(
-            nullptr,
+            psExe.c_str(),
             cmdBuf.data(),
             nullptr, nullptr,
-            TRUE,                                           // bInheritHandles
-            CREATE_NO_WINDOW | CREATE_SUSPENDED,
+            TRUE,                                           // required for whitelisted std handles
+            CREATE_NO_WINDOW | CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT,
             nullptr,                                        // inherit env
             cwdArg,
-            &si,
+            reinterpret_cast<LPSTARTUPINFOW>(&si),
             &pi
         );
         if (!ok) {
             DWORD err = GetLastError();
-            result.stderrText = "CreateProcess(powershell.exe) failed, "
-                                "error=" + std::to_string(err);
+            result.stderrText = "CreateProcess(PowerShell) failed for " +
+                                WideToUtf8(psExe) + ", error=" + std::to_string(err);
             result.exitCode = -1;
             return;
         }
@@ -631,14 +832,14 @@ private:
         CloseHandle(errW.release());
 
         // 5. Spin up reader threads.
-        std::mutex outMu, errMu;
-        std::atomic<bool> truncated(false);
+        std::atomic<bool> stdoutTruncated(false);
+        std::atomic<bool> stderrTruncated(false);
         std::thread outThread(ReaderLoop,
-            outR.h, std::ref(result.stdoutText), std::ref(outMu),
-            std::ref(truncated));
+            outR.h, std::ref(result.stdoutText),
+            std::ref(stdoutTruncated));
         std::thread errThread(ReaderLoop,
-            errR.h, std::ref(result.stderrText), std::ref(errMu),
-            std::ref(truncated));
+            errR.h, std::ref(result.stderrText),
+            std::ref(stderrTruncated));
 
         // 6. Wait loop: poll process with timeout, observe cancel
         //    flag, enforce the overall deadline.
@@ -668,7 +869,14 @@ private:
             // the entire process tree.
             CloseHandle(job.release());
             // Give the OS a beat to deliver the kill so readers unblock.
-            WaitForSingleObject(proc.h, 2000);
+            DWORD killed = WaitForSingleObject(proc.h, 2000);
+            if (killed == WAIT_TIMEOUT) {
+                // Rare escape hatch: if a stubborn process or leaked writer
+                // keeps a pipe open after the job kill, cancel the synchronous
+                // ReadFile calls so this detached worker cannot wedge forever.
+                if (outThread.joinable()) CancelThreadSynchronousIoLocal(outThread.native_handle());
+                if (errThread.joinable()) CancelThreadSynchronousIoLocal(errThread.native_handle());
+            }
         }
 
         // Drain readers.
@@ -682,7 +890,11 @@ private:
         else
             result.exitCode = -1;
 
-        result.truncated = truncated.load();
+        result.stdoutTruncated = stdoutTruncated.load();
+        result.stderrTruncated = stderrTruncated.load();
+        result.truncated = result.stdoutTruncated || result.stderrTruncated;
+        if (result.stdoutTruncated) TrimIncompleteUtf8Tail(result.stdoutText);
+        if (result.stderrTruncated) TrimIncompleteUtf8Tail(result.stderrText);
 
         // Strip PowerShell CLIXML serialization noise from both streams.
         // Must happen BEFORE the cancel/timeout breadcrumb below — we
@@ -691,13 +903,65 @@ private:
         StripClixmlInPlace(result.stderrText);
 
         // If we killed and nothing was written to stderr, leave a
-        // breadcrumb the display layer can style.
-        if (result.cancelled && result.stderrText.empty())
+        // breadcrumb the display layer can style.  On timeout, make the
+        // breadcrumb CORRECTIVE for the model, not just diagnostic —
+        // observed failure mode is a script/command that silently scans
+        // far more than asked (build trees, IDE caches) and emits
+        // nothing before the deadline, giving the model nothing to fix.
+        if (result.cancelled && result.stderrText.empty()) {
             result.stderrText = "[cancelled by user]\r\n";
-        else if (result.timedOut && result.stderrText.empty())
-            result.stderrText = "[timed out]\r\n";
+        } else if (result.timedOut && result.stderrText.empty()) {
+            result.stderrText =
+                "[timed out after " +
+                std::to_string(m_timeoutMs / 1000) + "s" +
+                (IsBlankTextLocal(result.stdoutText)
+                     ? " with no output. If this command scans or compresses "
+                       "directories, exclude build/IDE folders such as .vs, "
+                       ".git, x64, Debug, Release, node_modules, __pycache__, "
+                       "and emit progress as it works so partial output "
+                       "survives a timeout"
+                     : "") +
+                "]\r\n";
+        }
+
+        // Workspace delta: compute BEFORE large-output externalization
+        // (the externalized .txt lands under the chat root and must not
+        // self-report as a created file), but append the manifest text
+        // AFTER it (so the manifest stays in the inline preview instead
+        // of being swept into the saved output file).
+        std::string wsManifest;
+        bool stdoutWasBlank = IsBlankTextLocal(result.stdoutText);
+        if (trackWorkspace) {
+            wsManifest = ApplyWorkspaceDeltaLocal(result, wsBefore, m_cwd);
+        }
 
         ApplyLargeOutputHandlingLocal(result, m_cwd);
+
+        if (!wsManifest.empty()) {
+            if (!result.stdoutText.empty() && result.stdoutText.back() != '\n')
+                result.stdoutText += "\r\n";
+            if (!result.stdoutText.empty()) result.stdoutText += "\r\n";
+            result.stdoutText += wsManifest;
+        }
+
+        // Silent-no-op footgun hint (see ps_command_hints.h).  Only when
+        // the command "succeeded" with nothing to show for it: exit 0,
+        // no output, and no workspace changes — exactly the shape that
+        // makes a local model hallucinate success.
+        const bool noWorkspaceEffect =
+            wsManifest.empty() ||
+            wsManifest.find("no files were created") != std::string::npos;
+        if (result.exitCode == 0 && !result.timedOut && !result.cancelled &&
+            stdoutWasBlank && noWorkspaceEffect) {
+            std::string hint =
+                ps_command_hints::GetChildItemIncludeHint(result.command);
+            if (!hint.empty()) {
+                if (!result.stdoutText.empty() && result.stdoutText.back() != '\n')
+                    result.stdoutText += "\r\n";
+                result.stdoutText += hint;
+                result.stdoutText += "\r\n";
+            }
+        }
     }
 
     // Post the completion event back to the UI thread iff the frame
@@ -746,8 +1010,6 @@ bool CmdExecutor::Start(const std::string& command,
                         const std::string& cwd,
                         unsigned long      timeoutMs)
 {
-    if (IsRunning()) return false;
-
     // Reject empty / whitespace-only input.
     bool anyNonWs = false;
     for (char c : command) {
@@ -755,10 +1017,14 @@ bool CmdExecutor::Start(const std::string& command,
     }
     if (!anyNonWs) return false;
 
-    // Reset cancel flag for the new run; mark running up-front so a
-    // double-click on Send can't race us into two workers.
+    // Test-and-set atomically so two callers cannot race into two workers
+    // if Start() is ever reached off the UI thread.
+    bool expected = false;
+    if (!m_isRunning->compare_exchange_strong(expected, true))
+        return false;
+
+    // Reset cancel flag for the new run after we own the running slot.
     m_cancelFlag->store(false);
-    m_isRunning->store(true);
 
     auto* worker = new CmdWorkerThread(
         m_eventHandler,

@@ -11,6 +11,9 @@
 
 // Theme system
 #include "theme.h"
+// Active inference target descriptor (transport URL/path/tls/auth/protocol).
+// tool_protocol.h (pulled in transitively) is wx-only, so this stays light.
+#include "inference_target.h"
 // Forward declaration — full definition pulled in from server_manager.h
 // where needed. Defining it here avoids a cycle with server_manager.h
 // including us (via AppState pointer in some files).
@@ -19,6 +22,7 @@ struct ServerConfig;
 // Forward declaration to avoid pulling Poco JSON into every TU that
 // includes app_state.h.
 class SecretsStore;
+class EndpointStore;
 
 #include <memory>
 
@@ -38,6 +42,28 @@ public:
     void SetModel(const std::string& model);
     void SetApiUrl(const std::string& apiUrl);
 
+    // ── Active inference target ──────────────────────────────────
+    // The resolved endpoint the next chat turn is sent to. For the
+    // local lane this mirrors GetApiUrl()/GetModel() as a plain-http,
+    // no-auth, OpenAI-compatible target — SetApiUrl()/SetModel() keep
+    // it in sync, so existing callers need no changes. A remote
+    // endpoint installs the full descriptor (TLS + auth) via
+    // SetActiveTarget(), which also updates GetApiUrl() to match.
+    const InferenceTarget& GetActiveTarget() const { return m_activeTarget; }
+    void SetActiveTarget(const InferenceTarget& target);
+
+    // ── Last model selection (persisted) ─────────────────────────
+    // The user's most recent model choice, stored independently of the
+    // session model state so it survives a relaunch. For a local model
+    // this is the .gguf path; for a remote model it is the picker key
+    // "remote:<endpoint>/<model>". StartInitialServer reads it at boot to
+    // restore that choice — including re-activating a remote endpoint
+    // without spawning a local server. Written immediately on its own
+    // lifecycle (like the sidebar width / first-run flag), not bundled
+    // with SaveSettings.
+    std::string GetLastSelection() const;
+    void SetLastSelection(const std::string& selection);
+
     // Context length (tokens) used when launching llama-server.
     // Persisted across sessions via wxFileConfig.
     int  GetCtxSize() const { return m_ctxSize; }
@@ -54,6 +80,29 @@ public:
     // sessions. Default: false — users opt into tool execution.
     bool GetAgentDefaultOn() const { return m_agentDefaultOn; }
     void SetAgentDefaultOn(bool on);
+
+    // Context meter: show "ctx <used>/<window>" occupancy in the top
+    // bar.  The setting controls WIDGET VISIBILITY ONLY — the token
+    // accounting always runs (it is two integers parsed from a usage
+    // object the client already deserializes), so toggling the meter
+    // on mid-conversation shows an exact number immediately instead of
+    // an estimate.  Persisted across sessions.  Default: true.
+    bool GetContextMeterOn() const { return m_contextMeterOn; }
+    void SetContextMeterOn(bool on);
+
+    // 8-bit KV cache: launch the local llama-server with q8_0 K/V
+    // cache types (halves KV memory — roughly doubles the context
+    // that fits in VRAM).  Launch-argument setting: changes require
+    // a server restart, handled by the Settings flow like ctx size.
+    // Persisted across sessions.  Default: true.
+    bool GetKvCacheQ8() const { return m_kvCacheQ8; }
+    void SetKvCacheQ8(bool on);
+
+    // Maximum tool steps per agent turn (the iteration safety cap).
+    // Persisted across sessions; AgentController clamps and applies it.
+    // Default 12 matches the historical AgentController::kMaxIterations.
+    int  GetAgentMaxToolSteps() const { return m_agentMaxToolSteps; }
+    void SetAgentMaxToolSteps(int steps);
 
     // Build a ServerConfig populated with the user's current settings.
     // Callers use this instead of the default-constructed ServerConfig
@@ -127,15 +176,35 @@ public:
     // pointer) when spawning python_run_script subprocesses.
     SecretsStore* GetSecretsStore();
 
+    // ── Endpoints / remote inference ─────────────────────────────
+    // EndpointStore owns %LOCALAPPDATA%\LlamaBoss\endpoints.json — the
+    // non-secret config for remote OpenAI-compatible endpoints (URLs,
+    // headers, model lists, and which SecretsStore key to use). Lazily
+    // constructed and Load()ed on first access, exactly like the
+    // secrets store. The model switcher reads it to populate the picker
+    // and to resolve a selection into an InferenceTarget.
+    EndpointStore* GetEndpointStore();
+
 private:
     // Configuration data
     std::string m_currentModel;
     std::string m_currentApiUrl;
+
+    // Resolved send endpoint. Kept in sync with m_currentModel /
+    // m_currentApiUrl for the local lane; replaced wholesale for a
+    // remote endpoint via SetActiveTarget(). m_currentApiUrl remains
+    // the canonical persisted URL; this is the richer overlay the
+    // transport reads.
+    InferenceTarget m_activeTarget;
+
     std::string m_defaultModel;
     std::string m_defaultApiUrl;
     int         m_ctxSize = 8192;  // tokens — default matches ServerConfig default
-    int         m_fontSize = 16;   // points — default chat font size
+    int         m_fontSize = 15;   // points — default chat font size
     bool        m_agentDefaultOn = false;  // seed for new chats / app launches
+    bool        m_contextMeterOn = true;   // top-bar context occupancy readout
+    bool        m_kvCacheQ8 = true;        // q8_0 KV cache on local launches
+    int         m_agentMaxToolSteps = 12;  // agent tool-step safety cap
 
     // Application components
     Poco::Logger* m_logger;
@@ -145,6 +214,9 @@ private:
     // forward-declared type works in this header.  Constructed on
     // first GetSecretsStore() call.
     std::unique_ptr<SecretsStore> m_secretsStore;
+
+    // Lazily constructed on first GetEndpointStore() call (see above).
+    std::unique_ptr<EndpointStore> m_endpointStore;
 
     // Configuration file handling
     void LoadSettings();
@@ -159,5 +231,9 @@ private:
     static const char* CONFIG_CTX_SIZE_KEY;
     static const char* CONFIG_FONT_SIZE_KEY;
     static const char* CONFIG_AGENT_DEFAULT_ON_KEY;
+    static const char* CONFIG_CONTEXT_METER_KEY;
+    static const char* CONFIG_KV_CACHE_Q8_KEY;
+    static const char* CONFIG_AGENT_MAX_TOOL_STEPS_KEY;
     static const char* CONFIG_FIRST_RUN_KEY;
+    static const char* CONFIG_LAST_SELECTION_KEY;
 };

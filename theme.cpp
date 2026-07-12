@@ -98,9 +98,9 @@ ThemeData ThemeManager::GetDarkTheme()
     ThemeData t;
     t.name = "dark";
 
-    // Window / layout backgrounds
+    // Window / layout backgrounds  
     t.bgMain            = wxColour(14, 22, 33);       // #0E1621
-    t.bgToolbar         = wxColour(23, 33, 43);       //
+    t.bgToolbar         = wxColour(23, 33, 43);       // 
     t.bgSidebar         = wxColour(14, 22, 33);       // #0E1621
     t.bgInputField      = wxColour(36, 47, 61);       // #242F3D
     t.bgInputArea       = wxColour(23, 33, 43);       // #17212B — composer/footer surface

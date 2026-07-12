@@ -40,12 +40,15 @@ namespace tool_names {
     constexpr const char* kPdfFillForm    = "pdf_fill_form";
     constexpr const char* kDocxExtractText = "docx_extract_text";
     constexpr const char* kDocxInspect     = "docx_inspect";
+    constexpr const char* kZipInspect      = "zip_inspect";
+    constexpr const char* kZipExtract      = "zip_extract";
     constexpr const char* kPythonCreateScript = "python_create_script";
     constexpr const char* kPythonRunScript = "python_run_script";
     constexpr const char* kPythonInstallPackage = "python_install_package";
     constexpr const char* kOpen       = "open";
     constexpr const char* kWrite      = "write";
     constexpr const char* kOverwriteFile = "overwrite_file";
+    constexpr const char* kWritePowerShellScript = "write_powershell_script";
     constexpr const char* kMkdir      = "mkdir";
     constexpr const char* kEdit       = "edit";
     constexpr const char* kDelete     = "delete";

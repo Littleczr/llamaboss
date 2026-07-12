@@ -123,6 +123,35 @@ TopBarWidgets BuildTopBar(wxWindow* parent, wxBoxSizer* mainSizer,
 
     sizer->AddStretchSpacer(1);
 
+    // ── Context meter (right side) ──
+    // "ctx 18.2k/32k" occupancy readout for the model's context window.
+    // Same terminal-style monospace and muted color as the model pill;
+    // MyFrame::RefreshContextMeter() owns the label, color states
+    // (amber past the elision threshold, red near the window cap), and
+    // visibility (Settings → "Show context meter in the top bar").
+    // Same MSW quirk as the protocol chip above: create with a
+    // representative label so the control gets a real best size, then
+    // clear and hide until the frame's first refresh.
+    w.ctxMeter = new wxStaticText(
+        w.toolbarPanel,
+        wxID_ANY,
+        "ctx 888.8k/888.8k \xc2\xb7" "elided",
+        wxDefaultPosition,
+        wxSize(190, -1),
+        wxALIGN_RIGHT | wxST_NO_AUTORESIZE
+    );
+    w.ctxMeter->SetForegroundColour(theme.textMuted);
+    w.ctxMeter->SetBackgroundColour(theme.bgToolbar);
+    {
+        wxFont meterFont(10, wxFONTFAMILY_TELETYPE, wxFONTSTYLE_NORMAL,
+                         wxFONTWEIGHT_NORMAL, false, "Consolas");
+        w.ctxMeter->SetFont(meterFont);
+    }
+    w.ctxMeter->SetMinSize(wxSize(190, -1));
+    w.ctxMeter->SetLabel("");
+    w.ctxMeter->Hide();
+    sizer->Add(w.ctxMeter, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 10);
+
     // ── Right: New Chat button ──
     w.newChatButton = new wxButton(w.toolbarPanel, wxID_ANY, "+",
         wxDefaultPosition, wxSize(48, 44), wxBORDER_NONE);
@@ -190,15 +219,18 @@ InputAreaWidgets BuildInputArea(wxWindow* parent, wxBoxSizer* parentSizer,
     // Input row: [📎] [TextInput] [Send/Stop]
     w.inputSizer = new wxBoxSizer(wxHORIZONTAL);
 
-    // Attach button
+    // Attach button — sized up slightly (52x42/18pt → 58x46/21pt) so the
+    // paperclip reads clearly at high-DPI / large-monitor sizes.  If the
+    // frame styles a sibling icon button off this one (e.g. the agent
+    // toggle), keep its font size in step so the row stays balanced.
     wxString clip = wxString::FromUTF8("\xF0\x9F\x93\x8E");
     w.attachButton = new wxButton(w.inputContainer, wxID_ANY, clip,
-        wxDefaultPosition, wxSize(52, 42), wxBORDER_NONE);
+        wxDefaultPosition, wxSize(58, 46), wxBORDER_NONE);
     w.attachButton->SetBackgroundColour(theme.bgInputArea);
     w.attachButton->SetForegroundColour(theme.textMuted);
     w.attachButton->SetToolTip("Attach files");
     wxFont clipFont = w.attachButton->GetFont();
-    clipFont.SetPointSize(18);
+    clipFont.SetPointSize(21);
     w.attachButton->SetFont(clipFont);
     w.attachButton->SetCursor(wxCURSOR_HAND);
     w.inputSizer->Add(w.attachButton, 0, wxALIGN_CENTER_VERTICAL | wxLEFT, 6);

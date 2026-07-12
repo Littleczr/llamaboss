@@ -1,6 +1,7 @@
 ﻿// app_state.cpp
 #include "app_state.h"
 #include "secrets_store.h"
+#include "endpoint_store.h"
 #include "server_manager.h"   // for ServerConfig (MakeServerConfig)
 
 // wxWidgets headers
@@ -14,6 +15,8 @@
 #include <Poco/PatternFormatter.h>
 #include <Poco/FormattingChannel.h>
 #include <Poco/AutoPtr.h>
+#include <Poco/Channel.h>
+#include <Poco/Message.h>
 
 // Configuration constants
 const char* AppState::CONFIG_APP_NAME = "LlamaBoss";
@@ -23,7 +26,11 @@ const char* AppState::CONFIG_THEME_KEY = "Theme";
 const char* AppState::CONFIG_CTX_SIZE_KEY = "ContextLength";
 const char* AppState::CONFIG_FONT_SIZE_KEY = "ChatFontSize";
 const char* AppState::CONFIG_AGENT_DEFAULT_ON_KEY = "AgentDefaultOn";
+const char* AppState::CONFIG_CONTEXT_METER_KEY = "ContextMeterOn";
+const char* AppState::CONFIG_KV_CACHE_Q8_KEY = "KvCacheQ8";
+const char* AppState::CONFIG_AGENT_MAX_TOOL_STEPS_KEY = "AgentMaxToolSteps";
 const char* AppState::CONFIG_FIRST_RUN_KEY = "FirstRunCompleted";
+const char* AppState::CONFIG_LAST_SELECTION_KEY = "LastSelection";
 
 AppState::AppState()
     : m_currentModel("")
@@ -37,7 +44,20 @@ AppState::AppState()
 
 AppState::~AppState()
 {
-    LogShutdownMessage();
+    // Never let logging throw out of a destructor: if this dtor runs
+    // during stack unwinding (e.g. MyFrame's ctor aborting because
+    // Initialize() failed) a second in-flight exception means
+    // std::terminate — which is exactly the anonymous CRT abort()
+    // dialog this guard was added to kill.  The swallowing channel
+    // below makes Poco log calls non-throwing anyway; this is the
+    // belt-and-suspenders layer for the one place a throw is fatal
+    // by language rule rather than merely rude.
+    try {
+        LogShutdownMessage();
+    }
+    catch (...) {
+        // Nothing sane to do — the logger is the broken part.
+    }
     // No more Ollama model unloading — ServerManager handles process cleanup
 }
 
@@ -55,11 +75,41 @@ SecretsStore* AppState::GetSecretsStore()
     return m_secretsStore.get();
 }
 
+// Mirror of GetSecretsStore(): lazy construct + Load() on first access.
+// A missing endpoints.json seeds a default OpenRouter endpoint inside
+// Load(), so the picker always has at least one remote option.
+EndpointStore* AppState::GetEndpointStore()
+{
+    if (!m_endpointStore) {
+        m_endpointStore = std::make_unique<EndpointStore>();
+        m_endpointStore->Load();
+    }
+    return m_endpointStore.get();
+}
+
 
 bool AppState::Initialize()
 {
+    // Logger setup gets its own guard and is deliberately NON-fatal:
+    // the classic trigger is a second LlamaBoss.exe (or an AV scan)
+    // holding llamaboss.log open — Poco opens the file without
+    // shared write access, so the open throws.  A locked log file
+    // must not take the whole app down; every m_logger use in the
+    // codebase is already null-guarded, so running without file
+    // logging is safe.
     try {
         InitializeLogger();
+    }
+    catch (...) {
+        m_logger = nullptr;
+#ifdef __WXMSW__
+        ::OutputDebugStringA("LlamaBoss: file logger unavailable "
+                             "(log file locked or logs dir not writable); "
+                             "continuing without file logging.\n");
+#endif
+    }
+
+    try {
         LoadSettings();
         LogStartupMessage();
 
@@ -80,9 +130,19 @@ bool AppState::Initialize()
         return true;
     }
     catch (const std::exception& ex) {
-        if (m_logger) {
-            m_logger->error("Failed to initialize application state: " + std::string(ex.what()));
+        // This catch used to be a throw site itself: when the logger's
+        // file channel is the broken component, logging the failure
+        // re-attempts the file open and throws a second time, which
+        // then cascaded into terminate() via ~AppState during
+        // unwinding.  Guard it so Initialize() keeps its contract of
+        // returning false instead of exploding.
+        try {
+            if (m_logger) {
+                m_logger->error("Failed to initialize application state: "
+                                + std::string(ex.what()));
+            }
         }
+        catch (...) { /* logger is the broken part; nothing to do */ }
         return false;
     }
 }
@@ -92,6 +152,11 @@ void AppState::SetModel(const std::string& model)
     if (m_currentModel != model) {
         std::string previousModel = m_currentModel;
         m_currentModel = model;
+
+        // Keep the active target's wire model in sync. For the local
+        // lane the body carries the model separately, so this is
+        // belt-and-suspenders; for a remote endpoint it matters.
+        m_activeTarget.modelId = model;
 
         if (m_logger) {
             m_logger->information("Model changed from '" + previousModel + "' to '" + model + "'");
@@ -105,8 +170,32 @@ void AppState::SetApiUrl(const std::string& apiUrl)
         std::string previousUrl = m_currentApiUrl;
         m_currentApiUrl = apiUrl;
 
+        // SetApiUrl semantically means "point at this local lane":
+        // rebuild the active target as a plain-http, no-auth,
+        // OpenAI-compatible local target. A remote endpoint is
+        // installed via SetActiveTarget() instead, never here.
+        m_activeTarget = InferenceTarget::Local(m_currentApiUrl, m_currentModel);
+
         if (m_logger) {
             m_logger->information("API URL changed from '" + previousUrl + "' to '" + apiUrl + "'");
+        }
+    }
+}
+
+void AppState::SetActiveTarget(const InferenceTarget& target)
+{
+    m_activeTarget = target;
+
+    // Mirror the endpoint URL into the canonical field so GetApiUrl(),
+    // logging, and persistence reflect where turns actually go. Auth
+    // material lives only on the target and is never persisted here.
+    if (m_currentApiUrl != target.baseUrl) {
+        std::string previousUrl = m_currentApiUrl;
+        m_currentApiUrl = target.baseUrl;
+        if (m_logger) {
+            m_logger->information("Active endpoint changed from '" + previousUrl +
+                "' to '" + target.baseUrl + "' (" +
+                (target.managed ? "local" : "remote") + ")");
         }
     }
 }
@@ -156,10 +245,50 @@ void AppState::SetAgentDefaultOn(bool on)
     }
 }
 
+void AppState::SetContextMeterOn(bool on)
+{
+    if (m_contextMeterOn != on) {
+        m_contextMeterOn = on;
+        SaveSettings();
+        if (m_logger)
+            m_logger->information(std::string("Context meter changed to ") +
+                (on ? "ON" : "OFF"));
+    }
+}
+
+void AppState::SetKvCacheQ8(bool on)
+{
+    if (m_kvCacheQ8 != on) {
+        m_kvCacheQ8 = on;
+        SaveSettings();
+        if (m_logger)
+            m_logger->information(std::string("8-bit KV cache changed to ") +
+                (on ? "ON" : "OFF"));
+    }
+}
+
+void AppState::SetAgentMaxToolSteps(int steps)
+{
+    // Mirror AgentController::SetMaxToolSteps clamping so a hand-edited
+    // config value cannot persist out of range.
+    if (steps < 4)  steps = 4;
+    if (steps > 60) steps = 60;
+
+    if (m_agentMaxToolSteps != steps) {
+        int previous = m_agentMaxToolSteps;
+        m_agentMaxToolSteps = steps;
+        SaveSettings();
+        if (m_logger)
+            m_logger->information("Agent max tool steps changed from " +
+                std::to_string(previous) + " to " + std::to_string(steps));
+    }
+}
+
 ServerConfig AppState::MakeServerConfig() const
 {
     ServerConfig cfg;       // defaults for port / gpuLayers / threads / flashAttn
-    cfg.ctxSize = m_ctxSize;
+    cfg.ctxSize   = m_ctxSize;
+    cfg.kvCacheQ8 = m_kvCacheQ8;
     return cfg;
 }
 
@@ -186,6 +315,9 @@ void AppState::SaveSettings()
         cfg.Write(CONFIG_CTX_SIZE_KEY, (long)m_ctxSize);
         cfg.Write(CONFIG_FONT_SIZE_KEY, (long)m_fontSize);
         cfg.Write(CONFIG_AGENT_DEFAULT_ON_KEY, m_agentDefaultOn);
+        cfg.Write(CONFIG_CONTEXT_METER_KEY, m_contextMeterOn);
+        cfg.Write(CONFIG_KV_CACHE_Q8_KEY, m_kvCacheQ8);
+        cfg.Write(CONFIG_AGENT_MAX_TOOL_STEPS_KEY, (long)m_agentMaxToolSteps);
         cfg.Flush();
 
         if (m_logger) {
@@ -382,6 +514,29 @@ void AppState::SetSidebarWidth(int w)
     cfg.Flush();
 }
 
+// ── Last model selection (persisted) ───────────────────────────────
+// Own lifecycle via wxFileConfig, like the sidebar width above: a model
+// switch shouldn't rewrite every other setting, and this needs to survive
+// even if the user later cancels the Settings dialog.
+
+std::string AppState::GetLastSelection() const
+{
+    wxFileConfig cfg(CONFIG_APP_NAME);
+    wxString sel;
+    cfg.Read(CONFIG_LAST_SELECTION_KEY, &sel);
+    return std::string(sel.ToUTF8().data());
+}
+
+void AppState::SetLastSelection(const std::string& selection)
+{
+    wxFileConfig cfg(CONFIG_APP_NAME);
+    cfg.Write(CONFIG_LAST_SELECTION_KEY, wxString::FromUTF8(selection.c_str()));
+    cfg.Flush();
+
+    if (m_logger)
+        m_logger->information("Last selection saved: " + selection);
+}
+
 // ── Collapsed project sections in the sidebar ──────────────────────
 //
 // Stored as a single comma-separated string under "CollapsedProjects".
@@ -497,6 +652,32 @@ void AppState::LoadSettings()
         m_agentDefaultOn = savedAgentDefault;
     }
 
+    // Context meter: bool, absent on fresh installs (falls through to
+    // the m_contextMeterOn = true initializer from the header — the
+    // meter is on by default; the casual user it teaches the most is
+    // the one least likely to find a buried enable checkbox).
+    bool savedContextMeter = true;
+    if (cfg.Read(CONFIG_CONTEXT_METER_KEY, &savedContextMeter)) {
+        m_contextMeterOn = savedContextMeter;
+    }
+
+    // 8-bit KV cache: bool, absent on fresh installs (falls through to
+    // the m_kvCacheQ8 = true initializer from the header — on by
+    // default; q8_0 K/V costs nothing measurable and doubles usable
+    // context, so the checkbox exists as a kill switch, not an opt-in).
+    bool savedKvCacheQ8 = true;
+    if (cfg.Read(CONFIG_KV_CACHE_Q8_KEY, &savedKvCacheQ8)) {
+        m_kvCacheQ8 = savedKvCacheQ8;
+    }
+
+    long savedMaxSteps = 0;
+    if (cfg.Read(CONFIG_AGENT_MAX_TOOL_STEPS_KEY, &savedMaxSteps) &&
+        savedMaxSteps > 0) {
+        if (savedMaxSteps < 4)  savedMaxSteps = 4;
+        if (savedMaxSteps > 60) savedMaxSteps = 60;
+        m_agentMaxToolSteps = (int)savedMaxSteps;
+    }
+
     // Keep defaults if nothing was saved
     if (m_currentModel.empty()) {
         m_currentModel = m_defaultModel;
@@ -504,7 +685,55 @@ void AppState::LoadSettings()
     if (m_currentApiUrl.empty()) {
         m_currentApiUrl = m_defaultApiUrl;
     }
+
+    // Seed the active target from the loaded local config so the
+    // transport has a valid endpoint before the first model load.
+    m_activeTarget = InferenceTarget::Local(m_currentApiUrl, m_currentModel);
 }
+
+// ── Exception-safe log channel ───────────────────────────────────
+// Poco's FileChannel re-attempts the file open on EVERY log call and
+// throws on failure.  Left bare, that means a log file that becomes
+// unwritable at runtime (AV lock, disk full, second process) turns
+// every innocent m_logger->information() — in SetTheme, SetModel,
+// ServerManager, anywhere — into a throw site in code that never
+// expects one.  This wrapper makes the entire Poco logging path
+// non-throwing: failed writes are dropped silently, and because
+// FileChannel retries the open per call, logging self-heals the
+// moment the file becomes writable again.
+namespace {
+class LbSwallowingChannel : public Poco::Channel
+{
+public:
+    explicit LbSwallowingChannel(Poco::AutoPtr<Poco::Channel> inner)
+        : m_inner(std::move(inner)) {}
+
+    void log(const Poco::Message& msg) override
+    {
+        try {
+            if (m_inner) m_inner->log(msg);
+        }
+        catch (...) {
+            // Swallow: a broken log sink must never break the app.
+        }
+    }
+
+    void open() override
+    {
+        try { if (m_inner) m_inner->open(); }
+        catch (...) {}
+    }
+
+    void close() override
+    {
+        try { if (m_inner) m_inner->close(); }
+        catch (...) {}
+    }
+
+private:
+    Poco::AutoPtr<Poco::Channel> m_inner;
+};
+} // namespace
 
 void AppState::InitializeLogger()
 {
@@ -539,7 +768,12 @@ void AppState::InitializeLogger()
         new Poco::FormattingChannel(pPF, pFile)
     );
 
-    Poco::Logger::root().setChannel(pFC);
+    // Wrap the whole formatting/file stack so no log call anywhere in
+    // the app can throw — see LbSwallowingChannel above.
+    Poco::AutoPtr<Poco::Channel> pSafe(
+        new LbSwallowingChannel(Poco::AutoPtr<Poco::Channel>(pFC)));
+
+    Poco::Logger::root().setChannel(pSafe);
     Poco::Logger::root().setLevel(Poco::Message::PRIO_INFORMATION);
 
     m_logger = &Poco::Logger::get("LlamaBoss");
@@ -550,4 +784,8 @@ void AppState::SetDefaults()
 {
     m_currentModel = m_defaultModel;
     m_currentApiUrl = m_defaultApiUrl;
+
+    // Seed the active target so GetActiveTarget() is valid from the
+    // moment the ctor finishes, before LoadSettings() runs.
+    m_activeTarget = InferenceTarget::Local(m_currentApiUrl, m_currentModel);
 }

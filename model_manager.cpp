@@ -8,12 +8,15 @@
 #include "server_manager.h"
 #include "theme.h"
 #include "widgets.h"   // ApplyDialogThemeRecursive, ApplyDarkTitleBar
+#include "lb_project_ui_actions.h"
+#include "path_safety.h"
 
 #include <wx/filename.h>
 #include <wx/msgdlg.h>
 
 #include <sstream>
 #include <iomanip>
+#include <utility>
 
 // ─────────────────────────────────────────────────────────────────
 //  Button helpers (file-local)
@@ -94,16 +97,23 @@ wxBEGIN_EVENT_TABLE(ModelManagerDialog, wxDialog)
     EVT_BUTTON(wxID_CLOSE,       ModelManagerDialog::OnClose)
 wxEND_EVENT_TABLE()
 
-ModelManagerDialog::ModelManagerDialog(wxWindow* parent, const ThemeData* theme)
+ModelManagerDialog::ModelManagerDialog(wxWindow* parent,
+                                       const ThemeData* theme,
+                                       std::string loadedModelPath,
+                                       std::string configuredModelPath)
     : wxDialog(parent, wxID_ANY, "Manage Models", wxDefaultPosition, wxSize(640, 480),
                wxDEFAULT_DIALOG_STYLE | wxRESIZE_BORDER)
     , m_theme(theme)
+    , m_loadedModelPath(std::move(loadedModelPath))
+    , m_configuredModelPath(std::move(configuredModelPath))
 {
     // Bump dialog default font to match the rest of the dialog family.
     wxFont f = GetFont();
     f.SetPointSize(11);
     f.SetWeight(wxFONTWEIGHT_NORMAL);
     SetFont(f);
+
+    SetEscapeId(wxID_CLOSE);
 
     CreateControls();
     RefreshModelList();
@@ -130,7 +140,7 @@ void ModelManagerDialog::CreateControls()
 
     // ── Header: muted folder path line ──────────────────────────
     auto* headerLabel = new wxStaticText(body, wxID_ANY,
-        "Models folder: " + ServerManager::GetModelsDir());
+        "Models folder: " + wxString::FromUTF8(ServerManager::GetModelsDir()));
     wxFont hf = headerLabel->GetFont();
     hf.SetPointSize(10);
     headerLabel->SetFont(hf);
@@ -282,21 +292,63 @@ void ModelManagerDialog::RefreshModelList()
     m_statusText->SetLabel(wxString::Format("%ld model(s) found", row));
 }
 
+std::string ModelManagerDialog::SelectedModelPath() const
+{
+    if (!m_modelList) return {};
+    const long sel = m_modelList->GetNextItem(-1, wxLIST_NEXT_ALL,
+                                              wxLIST_STATE_SELECTED);
+    if (sel < 0 || sel >= static_cast<long>(m_modelPaths.size())) return {};
+    return m_modelPaths[static_cast<size_t>(sel)];
+}
+
+bool ModelManagerDialog::IsLoadedModelPath(const std::string& path) const
+{
+    return !path.empty() &&
+           !m_loadedModelPath.empty() &&
+           path_safety::SameModelPath(path, m_loadedModelPath);
+}
+
+bool ModelManagerDialog::IsConfiguredModelPath(const std::string& path) const
+{
+    return !path.empty() &&
+           !m_configuredModelPath.empty() &&
+           path_safety::SameModelPath(path, m_configuredModelPath);
+}
+
 // ── Event handlers ───────────────────────────────────────────────
 
-void ModelManagerDialog::OnContextMenu(wxContextMenuEvent&)
+void ModelManagerDialog::OnContextMenu(wxContextMenuEvent& event)
 {
-    // Right-click on the list. Only show the menu when there's a row
-    // selected to act on — otherwise the user is clicking empty space
-    // and the menu would be a dead end.
-    if (!m_modelList) return;
-    if (m_modelPaths.empty()) return;
-    long sel = m_modelList->GetNextItem(-1, wxLIST_NEXT_ALL, wxLIST_STATE_SELECTED);
-    if (sel < 0) return;
+    // Mouse right-click should target the row under the pointer, not
+    // whatever row happened to be selected before the click.  Keyboard
+    // context-menu events report (-1,-1), so those intentionally fall
+    // back to the current selection.
+    if (!m_modelList || m_modelPaths.empty()) return;
+
+    wxPoint popupAt;
+    const wxPoint screenPos = event.GetPosition();
+    if (screenPos.x == -1 && screenPos.y == -1) {
+        long sel = m_modelList->GetNextItem(-1, wxLIST_NEXT_ALL,
+                                            wxLIST_STATE_SELECTED);
+        if (sel < 0 || sel >= static_cast<long>(m_modelPaths.size())) return;
+        if (!m_modelList->GetItemPosition(sel, popupAt))
+            popupAt = wxPoint(8, 8);
+    } else {
+        const wxPoint pt = m_modelList->ScreenToClient(screenPos);
+        int flags = 0;
+        const long hit = m_modelList->HitTest(pt, flags);
+        if (hit < 0 || hit >= static_cast<long>(m_modelPaths.size())) return;
+        if ((flags & wxLIST_HITTEST_ONITEM) == 0) return;
+
+        m_modelList->SetItemState(hit,
+            wxLIST_STATE_SELECTED | wxLIST_STATE_FOCUSED,
+            wxLIST_STATE_SELECTED | wxLIST_STATE_FOCUSED);
+        popupAt = pt;
+    }
 
     wxMenu menu;
     menu.Append(ID_MM_DELETE, "Delete model");
-    PopupMenu(&menu);
+    m_modelList->PopupMenu(&menu, popupAt);
 }
 
 void ModelManagerDialog::OnCharHook(wxKeyEvent& event)
@@ -326,22 +378,50 @@ void ModelManagerDialog::OnDeleteClicked(wxCommandEvent&)
         return;
     }
 
-    if (sel >= (long)m_modelPaths.size()) return;
+    if (sel >= static_cast<long>(m_modelPaths.size())) return;
 
-    std::string modelPath = m_modelPaths[sel];
-    std::string displayName = m_modelList->GetItemText(sel).ToUTF8().data();
+    const std::string modelPath = m_modelPaths[static_cast<size_t>(sel)];
+    const wxString displayName = m_modelList->GetItemText(sel);
+    const wxString modelPathWx = wxString::FromUTF8(modelPath);
 
-    if (wxMessageBox(
-            wxString::Format("Delete \"%s\"?\n\nFile: %s\n\nThis cannot be undone.",
-                             displayName, modelPath),
-            "Confirm Delete", wxYES_NO | wxICON_WARNING, this) != wxYES)
+    if (IsLoadedModelPath(modelPath)) {
+        wxMessageBox(
+            "This model is currently loaded by llama-server.\n\n"
+            "Switch to another model before deleting it.",
+            "Model In Use", wxOK | wxICON_INFORMATION, this);
+        wxString status = "Cannot delete loaded model: ";
+        status += displayName;
+        m_statusText->SetLabel(status);
         return;
+    }
 
-    if (wxRemoveFile(wxString::FromUTF8(modelPath))) {
-        m_statusText->SetLabel("Deleted: " + displayName);
+    wxString confirm = "Delete \"";
+    confirm += displayName;
+    confirm += "\"?\n\nFile: ";
+    confirm += modelPathWx;
+    confirm += "\n\n";
+    if (IsConfiguredModelPath(modelPath)) {
+        confirm +=
+            "This model is currently selected/configured for LlamaBoss. "
+            "If you delete it, choose another model before sending your next message.\n\n";
+    }
+    confirm += "This cannot be undone.";
+
+    if (wxMessageBox(confirm, "Confirm Delete",
+                     wxYES_NO | wxICON_WARNING, this) != wxYES) {
+        return;
+    }
+
+    if (wxRemoveFile(modelPathWx)) {
+        wxString status = "Deleted: ";
+        status += displayName;
+        m_statusText->SetLabel(status);
         RefreshModelList();
     } else {
-        m_statusText->SetLabel("Failed to delete: " + displayName);
+        wxString status = "Failed to delete: ";
+        status += displayName;
+        status += " - file may be in use by llama-server";
+        m_statusText->SetLabel(status);
     }
 }
 
@@ -353,10 +433,7 @@ void ModelManagerDialog::OnRefreshClicked(wxCommandEvent&)
 void ModelManagerDialog::OnOpenFolderClicked(wxCommandEvent&)
 {
     ServerManager::EnsureDataDirs();
-#ifdef __WXMSW__
-    wxExecute("explorer \"" + wxString::FromUTF8(ServerManager::GetModelsDir()) + "\"",
-              wxEXEC_ASYNC);
-#endif
+    LbLaunchPathInOS(this, ServerManager::GetModelsDir(), "models folder");
 }
 
 void ModelManagerDialog::OnClose(wxCommandEvent&)
