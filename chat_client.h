@@ -26,8 +26,13 @@ wxDECLARE_EVENT(wxEVT_ASSISTANT_ERROR, wxCommandEvent);
 // native tool-calling protocol it may also have emitted a
 // structured tool_calls array; we surface that here.
 //
-// AssistantCompletePayload is attached via SetClientObject (wx
-// owns it and frees it after the event is consumed).  Recipients
+// AssistantCompletePayload is attached via SetClientObject.
+// IMPORTANT ownership contract: wxCommandEvent does NOT own or delete
+// its client object (wx/event.h keeps a raw m_clientObject with no
+// delete in any destructor -- it exists to point at control-owned
+// listbox item data).  The receiving handler must take ownership;
+// MyFrame::OnAssistantComplete wraps it in a std::unique_ptr as its
+// very first action, before any early return.  Recipients
 // that don't know about tool_calls can ignore the payload entirely
 // — the existing SetString-based contract is unchanged.
 //

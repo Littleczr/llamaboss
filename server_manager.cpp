@@ -18,6 +18,9 @@
 #include <Poco/Net/HTTPResponse.h>
 #include <Poco/StreamCopier.h>
 #include <Poco/Timespan.h>
+#include <Poco/JSON/Parser.h>
+#include <Poco/JSON/Array.h>
+#include <Poco/JSON/Object.h>
 
 #include <sstream>
 #include <fstream>
@@ -154,6 +157,67 @@ static bool LooksLikeJinjaOrTemplateFailure(const std::string& error)
     return false;
 }
 
+// ── Single-slot verification (startup backstop) ─────────────────
+// GET /slots and count the entries.  The launch command pins
+// --parallel 1, but llama-server's default changed under us once
+// already (1 → auto in late 2025, resolving to 4 slots + unified KV
+// + automatic slot assignment), and every KV-persistence assumption
+// in ServerManager is single-slot: ExecuteSlotAction hard-codes
+// /slots/0, the m_slotOwner/m_slotDirty contract assumes requests
+// serialize on one slot, and the multi-window queue notice promises
+// FIFO waiting.  If a future bundled binary ignores or repurposes
+// the flag, this logs an unmissable error at every launch instead of
+// letting the conversation-switch fast path corrupt silently (its
+// failures are swallowed by design).  Diagnostic only: runs after
+// wxEVT_SERVER_READY is posted so readiness is never delayed, and
+// every failure mode collapses to "unverified this launch".
+static void VerifySingleSlot(const std::string& baseUrl,
+                             Poco::Logger* logger)
+{
+    if (!logger) return;
+    try {
+        Poco::URI uri(baseUrl + "/slots");
+        Poco::Net::HTTPClientSession sess(uri.getHost(), uri.getPort());
+        sess.setTimeout(Poco::Timespan(2, 0));
+
+        Poco::Net::HTTPRequest req(Poco::Net::HTTPRequest::HTTP_GET,
+                                   uri.getPathAndQuery());
+        sess.sendRequest(req);
+
+        Poco::Net::HTTPResponse resp;
+        std::istream& in = sess.receiveResponse(resp);
+        std::string body;
+        Poco::StreamCopier::copyToString(in, body);
+
+        if (resp.getStatus() != Poco::Net::HTTPResponse::HTTP_OK) {
+            logger->warning("slotpin: /slots probe returned HTTP " +
+                            std::to_string((int)resp.getStatus()) +
+                            " - slot count unverified this launch");
+            return;
+        }
+
+        Poco::JSON::Parser p;
+        auto var = p.parse(body);
+        auto arr = var.extract<Poco::JSON::Array::Ptr>();
+        const std::size_t n = arr ? arr->size() : 0;
+
+        if (n == 1) {
+            logger->information("slotpin: verified single slot (n_slots=1)");
+        } else {
+            logger->error(
+                "slotpin: llama-server reports " + std::to_string(n) +
+                " slots despite --parallel 1. KV save/restore targets "
+                "/slots/0 and assumes serialized single-slot scheduling; "
+                "the conversation-switch fast path and the multi-window "
+                "busy notice are NOT safe under multi-slot assignment. "
+                "Check the bundled llama-server build before shipping.");
+        }
+    } catch (...) {
+        // Server stopping, endpoint refused, malformed body — all
+        // equivalent to "unverified this launch".  Never fatal.
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════
 
 ServerHealthThread::ServerHealthThread(wxEvtHandler* handler,
@@ -165,7 +229,8 @@ ServerHealthThread::ServerHealthThread(wxEvtHandler* handler,
 #endif
                                        const std::string& logPath,
                                        ServerLaunchGeneration generation,
-                                       int timeoutMs)
+                                       int timeoutMs,
+                                       Poco::Logger* logger)
     : wxThread(wxTHREAD_DETACHED)
     , m_handler(handler)
     , m_baseUrl(baseUrl)
@@ -177,6 +242,7 @@ ServerHealthThread::ServerHealthThread(wxEvtHandler* handler,
     , m_logPath(logPath)
     , m_generation(generation)
     , m_timeoutMs(timeoutMs)
+    , m_logger(logger)
 {
 #ifdef __WXMSW__
     // Duplicate the handle so we own our own copy. Required because
@@ -277,6 +343,13 @@ wxThread::ExitCode ServerHealthThread::Entry()
                 auto* ev = new wxCommandEvent(wxEVT_SERVER_READY);
                 SetServerEventGeneration(*ev, m_generation);
                 SafePost(ev);
+
+                // Post-ready, pre-exit: cheap /slots probe confirming
+                // the --parallel 1 pin actually took.  Ordered after
+                // SafePost so readiness latency is untouched; skipped
+                // when a StopServer already raced in.
+                if (!m_cancelFlag->load())
+                    VerifySingleSlot(m_baseUrl, m_logger);
 #ifdef __WXMSW__
                 if (m_processHandle != INVALID_HANDLE_VALUE)
                     CloseHandle(m_processHandle);
@@ -332,6 +405,11 @@ struct SlotAction {
     std::string baseUrl;
     std::string action;     // "save" | "restore"
     std::string filename;
+    // Outcome logging only.  A raw pointer is safe on the detached
+    // worker because Poco loggers live in the process-lifetime
+    // registry — unlike ServerManager members, which the worker must
+    // never touch (it can outlive the object).
+    Poco::Logger* logger = nullptr;
 };
 
 struct SlotActionQueue {
@@ -407,11 +485,58 @@ static std::string SlotCacheFilenameFor(const std::string& modelGgufPath,
     return m + "__" + c + ".kvbin";
 }
 
+// ── Slot-action response helpers ─────────────────────────────────
+// llama-server's save/restore responses carry useful telemetry:
+// {"n_saved":..,"n_written":..,"timings":{"save_ms":..}} and
+// {"n_restored":..,"n_read":..,"timings":{"restore_ms":..}}.
+// Field names have drifted across versions, so everything is parsed
+// as optional — an empty string just means "log without details".
+static std::string DescribeSlotActionResult(const std::string& action,
+                                            const std::string& body)
+{
+    try {
+        Poco::JSON::Parser p;
+        auto var = p.parse(body);
+        auto obj = var.extract<Poco::JSON::Object::Ptr>();
+        if (!obj) return "";
+
+        std::string out;
+        const char* nKey = (action == "restore") ? "n_restored" : "n_saved";
+        if (obj->has(nKey))
+            out += std::string(nKey) + "=" + obj->get(nKey).toString();
+
+        if (obj->has("timings")) {
+            auto t = obj->getObject("timings");
+            const char* msKey = (action == "restore") ? "restore_ms"
+                                                      : "save_ms";
+            if (t && t->has(msKey)) {
+                if (!out.empty()) out += ", ";
+                out += t->get(msKey).toString() + " ms";
+            }
+        }
+        return out;
+    } catch (...) {
+        return "";
+    }
+}
+
+// Control characters flattened, hard cap — error bodies go into a
+// single log line, and llama-server error JSON can embed newlines.
+static std::string SanitizeLogSnippet(std::string s)
+{
+    for (char& c : s)
+        if (static_cast<unsigned char>(c) < 0x20) c = ' ';
+    if (s.size() > 200) { s.resize(200); s += "..."; }
+    return s;
+}
+
 // Blocking POST /slots/0?action=<save|restore>.  Runs on the worker
 // thread only.  Value copies, no UI, no ServerManager member access —
-// the worker can outlive the object.  Failures are swallowed: server
-// gone, action rejected, timeout are all equivalent to "no fast path
-// this time", and the status quo (full reprocess) is the fallback.
+// the worker can outlive the object.  Failures are non-fatal but no
+// longer silent: server gone, action rejected, timeout are all
+// equivalent to "no fast path this time" with full reprocess as the
+// fallback, and each outcome is logged so the fast path's actual hit
+// rate is measurable instead of an article of faith.
 static void ExecuteSlotAction(const SlotAction& a)
 {
     try {
@@ -430,11 +555,35 @@ static void ExecuteSlotAction(const SlotAction& a)
 
         Poco::Net::HTTPResponse resp;
         std::istream& in = sess.receiveResponse(resp);
-        std::string drain;
-        Poco::StreamCopier::copyToString(in, drain);
-        (void)resp;
+        std::string respBody;
+        Poco::StreamCopier::copyToString(in, respBody);
+
+        const int status = static_cast<int>(resp.getStatus());
+        if (status >= 200 && status < 300) {
+            if (a.logger) {
+                const std::string details =
+                    DescribeSlotActionResult(a.action, respBody);
+                a.logger->information(
+                    "kvslot: " + a.action + " \"" + a.filename + "\" ok" +
+                    (details.empty() ? "" : " (" + details + ")"));
+            }
+        } else {
+            if (a.logger) {
+                std::string msg = "kvslot: " + a.action + " \"" + a.filename +
+                                  "\" failed (HTTP " + std::to_string(status) +
+                                  ") - full reprocess fallback";
+                const std::string snippet = SanitizeLogSnippet(respBody);
+                if (!snippet.empty()) msg += " | " + snippet;
+                a.logger->warning(msg);
+            }
+        }
     } catch (...) {
-        // Nothing to unwind.
+        // Connection refused / reset / timeout — the server is gone or
+        // going.  Same fallback, logged for the hit-rate picture.
+        if (a.logger)
+            a.logger->warning("kvslot: " + a.action + " \"" + a.filename +
+                              "\" failed (connection error/timeout) - "
+                              "full reprocess fallback");
     }
 }
 
@@ -452,7 +601,7 @@ void ServerManager::EnqueueSlotAction(const std::string& action,
     bool spawnWorker = false;
     {
         std::lock_guard<std::mutex> lock(q->mutex);
-        q->items.push_back({ GetBaseUrl(), action, filename });
+        q->items.push_back({ GetBaseUrl(), action, filename, m_logger });
         if (!q->workerRunning) {
             q->workerRunning = true;
             spawnWorker = true;
@@ -519,6 +668,41 @@ void ServerManager::NoteSlotOwner(const std::string& conversationPath)
     const std::string fname =
         SlotCacheFilenameFor(m_loadedModel, conversationPath);
     if (fname.empty()) return;
+
+    // ── Purge stale queued slot actions ──────────────────────────
+    // A generation for this conversation is dispatching on its own
+    // HTTP connection.  Any action still waiting in the CLIENT-side
+    // FIFO was enqueued under assumptions this generation is about
+    // to invalidate:
+    //
+    //   restore (this conversation)  — worthless: the generation
+    //     rebuilds the slot to a longer prefix than the file holds,
+    //     and letting it land AFTER the generation truncates the
+    //     slot back to a stale prefix and triggers a redundant
+    //     multi-GB rewrite on the next switch-away.
+    //   restore (other conversation) — worse: rapid multi-switch can
+    //     leave one queued; landing post-generation it clobbers the
+    //     slot with foreign KV while ownership says otherwise.
+    //   save — the slot's KV at execution time will be THIS
+    //     conversation's, not the state the save was enqueued to
+    //     capture; writing it would corrupt that conversation's
+    //     cache file.  Dropping it merely skips one incremental
+    //     update — the older file on disk stays prefix-valid.
+    //
+    // Only queued items are touched.  The in-flight action (already
+    // popped by the worker) is safe either way: once its POST reaches
+    // the server, llama-server's per-slot task queue serializes the
+    // generation behind it in arrival order.
+    bool purged = false;
+    if (m_slotQueue) {
+        std::lock_guard<std::mutex> lock(m_slotQueue->mutex);
+        purged = !m_slotQueue->items.empty();
+        m_slotQueue->items.clear();
+    }
+    if (purged && m_logger)
+        m_logger->information(
+            "kvslot: purged queued action(s) superseded by generation "
+            "dispatch for \"" + fname + "\"");
 
     m_slotOwner = fname;
     m_slotDirty = true;
@@ -1656,10 +1840,30 @@ bool ServerManager::StartServer(const std::string& ggufPath, const ServerConfig&
         }
     }
 
+    // ── Single-slot pinning ──────────────────────────────────────
+    // llama-server's --parallel default changed in late 2025 from 1
+    // to auto, which resolves to 4 slots + unified KV + automatic
+    // slot assignment (continuous batching is also on by default).
+    // Everything downstream is written against single-slot
+    // semantics: ExecuteSlotAction hard-codes /slots/0, the
+    // m_slotOwner/m_slotDirty ownership contract assumes requests
+    // serialize on one slot, and the multi-window queue notice in
+    // LlamaBoss.cpp promises FIFO waiting.  Under auto, a request
+    // can be scheduled onto slot 1-3 while save/restore silently
+    // targets a stale slot 0 — and slot-action failures are
+    // swallowed by design, so nothing would surface.  Pin it.
+    // An explicit --parallel 1 also keeps unified KV off (its
+    // default is "on when slot count is auto"), restoring the
+    // classic per-slot KV layout.  VerifySingleSlot() backstops
+    // this at every launch in case a future bundled binary changes
+    // flag semantics again.
+    cmd << " --parallel 1";
+
     // ── KV slot state persistence ────────────────────────────────
     // Always armed: --slot-save-path enables POST /slots/0?action=
     // save|restore (used by the conversation-switch fast path) and
-    // --slots enables the read-only slot listing for diagnostics.
+    // --slots enables the read-only slot listing for diagnostics —
+    // and, since the 2025 default change, the VerifySingleSlot probe.
     // Costs nothing when unused.
     cmd << " --slots --slot-save-path \"" << GetKvSlotCacheDir() << "\"";
 
@@ -1858,7 +2062,8 @@ bool ServerManager::StartServer(const std::string& ggufPath, const ServerConfig&
     m_healthCancelFlag = std::make_shared<std::atomic<bool>>(false);
     auto* healthThread = new ServerHealthThread(
         m_eventHandler, GetBaseUrl(), m_healthCancelFlag, m_aliveToken,
-        m_processHandle, healthLogPath, launchGeneration, 120000); // 2min timeout
+        m_processHandle, healthLogPath, launchGeneration, 120000, // 2min timeout
+        m_logger);
 
     auto failHealthMonitorStart = [&](const std::string& detail) -> bool {
         if (m_logger)

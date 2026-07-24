@@ -462,6 +462,11 @@ ChatDisplay::ChatDisplay(wxRichTextCtrl* displayCtrl)
                 const std::string& code = m_markdownRenderer->GetCodeBlock(static_cast<size_t>(blockIdx));
                 if (wxTheClipboard->Open()) {
                     wxTheClipboard->SetData(new wxTextDataObject(wxString::FromUTF8(code)));
+                    // Render the data to the OS clipboard immediately so
+                    // the copied code survives app close (and even an
+                    // unclean exit).  Without Flush, wx keeps the bytes
+                    // process-owned and empties the clipboard on exit.
+                    wxTheClipboard->Flush();
                     wxTheClipboard->Close();
                     m_markdownRenderer->MarkCopyLinkCopied(static_cast<size_t>(blockIdx));
                 }
@@ -2207,15 +2212,37 @@ void ChatDisplay::EndReplayBatch()
     if (m_markdownRenderer) m_markdownRenderer->SetBulkMode(false);
 
     if (m_displayCtrl) {
-        if (m_replayBatchNeedsScroll) {
-            m_displayCtrl->SetInsertionPointEnd();
-            m_displayCtrl->ShowPosition(m_displayCtrl->GetLastPosition());
-        }
         HideRichTextCaret(m_displayCtrl);
 
         if (m_replayBatchFrozen) {
             m_displayCtrl->Thaw();
             m_replayBatchFrozen = false;
+        }
+
+        if (m_replayBatchNeedsScroll) {
+            // Scroll AFTER Thaw, not before.  ShowPosition against a
+            // frozen control computes from a stale layout on MSW; image
+            // thumbnails and code-block sizing finish only after the
+            // thaw, so the document grows and a pre-thaw scroll lands
+            // short of the true bottom (the "old chat opens scrolled
+            // slightly up" bug).
+            m_displayCtrl->LayoutContent();
+            m_displayCtrl->SetInsertionPointEnd();
+            m_displayCtrl->ShowPosition(m_displayCtrl->GetLastPosition());
+
+            // Second, deferred pass once pending size/layout events have
+            // settled.  Scrolling to the virtual-size bottom (rather than
+            // a character position) is what deterministically pins the
+            // view to the end of a large restored conversation.
+            wxRichTextCtrl* ctrl = m_displayCtrl;
+            ctrl->CallAfter([ctrl]() {
+                ctrl->SetInsertionPointEnd();
+                ctrl->ShowPosition(ctrl->GetLastPosition());
+                int vx = 0, vy = 0, ppuX = 0, ppuY = 0;
+                ctrl->GetVirtualSize(&vx, &vy);
+                ctrl->GetScrollPixelsPerUnit(&ppuX, &ppuY);
+                if (ppuY > 0) ctrl->Scroll(-1, vy / ppuY);
+            });
         }
 
         // Thaw usually schedules a repaint, but Refresh() keeps the end of a

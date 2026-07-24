@@ -24,6 +24,7 @@
 #include <wx/filename.h>
 
 #include <map>
+#include <set>
 #include <string>
 
 class ConversationRegistry
@@ -40,6 +41,34 @@ public:
     void Remove(wxFrame* frame)
     {
         m_current.erase(frame);
+    }
+
+    // ── Session-scoped approval trust ────────────────────────────
+    // "Approve" (one-approval mode) used to die on every conversation
+    // reload because ChatHistory's trust flag is in-memory only and
+    // LoadFromFile always builds a fresh history.  These two methods
+    // give trust app-session lifetime instead: granting trust records
+    // the conversation's normalized path here, and the load path in
+    // ConversationController re-arms the ChatHistory flag when the
+    // same file is opened again in this run of LlamaBoss.
+    //
+    // Deliberately NOT persisted to disk: a chat reopened weeks later
+    // should not silently carry pre-approved delete/script-create.
+    // Restarting the app is the reset. python_install_package remains
+    // per-card regardless (IsToolChatApproved hard-refuses it).
+    // Empty paths (unsaved new chats) are ignored; the in-memory flag
+    // covers those until AutoSaveConversation assigns a path and
+    // syncs the claim here.
+    void RememberSessionTrust(const std::string& path)
+    {
+        const std::string key = Normalize(path);
+        if (!key.empty()) m_sessionTrust.insert(key);
+    }
+
+    bool HasSessionTrust(const std::string& path) const
+    {
+        const std::string key = Normalize(path);
+        return !key.empty() && m_sessionTrust.count(key) > 0;
     }
 
     // The frame (other than |exclude|) that currently has |path|
@@ -74,4 +103,8 @@ private:
     }
 
     std::map<wxFrame*, std::string> m_current;
+
+    // Normalized paths of conversations granted one-approval mode
+    // during this app session.  App lifetime; never saved to disk.
+    std::set<std::string> m_sessionTrust;
 };

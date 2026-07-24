@@ -582,6 +582,13 @@ void ConversationController::OnSaveConversation()
             // point, and this is that point).
             wxGetApp().GetConversationRegistry().SetCurrent(
                 &m_frame, m_chatHistory->GetFilePath());
+            // Session trust follows the conversation to its new path.
+            // (The old path keeps its session grant too; both names
+            // refer to content the user trusted this session.)
+            if (m_chatHistory->IsChatApprovalTrustEnabled()) {
+                wxGetApp().GetConversationRegistry().RememberSessionTrust(
+                    m_chatHistory->GetFilePath());
+            }
             UpdateWindowTitle();
             m_chatDisplay->DisplaySystemMessage("Conversation saved.");
         }
@@ -635,6 +642,14 @@ void ConversationController::AutoSaveConversation(bool refreshSidebar, bool dura
 
     const std::string savePath = m_chatHistory->GetFilePath();
     ChatHistory::EnsureWorkflowDir(savePath);
+
+    // Session trust: an unsaved chat can be granted one-approval mode
+    // before it has a file path (HandleApprovalCommand ignores empty
+    // paths).  Now that a path exists, record the grant so trust
+    // survives a later reload within this app session.
+    if (m_chatHistory->IsChatApprovalTrustEnabled()) {
+        wxGetApp().GetConversationRegistry().RememberSessionTrust(savePath);
+    }
 
     const std::vector<std::string> models{
         m_modelSwitcher.GetConversationModelForSave()
@@ -937,6 +952,15 @@ bool ConversationController::LoadConversationFromPath(const std::string& path)
     // claim implicitly — one claim per frame).
     wxGetApp().GetConversationRegistry().SetCurrent(
         &m_frame, m_chatHistory->GetFilePath());
+
+    // Session trust: LoadFromFile always starts with a clean approval
+    // state (chat_history.cpp commit block).  If this conversation was
+    // granted one-approval mode earlier in this app session, re-arm it
+    // so the user isn't re-prompted just for having switched chats.
+    if (wxGetApp().GetConversationRegistry().HasSessionTrust(
+            m_chatHistory->GetFilePath())) {
+        m_chatHistory->RememberAllToolApprovalsForChat();
+    }
 
     // ── Model handling: frame-owned preference, deferred service switch ──
     // Loading a conversation must not rewrite the app-global active target or

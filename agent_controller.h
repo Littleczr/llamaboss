@@ -52,8 +52,10 @@
 //   kMaxMalformedPerTurn: bail out if the model produces this many
 //                         un-parseable <tool_call> blocks in a row.
 //
-// User stop: calling Cancel() sets m_cancelled, which causes the
-// next event handler to stop the loop and emit OnAgentLoopEnd.
+// User stop: calling Cancel() sets m_cancelled. Async tool workers
+// finish through their completion event; a cancelled model stream
+// must be finalized explicitly with FinishCancelledStream() because
+// ChatClient intentionally suppresses terminal events after Stop.
 //
 // ─── ChatHistory lifetime ────────────────────────────────────────
 // We hold a REFERENCE to MyFrame's std::unique_ptr<ChatHistory>,
@@ -218,7 +220,15 @@ public:
     bool CancelPendingApproval();
 
     // User-initiated cancel (Stop button).  Safe no-op if inactive.
+    // Async tool workers still finish through their completion event.
     void Cancel();
+
+    // Complete cancellation when Stop terminated the active MODEL stream.
+    // ChatClient posts no completion/error event after cancellation, so the
+    // frame must call this after stopping the transport. Returns true only
+    // when it ended an active, non-worker, non-approval agent turn. The frame
+    // owns the already-visible "Generation stopped by user" message.
+    bool FinishCancelledStream();
 
     // ─── Event handlers (called from MyFrame on event dispatch) ──
     // Each returns true iff the controller "consumed" the event:

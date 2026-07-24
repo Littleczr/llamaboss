@@ -8,6 +8,7 @@
 
 #ifdef __WXMSW__
 #include <wx/msw/wrapwin.h>
+#include <wx/clipbrd.h>
 #include <thread>
 #endif
 
@@ -225,6 +226,19 @@ void MyApp::OpenNewWindowFromSecondLaunch()
 
 int MyApp::OnExit()
 {
+    // Keep whatever LlamaBoss put on the clipboard alive after we exit.
+    // wxWidgets on MSW places clipboard data in application-owned /
+    // delayed-render mode: the OS clipboard holds a promise and the
+    // actual bytes live in this process, and wx's cleanup EMPTIES the
+    // clipboard on exit unless Flush() renders it out first
+    // (OleFlushClipboard underneath).  Without this, copying a chat
+    // response and then closing the app made the paste target come up
+    // empty.  Covers Ctrl+C from the transcript, the input box, and
+    // the code-block [Copy] button alike.  Runs first, while the app
+    // is fully alive; harmless no-op when we don't own the clipboard.
+    if (wxTheClipboard)
+        wxTheClipboard->Flush();
+
     // Stop and join the second-launch listener before anything else
     // tears down — its CallAfter target is this app object.
     StopNewWindowListener();

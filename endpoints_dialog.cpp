@@ -89,7 +89,7 @@ wxPanel* MakeHairline(wxWindow* parent, const ThemeData& t)
     return line;
 }
 
-constexpr int kHintWrapWidth = 460;
+constexpr int kHintWrapWidth = 640;
 
 // Endpoint ids, secret provider/key names: lowercase letters, digits,
 // underscores — same identifier rule the Connections dialog uses.
@@ -112,11 +112,84 @@ bool IsSafeIdentifier(const wxString& s)
 // The edit dialog presents the model list as one line per model:
 //   anthropic/claude-sonnet-4.6 = Claude Sonnet 4.6
 //   google/gemini-2.5-flash-image = Nano Banana [image]
-// The part after the first '=' is the display name (optional; defaults
-// to the id). A trailing "[image]" tag (case-insensitive) marks an
-// image-generation model. Flags-as-line-suffix keeps the editor a
-// single monospace text box rather than a nested list control with a
-// checkbox column.
+// The part after the first '=' is the display name (optional). A
+// trailing "[image]" tag (case-insensitive) marks an image-generation
+// model; "[text]" forces it off. Both the display name and the image
+// flag are AUTO-DERIVED for bare ids so a casual user can paste just
+// the model id and be done:
+//   * ids whose last path segment contains the token "image"
+//     (gemini-3.1-flash-lite-image, gpt-image-1, ...) are auto-marked
+//     as image models -- explicit [image]/[text] always wins;
+//   * a missing display name is prettified from the id
+//     (google/gemini-3.1-flash-lite-image -> Gemini 3.1 Flash Lite
+//     Image) -- an explicit "= name" always wins.
+// Flags-as-line-suffix keeps the editor a single monospace text box
+// rather than a nested list control with a checkbox column.
+
+// True if the id's final path segment contains "image" as a token
+// delimited by '-', '_', '.', ':' or string edges.  Token match (not
+// substring) so a hypothetical "imagen-analyzer" style id doesn't
+// misfire on partial words.
+bool IdLooksLikeImageModel(const std::string& id)
+{
+    const auto slash = id.find_last_of('/');
+    std::string seg = (slash == std::string::npos) ? id
+                                                   : id.substr(slash + 1);
+    std::transform(seg.begin(), seg.end(), seg.begin(),
+                   [](unsigned char c) { return (char)std::tolower(c); });
+    std::string token;
+    auto flush = [&]() {
+        const bool hit = (token == "image");
+        token.clear();
+        return hit;
+    };
+    for (char c : seg) {
+        if (c == '-' || c == '_' || c == '.' || c == ':') {
+            if (flush()) return true;
+        } else {
+            token += c;
+        }
+    }
+    return flush();
+}
+
+// "google/gemini-3.1-flash-lite-image" -> "Gemini 3.1 Flash Lite Image"
+// "moonshotai/kimi-k3:free"            -> "Kimi K3 Free"
+// Last path segment; '-'/'_'/':' become spaces; each word gets an
+// uppercase first letter ('.'-joined version numbers pass through
+// untouched), plus a tiny acronym map for the usual suspects.
+std::string PrettyNameFromId(const std::string& id)
+{
+    const auto slash = id.find_last_of('/');
+    const std::string seg = (slash == std::string::npos)
+                                ? id : id.substr(slash + 1);
+    std::string out;
+    std::string word;
+    auto flushWord = [&]() {
+        if (word.empty()) return;
+        std::string lower = word;
+        std::transform(lower.begin(), lower.end(), lower.begin(),
+                       [](unsigned char c) { return (char)std::tolower(c); });
+        if (!out.empty()) out += ' ';
+        if (lower == "gpt" || lower == "ai" || lower == "vl" ||
+            lower == "xl") {
+            std::transform(lower.begin(), lower.end(), lower.begin(),
+                           [](unsigned char c) { return (char)std::toupper(c); });
+            out += lower;
+        } else {
+            lower[0] = (char)std::toupper((unsigned char)lower[0]);
+            out += lower;
+        }
+        word.clear();
+    };
+    for (char c : seg) {
+        if (c == '-' || c == '_' || c == ':') flushWord();
+        else                                  word += c;
+    }
+    flushWord();
+    return out.empty() ? id : out;
+}
+
 std::vector<EndpointStore::Model> ParseModelsText(const wxString& text)
 {
     std::vector<EndpointStore::Model> out;
@@ -132,29 +205,33 @@ std::vector<EndpointStore::Model> ParseModelsText(const wxString& text)
 
         EndpointStore::Model m;
 
-        // Strip a trailing [image] tag before the '=' split so it can
-        // follow either a bare id or a display name.
+        // Strip a trailing [image] / [text] tag before the '=' split so
+        // it can follow either a bare id or a display name.  [image]
+        // forces the flag on, [text] forces it off (overriding the
+        // id-based auto-detection below).
+        bool forcedText = false;
         {
-            static const std::string kTag = "[image]";
-            if (line.size() >= kTag.size()) {
-                std::string tail = line.substr(line.size() - kTag.size());
+            auto stripTag = [&line](const std::string& tag) -> bool {
+                if (line.size() < tag.size()) return false;
+                std::string tail = line.substr(line.size() - tag.size());
                 std::transform(tail.begin(), tail.end(), tail.begin(),
                                [](unsigned char c) { return (char)std::tolower(c); });
-                if (tail == kTag) {
-                    m.imageOutput = true;
-                    line.erase(line.size() - kTag.size());
-                    auto e = line.find_last_not_of(" \t");
-                    line = (e == std::string::npos)
-                               ? std::string()
-                               : line.substr(0, e + 1);
-                    if (line.empty()) continue;  // tag with no model id
-                }
-            }
+                if (tail != tag) return false;
+                line.erase(line.size() - tag.size());
+                auto e = line.find_last_not_of(" \t");
+                line = (e == std::string::npos)
+                           ? std::string()
+                           : line.substr(0, e + 1);
+                return true;
+            };
+            if      (stripTag("[image]")) m.imageOutput = true;
+            else if (stripTag("[text]"))  forcedText    = true;
+            if (line.empty()) continue;  // tag with no model id
         }
         const auto eq = line.find('=');
         if (eq == std::string::npos) {
             m.id = line;
-            m.displayName = line;
+            m.displayName = PrettyNameFromId(line);
         } else {
             std::string id   = line.substr(0, eq);
             std::string disp = line.substr(eq + 1);
@@ -167,8 +244,11 @@ std::vector<EndpointStore::Model> ParseModelsText(const wxString& text)
             m.id = trim(id);
             m.displayName = trim(disp);
             if (m.id.empty()) continue;
-            if (m.displayName.empty()) m.displayName = m.id;
+            if (m.displayName.empty())
+                m.displayName = PrettyNameFromId(m.id);
         }
+        if (!m.imageOutput && !forcedText && IdLooksLikeImageModel(m.id))
+            m.imageOutput = true;
         out.push_back(std::move(m));
     }
     return out;
@@ -212,7 +292,7 @@ public:
 
         auto labeledRow = [&](const wxString& label,
                               const wxString& value,
-                              int width = 320) -> wxTextCtrl* {
+                              int width = 480) -> wxTextCtrl* {
             auto* row = new wxBoxSizer(wxHORIZONTAL);
             auto* lbl = new wxStaticText(this, wxID_ANY, label);
             lbl->SetMinSize(wxSize(150, -1));
@@ -316,7 +396,7 @@ public:
 
         m_modelsField = new wxTextCtrl(this, wxID_ANY,
             ModelsToText(seed.models),
-            wxDefaultPosition, wxSize(-1, 110),
+            wxDefaultPosition, wxSize(-1, 140),
             wxTE_MULTILINE | wxHSCROLL);
         // Monospace for the id list — fits the rest of the app's voice.
         {
@@ -324,10 +404,12 @@ public:
             m_modelsField->SetFont(mono);
         }
         root->Add(m_modelsField, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 12);
-        hint("One model per line: <model id> = <display name>. The display "
-             "name is optional. Append [image] to mark an image-generation "
-             "model. e.g. google/gemini-2.5-flash-image = Nano Banana "
-             "[image]");
+        hint("One model per line - pasting just the model id is enough. "
+             "Display names are derived automatically (google/gemini-2.5-"
+             "flash-image -> Gemini 2.5 Flash Image) and ids containing "
+             "'image' are auto-marked as image-generation models. "
+             "Overrides: <id> = <name> sets the name; a trailing [image] "
+             "or [text] forces the image flag on or off.");
 
         // ── Buttons ─────────────────────────────────────────────
         root->Add(MakeHairline(this, theme), 0,
