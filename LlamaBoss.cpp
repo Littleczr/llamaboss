@@ -42,6 +42,7 @@
 #include <system_error>
 #include <atomic>
 #include <thread>
+#include <mutex>
 #include <stdexcept>
 #include <chrono>
 #include <cstdint>
@@ -113,7 +114,7 @@ wxDEFINE_EVENT(wxEVT_UPDATE_CHECK_RESULT, wxThreadEvent);
 #include "ascii_animation.h"
 
 // Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Application version Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
-static const char* LLAMABOSS_VERSION = "0.1.9";
+static const char* LLAMABOSS_VERSION = "0.1.10";
 
 // Native menu command ids. Keep above wxID_HIGHEST to avoid collisions
 // with stock wxWidgets commands.
@@ -236,8 +237,12 @@ const char* LbAgentEndReasonName(AgentEndReason reason)
 
 std::string LbUtcTimestampForJson()
 {
+    // Format explicitly in UTC: wxDateTime::Format defaults to the LOCAL
+    // timezone, so the previous FormatISOCombined('T') + "Z" stamped
+    // local wall time with a UTC designator into the agent traces.
     wxDateTime now = wxDateTime::UNow();
-    return now.FormatISOCombined('T').ToStdString() + "Z";
+    return now.Format("%Y-%m-%dT%H:%M:%S", wxDateTime::UTC).ToStdString()
+           + "Z";
 }
 
 std::string LbTraceTimestampForFilename()
@@ -245,6 +250,59 @@ std::string LbTraceTimestampForFilename()
     wxDateTime now = wxDateTime::UNow();
     return now.Format("%Y%m%d_%H%M%S").ToStdString();
 }
+
+// Joins fire-and-forget background threads at process exit.
+//
+// CheckForUpdates() used to std::thread(...).detach().  If the user quit
+// while the HTTP check was stalled, the leftover thread kept running
+// through static destruction and could touch function-local statics
+// (ui_event_post's mutex) mid-teardown -- the classic sporadic
+// crash-on-exit that never reproduces under a debugger.
+//
+// Threads launched through the keeper behave exactly like detached ones
+// while the app runs; the keeper's destructor joins them at exit.  The
+// singleton is constructed lazily on first use (well after the statics
+// those threads depend on), so reverse-order static destruction
+// guarantees the join happens while everything they touch is still
+// alive.  UpdateChecker::CheckBlocking has a hard 8 s network timeout,
+// so the worst-case exit delay is bounded and small; typical exits see
+// no delay because no check is in flight.
+class LbBackgroundThreadKeeper
+{
+public:
+    static LbBackgroundThreadKeeper& Instance()
+    {
+        static LbBackgroundThreadKeeper keeper;
+        return keeper;
+    }
+
+    void Launch(std::function<void()> fn)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_threads.emplace_back(std::move(fn));
+    }
+
+    ~LbBackgroundThreadKeeper()
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        for (auto& t : m_threads) {
+            if (t.joinable())
+                t.join();
+        }
+    }
+
+    LbBackgroundThreadKeeper(const LbBackgroundThreadKeeper&) = delete;
+    LbBackgroundThreadKeeper& operator=(const LbBackgroundThreadKeeper&) = delete;
+
+private:
+    LbBackgroundThreadKeeper() = default;
+
+    // Update checks are rare (gated by a per-frame in-flight flag), so the
+    // vector holds at most a handful of entries per session; finished
+    // threads join instantly at exit.
+    std::mutex m_mutex;
+    std::vector<std::thread> m_threads;
+};
 
 const wxColour& LbInteractiveAccentForTheme(const ThemeData& theme)
 {
@@ -683,6 +741,18 @@ private:
         );
         _chatDisplayCtrl->SetBackgroundColour(m_appState->GetTheme().bgMain);
         _chatDisplayCtrl->SetForegroundColour(m_appState->GetTheme().textPrimary);
+
+        // The chat display is presentation-only chrome: read-only, never
+        // user-edited, undo never wanted.  wxRichTextCtrl nevertheless
+        // routes every programmatic WriteText/Remove through its
+        // wxCommandProcessor by default, allocating an undo action per
+        // call -- and Remove() actions retain a styled copy of the text
+        // they deleted.  The streaming path (MarkdownRenderer's 16 ms
+        // flush: RemovePartialLine + segment-by-segment re-render) and
+        // full-conversation replay generate thousands of such actions
+        // per session, all dead weight.  Suppress undo for the
+        // control's lifetime; never paired with EndSuppressUndo.
+        _chatDisplayCtrl->BeginSuppressUndo();
         rightSizer->Add(_chatDisplayCtrl, 1, wxEXPAND | wxLEFT | wxRIGHT, 8);
 
         // Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ ATTACHMENT CHIP BAR (hidden by default) Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
@@ -752,6 +822,14 @@ private:
         _contentSizer->Add(_rightPanel, 1, wxEXPAND);
         mainSizer->Add(_contentSizer, 1, wxEXPAND);
         SetSizer(mainSizer);
+
+        // Composer drag-resize handle (separator above the input) +
+        // restore of any persisted manual height.  Same pattern as the
+        // sidebar-width restore above: read once at build, write on
+        // drag release.  0 = auto-grow, nothing to apply.
+        BindInputResizeHandle();
+        if (const int h = m_appState->GetInputAreaHeight(); h > 0)
+            ApplyInputHeightOverride(h);
     }
 
 
@@ -1351,6 +1429,19 @@ private:
     wxPanel*       _rightPanel;
     wxPanel*       _inputContainer;
     wxPanel*       _inputSeparator;
+
+    // ── Composer vertical drag-resize state ───────────────────────
+    // Mirror of ConversationSidebar's border drag, rotated 90°.
+    // m_inputHeightOverride > 0 means the user dragged the handle;
+    // OnUserInputChanged treats it as a *floor*, so content-driven
+    // auto-grow can still expand past it but never shrinks below it.
+    // 0 = pure auto-grow (the pre-feature behavior, and the default).
+    bool m_inputDragActive      = false;
+    int  m_inputDragStartY      = 0;
+    int  m_inputDragStartH      = 0;
+    int  m_inputDragAutoHeight  = 0;  // content floor sampled once per drag
+    int  m_inputHeightOverride  = 0;
+    static constexpr int kInputMinHeightPx = 30;  // auto-grow base height
 
     std::unique_ptr<ConversationSidebar> m_sidebar;
     bool m_isClosing;
@@ -2307,11 +2398,23 @@ private:
             // same-second collision with an existing file.
             std::string fname;
             std::string absPath;
+            bool freeNameFound = false;
             for (int bump = 0; bump < 1000; ++bump) {
                 fname = "generated_" + stamp + "_" +
                         std::to_string(seq + bump) + "." + ext;
                 absPath = genDir + "/" + fname;
-                if (!wxFileExists(wxString::FromUTF8(absPath))) break;
+                if (!wxFileExists(wxString::FromUTF8(absPath))) {
+                    freeNameFound = true;
+                    break;
+                }
+            }
+            if (!freeNameFound) {
+                // Practically unreachable (1000 same-second collisions),
+                // but the old loop fell out holding an EXISTING path and
+                // silently overwrote it.  Skip instead.
+                m_chatDisplay->DisplaySystemMessage(
+                    "generated image skipped: no free filename in " + genDir);
+                continue;
             }
 
             bool written = false;
@@ -2358,6 +2461,20 @@ private:
 
     void OnAssistantComplete(wxCommandEvent& event)
     {
+        // CRITICAL leak fix: wxCommandEvent does NOT delete its client
+        // object (wx/event.h keeps a raw m_clientObject; no wx destructor
+        // frees it -- it exists for pointing at control-owned item data).
+        // Take ownership as the very first action so EVERY exit path,
+        // including the stale-generation guard and the hidden skill/goal
+        // turn consumes below, frees the payload.  Image-generation turns
+        // carry the full base64 image data in here, so the old leak was
+        // multiple MB per generated image and one small payload per agent
+        // iteration on text turns.
+        std::unique_ptr<wxClientData> payloadOwner(event.GetClientObject());
+        event.SetClientObject(nullptr);
+        auto* payload =
+            dynamic_cast<AssistantCompletePayload*>(payloadOwner.get());
+
         if (m_isClosing) return;
         if (static_cast<unsigned long>(event.GetExtraLong()) != m_generationId) return;
 
@@ -2382,13 +2499,12 @@ private:
         // Agent-loop iterations do flow through here and re-anchor on
         // every iteration, which is exactly right: the meter visibly
         // climbs as the loop spends budget.
-        if (auto* usagePayload = dynamic_cast<AssistantCompletePayload*>(
-                event.GetClientObject())) {
-            if (usagePayload->PromptTokens() >= 0) {
-                m_ctxAnchorPromptTokens = usagePayload->PromptTokens();
+        if (payload) {
+            if (payload->PromptTokens() >= 0) {
+                m_ctxAnchorPromptTokens = payload->PromptTokens();
                 m_ctxAnchorCompletionTokens =
-                    usagePayload->CompletionTokens() > 0
-                        ? usagePayload->CompletionTokens() : 0;
+                    payload->CompletionTokens() > 0
+                        ? payload->CompletionTokens() : 0;
                 m_ctxAnchorExact = true;
                 RefreshContextMeter();
             }
@@ -2401,8 +2517,7 @@ private:
         // the chat renders an empty "model:" row before the tool card.
         std::string toolCallsJson;
         std::vector<std::string> imageDataUrls;
-        if (auto* payload = dynamic_cast<AssistantCompletePayload*>(
-                event.GetClientObject())) {
+        if (payload) {
             toolCallsJson = payload->ToolCallsJson();
             imageDataUrls = payload->ImageDataUrls();
         }
@@ -2904,6 +3019,18 @@ private:
         // typed-command fallback path hasn't, so this is where the row
         // actually vanishes for keyboard users.  Cheap either way.
         if (m_chatDisplay) m_chatDisplay->ClearApprovalButtons();
+
+        // Session trust: chat-wide approval survives switching away and
+        // back within this run of LlamaBoss.  Record the path here — the
+        // single choke point both the slash and agent paths route
+        // through for clicks AND typed commands — and let
+        // LoadConversationFromPath re-arm the ChatHistory flag on
+        // reload.  Unsaved chats have an empty path and are ignored;
+        // AutoSaveConversation syncs them once a path exists.
+        if (approve && rememberForChat && m_chatHistory) {
+            wxGetApp().GetConversationRegistry()
+                .RememberSessionTrust(m_chatHistory->GetFilePath());
+        }
 
         if (m_pendingSlashApproval.active) {
             if (approve) ExecuteApprovedSlashTool(rememberForChat);
@@ -3762,23 +3889,23 @@ private:
         if (m_goalController->HandleStopGeneration()) return;
 
         // Ã¢â€â‚¬Ã¢â€â‚¬ Agent loop cancellation Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
-        // If a loop is active, arm the cancel flag first so the
-        // NEXT event-driven transition (streaming complete, grep
-        // complete) tears down cleanly.  We still fall through to
-        // the per-state cancel below Ã¢â‚¬â€ the in-flight op needs to
-        // be stopped too, not just the loop wrapper.
-        if (m_agentController->IsActive()) {
+        // Arm agent cancellation before stopping the in-flight operation.
+        // Async workers retain their event-driven teardown. A model stream is
+        // different: ChatClient intentionally suppresses COMPLETE/ERROR after
+        // StopGeneration(), so we finalize that agent loop explicitly below.
+        const bool stoppingAgentStream = m_agentController->IsActive();
+        if (stoppingAgentStream) {
             m_agentController->Cancel();
 
             // If the agent is waiting on an async tool worker, Cancel()
-            // has already signaled that worker.  Do NOT fall through to
+            // has already signaled that worker. Do NOT fall through to
             // StopGeneration(), because there is no chat stream to stop;
             // the worker's completion event will reset the UI cleanly.
             if (m_agentController->IsAwaitingAsyncResult())
                 return;
 
-            // Otherwise fall through so the active chat stream gets its
-            // normal StopGeneration() signal.
+            // Otherwise fall through so the active model stream receives
+            // StopGeneration(), then synchronously close the agent lifecycle.
         }
 
         if (IsBusy()) {
@@ -3808,13 +3935,28 @@ private:
                 return;
             }
 
-            DiscardPendingAssistantDelta();
+            // Policy alignment with OnClose/OnAssistantError: commit the
+            // last batched delta (up to ~16 ms of streamed text) instead
+            // of dropping it, so Stop preserves exactly what was
+            // generated.  Must run BEFORE ++m_generationId or the flush
+            // discards the batch as stale.
+            FlushPendingAssistantDelta();
             ++m_generationId;
             m_chatClient->StopGeneration();
             m_chatDisplay->DisplayAssistantComplete();
             m_chatDisplay->DisplaySystemMessage("Generation stopped by user");
             if (m_chatHistory->HasAssistantPlaceholder())
                 m_chatHistory->RemoveLastAssistantMessage();
+
+            // A cancelled ChatClient posts no terminal event. Without this
+            // explicit agent-loop completion, m_agentController stays active
+            // forever and IsBusy() blocks both Send and model switching.
+            if (stoppingAgentStream) {
+                ResetAgentToolStreamFilter();
+                if (m_agentController->FinishCancelledStream())
+                    return;  // OnAgentLoopEnd performs the standard reset/save.
+            }
+
             SetStreamingState(false);
             m_chatDisplay->ClearFilePersistenceContext();
             if (!m_chatHistory->IsEmpty()) m_convController->AutoSaveConversation();
@@ -4142,15 +4284,19 @@ private:
         wxEvtHandler* target = this;
         std::weak_ptr<std::atomic<bool>> alive = m_alive;
 
-        std::thread([target, alive, current, silent]() {
-            UpdateChecker::UpdateInfo info =
-                UpdateChecker::CheckBlocking(current);
+        // Keeper instead of std::thread(...).detach(): identical runtime
+        // behavior, but the thread is joined at process exit so it can
+        // never race static destruction (see LbBackgroundThreadKeeper).
+        LbBackgroundThreadKeeper::Instance().Launch(
+            [target, alive, current, silent]() {
+                UpdateChecker::UpdateInfo info =
+                    UpdateChecker::CheckBlocking(current);
 
-            auto* ev = new wxThreadEvent(wxEVT_UPDATE_CHECK_RESULT);
-            ev->SetPayload(info);
-            ev->SetInt(silent ? 1 : 0);
-            LbQueueEventIfAlive(target, alive, ev);
-        }).detach();
+                auto* ev = new wxThreadEvent(wxEVT_UPDATE_CHECK_RESULT);
+                ev->SetPayload(info);
+                ev->SetInt(silent ? 1 : 0);
+                LbQueueEventIfAlive(target, alive, ev);
+            });
     }
 
     void OnUpdateCheckThreadResult(wxThreadEvent& event)
@@ -4664,35 +4810,188 @@ private:
         }
     }
 
+    int CalculateAutoInputHeight() const
+    {
+        if (!_userInputCtrl) return kInputMinHeightPx;
+
+        constexpr int MAX_LINES_TO_SHOW = 5;
+        const int lineHeight = _userInputCtrl->GetCharHeight() + 4;
+        const int lines = _userInputCtrl->GetNumberOfLines();
+
+        if (_userInputCtrl->IsEmpty() || lines <= 1)
+            return std::max(kInputMinHeightPx, lineHeight);
+
+        return std::max(lineHeight * std::min(lines, MAX_LINES_TO_SHOW),
+                        kInputMinHeightPx);
+    }
+
+    void LayoutInputAreaOnly()
+    {
+        // The composer lives entirely inside _rightPanel.  A full frame
+        // Layout() needlessly recalculates the toolbar, strips, sidebar,
+        // and outer content hierarchy on every mouse-move event.
+        if (_rightPanel && _rightPanel->GetSizer())
+            _rightPanel->GetSizer()->Layout();
+        if (_inputContainer && _inputContainer->GetSizer())
+            _inputContainer->GetSizer()->Layout();
+    }
+
     void OnUserInputChanged(wxCommandEvent&)
     {
         if (!_userInputCtrl || !_inputSizer) return;
 
-        const int DESIRED_BASE_HEIGHT = 30;
-        const int MAX_LINES_TO_SHOW = 5;
+        const bool hasExpandedContent =
+            !_userInputCtrl->IsEmpty() &&
+            _userInputCtrl->GetNumberOfLines() > 1;
 
-        int charHeight = _userInputCtrl->GetCharHeight();
-        int lineHeight = charHeight + 4;
-        int lines = _userInputCtrl->GetNumberOfLines();
-        const bool inputEmpty = _userInputCtrl->IsEmpty();
+        // The resize affordance is contextual: keep the compact one-line
+        // composer visually clean, then reveal the handle as soon as the
+        // text wraps or contains multiple lines.  Once the draft collapses
+        // back to one line, discard any manual height floor so the composer
+        // returns to its normal compact state and the handle can disappear.
+        if (!hasExpandedContent && m_inputHeightOverride > 0) {
+            m_inputHeightOverride = 0;
+            m_appState->SetInputAreaHeight(0);
+        }
 
-        int newH;
-        if (inputEmpty || lines == 1)
-            newH = std::max(DESIRED_BASE_HEIGHT, lineHeight);
-        else
-            newH = std::max(lineHeight * std::min(lines, MAX_LINES_TO_SHOW),
-                            DESIRED_BASE_HEIGHT);
+        int newH = CalculateAutoInputHeight();
+
+        // Manual drag override acts as a floor only while there is expanded
+        // content to work with.  Content-driven auto-grow can still exceed
+        // the dragged height.  Clamp against half the client height so a
+        // large value cannot swallow the chat display after a window resize.
+        if (hasExpandedContent && m_inputHeightOverride > 0) {
+            const int maxH = std::max(kInputMinHeightPx,
+                                      GetClientSize().y / 2);
+            newH = std::max(newH, std::min(m_inputHeightOverride, maxH));
+        }
+
+        bool layoutNeeded = false;
+
+        if (_inputSeparator &&
+            _inputSeparator->IsShown() != hasExpandedContent) {
+            _inputSeparator->Show(hasExpandedContent);
+            layoutNeeded = true;
+        }
 
         if (_userInputCtrl->GetMinSize().y != newH) {
             _userInputCtrl->SetMinSize(wxSize(-1, newH));
-            _inputSizer->Layout();
-            if (GetSizer()) GetSizer()->Layout();
+            layoutNeeded = true;
         }
 
-        // Context meter: re-price the pending composer text.  Cheap â€”
+        // Height and separator visibility are applied in one local layout,
+        // avoiding a second layout pass when the draft crosses the one-line
+        // / multi-line threshold.
+        if (layoutNeeded)
+            LayoutInputAreaOnly();
+
+        // Context meter: re-price the pending composer text.  Cheap —
         // the refresh uses GetLastPosition() (O(1), no buffer copy) and
         // only touches the widget when the rendered label changes.
         RefreshContextMeter();
+    }
+
+    // Fast path used only while the separator is actively being dragged.
+    // The content-driven floor was sampled on LEFT_DOWN, so there is no
+    // need to call GetNumberOfLines(), IsEmpty(), or RefreshContextMeter()
+    // for every mouse motion.  Typing cannot occur while this control owns
+    // mouse capture, so the sampled floor remains valid for the drag.
+    void ApplyInputDragHeight(int requestedHeight)
+    {
+        if (!_userInputCtrl) return;
+
+        const int maxH = std::max(kInputMinHeightPx,
+                                  GetClientSize().y / 2);
+        const int clampedH = std::clamp(requestedHeight,
+                                        kInputMinHeightPx, maxH);
+        const int newOverride =
+            (clampedH <= kInputMinHeightPx) ? 0 : clampedH;
+        const int effectiveH = std::max(
+            std::max(kInputMinHeightPx, m_inputDragAutoHeight),
+            newOverride > 0 ? newOverride : kInputMinHeightPx);
+
+        // Skip duplicate pixel positions generated by high-frequency mice.
+        if (m_inputHeightOverride == newOverride &&
+            _userInputCtrl->GetMinSize().y == effectiveH) {
+            return;
+        }
+
+        m_inputHeightOverride = newOverride;
+        if (_userInputCtrl->GetMinSize().y != effectiveH) {
+            _userInputCtrl->SetMinSize(wxSize(-1, effectiveH));
+            LayoutInputAreaOnly();
+        }
+    }
+
+    // ── Composer drag-resize ───────────────────────────────────────
+    // The separator above the input doubles as a vertical drag handle
+    // (same pattern as ConversationSidebar's right-edge border: mouse
+    // capture on LEFT_DOWN, screen-coordinate deltas on MOTION, persist
+    // on LEFT_UP, bail on CAPTURE_LOST).  Drag up = taller composer.
+    // Dragging back down to the base height — or double-clicking the
+    // handle — clears the override and returns to pure auto-grow.
+    void BindInputResizeHandle()
+    {
+        if (!_inputSeparator || !_userInputCtrl) return;
+
+        _inputSeparator->Bind(wxEVT_LEFT_DOWN, [this](wxMouseEvent& e) {
+            m_inputDragActive = true;
+            m_inputDragStartY =
+                _inputSeparator->ClientToScreen(e.GetPosition()).y;
+            m_inputDragStartH = _userInputCtrl->GetSize().y;
+            m_inputDragAutoHeight = CalculateAutoInputHeight();
+            _inputSeparator->CaptureMouse();
+        });
+        _inputSeparator->Bind(wxEVT_MOTION, [this](wxMouseEvent& e) {
+            if (!m_inputDragActive) return;
+            const int screenY =
+                _inputSeparator->ClientToScreen(e.GetPosition()).y;
+            const int delta = m_inputDragStartY - screenY;   // up = grow
+            ApplyInputDragHeight(m_inputDragStartH + delta);
+        });
+        _inputSeparator->Bind(wxEVT_LEFT_UP, [this](wxMouseEvent&) {
+            if (!m_inputDragActive) return;
+            m_inputDragActive = false;
+            if (_inputSeparator->HasCapture())
+                _inputSeparator->ReleaseMouse();
+            m_appState->SetInputAreaHeight(m_inputHeightOverride);
+        });
+        _inputSeparator->Bind(wxEVT_MOUSE_CAPTURE_LOST,
+            [this](wxMouseCaptureLostEvent&) {
+                m_inputDragActive = false;
+            });
+
+        // Double-click = reset to auto-grow, persisted immediately.
+        _inputSeparator->Bind(wxEVT_LEFT_DCLICK, [this](wxMouseEvent&) {
+            m_inputHeightOverride = 0;
+            m_appState->SetInputAreaHeight(0);
+            wxCommandEvent e(wxEVT_TEXT, _userInputCtrl->GetId());
+            OnUserInputChanged(e);   // snap back to content-driven height
+        });
+
+        // A window shrink can strand a large override (persisted on a
+        // taller monitor, say) above the half-height clamp.  Re-run the
+        // height computation on resize; OnUserInputChanged only touches
+        // layout when the effective height actually changes, so this is
+        // a no-op in the steady state.
+        Bind(wxEVT_SIZE, [this](wxSizeEvent& e) {
+            e.Skip();
+            if (m_inputHeightOverride > 0 && _userInputCtrl && _inputSizer) {
+                wxCommandEvent te(wxEVT_TEXT, _userInputCtrl->GetId());
+                OnUserInputChanged(te);
+            }
+        });
+    }
+
+    // Applies a manual composer height outside an active drag (startup
+    // restore and other programmatic paths).  Those infrequent paths keep
+    // the normal content-aware calculation; mouse motion uses the fast path
+    // above instead.
+    void ApplyInputHeightOverride(int h)
+    {
+        m_inputHeightOverride = (h <= kInputMinHeightPx) ? 0 : h;
+        wxCommandEvent e(wxEVT_TEXT, _userInputCtrl->GetId());
+        OnUserInputChanged(e);
     }
 
     void OnCharHook(wxKeyEvent& evt)
@@ -4805,11 +5104,31 @@ private:
         if (m_chatState == ChatState::AwaitingApproval) {
             if (userInput.empty()) return true;
 
+            const auto action =
+                lb_input_parsers::ParseApprovalInput(userInput);
+
+            if (action ==
+                lb_input_parsers::ApprovalInputAction::Unrecognized) {
+                // Two fixes vs the old branch:
+                //  * do NOT clear the composer -- clearing silently
+                //    destroyed the user's typed draft;
+                //  * use a system line, not DisplayAssistantMessage --
+                //    the old fake assistant turn was never added to
+                //    history, so the transcript and the saved
+                //    conversation diverged on reload.
+                m_chatDisplay->DisplaySystemMessage(
+                    "Approval is still pending. Use the buttons above, "
+                    "or type approve / allow once / deny. Your draft is "
+                    "kept in the input box.");
+                _userInputCtrl->SetFocus();
+                return true;
+            }
+
             _userInputCtrl->Clear();
             { wxCommandEvent e(wxEVT_TEXT, _userInputCtrl->GetId());
               OnUserInputChanged(e); }
 
-            switch (lb_input_parsers::ParseApprovalInput(userInput)) {
+            switch (action) {
             case lb_input_parsers::ApprovalInputAction::ApproveOnce:
                 HandleApprovalCommand(true, /*rememberForChat=*/false);
                 break;
@@ -4819,13 +5138,7 @@ private:
             case lb_input_parsers::ApprovalInputAction::Deny:
                 HandleApprovalCommand(false);
                 break;
-            case lb_input_parsers::ApprovalInputAction::Unrecognized:
-                m_chatDisplay->DisplayAssistantMessage(
-                    ServerManager::ModelDisplayName(
-                        m_modelSwitcher->GetConversationModelForSave()),
-                    "Approval is still pending. Use the buttons above to respond.",
-                    m_appState->GetTheme().chatAssistant);
-                _userInputCtrl->SetFocus();
+            default:
                 break;
             }
             return true;

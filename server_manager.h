@@ -84,7 +84,8 @@ public:
 #endif
                        const std::string& logPath,
                        ServerLaunchGeneration generation,
-                       int timeoutMs = 60000);
+                       int timeoutMs = 60000,
+                       Poco::Logger* logger = nullptr);
 protected:
     ExitCode Entry() override;
 private:
@@ -98,6 +99,7 @@ private:
     std::string   m_logPath;
     ServerLaunchGeneration m_generation;
     int m_timeoutMs;
+    Poco::Logger* m_logger;   // app logger; nullable — verification is best-effort
     bool SafePost(wxCommandEvent* ev);
 };
 

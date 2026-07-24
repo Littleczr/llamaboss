@@ -73,6 +73,46 @@ std::string WxToUtf8String(const wxString& s)
     return buf.data() ? std::string(buf.data()) : std::string();
 }
 
+bool IsLegacySessionContextTitle(const std::string& title)
+{
+    return title.rfind("[Session context:", 0) == 0;
+}
+
+std::string CollapseSidebarTitleWhitespace(std::string text)
+{
+    std::string out;
+    out.reserve(text.size());
+    bool lastWasSpace = false;
+
+    for (unsigned char ch : text) {
+        if (std::isspace(ch)) {
+            if (!lastWasSpace && !out.empty()) out.push_back(' ');
+            lastWasSpace = true;
+        } else {
+            out.push_back(static_cast<char>(ch));
+            lastWasSpace = false;
+        }
+    }
+    while (!out.empty() && out.back() == ' ') out.pop_back();
+    return out;
+}
+
+// Old conversation files created after the per-turn clock header was added
+// may have persisted that internal header as their title.  For those files
+// only, derive a display title from the first real user message while the
+// sidebar is already scanning the JSON.  No model/API call is involved.
+std::string MeaningfulTitleFromStoredUserContent(std::string content)
+{
+    if (content.rfind("[Session context:", 0) == 0) {
+        const size_t closeBracket = content.find(']');
+        if (closeBracket == std::string::npos) return {};
+        content.erase(0, closeBracket + 1);
+    }
+
+    content = CollapseSidebarTitleWhitespace(std::move(content));
+    return content;
+}
+
 wxString SidebarDisplayTitleFromUtf8(const std::string& utf8)
 {
     // Titles are stored as UTF-8 in the JSON conversation files.  Decode
@@ -80,8 +120,8 @@ wxString SidebarDisplayTitleFromUtf8(const std::string& utf8)
     // split a multi-byte UTF-8 sequence and accidentally feed invalid UTF-8
     // back into wxStaticText.
     wxString title = wxString::FromUTF8(utf8.c_str());
-    if (title.length() > 35)
-        title = title.Left(32) + wxS("...");
+    if (title.length() > 64)
+        title = title.Left(61) + wxS("...");
     return title;
 }
 
@@ -190,11 +230,23 @@ ConversationSidebar::ConversationSidebar(wxWindow* parent,
     });
     m_border->Bind(wxEVT_MOTION, [this](wxMouseEvent& e) {
         if (!m_dragging) return;
-        int screenX = m_border->ClientToScreen(e.GetPosition()).x;
-        int delta = screenX - m_dragStartX;
-        int newW = std::clamp(m_dragStartWidth + delta, MIN_WIDTH, MAX_WIDTH);
+
+        const int screenX = m_border->ClientToScreen(e.GetPosition()).x;
+        const int delta = screenX - m_dragStartX;
+        const int newW = std::clamp(m_dragStartWidth + delta,
+                                    MIN_WIDTH, MAX_WIDTH);
+
+        // High-frequency mice can deliver many motion events that map to
+        // the same integer width.  Avoid a redundant sizer pass in that
+        // case, and lay out only the horizontal content sizer rather than
+        // the complete frame (toolbar, project strip, etc.).
+        if (m_panel->GetMinSize().x == newW) return;
+
         m_panel->SetMinSize(wxSize(newW, -1));
-        m_panel->GetParent()->Layout();
+        if (wxSizer* containingSizer = m_panel->GetContainingSizer())
+            containingSizer->Layout();
+        else if (wxWindow* parent = m_panel->GetParent())
+            parent->Layout();  // Defensive fallback for an unusual host.
     });
     m_border->Bind(wxEVT_LEFT_UP, [this](wxMouseEvent&) {
         if (!m_dragging) return;
@@ -962,8 +1014,39 @@ ConversationSidebar::ScanConversations()
                     };
 
                     std::string line;
+                    bool scanningMessagesForLegacyTitle = false;
+                    bool nextContentBelongsToUser = false;
+
                     while (std::getline(file, line)) {
-                        if (line.find("\"messages\"") != std::string::npos) break;
+                        if (!scanningMessagesForLegacyTitle &&
+                            line.find("\"messages\"") != std::string::npos) {
+                            // Normal files stop at the message array exactly as
+                            // before.  Legacy session-context titles get one
+                            // narrow fallback scan for the first user message.
+                            if (!IsLegacySessionContextTitle(entry.title)) break;
+                            scanningMessagesForLegacyTitle = true;
+                            continue;
+                        }
+
+                        if (scanningMessagesForLegacyTitle) {
+                            std::string role;
+                            if (extractStringField(line, "role", role)) {
+                                nextContentBelongsToUser = (role == "user");
+                                continue;
+                            }
+
+                            if (nextContentBelongsToUser) {
+                                std::string storedContent;
+                                if (extractStringField(line, "content", storedContent)) {
+                                    std::string repaired =
+                                        MeaningfulTitleFromStoredUserContent(
+                                            std::move(storedContent));
+                                    if (!repaired.empty()) entry.title = std::move(repaired);
+                                    break;
+                                }
+                            }
+                            continue;
+                        }
 
                         if (!sawTitle && extractStringField(line, "title", entry.title))
                             sawTitle = true;
@@ -980,7 +1063,11 @@ ConversationSidebar::ScanConversations()
                         if (!sawObjective && extractStringField(line, "objective", entry.goalObjective))
                             sawObjective = true;
 
-                        if (sawTitle && sawProjectId && sawProjectName && sawObjective) break;
+                        if (sawTitle && sawProjectId && sawProjectName &&
+                            sawObjective &&
+                            !IsLegacySessionContextTitle(entry.title)) {
+                            break;
+                        }
                     }
                 }
             }

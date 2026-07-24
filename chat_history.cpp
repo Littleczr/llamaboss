@@ -17,6 +17,7 @@
 #include <Poco/Base64Encoder.h>   // image attachment wire projection
 #include <Poco/FileStream.h>      // UTF-8-safe binary reads on Windows
 #include <Poco/StreamCopier.h>    // file → base64 encoder pump
+#include <Poco/File.h>            // stat (size/mtime) for the data-URI cache
 
 // wxWidgets for paths and file system
 #include <wx/stdpaths.h>
@@ -29,6 +30,8 @@
 #include <cctype>
 #include <cstring>
 #include <utility>
+#include <unordered_map>   // data-URI cache
+#include <mutex>           // data-URI cache guard
 
 // File format version: 9 adds durable awaiting-user prompt/reply checkpoint
 // evidence for resumed waiting goals.
@@ -41,6 +44,39 @@ static const int CONVERSATION_FORMAT_VERSION = 9;
 static std::string JoinWorkflowPath(const std::string& a, const std::string& b);
 
 namespace {
+
+constexpr const char* kSessionContextPrefix = "[Session context:";
+
+bool IsLegacySessionContextTitle(const std::string& title)
+{
+    return title.rfind(kSessionContextPrefix, 0) == 0;
+}
+
+// The wire copy of each user turn begins with a timestamp header for model
+// grounding.  That header is intentionally persisted, but it is not authored
+// by the user and must never become the conversation title.
+std::string StripSessionContextHeader(std::string content)
+{
+    if (!IsLegacySessionContextTitle(content)) return content;
+
+    const size_t paragraphBreak = content.find("\n\n");
+    if (paragraphBreak != std::string::npos)
+        return content.substr(paragraphBreak + 2);
+
+    // Defensive fallback for older/normalized files where line breaks may
+    // have been collapsed.  The injected header always closes with ']'.
+    const size_t closeBracket = content.find(']');
+    if (closeBracket != std::string::npos) {
+        size_t start = closeBracket + 1;
+        while (start < content.size() &&
+               std::isspace(static_cast<unsigned char>(content[start]))) {
+            ++start;
+        }
+        return content.substr(start);
+    }
+
+    return content;
+}
 
 std::string PersistedGoalStatus(GoalStatus status)
 {
@@ -182,6 +218,112 @@ std::string LoadImageAsDataUri(const std::string& absPath,
     const std::string mime = mimeType.empty()
         ? std::string("image/png") : mimeType;
     return "data:" + mime + ";base64," + b64.str();
+}
+
+// ─── Data-URI cache ──────────────────────────────────────────────
+//
+// BuildChatRequestJson rebuilds the wire request on every agent
+// iteration, and the image-carrier message re-reads and re-encodes
+// its persisted images each time — a multi-MB read plus a ~4/3-size
+// base64 string allocation per step, for files that never change
+// once written into the conversation's workflow folder.  Cache the
+// finished data URI keyed by absolute path, validated by (size,
+// mtime, mime): any rewrite of the file — or a future path that
+// reuses a name — misses cleanly and re-encodes.
+//
+// Bounded at 64 MiB of stored URI bytes with LRU eviction, so a
+// conversation cycling through many large images degrades to the
+// old per-request encode instead of holding every image in memory
+// forever.  An entry larger than the whole cap is served uncached.
+// Mutex-guarded: builds run on the UI thread today, but the guard
+// costs nothing and keeps this correct if a background builder ever
+// appears.
+namespace {
+
+struct CachedImageUri {
+    Poco::Timestamp mtime;
+    Poco::File::FileSize size = 0;
+    std::string     mime;
+    std::string     uri;
+    Poco::UInt64    lastUsed = 0;   // LRU tick
+};
+
+std::mutex                                        g_imageUriCacheMutex;
+std::unordered_map<std::string, CachedImageUri>   g_imageUriCache;
+size_t                                            g_imageUriCacheBytes = 0;
+Poco::UInt64                                      g_imageUriCacheTick  = 0;
+
+constexpr size_t kImageUriCacheCapBytes = 64ull * 1024 * 1024;
+
+} // namespace
+
+static std::string LoadImageAsDataUriCached(const std::string& absPath,
+                                            const std::string& mimeType)
+{
+    Poco::Timestamp      mtime;
+    Poco::File::FileSize size = 0;
+    try {
+        Poco::File f(absPath);
+        if (!f.exists()) return std::string();
+        mtime = f.getLastModified();
+        size  = f.getSize();
+    } catch (...) {
+        // Stat failed — path gone or unreadable.  The uncached loader
+        // would fail identically; skip the read attempt.
+        return std::string();
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_imageUriCacheMutex);
+        auto it = g_imageUriCache.find(absPath);
+        if (it != g_imageUriCache.end() &&
+            it->second.mtime == mtime &&
+            it->second.size  == size &&
+            it->second.mime  == mimeType) {
+            it->second.lastUsed = ++g_imageUriCacheTick;
+            return it->second.uri;
+        }
+    }
+
+    // Miss (or stale) — encode outside the lock; a multi-MB base64
+    // pass must never serialize other builders behind it.
+    std::string uri = LoadImageAsDataUri(absPath, mimeType);
+    if (uri.empty()) return uri;
+
+    if (uri.size() <= kImageUriCacheCapBytes) {
+        std::lock_guard<std::mutex> lock(g_imageUriCacheMutex);
+
+        // Replace any stale entry for this path first so its bytes
+        // are not double-counted against the cap.
+        auto it = g_imageUriCache.find(absPath);
+        if (it != g_imageUriCache.end()) {
+            g_imageUriCacheBytes -= it->second.uri.size();
+            g_imageUriCache.erase(it);
+        }
+
+        // LRU-evict until the new entry fits.
+        while (g_imageUriCacheBytes + uri.size() > kImageUriCacheCapBytes &&
+               !g_imageUriCache.empty()) {
+            auto lru = g_imageUriCache.begin();
+            for (auto e = g_imageUriCache.begin();
+                 e != g_imageUriCache.end(); ++e) {
+                if (e->second.lastUsed < lru->second.lastUsed) lru = e;
+            }
+            g_imageUriCacheBytes -= lru->second.uri.size();
+            g_imageUriCache.erase(lru);
+        }
+
+        CachedImageUri entry;
+        entry.mtime    = mtime;
+        entry.size     = size;
+        entry.mime     = mimeType;
+        entry.uri      = uri;
+        entry.lastUsed = ++g_imageUriCacheTick;
+        g_imageUriCacheBytes += uri.size();
+        g_imageUriCache.emplace(absPath, std::move(entry));
+    }
+
+    return uri;
 }
 
 // ─── Reasoning stripping ─────────────────────────────────────────
@@ -982,7 +1124,7 @@ std::string ChatHistory::BuildChatRequestJson(const std::string& model, bool str
                             a->optValue<std::string>("storage_path", "");
                         if (rel.empty()) continue;
 
-                        const std::string uri = LoadImageAsDataUri(
+                        const std::string uri = LoadImageAsDataUriCached(
                             imageWorkflowDir + "/" + rel,
                             a->optValue<std::string>("mime_type", ""));
                         if (uri.empty()) continue;
@@ -1429,9 +1571,12 @@ bool ChatHistory::CreateSaveSnapshot(
         m_updatedAt = CurrentTimestamp();
 
         const std::string generatedTitle = GenerateTitle();
-        if (m_title.empty() ||
-            (m_title == "Untitled conversation" &&
-             generatedTitle != "Untitled conversation")) {
+        const bool titleNeedsRepair =
+            m_title.empty() ||
+            m_title == "Untitled conversation" ||
+            IsLegacySessionContextTitle(m_title);
+        if (titleNeedsRepair &&
+            generatedTitle != "Untitled conversation") {
             m_title = generatedTitle;
         }
 
@@ -1980,6 +2125,16 @@ bool ChatHistory::LoadFromFile(const std::string& filePath, std::vector<std::str
         m_goalState      = std::move(newGoal);
         m_messages       = std::move(newMessages);
 
+        // Repair legacy titles in memory as soon as the conversation opens
+        // so the window title is useful immediately.  The next normal save
+        // persists the repaired value; loading itself remains read-only.
+        if (IsLegacySessionContextTitle(m_title) ||
+            m_title == "Untitled conversation") {
+            const std::string repairedTitle = GenerateTitle();
+            if (repairedTitle != "Untitled conversation")
+                m_title = repairedTitle;
+        }
+
         // Per-chat approval choices are intentionally in-memory only and
         // reset on every load.  Loading also clears any unflushed streaming
         // buffer so a prior session can't leak into the next assistant
@@ -2152,7 +2307,7 @@ std::string TitleMakeFromYouTube(const std::string& content,
     return "YouTube video " + videoId;
 }
 
-std::string TitleTruncate(std::string s, size_t maxLen = 60)
+std::string TitleTruncate(std::string s, size_t maxLen = 64)
 {
     s = TitleCollapseWhitespace(std::move(s));
     if (s.size() > maxLen) {
@@ -2187,8 +2342,9 @@ std::string ChatHistory::GenerateTitle() const
         }
 
         std::string content = msg->getValue<std::string>("content");
+        content = StripSessionContextHeader(std::move(content));
         content = TitleStripGreeting(TitleStripOuterQuotes(
-            TitleCollapseWhitespace(content)));
+            TitleCollapseWhitespace(std::move(content))));
         if (content.empty()) continue;
 
         const std::string youtubeId = TitleExtractYouTubeId(content);

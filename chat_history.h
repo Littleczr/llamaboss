@@ -346,9 +346,15 @@ public:
     // name (via RememberToolApproval), but installs cannot be
     // wholesale-approved for the rest of the chat.
     //
-    // This is intentionally in-memory only.  It is not persisted with
-    // the conversation file, so reopening an older conversation starts
-    // with a clean trust state.
+    // This flag itself is in-memory only and is never persisted with
+    // the conversation file.  However, trust now has app-SESSION
+    // lifetime rather than dying on every reload: granting chat-wide
+    // trust also records the conversation path in
+    // ConversationRegistry (RememberSessionTrust), and
+    // ConversationController::LoadConversationFromPath re-arms this
+    // flag when a session-trusted conversation is reopened.  Restarting
+    // LlamaBoss clears all session grants, so a conversation reopened
+    // in a later run always starts with a clean trust state.
     bool IsToolChatApproved(const std::string& name) const {
         if (name == tool_names::kPythonInstallPackage) {
             // Per-package review is the safety boundary now that the

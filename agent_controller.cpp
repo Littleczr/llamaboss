@@ -217,6 +217,43 @@ std::string AgentListJsonObjectKeys(const std::string& json)
     }
 }
 
+// Native function-call arguments are themselves a JSON-encoded string.
+// The outer tool_calls array can remain valid even when that inner string
+// was truncated by a provider, for example:
+//   {"args":"& nvidia-smi ... 2>
+//
+// Never project that broken wrapper as a legacy PowerShell command.  Doing
+// so makes CommandPolicy diagnose the wrapper's opening JSON quote as an
+// "unterminated double-quoted string", and persisting the malformed native
+// sidecar causes strict providers to reject the next request with HTTP 400.
+constexpr const char* kInvalidNativeArgsJsonPrefix =
+    "Native tool arguments were incomplete or invalid JSON.";
+
+bool AgentNativeArgsJsonIsValidObject(const std::string& argsJson)
+{
+    // Some providers emit an empty argument string for no-argument tools.
+    // Preserve that compatibility by treating empty as the canonical {}.
+    const std::string payload = argsJson.empty() ? std::string("{}") : argsJson;
+
+    try {
+        Poco::JSON::Parser parser;
+        auto var = parser.parse(payload);
+        Poco::JSON::Object::Ptr obj = var.extract<Poco::JSON::Object::Ptr>();
+        return obj != nullptr;
+    } catch (...) {
+        return false;
+    }
+}
+
+bool AgentHasUnsafeNativeArgs(const ToolInvocation& inv)
+{
+    return !inv.valid &&
+           inv.invalidReason.compare(
+               0,
+               std::char_traits<char>::length(kInvalidNativeArgsJsonPrefix),
+               kInvalidNativeArgsJsonPrefix) == 0;
+}
+
 std::string AgentPresentedFileExtLower(const PresentedFile& f)
 {
     std::string name = !f.displayName.empty() ? f.displayName : f.diskPath;
@@ -888,6 +925,25 @@ void AgentController::Cancel()
             m_toolWorker->Cancel();
         }
     }
+}
+
+bool AgentController::FinishCancelledStream()
+{
+    // Approval and async-worker cancellation each have their own terminal
+    // path. This method is only for the model-stream case, where ChatClient
+    // deliberately suppresses COMPLETE/ERROR after StopGeneration().
+    if (!m_active || m_awaitingAsyncResult || m_awaitingApproval)
+        return false;
+
+    m_cancelled = true;
+    DrainQueuedInvocationsWithSkippedResults(
+        "the agent loop was stopped by the user.");
+
+    // The Stop handler has already rendered its standard user-facing line.
+    // EndLoop still emits the structured Cancelled reason so goals and other
+    // loop-scoped owners unwind through the normal sink callback.
+    EndLoop(AgentEndReason::Cancelled, "");
+    return true;
 }
 
 void AgentController::EndLoop(AgentEndReason     reason,
@@ -1850,7 +1906,17 @@ bool AgentController::HandleAssistantComplete(const std::string& fullResponse,
                     "still needed.";
             }
 
-            bool batchMode = invocations.size() > 1;
+            // A malformed inner function.arguments string must never be
+            // persisted in assistant.tool_calls.  Strict providers validate
+            // historical tool-call arguments on the next request and reject
+            // the whole transcript before the model can self-correct.
+            const bool hasUnsafeNativeArgs = std::any_of(
+                invocations.begin(), invocations.end(),
+                [](const ToolInvocation& inv) {
+                    return AgentHasUnsafeNativeArgs(inv);
+                });
+
+            bool batchMode = invocations.size() > 1 && !hasUnsafeNativeArgs;
             std::string sidecarJson;
             if (batchMode) {
                 sidecarJson =
@@ -1879,26 +1945,44 @@ bool AgentController::HandleAssistantComplete(const std::string& fullResponse,
             // matching sidecar entry, exactly as Phase 3 did.
             ToolInvocation first = invocations.front();
             if (invocations.size() > 1) {
-                m_pendingSoftHint +=
-                    "\n\n[notice] You emitted " + std::to_string(invocations.size()) +
-                    " tool calls in one assistant turn, but this provider did "
-                    "not supply usable tool call ids, so LlamaBoss executed only "
-                    "the first one to keep the native transcript valid. Re-issue "
-                    "any remaining tool calls one at a time after reading this result.";
+                if (hasUnsafeNativeArgs) {
+                    m_pendingSoftHint +=
+                        "\n\n[notice] One or more native tool calls contained "
+                        "truncated or invalid JSON arguments. LlamaBoss did not "
+                        "persist or execute those unsafe calls. Re-issue any "
+                        "remaining calls after reading this result.";
+                } else {
+                    m_pendingSoftHint +=
+                        "\n\n[notice] You emitted " +
+                        std::to_string(invocations.size()) +
+                        " tool calls in one assistant turn, but this provider did "
+                        "not supply usable tool call ids, so LlamaBoss executed only "
+                        "the first one to keep the native transcript valid. Re-issue "
+                        "any remaining tool calls one at a time after reading this result.";
+                }
             }
-            std::string oneToolCallJson =
-                KeepOnlySelectedToolCallJson(toolCallsJson, first.toolCallId);
 
-            if (!oneToolCallJson.empty()) {
-                m_history->SetLastAssistantToolCalls(oneToolCallJson);
-            } else {
-                // Defensive fallback: if we could not safely attach the
-                // assistant.tool_calls sidecar, do not add the upcoming
-                // result as role:"tool".  Let AddToolResultMessage degrade
-                // to the legacy user-message format instead; that is valid
-                // for both XML and native requests, while an orphan tool
-                // message is not.
+            if (AgentHasUnsafeNativeArgs(first)) {
+                // Do not retain the malformed assistant.tool_calls sidecar and
+                // do not thread the error as role:"tool".  A normal user-style
+                // corrective result keeps the next provider request valid and
+                // gives the model a chance to emit a complete tool call.
                 first.toolCallId.clear();
+            } else {
+                std::string oneToolCallJson =
+                    KeepOnlySelectedToolCallJson(toolCallsJson, first.toolCallId);
+
+                if (!oneToolCallJson.empty()) {
+                    m_history->SetLastAssistantToolCalls(oneToolCallJson);
+                } else {
+                    // Defensive fallback: if we could not safely attach the
+                    // assistant.tool_calls sidecar, do not add the upcoming
+                    // result as role:"tool".  Let AddToolResultMessage degrade
+                    // to the legacy user-message format instead; that is valid
+                    // for both XML and native requests, while an orphan tool
+                    // message is not.
+                    first.toolCallId.clear();
+                }
             }
 
             bool cont = DispatchAndContinue(first);
@@ -2051,11 +2135,32 @@ std::vector<ToolInvocation> AgentController::ParseStructuredToolCalls(
         // small JSON object and project to the legacy args-string
         // shape that ValidateToolArgs and the dispatchers expect.
         std::string argsRaw;
+        bool argsFieldIsString = true;
         try { argsRaw = fn->getValue<std::string>("arguments"); }
-        catch (...) { argsRaw.clear(); }
+        catch (...) {
+            argsRaw.clear();
+            argsFieldIsString = false;
+        }
 
-        inv.args     = ProjectStructuredArgs(inv.name, argsRaw);
         inv.rawBlock = "[native tool_call] " + inv.name + "(" + argsRaw + ")";
+
+        // Validate the inner JSON before projecting it into the legacy
+        // single-string command shape.  The outer tool_calls array may be
+        // perfectly valid while function.arguments is a truncated string.
+        // Passing that string through as PowerShell both misdiagnoses the
+        // failure and poisons the next native transcript.
+        if (!argsFieldIsString || !AgentNativeArgsJsonIsValidObject(argsRaw)) {
+            inv.args.clear();
+            inv.valid = false;
+            inv.invalidReason =
+                std::string(kInvalidNativeArgsJsonPrefix) +
+                " No tool was executed. Reissue the complete tool call "
+                "using the parameter names from the tool catalog.";
+            out.push_back(std::move(inv));
+            continue;
+        }
+
+        inv.args = ProjectStructuredArgs(inv.name, argsRaw);
 
         // Validate now so DispatchAndContinue can route the same
         // way malformed XML invocations route.
@@ -2114,9 +2219,9 @@ std::vector<ToolInvocation> AgentController::ParseStructuredToolCalls(
 // if a model emits the old {args} shape, the trailing fallback at
 // the bottom picks it up and the dispatchers run as before.
 //
-// On parse failure we fall through to the raw string; most
-// dispatchers tolerate that for single-arg tools and the
-// validator catches anything truly malformed.
+// Parse failures fail closed.  ParseStructuredToolCalls validates the
+// inner JSON before calling this helper; the empty fallback below is a
+// defensive backstop for any future direct caller.
 std::string AgentController::ProjectStructuredArgs(
     const std::string& toolName,
     const std::string& argsJson)
@@ -2129,9 +2234,9 @@ std::string AgentController::ProjectStructuredArgs(
         auto var = parser.parse(argsJson.empty() ? std::string("{}") : argsJson);
         obj = var.extract<Poco::JSON::Object::Ptr>();
     } catch (...) {
-        return argsJson;   // best-effort fallback
+        return std::string();
     }
-    if (!obj) return argsJson;
+    if (!obj) return std::string();
 
     // Small helper: pull a string field, return empty on absence
     // or type mismatch (rather than throw) so the projection

@@ -210,10 +210,16 @@ InputAreaWidgets BuildInputArea(wxWindow* parent, wxBoxSizer* parentSizer,
     w.inputContainer->SetBackgroundColour(theme.bgInputArea);
     auto* outerSizer = new wxBoxSizer(wxVERTICAL);
 
-    // Separator line above input
+    // Contextual separator above the input — doubles as a vertical drag
+    // handle.  It starts hidden so the normal one-line composer stays clean;
+    // MyFrame reveals it when the draft wraps or contains multiple lines.
+    // 5px tall matches ConversationSidebar::BORDER_WIDTH, rotated 90°.
     w.inputSeparator = new wxPanel(w.inputContainer, wxID_ANY,
-        wxDefaultPosition, wxSize(-1, 1));
+        wxDefaultPosition, wxSize(-1, 5));
     w.inputSeparator->SetBackgroundColour(theme.borderSubtle);
+    w.inputSeparator->SetCursor(wxCursor(wxCURSOR_SIZENS));
+    w.inputSeparator->SetToolTip("Drag to resize input area (double-click to reset)");
+    w.inputSeparator->Hide();
     outerSizer->Add(w.inputSeparator, 0, wxEXPAND);
 
     // Input row: [📎] [TextInput] [Send/Stop]

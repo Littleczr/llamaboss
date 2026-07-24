@@ -137,6 +137,13 @@ public:
     int  GetSidebarWidth() const;
     void SetSidebarWidth(int w);
 
+    // Composer (input area) manual height persistence.
+    // 0 = automatic (grow with content) — the default behavior.
+    // >0 = user dragged the handle; value is the pixel floor the
+    // composer keeps until reset (double-click on the handle).
+    int  GetInputAreaHeight() const;
+    void SetInputAreaHeight(int h);
+
     // ── Collapsed project sections in the sidebar ────────────────
     // Persisted as a comma-separated list of project IDs.  An empty
     // list means every section is expanded.  The pseudo-id

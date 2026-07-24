@@ -136,6 +136,13 @@ wxThread::ExitCode ChatWorkerThread::Entry()
 
     auto ensureToolCallSlot = [&](int idx) -> ToolCallAcc* {
         if (idx < 0) return nullptr;
+        // The index comes off the wire.  Without a ceiling, a buggy or
+        // hostile endpoint sending {"index": 2000000000} drives a
+        // multi-GB resize below (each slot is four std::strings).
+        // Real tool-call fan-out is single digits; anything past the
+        // cap is a malformed fragment to drop, not a slot to allocate.
+        constexpr int kMaxToolCallSlots = 128;
+        if (idx >= kMaxToolCallSlots) return nullptr;
         if ((size_t)idx >= toolCalls.size()) {
             toolCalls.resize(idx + 1);
         }
@@ -313,10 +320,20 @@ wxThread::ExitCode ChatWorkerThread::Entry()
                 if (!choices || choices->size() == 0) continue;
 
                 auto choice = choices->getObject(0);
+                // choices[0] can be a non-object on shape-variant
+                // chunks; getObject then yields a null Ptr whose
+                // operator-> throws Poco::NullPointerException — an
+                // exception the JSONException-only catch below never
+                // absorbed, so one odd chunk aborted the whole stream.
+                if (!choice) continue;
 
-                // Extract content delta
-                if (choice->has("delta")) {
-                    auto delta = choice->getObject("delta");
+                // Extract content delta.  Same null discipline for
+                // delta: some providers emit "delta": null on finish
+                // chunks.
+                auto delta = choice->has("delta")
+                                 ? choice->getObject("delta")
+                                 : Poco::JSON::Object::Ptr();
+                if (delta) {
 
                     // ── Reasoning deltas ─────────────────────────
                     // Re-wrapped as inline think tags; see the state
@@ -354,7 +371,10 @@ wxThread::ExitCode ChatWorkerThread::Entry()
                     }
 
                     if (delta->has("content") && !delta->isNull("content")) {
-                        std::string content = delta->getValue<std::string>("content");
+                        std::string content;
+                        try {
+                            content = delta->getValue<std::string>("content");
+                        } catch (...) { /* non-string content — treat as absent */ }
 
                         // First visible content byte after reasoning:
                         // close the think block so display and stored
@@ -492,7 +512,10 @@ wxThread::ExitCode ChatWorkerThread::Entry()
                 // reasons (for example "content_filter") do not force us to
                 // wait for a marker that some local servers may omit.
                 if (choice->has("finish_reason") && !choice->isNull("finish_reason")) {
-                    std::string reason = choice->getValue<std::string>("finish_reason");
+                    std::string reason;
+                    try {
+                        reason = choice->getValue<std::string>("finish_reason");
+                    } catch (...) { /* non-string finish_reason — ignore */ }
                     if (!reason.empty()) {
                         sawTerminalEvent = true;
                         // llama-server reports usage on this same final
@@ -510,6 +533,16 @@ wxThread::ExitCode ChatWorkerThread::Entry()
             }
             catch (const Poco::JSON::JSONException&) {
                 // Skip malformed JSON lines
+                continue;
+            }
+            catch (const Poco::Exception&) {
+                // Belt-and-braces for the guards above: any other Poco
+                // failure inside ONE chunk (null Ptr deref, bad cast on
+                // an unexpected field type) skips that chunk instead of
+                // escaping to the outer handlers and demoting a fine
+                // in-flight reply to a stream error.  Transport errors
+                // still surface — they throw from getline/receive,
+                // outside this per-chunk try.
                 continue;
             }
         }

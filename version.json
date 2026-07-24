@@ -1,4 +1,4 @@
-{
+﻿{
   "version": "0.1.9",
   "url": "https://pub-2d2e18de339c4fe3ab067f6afd1e7656.r2.dev/LlamaBoss_Beta_v0.1.9_Setup.exe",
   "notes": "Multi independent chat windows that share one app-owned local-model service; remote endpoints and Connections; Agent Mode approvals; Projects, Workflows, and Skills; Goals; and expanded local file workflows. Docs: https://llamaboss.com/docs/"

@@ -514,6 +514,25 @@ void AppState::SetSidebarWidth(int w)
     cfg.Flush();
 }
 
+// ── Composer manual height (persisted, 0 = auto-grow) ──────────────
+// Same lifecycle rationale as SidebarWidth above: a drag on the
+// handle shouldn't rewrite every other setting, and the value must
+// survive a later Settings-dialog cancel.
+int AppState::GetInputAreaHeight() const
+{
+    wxFileConfig cfg(CONFIG_APP_NAME);
+    int h = 0;   // 0 = auto-grow, no manual override
+    cfg.Read("InputAreaHeight", &h);
+    return h;
+}
+
+void AppState::SetInputAreaHeight(int h)
+{
+    wxFileConfig cfg(CONFIG_APP_NAME);
+    cfg.Write("InputAreaHeight", h);
+    cfg.Flush();
+}
+
 // ── Last model selection (persisted) ───────────────────────────────
 // Own lifecycle via wxFileConfig, like the sidebar width above: a model
 // switch shouldn't rewrite every other setting, and this needs to survive

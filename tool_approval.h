@@ -493,7 +493,7 @@ inline bool RequiresApproval(const ToolInvocation& inv,
         body << "\n\nReason: " << out.reason;
         if (!out.preview.empty()) body << "\n\n" << out.preview;
         body << "\n\nApprove options:\n"
-             << "  approve       Continue and trust tools for this chat.\n"
+             << "  approve       Trust tools for this chat until LlamaBoss restarts.\n"
              << "  approve once  Approve only this action.\n"
              << "  deny          Cancel.\n"
              << "Slash forms also work.";
@@ -546,7 +546,7 @@ inline bool RequiresApproval(const ToolInvocation& inv,
     body << "\n\nReason: " << out.reason;
     if (!out.preview.empty()) body << "\n\n" << out.preview;
     body << "\n\nApprove options:\n"
-         << "  approve       Continue and trust tools for this chat.\n"
+         << "  approve       Trust tools for this chat until LlamaBoss restarts.\n"
          << "  approve once  Approve only this action.\n"
          << "  deny          Cancel.\n"
          << "Slash forms also work.";
