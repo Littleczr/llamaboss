@@ -18,6 +18,14 @@ struct DropImportControllerCallbacks {
     std::function<std::string()> resolveCurrentCwd;
     std::function<void()> restoreComposerFocusDeferred;
 
+    // Fired immediately after a dropped file is successfully copied into
+    // the conversation's Workspace folder.  The copy is durable on-disk
+    // state, so the owner must ensure the conversation persists (see
+    // ChatHistory::NoteWorkspaceSideEffect).  Deliberately fired at the
+    // copy site rather than after attach: an attach failure after a
+    // successful copy would otherwise recreate the orphaned-folder leak.
+    std::function<void()> noteWorkspaceSideEffect;
+
     std::function<bool(const std::string& absPath,
                        const std::string& relPath)> attachPdfFile;
     std::function<bool(const std::string& absPath,

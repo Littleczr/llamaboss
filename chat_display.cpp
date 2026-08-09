@@ -429,6 +429,37 @@ ChatDisplay::ChatDisplay(wxRichTextCtrl* displayCtrl)
         PresentFile(f);
     });
 
+    // ── Sticky autoscroll: follow-mode tracking ───────────────────
+    // The renderer consults follow mode before its per-delta scrolls,
+    // and any user scroll input (wheel or scrollbar) re-evaluates the
+    // flag AFTER the scroll has been applied.  The check is deferred
+    // with CallAfter because this handler runs before the control's
+    // default scroll processing; the weak token makes a late-firing
+    // check on a destroyed ChatDisplay a silent no-op.
+    m_markdownRenderer->SetAutoScrollPredicate(
+        [this]() { return m_followStream; });
+
+    {
+        std::weak_ptr<int> alive = m_followCheckAlive;
+        auto scheduleFollowCheck = [this, alive](wxEvent& event) {
+            event.Skip();   // let the control actually scroll first
+            if (!m_displayCtrl) return;
+            m_displayCtrl->CallAfter([this, alive]() {
+                if (alive.expired()) return;
+                UpdateFollowFromScrollPosition();
+            });
+        };
+        m_displayCtrl->Bind(wxEVT_MOUSEWHEEL, scheduleFollowCheck);
+        const wxEventTypeTag<wxScrollWinEvent> kScrollTypes[] = {
+            wxEVT_SCROLLWIN_TOP,        wxEVT_SCROLLWIN_BOTTOM,
+            wxEVT_SCROLLWIN_LINEUP,     wxEVT_SCROLLWIN_LINEDOWN,
+            wxEVT_SCROLLWIN_PAGEUP,     wxEVT_SCROLLWIN_PAGEDOWN,
+            wxEVT_SCROLLWIN_THUMBTRACK, wxEVT_SCROLLWIN_THUMBRELEASE,
+        };
+        for (const auto& type : kScrollTypes)
+            m_displayCtrl->Bind(type, scheduleFollowCheck);
+    }
+
     // ── Image thumbnails: right-click menu ────────────────────────
     // Save/reveal for any thumbnail tagged with its source path (see
     // TagLastWrittenImage).  Non-image positions Skip() through so
@@ -659,7 +690,7 @@ void ChatDisplay::StartThinkingIndicator()
     m_displayCtrl->WriteText(".");
     m_displayCtrl->EndStyle();
     m_thinkingDotsEndPos = m_displayCtrl->GetInsertionPoint();
-    EnsureVisibleAtEnd();
+    EnsureVisibleAtEndIfFollowing();
 
     if (!m_thinkingTimer)
         m_thinkingTimer = std::make_unique<ThinkingTimer>(this);
@@ -1015,6 +1046,13 @@ void ChatDisplay::ShiftOtherRegions(const ToolBlockRegion* skip,
     }
     if (m_approvalRowStart >= pivot) m_approvalRowStart += delta;
     if (m_approvalRowEnd   >= pivot) m_approvalRowEnd   += delta;
+
+    // Code-block [Copy] affordances are tracked by MarkdownRenderer but
+    // live in the SAME document, so they shift identically.  Omitting
+    // them left links stale after any toggle above a code block: the
+    // hit-test then matched unrelated prose, and MarkCopyLinkCopied
+    // would Remove() a stale range and write "Copied" into it.
+    if (m_markdownRenderer) m_markdownRenderer->ShiftCopyLinks(pivot, delta);
 }
 
 void ChatDisplay::SetAffordanceText(ToolBlockRegion& r, const wxString& newText)
@@ -1580,7 +1618,34 @@ void ChatDisplay::DisplayToolBlock(const ToolBlock& block, bool startExpanded)
     int baseSize = baseFont.GetPointSize();
     if (baseSize <= 0) baseSize = 14;
 
-    const bool hasDetails = !block.body.empty() || !block.errorBody.empty();
+    // Long tool commands (especially generated PowerShell) can wrap across
+    // most of the viewport. Show a compact one-line preview in the card and
+    // retain the exact command inside [show details]. This is render-only:
+    // ToolBlock/history still keep the original command verbatim.
+    wxString commandPreview = wxString::FromUTF8(block.commandEcho);
+    commandPreview.Replace("\r", " ");
+    commandPreview.Replace("\n", " ");
+    commandPreview.Replace("\t", " ");
+    while (commandPreview.Find("  ") != wxNOT_FOUND)
+        commandPreview.Replace("  ", " ");
+
+    constexpr size_t kMaxCommandPreviewChars = 200;
+    constexpr size_t kCommandPreviewHeadChars = 196;
+    const bool commandWasCompacted =
+        commandPreview.length() > kMaxCommandPreviewChars;
+    if (commandWasCompacted) {
+        commandPreview = commandPreview.Left(kCommandPreviewHeadChars) +
+                         wxString::FromUTF8("\xE2\x80\xA6"); // …
+    }
+
+    std::string detailBody = block.body;
+    if (commandWasCompacted && !block.requiresApproval) {
+        detailBody = "Full command:\n" + block.commandEcho;
+        if (!block.body.empty())
+            detailBody += "\n\nOutput:\n" + block.body;
+    }
+
+    const bool hasDetails = !detailBody.empty() || !block.errorBody.empty();
 
     // Initial expanded state is decided by caller intent (startExpanded)
     // OR by automatic failure classification.  User-typed slash commands
@@ -1619,7 +1684,7 @@ void ChatDisplay::DisplayToolBlock(const ToolBlock& block, bool startExpanded)
     // The leading chevron is also a details toggle when body output exists:
     //   >  collapsed
     //   ▾  expanded
-    if (!block.commandEcho.empty()) {
+    if (!commandPreview.empty()) {
         wxRichTextAttr cmdAttr = MakeMonoAttr(m_systemColor, baseSize);
         wxRichTextAttr chevronAttr = hasDetails
             ? MakeMonoAttr(m_fileChipColor, baseSize, wxFONTSTYLE_ITALIC)
@@ -1636,7 +1701,9 @@ void ChatDisplay::DisplayToolBlock(const ToolBlock& block, bool startExpanded)
         m_displayCtrl->EndStyle();
 
         m_displayCtrl->BeginStyle(cmdAttr);
-        m_displayCtrl->WriteText(wxString::FromUTF8(std::string(" ") + block.commandEcho + "\n"));
+        m_displayCtrl->WriteText(" ");
+        m_displayCtrl->WriteText(commandPreview);
+        m_displayCtrl->WriteText("\n");
         m_displayCtrl->EndStyle();
 
         if (!hasDetails) {
@@ -1665,7 +1732,7 @@ void ChatDisplay::DisplayToolBlock(const ToolBlock& block, bool startExpanded)
     // command chevron can render with the correct direction.
     long bodyStart = m_displayCtrl->GetInsertionPoint();
     long bodyChars = expanded
-        ? WriteToolBodyAtCursor(block.body, block.errorBody)
+        ? WriteToolBodyAtCursor(detailBody, block.errorBody)
         : 0;
     long bodyEnd   = bodyStart + bodyChars;
 
@@ -1675,7 +1742,7 @@ void ChatDisplay::DisplayToolBlock(const ToolBlock& block, bool startExpanded)
     // read consistently.  Trailing \n keeps the affordance on its own
     // line BUT is captured outside the click range so only the
     // bracketed text is hittable.
-    if (!block.body.empty() || !block.errorBody.empty()) {
+    if (!detailBody.empty() || !block.errorBody.empty()) {
         long affStart = m_displayCtrl->GetInsertionPoint();
 
         wxRichTextAttr affAttr = MakeMonoAttr(m_fileChipColor, baseSize,
@@ -1694,7 +1761,7 @@ void ChatDisplay::DisplayToolBlock(const ToolBlock& block, bool startExpanded)
         region.chevronEnd      = commandChevronEnd;
         region.bodyStart       = bodyStart;
         region.bodyEnd         = bodyEnd;
-        region.body            = block.body;
+        region.body            = detailBody;
         region.errorBody       = block.errorBody;
         region.expanded        = expanded;
         m_toolBlocks.push_back(region);
@@ -1757,7 +1824,7 @@ void ChatDisplay::DisplayToolBlock(const ToolBlock& block, bool startExpanded)
     // Trailing blank line for separation.
     m_displayCtrl->WriteText("\n");
 
-    EnsureVisibleAtEnd();
+    EnsureVisibleAtEndIfFollowing();
     HideRichTextCaret(m_displayCtrl);
 }
 
@@ -1909,11 +1976,17 @@ void ChatDisplay::DisplayAssistantDelta(const std::string& delta)
                 trimLeadingWhitespace(thought_part);
             }
 
-            // Only render thought text if it actually contains visible characters.
-            if (hasVisibleChars(thought_part)) {
-                ClearThinkingIndicator();
-                AppendFormattedText(thought_part, m_thoughtColor);
-                m_hasRenderedAssistantContent = true;
+            // Same visibility/emission split as the holdback branch
+            // below: a thought_part that is pure whitespace still has to
+            // be written once visible content exists, or the space
+            // before a </think> that lands on a chunk boundary is lost.
+            if (!thought_part.empty()) {
+                const bool visible = hasVisibleChars(thought_part);
+                if (visible) ClearThinkingIndicator();
+                if (visible || m_hasRenderedAssistantContent) {
+                    AppendFormattedText(thought_part, m_thoughtColor);
+                }
+                if (visible) m_hasRenderedAssistantContent = true;
             }
 
             m_isInThoughtBlock = false;
@@ -1933,8 +2006,8 @@ void ChatDisplay::DisplayAssistantDelta(const std::string& delta)
             }
             else {
                 // Only thought text was rendered (via AppendFormattedText
-                // which doesn't scroll) — scroll now.
-                EnsureVisibleAtEnd();
+                // which doesn't scroll) — scroll now (if following).
+                EnsureVisibleAtEndIfFollowing();
             }
         }
         else {
@@ -1965,13 +2038,36 @@ void ChatDisplay::DisplayAssistantDelta(const std::string& delta)
                 trimLeadingWhitespace(safeToRender);
             }
 
-            if (hasVisibleChars(safeToRender)) {
-                ClearThinkingIndicator();
-                AppendFormattedText(safeToRender, m_thoughtColor);
-                m_hasRenderedAssistantContent = true;
+            // ── Whitespace-only chunks must still be written ─────
+            // The old form was `if (hasVisibleChars(safeToRender))
+            // { Clear; Append; mark rendered; }`, which silently
+            // DROPPED a chunk that was pure whitespace -- it lives in
+            // a local, and only combined.substr(safeLen) survives in
+            // the probe buffer.
+            //
+            // That is reachable constantly, not rarely.  "</think>" is
+            // 8 bytes so kHoldBack is 7; a streamed reasoning token of
+            // exactly 8 bytes beginning with a space (" summary",
+            // " economy", " clearly" -- i.e. any 7-letter word) leaves
+            // safeLen == 1 and safeToRender == " ".  Dropping it welds
+            // the word onto the previous one: "provide asummary".
+            //
+            // So: decide visibility and byte-emission separately.  Once
+            // anything visible has been rendered, EVERY subsequent byte
+            // goes out, whitespace included.  Before that point the
+            // trim above has already removed leading blanks, so a
+            // still-empty safeToRender is genuinely nothing to draw.
+            if (!safeToRender.empty()) {
+                const bool visible = hasVisibleChars(safeToRender);
+                if (visible) ClearThinkingIndicator();
+                if (visible || m_hasRenderedAssistantContent) {
+                    AppendFormattedText(safeToRender, m_thoughtColor);
+                }
+                if (visible) m_hasRenderedAssistantContent = true;
             }
             // AppendFormattedText doesn't scroll — do it here
-            EnsureVisibleAtEnd();
+            // (only while the user is following the stream)
+            EnsureVisibleAtEndIfFollowing();
         }
     }
     else {
@@ -2068,6 +2164,12 @@ void ChatDisplay::CancelPendingAssistantDisplay()
                 m_approvalRowEnd   = -1;
             }
 
+            // Reset() below deliberately preserves m_copyLinks so links
+            // from earlier turns keep working -- but links inside the
+            // range we are about to Remove() are not "earlier turns",
+            // they are about to point at whatever lands here next.
+            if (m_markdownRenderer) m_markdownRenderer->PruneCopyLinksFrom(pivot);
+
             m_displayCtrl->Remove(m_currentAssistantStartPos, end);
         }
     }
@@ -2083,7 +2185,7 @@ void ChatDisplay::CancelPendingAssistantDisplay()
     m_thinkEndProbeBuffer.clear();
     m_currentAssistantStartPos = -1;
 
-    EnsureVisibleAtEnd();
+    EnsureVisibleAtEndIfFollowing();
     HideRichTextCaret(m_displayCtrl);
 
 }
@@ -2179,7 +2281,7 @@ void ChatDisplay::DisplayAssistantMessage(const std::string& modelName,
     m_thinkEndProbeBuffer.clear();
     m_currentAssistantStartPos = -1;
 
-    EnsureVisibleAtEnd();
+    EnsureVisibleAtEndIfFollowing();
     HideRichTextCaret(m_displayCtrl);
 }
 
@@ -2220,6 +2322,10 @@ void ChatDisplay::EndReplayBatch()
         }
 
         if (m_replayBatchNeedsScroll) {
+            // Landing at the end of a restored conversation re-engages
+            // stream-follow mode for whatever streams next.
+            m_followStream = true;
+
             // Scroll AFTER Thaw, not before.  ShowPosition against a
             // frozen control computes from a stale layout on MSW; image
             // thumbnails and code-block sizing finish only after the
@@ -2256,6 +2362,10 @@ void ChatDisplay::EndReplayBatch()
 
 void ChatDisplay::Clear()
 {
+    // A fresh/cleared conversation always starts following the
+    // stream.
+    m_followStream = true;
+
     // Must stop the timer before wiping the document, otherwise the next
     // tick will try to Remove() a range that no longer exists.
     ClearThinkingIndicator();
@@ -2408,7 +2518,7 @@ void ChatDisplay::WriteAnimationLine(const std::vector<ColoredChar>& line)
 void ChatDisplay::EndAnimationFrame()
 {
     m_displayCtrl->Thaw();
-    EnsureVisibleAtEnd();
+    EnsureVisibleAtEndIfFollowing();
     HideRichTextCaret(m_displayCtrl);
 }
 
@@ -2456,6 +2566,50 @@ void ChatDisplay::EnsureVisibleAtEnd()
         return;
     }
 
+    // A deliberate jump to the end always re-engages follow mode:
+    // sending a message, /commands, ScrollToBottom, replay end.
+    m_followStream = true;
+
     m_displayCtrl->ShowPosition(m_displayCtrl->GetLastPosition());
     HideRichTextCaret(m_displayCtrl);
+}
+
+void ChatDisplay::EnsureVisibleAtEndIfFollowing()
+{
+    if (!m_displayCtrl) return;
+
+    // Replay batches keep their single-scroll-at-end contract.
+    if (IsReplayBatchActive()) {
+        m_replayBatchNeedsScroll = true;
+        return;
+    }
+
+    if (m_followStream) {
+        m_displayCtrl->ShowPosition(m_displayCtrl->GetLastPosition());
+    }
+    HideRichTextCaret(m_displayCtrl);
+}
+
+bool ChatDisplay::IsNearBottom() const
+{
+    if (!m_displayCtrl) return true;
+
+    int ppuX = 0, ppuY = 0;
+    m_displayCtrl->GetScrollPixelsPerUnit(&ppuX, &ppuY);
+    int vx = 0, vy = 0;
+    m_displayCtrl->GetViewStart(&vx, &vy);
+    int vw = 0, vh = 0;
+    m_displayCtrl->GetVirtualSize(&vw, &vh);
+
+    const int clientH = m_displayCtrl->GetClientSize().GetHeight();
+    const int topPx   = (ppuY > 0) ? vy * ppuY : vy;
+    const int gap     = vh - (topPx + clientH);
+    return gap <= kFollowSlackPx;
+}
+
+void ChatDisplay::UpdateFollowFromScrollPosition()
+{
+    // Wherever the user's scroll input landed decides follow mode:
+    // near the bottom = follow the stream, anywhere else = stay put.
+    m_followStream = IsNearBottom();
 }

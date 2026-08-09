@@ -496,8 +496,10 @@ bool GrepExecutor::Start(const std::string& pattern,
     }
     if (worker->Run() != wxTHREAD_NO_ERROR) {
         m_isRunning->store(false);
-        // Detached thread deletes itself on Entry exit; Run failure
-        // is rare and leaves ownership ambiguous — don't double-delete.
+        // A detached wxThread only deletes itself after its entry function
+        // runs; if Run() fails the thread never starts, so the object must
+        // be deleted here or it leaks.
+        delete worker;
         return false;
     }
     return true;

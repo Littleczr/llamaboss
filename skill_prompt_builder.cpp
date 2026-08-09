@@ -8,12 +8,30 @@
 
 std::string BuildSkillDraftBuilderSystemPrompt(const SkillPromptBuilderInput& input)
 {
+    // Agent Skills `name` = the skill's folder stem (kebab-case at
+    // creation time).  Derived here so the frontmatter instruction can
+    // pin the exact value instead of letting the model improvise one.
+    const std::string skillFolderName =
+        LbSkillFolderNameFromContractPath(input.skillPath);
+
     std::ostringstream p;
     p << "You are the LlamaBoss Skill Draft Builder. "
       << "You write the initial SKILL.md instruction file for one reusable cross-project LlamaBoss Skill based on the completed design conversation supplied by the application. "
       << "You do not run the Skill yourself. "
-      << "Return the complete SKILL.md Markdown body first, with no Markdown fence around it and no commentary. "
-      << "Use these exact required top-level sections in this order: "
+      << "Return the complete SKILL.md file first, with no Markdown fence around it and no commentary. "
+
+      // Agent Skills interop: the frontmatter block is the industry-
+      // standard contract (name + description) that lets LlamaBoss
+      // surface each skill's description cheaply in the system prompt
+      // and lets skills be shared with other Agent Skills consumers.
+      << "\n\nFRONTMATTER (REQUIRED, FIRST). "
+      << "The very first line of the file must be `---` opening a YAML frontmatter block, followed by exactly two fields and a closing `---` line: "
+      << "`name: " << (skillFolderName.empty() ? input.skillName : skillFolderName) << "` (use this exact value; do not change it) "
+      << "and `description: ` -- one or two plain sentences, under 500 characters, stating BOTH what the Skill does AND when the user would want it used. "
+      << "The description is shown to the model when it decides whether to use this Skill, so make it concrete: name the task, the inputs it acts on, and the trigger situation. "
+      << "Do not add any other frontmatter fields. "
+
+      << "\n\nAfter the closing `---`, use these exact required top-level sections in this order: "
       << "# <Skill Name> Skill, an introductory paragraph, ## Trigger Phrases, "
       << "## Inputs to Ask For, ## Steps, ## Output Expectations. "
 
@@ -43,6 +61,9 @@ std::string BuildSkillDraftBuilderSystemPrompt(const SkillPromptBuilderInput& in
 
       // Implementation-path preference order (only when no tool
       // sequence was demonstrated -- otherwise the rule above wins).
+      // This order is now also the Python-helper decision rule: the
+      // user no longer picks with/without a script at creation, so
+      // whether a helper ships is decided HERE, by this preference.
       << "\n\nIMPLEMENTATION-PATH PREFERENCE (apply only when the design conversation did NOT demonstrate a working tool sequence). "
       << "First, prefer native LlamaBoss tools for ordinary file and text operations. "
       << "Second, prefer approved PowerShell for Windows-native tasks that native tools cannot express -- recursive multi-folder searches, metadata-heavy reports, archive workflows, bulk file operations, OS-level utilities. "
@@ -61,32 +82,41 @@ std::string BuildSkillDraftBuilderSystemPrompt(const SkillPromptBuilderInput& in
       << "When the Skill writes a file via Out-File, add a follow-up verification step that confirms the file exists and is non-empty before reporting success. ";
 
     if (!input.pythonHelperPath.empty()) {
-        p << "\n\nPYTHON HELPER (explicitly requested at Skill creation). "
-          << "The user picked `New Skill with Python Script` at creation, so this Skill IS expected to ship a Python helper. "
-          << "Add the exact top-level section ## Optional Python Script immediately after ## Output Expectations and before ## Safety / Approval Notes. "
+        // Merged branch: Python is always AVAILABLE, never mandatory.
+        // The old two-branch design ("user picked with-script so a
+        // helper MUST ship" / "user didn't so it MUST NOT") is retired
+        // along with the two-entry creation menu.  The builder decides,
+        // and the implementation-path preference above is the rule.
+        p << "\n\nPYTHON HELPER (available, not mandatory -- your decision). "
+          << "A Python helper file slot is reserved for this Skill, but whether one ships is decided by the IMPLEMENTATION-PATH PREFERENCE above. "
+          << "Ship a helper ONLY when Python is genuinely the right implementation path for this Skill under that preference order. "
+          << "If native LlamaBoss tools or approved PowerShell cover the task, do NOT ship a helper: do not add a ## Optional Python Script section, do not emit any Python source block, and do not reference python_run_script in Steps. "
+          << "If and only if Python IS the right path: "
+          << "add the exact top-level section ## Optional Python Script immediately after ## Output Expectations and before ## Safety / Approval Notes. "
           << "Name the helper script by filename and describe exactly what runtime inputs it expects. "
           << "The helper must be a complete runnable implementation, not a starter scaffold, placeholder, TODO, or script to finish later. "
           << "Do not say that LlamaBoss will implement, refine, or complete the helper on first use. "
           << "The Skill steps may run the helper directly with `python_run_script` once the required inputs are known. "
-          << "The candidate helper script path is: "
+          << "The reserved helper script path (inside the Skill's scripts subfolder) is: "
           << input.pythonHelperPath << ". "
-          << "Do not reference temporary workspace scripts, design-time test scripts, or other one-off artifacts from the design conversation in SKILL.md; the saved Skill contract must stand alone and point only to its saved same-folder helper. "
+          << "Do not reference temporary workspace scripts, design-time test scripts, or other one-off artifacts from the design conversation in SKILL.md; the saved Skill contract must stand alone and point only to its saved in-folder helper. "
           << "If the helper needs runtime inputs such as a folder path, URL, output name, or mode, describe the args contract clearly: first line is the helper filename or path, and each optional later line is one command-line argument. "
           << "Prefer the Python standard library unless the user description clearly implies another dependency. "
           << "Write defensive argument validation, return a nonzero exit code on invalid inputs or failed work, and print clear success output including generated artifact paths when files are created. "
           << "For ZIP or archive helpers that walk a user-selected folder, treat an individual unreadable, locked, or permission-denied file as a recoverable warning rather than a whole-task failure whenever a valid archive can still be created. Skip the affected file, continue archiving, summarize what was skipped, and return success when the requested archive was produced. "
           << "If the requested Skill is specifically for source-code backups rather than a full byte-for-byte folder mirror, describe and implement sensible handling for transient IDE/cache/build content so files such as Visual Studio .vs cache entries do not make the backup fail. "
-          << "After the Markdown body, emit the full Python source only inside this exact machine-readable block, with no code fences:\n"
+          << "When you ship a helper, after the Markdown body emit the full Python source only inside this exact machine-readable block, with no code fences:\n"
           << kSkillPythonHelperBeginMarker << "\n"
           << "<complete runnable Python source>\n"
-          << kSkillPythonHelperEndMarker << " ";
+          << kSkillPythonHelperEndMarker << " "
+          << "\nCONSISTENCY: the ## Optional Python Script section and the marker block must appear together or not at all. Never emit one without the other. ";
     } else {
-        // FIRM no-Python branch.  The old version was wishy-washy
-        // and implied Python might still be useful -- that was the
-        // wiring that caused Python helpers to appear in Skills
-        // where the user never asked for one.
+        // Defensive fallback only: the controller now always reserves a
+        // helper path, so this branch fires only on a malformed contract
+        // path.  Keep the firm no-Python wording so the draft stays
+        // internally consistent with the save-side validation.
         p << "\n\nNO PYTHON HELPER (firm). "
-          << "The user did NOT pick `New Skill with Python Script` at creation, so this Skill MUST NOT include a Python helper. "
+          << "No helper script path could be reserved for this Skill, so this Skill MUST NOT include a Python helper. "
           << "Do not add a ## Optional Python Script section. "
           << "Do not emit any Python source block. "
           << "Do not reference python_run_script in Steps. "
@@ -111,12 +141,12 @@ std::string BuildSkillDraftBuilderUserPrompt(const SkillPromptBuilderInput& inpu
       << "SKILL FILE PATH:\n"
       << input.skillPath << "\n\n";
     if (!input.pythonHelperPath.empty()) {
-        p << "CANDIDATE PYTHON HELPER SCRIPT PATH IF NEEDED:\n"
+        p << "RESERVED PYTHON HELPER SCRIPT PATH (use only if Python is the chosen implementation path):\n"
           << input.pythonHelperPath << "\n\n";
     }
     p << "SKILL DESIGN CONVERSATION / AUTHORING BRIEF:\n"
       << input.userDescription << "\n\n"
-      << "Draft the complete SKILL.md now based on the design conversation above. "
+      << "Draft the complete SKILL.md now based on the design conversation above, starting with the required YAML frontmatter block. "
       << "Respect the implementation direction established in that conversation, especially any preference for existing LlamaBoss tools or PowerShell. Do not switch to Python merely because Python could solve the task. "
       << "If a Python helper is genuinely needed after applying that preference order, append the exact machine-readable helper source block required by the system instructions.";
     return p.str();

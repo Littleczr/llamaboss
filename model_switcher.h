@@ -10,7 +10,8 @@
 #include <memory>
 #include <utility>
 
-#include "tool_protocol.h"   // ToolProtocol (for the remote-activated callback)
+#include "tool_protocol.h"     // ToolProtocol (for the remote-activated callback)
+#include "inference_target.h"  // InferenceTarget (ResolveTargetForConversation)
 
 // Forward declarations
 class AppState;
@@ -87,6 +88,23 @@ public:
     bool IsConversationTargetActive() const;
     bool NeedsRemoteActivationForConversation() const;
     bool ActivateConversationPreferredRemoteTarget();
+
+    // True when this frame's session (its conversation-preferred
+    // model, falling back to the app-global selection) runs against
+    // the shared llama-server rather than a remote endpoint.  Powers
+    // this frame's FrameBusyKind probe.
+    bool SessionUsesLocalServer() const;
+
+    // Where does THIS frame's next request go?  Remote conversations
+    // resolve their endpoint from EndpointStore on every send WITHOUT
+    // touching the app-global target — pinning an in-flight agent
+    // loop / goal run / skill draft to its own model even if another
+    // window flips the global target mid-run.  Local conversations
+    // (and frames with no preference yet) return the global target
+    // unchanged.  This is the per-frame override seam the
+    // ModelService::ResolveTarget comment anticipated.  Main-thread
+    // only (reads SecretsStore).
+    InferenceTarget ResolveTargetForConversation();
 
     // ── Shared helper ────────────────────────────────────────────
     void UpdateModelLabel();

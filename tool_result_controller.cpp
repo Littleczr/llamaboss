@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <utility>
@@ -20,6 +21,7 @@
 #include "conversation_controller.h"
 
 #include "cmd_executor.h"
+#include "wait_executor.h"
 #include "python_runner.h"
 #include "tool_grep.h"
 #include "tool_web_fetch.h"
@@ -91,9 +93,18 @@ void ToolResultController::RenderAndPersistSlashResult(const ToolInvocationResul
 
 void ToolResultController::OnToolWorkerComplete(wxCommandEvent& evt)
 {
+    // Payload ownership.  wxCommandEvent does not delete its client
+    // object (see the contract in cmd_executor.h).  Claim it before ANY
+    // early return -- IsClosing(), null-data, and the agent-consumed
+    // path below are all reached on normal runs, so a leak here fires on
+    // every tool completion, not just at shutdown.  payloadOwner outlives
+    // every reference taken out of it in this function.
+    std::unique_ptr<wxClientData> payloadOwner(evt.GetClientObject());
+    evt.SetClientObject(nullptr);
+
     if (IsClosing()) return;
 
-    auto* data = static_cast<ToolWorkerResultClientData*>(evt.GetClientObject());
+    auto* data = static_cast<ToolWorkerResultClientData*>(payloadOwner.get());
     if (!data) {
         if (m_cb.setStreamingState) m_cb.setStreamingState(false);
         return;
@@ -121,11 +132,45 @@ void ToolResultController::OnToolWorkerComplete(wxCommandEvent& evt)
     FinishToolTurn();
 }
 
-void ToolResultController::OnCmdComplete(wxCommandEvent& evt)
+void ToolResultController::OnWaitComplete(wxCommandEvent& evt)
 {
+    // Payload ownership -- claim before any early return.  Same
+    // contract as CmdResultClientData (see cmd_executor.h).
+    std::unique_ptr<wxClientData> payloadOwner(evt.GetClientObject());
+    evt.SetClientObject(nullptr);
+
     if (IsClosing()) return;
 
-    auto* data = static_cast<CmdResultClientData*>(evt.GetClientObject());
+    auto* data = static_cast<WaitResultClientData*>(payloadOwner.get());
+    if (!data) {
+        if (m_cb.setStreamingState) m_cb.setStreamingState(false);
+        return;
+    }
+    const WaitResult& r = data->GetResult();
+
+    // wait is agent-loop-owned; there is no slash arm.  When the loop
+    // is active and awaiting THIS wait, the controller feeds the
+    // result and continues (or ends on cancel).  Anything else is a
+    // stale event from a frame teardown race -- just release the
+    // busy chrome defensively.
+    if (m_agentController.IsActive() &&
+        m_agentController.HandleWaitComplete(r)) {
+        return;
+    }
+
+    if (m_cb.setStreamingState) m_cb.setStreamingState(false);
+}
+
+void ToolResultController::OnCmdComplete(wxCommandEvent& evt)
+{
+    // Payload ownership -- claim before any early return.  See the
+    // contract comment on CmdResultClientData in cmd_executor.h.
+    std::unique_ptr<wxClientData> payloadOwner(evt.GetClientObject());
+    evt.SetClientObject(nullptr);
+
+    if (IsClosing()) return;
+
+    auto* data = static_cast<CmdResultClientData*>(payloadOwner.get());
     if (!data) {
         if (m_cb.setStreamingState) m_cb.setStreamingState(false);
         return;
@@ -211,9 +256,16 @@ void ToolResultController::OnCmdError(wxCommandEvent& evt)
 // ── controlled Python helper completion handler ──────────────────
 void ToolResultController::OnPythonComplete(wxCommandEvent& evt)
 {
+    // Payload ownership -- claim before any early return.  Note this
+    // handler also receives the synchronous python_install_package
+    // rejection event, which is posted from PythonRunner directly
+    // rather than from a worker thread; same contract applies.
+    std::unique_ptr<wxClientData> payloadOwner(evt.GetClientObject());
+    evt.SetClientObject(nullptr);
+
     if (IsClosing()) return;
 
-    auto* data = static_cast<PythonRunResultClientData*>(evt.GetClientObject());
+    auto* data = static_cast<PythonRunResultClientData*>(payloadOwner.get());
     if (!data) {
         if (m_cb.setStreamingState) m_cb.setStreamingState(false);
         return;
@@ -431,9 +483,13 @@ void ToolResultController::OnPythonError(wxCommandEvent& evt)
 // auto-save if anything's in history.
 void ToolResultController::OnGrepComplete(wxCommandEvent& evt)
 {
+    // Payload ownership -- claim before any early return.
+    std::unique_ptr<wxClientData> payloadOwner(evt.GetClientObject());
+    evt.SetClientObject(nullptr);
+
     if (IsClosing()) return;
 
-    auto* data = static_cast<GrepResultClientData*>(evt.GetClientObject());
+    auto* data = static_cast<GrepResultClientData*>(payloadOwner.get());
     if (!data) {
         if (m_cb.setStreamingState) m_cb.setStreamingState(false);
         return;
@@ -515,9 +571,15 @@ ToolResultController::MakeWebFetchToolInvocationResult(const WebFetchResult& r)
 
 void ToolResultController::OnWebFetchComplete(wxCommandEvent& evt)
 {
+    // Payload ownership -- claim before any early return.  WebFetchResult
+    // carries the extracted markdown body, so the agent-consumed path is
+    // the expensive one to leak.
+    std::unique_ptr<wxClientData> payloadOwner(evt.GetClientObject());
+    evt.SetClientObject(nullptr);
+
     if (IsClosing()) return;
 
-    auto* data = static_cast<WebFetchResultClientData*>(evt.GetClientObject());
+    auto* data = static_cast<WebFetchResultClientData*>(payloadOwner.get());
     if (!data) {
         if (m_cb.setStreamingState) m_cb.setStreamingState(false);
         return;

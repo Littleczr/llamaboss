@@ -15,6 +15,7 @@
 #include "ui_event_post.h"
 
 #include <wx/filedlg.h>
+#include <wx/textdlg.h>
 #include <wx/filename.h>
 #include <wx/dir.h>
 
@@ -24,6 +25,7 @@
 #include <exception>
 #include <condition_variable>
 #include <deque>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <utility>
@@ -478,7 +480,20 @@ void ConversationController::WaitForPendingSaves()
 
 void ConversationController::OnAsyncSaveComplete(wxCommandEvent& evt)
 {
-    auto* data = static_cast<ConversationSaveResultData*>(evt.GetClientObject());
+    // Payload ownership.  wxCommandEvent does not delete its client
+    // object (see the contract on CmdResultClientData in cmd_executor.h),
+    // so this handler must.  This is the costliest payload in the app:
+    // ConversationSaveResultData holds an entire SaveSnapshot -- every
+    // message's content plus its tool_calls / images / attachments JSON --
+    // and autosave fires after every message AND every agent tool step.
+    // Leaking it grows roughly with (conversation size x step count).
+    //
+    // payloadOwner must outlive `snapshot`, which is a reference into it
+    // and is used all the way to the end of the function.
+    std::unique_ptr<wxClientData> payloadOwner(evt.GetClientObject());
+    evt.SetClientObject(nullptr);
+
+    auto* data = static_cast<ConversationSaveResultData*>(payloadOwner.get());
     if (!data) return;
 
     const ChatHistory::SaveSnapshot& snapshot = data->Snapshot();
@@ -623,7 +638,9 @@ void ConversationController::OnLoadConversation()
 //  AUTO-SAVE
 // ═════════════════════════════════════════════════════════════════
 
-void ConversationController::AutoSaveConversation(bool refreshSidebar, bool durable)
+void ConversationController::AutoSaveConversation(bool refreshSidebar,
+                                                    bool durable,
+                                                    bool touchActivityTimestamp)
 {
     if (!m_chatHistory->HasPersistableContent()) return;
 
@@ -659,7 +676,8 @@ void ConversationController::AutoSaveConversation(bool refreshSidebar, bool dura
         // Earlier queued snapshots were drained above before the clean
         // fast-path.  The final write is synchronous and durable because the
         // in-memory history may be cleared or replaced immediately afterward.
-        if (m_chatHistory->SaveToFile("", models, /*durable=*/true)) {
+        if (m_chatHistory->SaveToFile("", models, /*durable=*/true,
+                                      touchActivityTimestamp)) {
             wxGetApp().GetConversationRegistry().SetCurrent(&m_frame, savePath);
             UpdateWindowTitle();
             if (refreshSidebar && m_sidebar.IsVisible())
@@ -671,7 +689,8 @@ void ConversationController::AutoSaveConversation(bool refreshSidebar, bool dura
     }
 
     ChatHistory::SaveSnapshot snapshot;
-    if (!m_chatHistory->CreateSaveSnapshot("", models, snapshot)) return;
+    if (!m_chatHistory->CreateSaveSnapshot("", models, snapshot,
+                                             touchActivityTimestamp)) return;
 
     // Claim/update immediately: the in-memory conversation already owns this
     // generated path, while disk construction proceeds in the worker.
@@ -681,6 +700,293 @@ void ConversationController::AutoSaveConversation(bool refreshSidebar, bool dura
     if (m_asyncSave)
         m_asyncSave->Queue(std::move(snapshot), refreshSidebar);
 }
+// ═════════════════════════════════════════════════════════════════
+//  SIDEBAR MANAGEMENT: rename / pin / archive
+// ═════════════════════════════════════════════════════════════════
+
+void ConversationController::RenameConversation(const std::string& path)
+{
+    if (path.empty()) return;
+
+    if (m_cb.isBusy && m_cb.isBusy()) {
+        wxMessageBox(
+            "Stop the current response before renaming a conversation.",
+            "Response in Progress",
+            wxOK | wxICON_INFORMATION,
+            &m_frame);
+        return;
+    }
+
+    const std::string activePath = m_chatHistory->GetFilePath();
+    const bool isActive = !activePath.empty() && path == activePath;
+
+    // Another window owns the path and may autosave at any moment.
+    if (!isActive &&
+        wxGetApp().GetConversationRegistry().OwnerOf(path, &m_frame)) {
+        wxMessageBox(
+            "That conversation is open in another LlamaBoss window. "
+            "Rename it from that window instead.",
+            "Conversation In Use",
+            wxOK | wxICON_INFORMATION,
+            &m_frame);
+        return;
+    }
+
+    std::string currentTitle;
+    std::vector<std::string> models;
+    ChatHistory tmp;
+
+    if (isActive) {
+        currentTitle = m_chatHistory->GetTitle();
+    }
+    else {
+        if (!tmp.LoadFromFile(path, models)) {
+            wxMessageBox(
+                "The conversation could not be opened for renaming.",
+                "Rename Conversation",
+                wxOK | wxICON_WARNING,
+                &m_frame);
+            return;
+        }
+        currentTitle = tmp.GetTitle();
+    }
+
+    wxTextEntryDialog dlg(
+        &m_frame,
+        "Enter a new conversation title:",
+        "Rename Conversation",
+        wxString::FromUTF8(currentTitle.c_str()));
+    if (dlg.ShowModal() != wxID_OK)
+        return;
+
+    wxString titleWx = dlg.GetValue();
+    titleWx.Trim(true).Trim(false);
+    if (titleWx.empty()) {
+        wxMessageBox(
+            "The conversation title cannot be empty.",
+            "Rename Conversation",
+            wxOK | wxICON_INFORMATION,
+            &m_frame);
+        return;
+    }
+
+    // Keep the stored title generous while protecting the title bar and
+    // sidebar from accidentally pasted paragraphs.  The sidebar still
+    // applies its own 64-character display shortening.
+    if (titleWx.length() > 160)
+        titleWx = titleWx.Left(160);
+
+    const std::string newTitle = std::string(titleWx.ToUTF8().data());
+    if (newTitle == currentTitle)
+        return;
+
+    bool saved = false;
+    if (isActive) {
+        m_chatHistory->SetTitle(newTitle);
+        AutoSaveConversation(/*refreshSidebar=*/false, /*durable=*/true,
+                             /*touchActivityTimestamp=*/false);
+        UpdateWindowTitle();
+        saved = true;
+    }
+    else {
+        tmp.SetTitle(newTitle);
+        saved = tmp.SaveToFile(path, models, /*durable=*/true,
+                               /*touchActivityTimestamp=*/false);
+    }
+
+    if (!saved) {
+        wxMessageBox(
+            "The new title could not be saved.",
+            "Rename Conversation",
+            wxOK | wxICON_WARNING,
+            &m_frame);
+        return;
+    }
+
+    if (m_sidebar.IsVisible()) {
+        m_sidebar.InvalidateMetadata({ path });
+        m_sidebar.Refresh(m_chatHistory->GetFilePath());
+    }
+}
+
+void ConversationController::SetConversationsPinned(
+    const std::vector<std::string>& paths,
+    bool pinned)
+{
+    if (paths.empty()) return;
+
+    if (m_cb.isBusy && m_cb.isBusy()) {
+        wxMessageBox(
+            "Stop the current response before changing pinned conversations.",
+            "Response in Progress",
+            wxOK | wxICON_INFORMATION,
+            &m_frame);
+        return;
+    }
+
+    const std::string activePath = m_chatHistory->GetFilePath();
+    size_t changed = 0;
+    size_t skipped = 0;
+
+    for (const auto& path : paths) {
+        if (path.empty()) continue;
+
+        const bool isActive = !activePath.empty() && path == activePath;
+        if (!isActive &&
+            wxGetApp().GetConversationRegistry().OwnerOf(path, &m_frame)) {
+            ++skipped;
+            continue;
+        }
+
+        if (isActive) {
+            if (m_chatHistory->IsPinned() == pinned)
+                continue;
+            m_chatHistory->SetPinned(pinned);
+            AutoSaveConversation(/*refreshSidebar=*/false, /*durable=*/true,
+                             /*touchActivityTimestamp=*/false);
+            ++changed;
+            continue;
+        }
+
+        ChatHistory tmp;
+        std::vector<std::string> models;
+        if (!tmp.LoadFromFile(path, models)) {
+            ++skipped;
+            continue;
+        }
+        if (tmp.IsPinned() == pinned)
+            continue;
+
+        tmp.SetPinned(pinned);
+        if (!tmp.SaveToFile(path, models, /*durable=*/true,
+                               /*touchActivityTimestamp=*/false)) {
+            ++skipped;
+            continue;
+        }
+        ++changed;
+    }
+
+    if (m_sidebar.IsVisible()) {
+        m_sidebar.InvalidateMetadata(paths);
+        m_sidebar.Refresh(m_chatHistory->GetFilePath());
+    }
+
+    // The card moving between PINNED / date sections is the success
+    // confirmation.  Do not write management acknowledgements into the chat
+    // surface: DisplaySystemMessage is display-only, but it still leaves
+    // distracting transcript-like lines until the conversation is replayed.
+    // Only surface exceptional partial failures, using a normal dialog that
+    // cannot be mistaken for conversation content.
+    if (skipped > 0) {
+        std::string message;
+        if (changed > 0) {
+            message = std::to_string(changed) +
+                      (changed == 1 ? " conversation was updated. "
+                                    : " conversations were updated. ");
+        }
+        else {
+            message = "No conversations were changed. ";
+        }
+        message += std::to_string(skipped) +
+                   (skipped == 1
+                       ? " conversation was skipped because it is open elsewhere or unreadable."
+                       : " conversations were skipped because they are open elsewhere or unreadable.");
+        wxMessageBox(
+            wxString::FromUTF8(message.c_str()),
+            pinned ? "Pin Conversations" : "Unpin Conversations",
+            wxOK | wxICON_WARNING,
+            &m_frame);
+    }
+}
+
+void ConversationController::SetConversationsArchived(
+    const std::vector<std::string>& paths,
+    bool archived)
+{
+    if (paths.empty()) return;
+
+    if (m_cb.isBusy && m_cb.isBusy()) {
+        wxMessageBox(
+            "Stop the current response before archiving conversations.",
+            "Response in Progress",
+            wxOK | wxICON_INFORMATION,
+            &m_frame);
+        return;
+    }
+
+    const std::string activePath = m_chatHistory->GetFilePath();
+    size_t changed = 0;
+    size_t skipped = 0;
+
+    for (const auto& path : paths) {
+        if (path.empty()) continue;
+
+        const bool isActive = !activePath.empty() && path == activePath;
+        if (!isActive &&
+            wxGetApp().GetConversationRegistry().OwnerOf(path, &m_frame)) {
+            ++skipped;
+            continue;
+        }
+
+        if (isActive) {
+            if (m_chatHistory->IsArchived() == archived)
+                continue;
+            m_chatHistory->SetArchived(archived);
+            AutoSaveConversation(/*refreshSidebar=*/false, /*durable=*/true,
+                             /*touchActivityTimestamp=*/false);
+            ++changed;
+            continue;
+        }
+
+        ChatHistory tmp;
+        std::vector<std::string> models;
+        if (!tmp.LoadFromFile(path, models)) {
+            ++skipped;
+            continue;
+        }
+        if (tmp.IsArchived() == archived)
+            continue;
+
+        tmp.SetArchived(archived);
+        if (!tmp.SaveToFile(path, models, /*durable=*/true,
+                               /*touchActivityTimestamp=*/false)) {
+            ++skipped;
+            continue;
+        }
+        ++changed;
+    }
+
+    if (m_sidebar.IsVisible()) {
+        m_sidebar.InvalidateMetadata(paths);
+        m_sidebar.Refresh(m_chatHistory->GetFilePath());
+    }
+
+    // Archiving/restoring visibly moves the card and updates the archive
+    // footer count, which is sufficient success feedback.  Keep the chat
+    // surface reserved for conversation content and report only partial
+    // failures with a conventional warning dialog.
+    if (skipped > 0) {
+        std::string message;
+        if (changed > 0) {
+            message = std::to_string(changed) +
+                      (changed == 1 ? " conversation was updated. "
+                                    : " conversations were updated. ");
+        }
+        else {
+            message = "No conversations were changed. ";
+        }
+        message += std::to_string(skipped) +
+                   (skipped == 1
+                       ? " conversation was skipped because it is open elsewhere or unreadable."
+                       : " conversations were skipped because they are open elsewhere or unreadable.");
+        wxMessageBox(
+            wxString::FromUTF8(message.c_str()),
+            archived ? "Archive Conversations" : "Restore Conversations",
+            wxOK | wxICON_WARNING,
+            &m_frame);
+    }
+}
+
 // ═════════════════════════════════════════════════════════════════
 //  DELETE
 // ═════════════════════════════════════════════════════════════════

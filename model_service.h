@@ -58,6 +58,15 @@ enum class ModelServiceChange : int
     Stopped
 };
 
+// ── Frame busy classification (Phase 3c refinement) ──────────────
+// What an attached frame's in-flight work depends on.  BusyLocal:
+// the session runs against the shared llama-server, so stopping or
+// restarting the process breaks it.  BusyRemote: the session is
+// pinned to a remote endpoint (ModelSwitcher::
+// ResolveTargetForConversation), so the local server's lifecycle is
+// irrelevant to it.
+enum class FrameBusyKind { Idle, BusyLocal, BusyRemote };
+
 wxDECLARE_EVENT(wxEVT_MODEL_SERVICE_STATE_CHANGED, wxCommandEvent);
 
 class ModelService : public wxEvtHandler
@@ -136,10 +145,12 @@ public:
     // DetachFrameSink removes it.  Attach is idempotent per handler;
     // Detach of an unknown handler is a no-op.
     // busyProbe (optional): "is this window mid-generation right
-    // now?" — main-thread pull, used by AnyOtherWindowBusy below.
+    // now, and does that work depend on the local llama-server or a
+    // remote endpoint?" — main-thread pull, used by the
+    // AnyOtherWindowBusy* queries below.
     void AttachFrameSink(wxEvtHandler* handler,
                          std::weak_ptr<std::atomic<bool>> aliveToken,
-                         std::function<bool()> busyProbe = {});
+                         std::function<FrameBusyKind()> busyProbe = {});
     void DetachFrameSink(wxEvtHandler* handler);
 
     // True if any attached window other than |self| is currently
@@ -151,6 +162,15 @@ public:
     // purpose: every frame already knows its own IsBusy(), so there
     // is no generation-lifecycle bookkeeping to get wrong.
     bool AnyOtherWindowBusy(const wxEvtHandler* self) const;
+
+    // Like AnyOtherWindowBusy, but true only when the busy window's
+    // session depends on the shared llama-server.  Powers the model
+    // switch / settings / deferred-load confirmations and the KV
+    // slot guards: a window busy on a REMOTE endpoint is pinned to
+    // that endpoint (ResolveTargetForConversation) and is not
+    // interrupted by a local server stop/restart, so it must not
+    // trigger those.
+    bool AnyOtherWindowBusyOnLocalServer(const wxEvtHandler* self) const;
 
     // ── KV slot actions, multi-window adjudicated (Phase 3c) ─────
     // The KV fast path was designed single-window: ownership is
@@ -199,7 +219,7 @@ private:
     struct FrameSink {
         wxEvtHandler*                    handler = nullptr;
         std::weak_ptr<std::atomic<bool>> alive;
-        std::function<bool()>            busyProbe;
+        std::function<FrameBusyKind()>   busyProbe;
     };
 
     // App-lifetime alive token for posts targeting the service

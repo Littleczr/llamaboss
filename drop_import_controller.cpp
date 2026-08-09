@@ -174,6 +174,14 @@ bool DropImportController::QueueDroppedFileImport(
             return false;
         }
 
+        // The copy above is durable user-visible disk state: this
+        // conversation must now persist so its workflow folder stays
+        // reachable (and deletable) from the sidebar.  Fired here, not
+        // after spec.attach, so a later attach failure can't orphan
+        // the folder.
+        if (m_callbacks.noteWorkspaceSideEffect)
+            m_callbacks.noteWorkspaceSideEffect();
+
         if (!DropImport_MakeRelativePathIfInsideCwd(fileForTool, cwd, relPath)) {
             DisplaySystemMessage(
                 icon + " " + label + " Import  \xC2\xB7  failed\n"

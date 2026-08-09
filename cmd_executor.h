@@ -51,8 +51,25 @@ struct CmdResult {
 };
 
 // wxClientData wrapper so we can pack a full CmdResult into a
-// wxCommandEvent without manual heap lifecycle management.
-// wxCommandEvent's destructor will delete the client data for us.
+// wxCommandEvent.
+//
+// OWNERSHIP CONTRACT -- read before writing a handler.  wxCommandEvent
+// does NOT own or delete its client object.  wx/event.h keeps a bare
+// m_clientObject pointer and no wx destructor frees it; the field
+// exists to point at control-owned listbox item data, which the
+// control outlives.  (An earlier version of this comment claimed the
+// event destructor deletes it.  It does not, and every handler
+// written against that claim leaked its payload on every completion.)
+//
+// The RECEIVING HANDLER must take ownership, as its very first action,
+// before any early return:
+//
+//     std::unique_ptr<wxClientData> payloadOwner(evt.GetClientObject());
+//     evt.SetClientObject(nullptr);
+//     auto* data = static_cast<CmdResultClientData*>(payloadOwner.get());
+//
+// Events rejected before delivery (dead target) are reclaimed by
+// LbQueueEventIfAlive -- see ReclaimClientObject in ui_event_post.h.
 class CmdResultClientData : public wxClientData {
 public:
     explicit CmdResultClientData(CmdResult r) : m_result(std::move(r)) {}
@@ -88,9 +105,12 @@ public:
     //
     // Used by the agent path to honour the per-conversation tool CWD set
     // by /cd, which the model expects PowerShell calls to respect.
+    // activeProjectRoot is an optional second trusted root for explicit
+    // ARTIFACT_FILE: markers emitted by successful PowerShell commands.
     bool Start(const std::string& command,
                const std::string& cwd,
-               unsigned long      timeoutMs);
+               unsigned long      timeoutMs,
+               const std::string& activeProjectRoot = std::string{});
 
     // Requests cancellation of any running command. Safe to call even
     // if nothing is running. The process tree is killed via its Job

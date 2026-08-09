@@ -938,7 +938,9 @@ void GoalController::BeginContractBuildIfNeeded()
         return;
     }
 
-    const std::string model = m_appState.GetModel();
+    // Conversation-pinned, not app-global: a model switch in another
+    // window must not retarget an in-flight goal send.
+    const std::string model = m_modelSwitcher.GetConversationModelForSave();
     if (model.empty()) {
         m_autoStartAfterContractBuild = false;
         m_chatHistory->MarkGoalContractFailed(
@@ -985,7 +987,10 @@ void GoalController::BeginContractBuildIfNeeded()
         "Goal contract builder is drafting success criteria.");
 
     if (!m_chatClient.SendMessage(
-            m_appState.GetActiveTarget(), body, genId)) {
+            // Pinned: honor this conversation's preferred model even
+            // if another window flipped the app-global target.
+            m_modelSwitcher.ResolveTargetForConversation(),
+            body, genId)) {
         m_contractBuilderInFlight = false;
         m_autoStartAfterContractBuild = false;
         m_cb.setStreamingUi(false);
@@ -1136,7 +1141,8 @@ void GoalController::BeginVerificationIfNeeded(bool manualOnly)
         return;
     }
 
-    const std::string model = m_appState.GetModel();
+    // Conversation-pinned (see the contract send above).
+    const std::string model = m_modelSwitcher.GetConversationModelForSave();
     if (model.empty()) {
         m_chatDisplay->DisplaySystemMessage(
             "Goal verifier could not run because no model is selected. "
@@ -1175,7 +1181,10 @@ void GoalController::BeginVerificationIfNeeded(bool manualOnly)
         "Goal verifier is checking whether the goal is complete.");
 
     if (!m_chatClient.SendMessage(
-            m_appState.GetActiveTarget(), body, genId)) {
+            // Pinned: honor this conversation's preferred model even
+            // if another window flipped the app-global target.
+            m_modelSwitcher.ResolveTargetForConversation(),
+            body, genId)) {
         m_verifierInFlight = false;
         m_verifierManualOnly = false;
         m_cb.setStreamingUi(false);
@@ -1352,7 +1361,8 @@ void GoalController::BeginContinuationTurn(const std::string& verifierReason)
 
     m_chatHistory->AddSystemMessage(continuation.str());
 
-    const std::string model = m_appState.GetModel();
+    // Conversation-pinned (see the contract send above).
+    const std::string model = m_modelSwitcher.GetConversationModelForSave();
     int ctxTokens = m_appState.GetCtxSize();
     if (ctxTokens <= 0) ctxTokens = 8192;
 
@@ -1406,7 +1416,10 @@ void GoalController::BeginContinuationTurn(const std::string& verifierReason)
     m_cb.setStreamingUi(true);
 
     if (!m_chatClient.SendMessage(
-            m_appState.GetActiveTarget(), body, genId)) {
+            // Pinned: honor this conversation's preferred model even
+            // if another window flipped the app-global target.
+            m_modelSwitcher.ResolveTargetForConversation(),
+            body, genId)) {
         // Roll back every artifact of the synthetic continuation turn.
         // Without this, the hidden system instruction can remain in
         // history and the visible transcript can keep an empty assistant

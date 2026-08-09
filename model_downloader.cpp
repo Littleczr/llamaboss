@@ -8,6 +8,7 @@
 #include "server_manager.h"
 #include "theme.h"
 #include "path_safety.h"
+#include "lb_ssl.h"
 
 #include <wx/filename.h>
 #include <wx/log.h>
@@ -18,9 +19,6 @@
 #include <Poco/Net/HTTPRequest.h>
 #include <Poco/Net/HTTPResponse.h>
 #include <Poco/Net/HTTPMessage.h>
-#include <Poco/Net/SSLManager.h>
-#include <Poco/Net/AcceptCertificateHandler.h>
-#include <Poco/Net/Context.h>
 #include <Poco/Net/NetSSL.h>
 #include <Poco/URI.h>
 #include <Poco/Exception.h>
@@ -226,38 +224,21 @@ const std::vector<DownloadableModel> ModelDownloaderDialog::kModels =
 };
 
 // ═══════════════════════════════════════════════════════════════════
-//  SSL — initialized once for the lifetime of the process
+//  SSL
 // ═══════════════════════════════════════════════════════════════════
-static void EnsureSSLInitialized()
-{
-    static std::once_flag s_flag;
-    std::call_once(s_flag, []()
-    {
-        Poco::Net::initializeSSL();
-
-        // Practical Windows/default for the current LlamaBoss downloader:
-        // allow downloads to keep working on corporate/work laptops where
-        // HTTPS traffic may be inspected by a local security proxy.
-        //
-        // The 4/21 build used this tolerant behavior and downloaded correctly
-        // on Cesar's work laptop. The stricter RejectCertificateHandler +
-        // VERIFY_STRICT version can fail with:
-        //   SSL routines::certificate verify failed
-        // even when the browser can download the same model.
-        //
-        // Future hardening path: switch model downloads to WinHTTP/WinINet or
-        // add a user-visible Advanced setting plus checksums. For now, restore
-        // the known-working behavior and keep the UI error handling clean.
-        Poco::SharedPtr<Poco::Net::InvalidCertificateHandler> pCert(
-            new Poco::Net::AcceptCertificateHandler(false));
-
-        Poco::Net::Context::Ptr pCtx(new Poco::Net::Context(
-            Poco::Net::Context::CLIENT_USE, ""));
-
-        Poco::Net::SSLManager::instance().initializeClient(
-            nullptr, pCert, pCtx);
-    });
-}
+// Deliberately NOT initialized here any more. Poco's SSLManager is a
+// process singleton: this file used to call initializeClient() with
+// its own AcceptCertificateHandler, which both disabled certificate
+// verification for model downloads AND raced lb_ssl.cpp for control
+// of the same singleton (whichever ran first won, and both claimed to
+// be authoritative). DownloadThread::Entry() now calls
+// lb::EnsureSSLInitialized() like every other HTTPS path.
+//
+// Remaining hardening for downloads specifically: publish SHA-256
+// hashes alongside the curated catalog entries and verify the
+// completed file before renaming it off .download. Transport
+// authenticity now holds; content authenticity would be the second
+// layer.
 
 static bool QuietRemoveFileUtf8(const std::string& path)
 {
@@ -371,7 +352,8 @@ DownloadThread::DownloadThread(wxEvtHandler*   handler,
                                const std::string& destPath,
                                long long          expectedBytes,
                                std::shared_ptr<std::atomic<bool>> cancelFlag,
-                               std::weak_ptr<std::atomic<bool>>   aliveToken)
+                               std::weak_ptr<std::atomic<bool>>   aliveToken,
+                               long               generation)
     : wxThread(wxTHREAD_DETACHED)
     , m_handler(handler)
     , m_url(url)
@@ -379,10 +361,16 @@ DownloadThread::DownloadThread(wxEvtHandler*   handler,
     , m_expectedBytes(expectedBytes)
     , m_cancelFlag(cancelFlag)
     , m_aliveToken(aliveToken)
+    , m_generation(generation)
 {}
 
 bool DownloadThread::SafePost(wxCommandEvent* ev)
 {
+    // Stamp the operation identity so the dialog can reject a late event
+    // from a cancelled/superseded worker. Done here so every event this
+    // worker posts carries it, without touching each construction site.
+    ev->SetInt(static_cast<int>(m_generation));
+
     // Cancelled? Drop the event on the floor.
     if (m_cancelFlag->load()) { delete ev; return false; }
 
@@ -394,9 +382,16 @@ bool DownloadThread::SafePost(wxCommandEvent* ev)
 
 wxThread::ExitCode DownloadThread::Entry()
 {
-    EnsureSSLInitialized();
+    lb::EnsureSSLInitialized();
 
-    std::string tempPath = m_destPath + ".download";
+    // Per-operation scratch path. A cancelled worker can still be blocked
+    // in socket I/O for up to its 60s receive timeout, and it removes its
+    // own temp file on the way out. A fresh retry must therefore NOT reuse
+    // the same name, or the old worker's cleanup can delete (or its final
+    // write can truncate) the new attempt's file. Keying the temp name on
+    // the download generation keeps the two operations fully isolated.
+    std::string tempPath =
+        m_destPath + ".download." + std::to_string(m_generation);
 
     try
     {
@@ -1051,12 +1046,18 @@ void ModelDownloaderDialog::OnDownloadClicked(size_t idx)
     // the .gguf comes first regardless of whether an mmproj is chained.
     m_downloadingMmproj = false;
 
+    // New operation: bump the generation so any still-unwinding worker
+    // from a just-cancelled download can no longer post into this row,
+    // and so this worker's temp file cannot collide with the old one's.
+    ++m_downloadGeneration;
+
     SetRowDownloading(idx);
 
     auto* thread = new DownloadThread(
         this, url, destPath, model.sizeBytes,
         m_cancelFlag,
-        std::weak_ptr<std::atomic<bool>>(m_handlerAlive));
+        std::weak_ptr<std::atomic<bool>>(m_handlerAlive),
+        m_downloadGeneration);
 
     if (thread->Run() != wxTHREAD_NO_ERROR) {
         delete thread;
@@ -1099,6 +1100,8 @@ void ModelDownloaderDialog::OnCancelClicked()
 void ModelDownloaderDialog::OnDownloadProgress(wxCommandEvent& ev)
 {
     if (m_activeRow < 0) return;
+    // Ignore a stale event from a cancelled/superseded worker.
+    if (ev.GetInt() != static_cast<int>(m_downloadGeneration)) return;
     ModelRow& row = m_rows[static_cast<size_t>(m_activeRow)];
 
     int pct = static_cast<int>(ev.GetExtraLong());
@@ -1120,9 +1123,12 @@ void ModelDownloaderDialog::OnDownloadProgress(wxCommandEvent& ev)
     row.statusLabel->SetLabel(label);
 }
 
-void ModelDownloaderDialog::OnDownloadComplete(wxCommandEvent&)
+void ModelDownloaderDialog::OnDownloadComplete(wxCommandEvent& ev)
 {
     if (m_activeRow < 0) return;
+    // Ignore a stale completion from a cancelled/superseded worker — it
+    // must not mark a later row complete or chain that row's mmproj.
+    if (ev.GetInt() != static_cast<int>(m_downloadGeneration)) return;
     size_t idx  = static_cast<size_t>(m_activeRow);
 
     // If we just finished the main .gguf and the catalog entry ships an
@@ -1136,6 +1142,11 @@ void ModelDownloaderDialog::OnDownloadComplete(wxCommandEvent&)
     if (needsMmproj) {
         m_downloadingMmproj = true;
         m_cancelFlag = std::make_shared<std::atomic<bool>>(false);
+
+        // Chained-but-distinct operation: give the projector stage its own
+        // generation so a cancel during the weights stage cannot let its
+        // worker post into the mmproj stage (or share its temp path).
+        ++m_downloadGeneration;
 
         // Show the sub-stage to the user so progress makes sense.
         ModelRow& row = m_rows[idx];
@@ -1151,7 +1162,8 @@ void ModelDownloaderDialog::OnDownloadComplete(wxCommandEvent&)
             BuildMmprojDestPath(model),
             model.mmprojSizeBytes,
             m_cancelFlag,
-            std::weak_ptr<std::atomic<bool>>(m_handlerAlive));
+            std::weak_ptr<std::atomic<bool>>(m_handlerAlive),
+            m_downloadGeneration);
 
         if (thread->Run() != wxTHREAD_NO_ERROR) {
             delete thread;
@@ -1195,6 +1207,10 @@ void ModelDownloaderDialog::OnDownloadComplete(wxCommandEvent&)
 void ModelDownloaderDialog::OnDownloadError(wxCommandEvent& ev)
 {
     if (m_activeRow < 0) return;
+    // Ignore a stale error from a cancelled/superseded worker — otherwise
+    // a worker dying on the abort could flip a later download's row to
+    // "Retry" mid-flight.
+    if (ev.GetInt() != static_cast<int>(m_downloadGeneration)) return;
     size_t idx  = static_cast<size_t>(m_activeRow);
     m_activeRow = -1;
     m_cancelFlag.reset();

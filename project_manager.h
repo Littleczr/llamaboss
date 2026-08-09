@@ -148,12 +148,16 @@ public:
 
     // ── Skills ───────────────────────────────────────────────────
     // User-facing Skills are cross-project, reusable abilities that live at
-    // %USERPROFILE%\LlamaBoss\Skills.  Each Skill is a folder containing a
-    // `SKILL.md` instruction contract plus an optional same-folder `.py`
-    // helper script.  No PROJECT.md, Sources, Templates, or Outputs
-    // scaffolding -- Skills are intentionally lightweight.  Resolution
-    // precedence is project-wins when a project is attached, so a project
-    // workflow with the same filename shadows a Skill.
+    // %USERPROFILE%\LlamaBoss\Skills.  Skills follow the Agent Skills
+    // standard layout: each Skill is a kebab-case folder containing a
+    // `SKILL.md` contract that opens with a YAML frontmatter block
+    // (name + description), plus optional helper `.py` scripts under a
+    // `scripts` subfolder.  Legacy skills (no frontmatter, same-folder
+    // helpers) remain fully supported by the listers/resolvers.  No
+    // PROJECT.md, Sources, Templates, or Outputs scaffolding -- Skills
+    // are intentionally lightweight.  Resolution precedence is
+    // project-wins when a project is attached, so a project workflow
+    // with the same filename shadows a Skill.
     //
     // Note: the underlying struct types are still named ProjectWorkflowInfo
     // and ProjectWorkflowScriptInfo (shared with the per-project workflow
@@ -168,17 +172,16 @@ public:
     static std::string GetSkillsDir();
     static bool EnsureSkillsRoot();
 
-    // Create a new Skill folder with a `SKILL.md` contract and, optionally, a
-    // same-folder `.py` helper under %USERPROFILE%\LlamaBoss\Skills.  Returns
-    // false if the name is blank or the Skill file cannot be written.
+    // Create a new Skill folder (kebab-case stem) with a starter
+    // `SKILL.md` contract under %USERPROFILE%\LlamaBoss\Skills.  No stub
+    // `.py` is pre-created: the Skill draft builder decides whether a
+    // helper ships and writes it into the scripts subfolder at
+    // draft-save time.  Returns false if the name is blank or the Skill
+    // file cannot be written.  (The old CreateSkillWithScript variant is
+    // retired along with the two-entry creation menu.)
     static bool CreateSkill(const std::string& skillName,
                             SkillInfo& outSkill,
                             std::string& outError);
-
-    static bool CreateSkillWithScript(const std::string& skillName,
-                                      SkillInfo& outSkill,
-                                      SkillScriptInfo& outScript,
-                                      std::string& outError);
 
     static std::vector<SkillInfo> ListSkills(std::size_t maxItems = 50);
 
@@ -191,6 +194,60 @@ public:
     static bool ResolveSkillScript(const std::string& requested,
                                    SkillScriptInfo& outScript,
                                    std::string& outError);
+
+    // ── Skill import ─────────────────────────────────────────────
+    // Load an external Agent Skills folder (SKILL.md + optional
+    // scripts/references/assets) into %USERPROFILE%\LlamaBoss\Skills.
+    // Two-phase so the UI can confirm with the user between validation
+    // and the copy: ProbeSkillImportFolder validates and reads metadata
+    // without writing anything; ImportSkillFolder re-validates and
+    // performs the copy.  The destination folder stem is the authored
+    // frontmatter `name` (kebab-cased), falling back to the source
+    // folder name, with the Skills-lane "-N" collision suffix.  After
+    // the copy, the destination SKILL.md is normalized: a frontmatter
+    // block is synthesized if missing, and its `name:` is aligned to
+    // the final folder stem.  Imported skills carry no special
+    // execution rights -- helper runs stay behind the normal
+    // python_run_script approval tier.
+    struct SkillImportProbe {
+        std::string proposedName;               // kebab stem, pre-collision
+        std::string finalName;                  // stem after collision suffix
+                                                // (advisory preview; the
+                                                // import recomputes it)
+        std::string description;                // frontmatter description ("" if none)
+        std::size_t fileCount = 0;              // files that would be copied
+        unsigned long long totalBytes = 0;      // bytes that would be copied
+        bool hasFrontmatter = false;            // authored name or description found
+    };
+
+    static bool ProbeSkillImportFolder(const std::string& sourceFolder,
+                                       SkillImportProbe& outProbe,
+                                       std::string& outError);
+
+    static bool ImportSkillFolder(const std::string& sourceFolder,
+                                  SkillInfo& outSkill,
+                                  std::string& outError);
+
+    // Extract a Skill .zip into a fresh temp folder and locate the Skill
+    // folder inside it (SKILL.md at the archive root, or inside a single
+    // top-level folder).  Entry names are validated against zip-slip
+    // (no absolute paths, drive letters, or ".." components) and the
+    // extraction enforces the same depth/count/byte caps as the folder
+    // walker, so an oversized or hostile archive fails fast.  On success
+    // the caller runs the normal probe/confirm/import against
+    // outSkillFolder, then ALWAYS removes outTempRoot (also on cancel).
+    static bool ExtractSkillZipToTemp(const std::string& zipPath,
+                                      std::string& outTempRoot,
+                                      std::string& outSkillFolder,
+                                      std::string& outError);
+
+    // Zip one Skill folder (identified by its SKILL.md contract path) to
+    // zipPath, rooted as "<stem>/..." inside the archive so it re-imports
+    // and shares cleanly.  Uses the same bounded walker as import, so the
+    // junk-dir skips and caps apply to exports too.
+    static bool ExportSkillToZip(const std::string& skillContractPath,
+                                 const std::string& zipPath,
+                                 std::string& outError);
 
 private:
     static std::string SanitizeId(const std::string& name);

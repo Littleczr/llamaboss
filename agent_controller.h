@@ -77,6 +77,7 @@
 #include "tool_dispatcher.h"
 #include "tool_protocol.h"
 
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <string>
@@ -89,9 +90,11 @@ class GrepExecutor;
 class CmdExecutor;
 class PythonRunner;
 class WebFetchExecutor;
+class WaitExecutor;
 struct CmdResult;
 struct PythonRunResult;
 struct WebFetchResult;
+struct WaitResult;
 
 class AgentController {
 public:
@@ -99,6 +102,19 @@ public:
     // counter UI messages can reference the same constants.
     static constexpr int kMaxIterations       = 12;
     static constexpr int kMaxMalformedPerTurn = 3;
+
+    // wait tool bounds.  Per-call range enforced at validation and
+    // again at dispatch; the per-turn budget caps cumulative wait
+    // time so a monitoring loop cannot hold a turn open forever.
+    // Waits are exempt from the tool-step cap (they cost time, not
+    // tokens) -- the budget is their own resource limit.  The floor
+    // also blocks tiny spam waits from being used to reset the loop
+    // guards cheaply (a completed wait clears the guard window).
+    static constexpr int kMinWaitSecondsPerCall     = 15;
+    static constexpr int kMaxWaitSecondsPerCall     = 600;
+    static constexpr int kDefaultWaitBudgetSeconds  = 1800;   // 30 min/turn
+    static constexpr int kMinConfigurableWaitBudget = 60;
+    static constexpr int kMaxConfigurableWaitBudget = 14400;  // 4 h
 
     // Phase 7: repeated-tool guard.  If the same normalized
     // tool signature would appear this many times inside the
@@ -159,6 +175,26 @@ public:
         // Optional — when unset (or returning Unknown) the agent
         // uses XML-protocol behaviour.
         std::function<ToolProtocol()> getActiveProtocol;
+
+        // The wire "model" field for this conversation's requests.
+        //
+        // MUST NOT be AppState::GetModel().  That is app-GLOBAL state:
+        // ModelService::SetActiveTarget writes it on every model
+        // activation in ANY window, so a model switch in window B
+        // rewrote the model name that window A's in-flight agent loop
+        // put on its next request.  A remote (OpenRouter) loop then
+        // sent a local .gguf path as the model ID and the provider
+        // rejected it with a 400.
+        //
+        // The transport was already pinned per conversation (see the
+        // sendRequest lambda in LlamaBoss.cpp, which discards its
+        // `model` argument and resolves the target itself) -- this
+        // pins the payload to match.
+        //
+        // Optional: when unset the controller falls back to the
+        // app-global model, preserving the previous behaviour for any
+        // caller that has not wired it up.
+        std::function<std::string()> resolveWireModel;
     };
 
     // Phase 5: takes an AgentEventSink* in the slot Phase 4 used for
@@ -170,7 +206,8 @@ public:
                     CmdExecutor*    cmdExec,
                     PythonRunner*   pythonRunner,
                     WebFetchExecutor* webFetchExec,
-                    ToolWorkerExecutor* toolWorker);
+                    ToolWorkerExecutor* toolWorker,
+                    WaitExecutor*   waitExec);
     ~AgentController() = default;
 
     void SetCallbacks(Callbacks cb) { m_cb = std::move(cb); }
@@ -191,6 +228,12 @@ public:
     // the next fed result.  Persisted by AppState; wired by MyFrame.
     void SetMaxToolSteps(int steps);
     int  GetMaxToolSteps() const { return m_maxToolSteps; }
+
+    // Session-level per-turn wait-time budget (seconds).  Clamped to
+    // [kMinConfigurableWaitBudget, kMaxConfigurableWaitBudget]; wired
+    // by MyFrame's /wait_budget command.  Not persisted (v1).
+    void SetWaitBudgetSeconds(int seconds);
+    int  GetWaitBudgetSeconds() const { return m_waitBudgetSeconds; }
 
     // True iff a loop is in progress.  MyFrame uses this to
     // decide whether to route events through us.
@@ -251,6 +294,13 @@ public:
                                  const std::string& toolCallsJson = "");
     bool HandleGrepComplete(const struct GrepResult& grepResult);
     bool HandleCmdComplete(const CmdResult& cmdResult);
+
+    // wait completion (WaitExecutor timer expiry or Cancel).  Mirrors
+    // HandleCmdComplete's consume-or-decline contract.  A completed
+    // (non-cancelled) wait also clears the loop-guard signature
+    // window: time passed, so identical re-checks of external state
+    // are legitimate again rather than doom-loop evidence.
+    bool HandleWaitComplete(const WaitResult& waitResult);
     bool HandlePythonComplete(const PythonRunResult& pythonResult);
     bool HandleWebFetchComplete(const WebFetchResult& webResult);
     bool HandleToolWorkerComplete(const ToolWorkerResult& workerResult);
@@ -320,9 +370,23 @@ private:
     // of the epilogue.  `cancelled` is (m_cancelled || worker reported
     // cancelled); `inv` supplies the tool_call_id for the cancel-path
     // history record.
+    // countTowardIterationCap: waits are exempt (they consume the
+    // wait-time budget instead of tool steps); every other async
+    // tool counts as before.
     bool FinishAsyncToolResult(const ToolInvocation&       inv,
                                const ToolInvocationResult& r,
-                               bool                        cancelled);
+                               bool                        cancelled,
+                               bool countTowardIterationCap = true);
+
+    // wait tool dispatch: parse '<seconds> [reason]', enforce the
+    // per-call bounds and the per-turn budget, arm the WaitExecutor
+    // timer, and suspend the loop on m_awaitingAsyncResult exactly
+    // like the specialized async executors.  Called from the agent
+    // dispatch path BEFORE DispatchInvocation.
+    bool StartWaitTool(const ToolInvocation& inv, const ToolContext& ctx);
+    static bool ParseWaitArgs(const std::string& args,
+                              int&               secondsOut,
+                              std::string&       reasonOut);
 
     // Phase 7: build and track recent tool signatures so a small
     // model cannot spin forever on the same exact call.
@@ -339,8 +403,18 @@ private:
     // Marks the most recent matching record's outcome; on success,
     // purges earlier FAILED records of the same signature (see the
     // ToolSignatureRecord comment for the rationale).
+    //
+    // Phase 7e: outputText is the success body of the result.  Its
+    // hash is stored on the record and drives the progress purge (see
+    // ToolSignatureRecord).  Callers on failure paths may omit it.
     void ResolveToolSignatureOutcome(const ToolInvocation& inv,
-                                     bool                  failed);
+                                     bool                  failed,
+                                     const std::string&    outputText
+                                         = std::string());
+
+    // Phase 7e: FNV-1a 64-bit hash of a tool result body with
+    // whitespace runs collapsed.  Static so tests can call it.
+    static uint64_t HashToolOutputForLoopGuard(const std::string& text);
 
     // Phase 9/Phase 3 trace: emit a non-rendered ToolCall AgentEvent
     // at the approved dispatch point.  Useful for sub-agent forwarders,
@@ -414,8 +488,14 @@ private:
     PythonRunner*   m_pythonRunner;
     WebFetchExecutor* m_webFetchExec;
     ToolWorkerExecutor* m_toolWorker;
+    WaitExecutor*   m_waitExec;
 
     Callbacks m_cb;
+
+    // Single funnel for the wire model name.  Both the request builder
+    // and the iteration kickoff go through this so they can never
+    // disagree about which model this conversation is talking to.
+    std::string ResolveWireModel() const;
 
     // Loop state.
     bool          m_active               = false;
@@ -431,9 +511,21 @@ private:
     // run(ok)) and the past failures no longer indicate a stuck loop.
     // Successful repeats still accumulate, so identical-successful-call
     // doom loops (the original Phase 7 motivation) remain guarded.
+    // Phase 7e added output-hash progress detection: when a call
+    // SUCCEEDS with output that differs from an earlier success of the
+    // same signature, the earlier records are purged -- same question,
+    // different answer means the call is doing real work (scroll ->
+    // snapshot paging is the canonical transcript), so it must not
+    // accumulate toward the repeat guard.  Successful repeats whose
+    // output MATCHES still accumulate, so identical-successful-call
+    // doom loops (same question, same answer, repeated) remain guarded
+    // at the unchanged threshold.
     struct ToolSignatureRecord {
         std::string signature;
-        bool        failed = false;   // set when the call's result lands
+        bool        failed        = false;  // set when the call's result lands
+        bool        resolved      = false;  // outcome landed (vs dispatched-only)
+        bool        hasOutputHash = false;  // outputHash is valid (successes only)
+        uint64_t    outputHash    = 0;      // hash of the success output body
     };
     std::vector<ToolSignatureRecord> m_recentToolSignatures;
 
@@ -441,6 +533,12 @@ private:
     // historical constant; AppState persists the user's value and
     // MyFrame pushes it here at startup and on /agent_steps.
     int           m_maxToolSteps = kMaxIterations;
+
+    // wait tool per-turn accounting.  m_waitSecondsUsed accumulates
+    // GRANTED wait time (reset by Begin); m_waitBudgetSeconds is the
+    // session-level cap (/wait_budget).
+    int           m_waitSecondsUsed   = 0;
+    int           m_waitBudgetSeconds = kDefaultWaitBudgetSeconds;
 
     // Phase 10: remaining native tool calls from the current assistant
     // turn, executed sequentially after the first.  Non-empty only
@@ -454,6 +552,18 @@ private:
     // truncation notices. Cleared on Begin(), Deny/Cancel approval, and
     // EndLoop() so it cannot leak onto unrelated results.
     std::string   m_pendingSoftHint;
+
+    // Phase 7e: loop-guard checkpoint (soft block before hard block).
+    // The FIRST time a signature trips the exact-repeat guard, the
+    // agent gets a model-facing challenge result instead of a hard
+    // stop; the signature is remembered here, and a SECOND trip of the
+    // same signature hard-blocks as before.  The cycle guard gets one
+    // checkpoint per agent turn via the bool.  Both cleared on Begin()
+    // and EndLoop().  Challenged calls are never dispatched and never
+    // recorded, so the guard window is unchanged when the model simply
+    // re-issues the identical call.
+    std::string   m_challengedLoopGuardSignature;
+    bool          m_cycleGuardChallenged = false;
 
     // When the current iteration triggered an async tool call, we
     // stash the invocation here so HandleGrepComplete can build the

@@ -16,6 +16,8 @@
 #define _CRT_SECURE_NO_WARNINGS
 
 #include "agent_controller.h"
+
+#include "wait_executor.h"   // WaitExecutor, WaitResult
 #include "python_runner.h"
 #include "python_arg_policy.h"
 #include "path_safety.h"
@@ -846,7 +848,8 @@ AgentController::AgentController(std::unique_ptr<ChatHistory>& history,
                                  CmdExecutor*    cmdExec,
                                  PythonRunner*   pythonRunner,
                                  WebFetchExecutor* webFetchExec,
-                                 ToolWorkerExecutor* toolWorker)
+                                 ToolWorkerExecutor* toolWorker,
+                                 WaitExecutor*   waitExec)
     : m_history(history)
     , m_sink(sink)
     , m_appState(appState)
@@ -855,6 +858,7 @@ AgentController::AgentController(std::unique_ptr<ChatHistory>& history,
     , m_pythonRunner(pythonRunner)
     , m_webFetchExec(webFetchExec)
     , m_toolWorker(toolWorker)
+    , m_waitExec(waitExec)
 {}
 
 // ═══════════════════════════════════════════════════════════════════
@@ -866,6 +870,7 @@ void AgentController::Begin()
     m_active               = true;
     m_cancelled            = false;
     m_iterationsUsed       = 0;   // incremented when a counted tool result is fed back
+    m_waitSecondsUsed      = 0;   // wait tool's per-turn budget consumption
     m_consecutiveMalformed = 0;
     m_awaitingAsyncResult    = false;
     m_pendingAsyncInvocation = ToolInvocation{};
@@ -876,6 +881,8 @@ void AgentController::Begin()
     m_currentToolCallId.clear();
     m_recentToolSignatures.clear();
     m_pendingSoftHint.clear();
+    m_challengedLoopGuardSignature.clear();   // Phase 7e checkpoint state
+    m_cycleGuardChallenged = false;
     m_queuedInvocations.clear();
     // The one-shot python_create_script -> python_run_script bypass may
     // survive one follow-up user turn so a natural "yes, run it" can work.
@@ -920,6 +927,10 @@ void AgentController::Cancel()
                  m_webFetchExec) {
             m_webFetchExec->Cancel();
         }
+        else if (m_pendingAsyncInvocation.name == tool_names::kWait &&
+                 m_waitExec) {
+            m_waitExec->Cancel();
+        }
         else if (ShouldDispatchToolOnWorker(m_pendingAsyncInvocation.name) &&
                  m_toolWorker) {
             m_toolWorker->Cancel();
@@ -959,6 +970,8 @@ void AgentController::EndLoop(AgentEndReason     reason,
     m_currentToolCallId.clear();
     m_recentToolSignatures.clear();
     m_pendingSoftHint.clear();
+    m_challengedLoopGuardSignature.clear();   // Phase 7e checkpoint state
+    m_cycleGuardChallenged = false;
     // Safety net: call sites that abandon a partially-executed batch
     // must drain it (with skipped results) BEFORE calling EndLoop so
     // native transcript pairing survives.  Clearing here guards any
@@ -986,6 +999,13 @@ void AgentController::SetMaxToolSteps(int steps)
     if (steps < kMinConfigurableToolSteps) steps = kMinConfigurableToolSteps;
     if (steps > kMaxConfigurableToolSteps) steps = kMaxConfigurableToolSteps;
     m_maxToolSteps = steps;
+}
+
+void AgentController::SetWaitBudgetSeconds(int seconds)
+{
+    if (seconds < kMinConfigurableWaitBudget) seconds = kMinConfigurableWaitBudget;
+    if (seconds > kMaxConfigurableWaitBudget) seconds = kMaxConfigurableWaitBudget;
+    m_waitBudgetSeconds = seconds;
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -1071,12 +1091,15 @@ void AgentController::EmitPendingToolBlock(const ToolInvocation& inv)
     tb.iconUtf8    = tool_approval::ToolIcon(inv.name);
     tb.toolName    = tool_approval::ToolDisplayName(inv.name);
     tb.statusChips = { "pending" };
-    tb.commandEcho = tool_approval::CommandEcho(inv);
+    tb.commandEcho.clear();
+    tb.isPending = true;
 
-    // Keep this intentionally body-less. The completed ToolBlock will carry
-    // stdout/stderr/artifacts. This card is just a lightweight acknowledgement
-    // that the approved async tool has started, so the user is not left staring
-    // at a blank assistant turn. It is UI-only and is not added to chat history.
+    // Keep this intentionally body-less and echo-less. The completed ToolBlock
+    // carries the command, stdout/stderr, and artifacts. Repeating a long
+    // PowerShell command here made the pending + terminal pair consume most of
+    // the viewport even though this card is only a lightweight acknowledgement
+    // that the approved async tool has started. It is UI-only and is not added
+    // to chat history.
     m_sink->OnAgentEvent(AgentEvent::ToolOutput(
         tb, /*expanded=*/false, AgentEventType::AgentStatus));
 }
@@ -1185,18 +1208,60 @@ void AgentController::RecordToolSignature(const std::string& signature)
         m_recentToolSignatures.erase(m_recentToolSignatures.begin());
 }
 
+uint64_t AgentController::HashToolOutputForLoopGuard(const std::string& text)
+{
+    // FNV-1a 64-bit over the output with whitespace runs collapsed to
+    // a single space.  Collapsing keeps trivial reflow/indent jitter
+    // from defeating the identical-output test, while leaving every
+    // number and word intact -- scroll positions, byte counts, and
+    // listing contents ARE the progress signal and must stay hashed.
+    //
+    // Deliberately NOT stripped: timestamps/durations.  If a tool
+    // stamps a volatile field into every success body, its successful
+    // repeats simply never match and the repeat guard stays lenient
+    // for that tool -- a safe failure direction (the failure-loop
+    // guard, the cycle guard, and the iteration cap still apply).
+    // Per-tool normalization can be added here later if one tool
+    // proves to need it.
+    uint64_t h = 1469598103934665603ULL;              // FNV offset basis
+    bool pendingSpace = false;
+    bool emitted      = false;
+    for (unsigned char c : text) {
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
+            pendingSpace = emitted;                   // no leading space
+            continue;
+        }
+        if (pendingSpace) {
+            h ^= static_cast<uint64_t>(' ');
+            h *= 1099511628211ULL;                    // FNV prime
+            pendingSpace = false;
+        }
+        h ^= static_cast<uint64_t>(c);
+        h *= 1099511628211ULL;
+        emitted = true;
+    }
+    return h;
+}
+
 void AgentController::ResolveToolSignatureOutcome(const ToolInvocation& inv,
-                                                  bool                  failed)
+                                                  bool                  failed,
+                                                  const std::string&    outputText)
 {
     const std::string sig = BuildToolSignature(inv);
     if (sig.empty() || m_recentToolSignatures.empty()) return;
+
+    const uint64_t outHash = HashToolOutputForLoopGuard(outputText);
 
     // The matching record is normally the newest one (recorded at this
     // call's dispatch).  An async completion can only resolve after its
     // own dispatch, and the batch queue is sequential, so back() is the
     // right slot whenever the signatures agree.
     if (m_recentToolSignatures.back().signature == sig) {
-        m_recentToolSignatures.back().failed = failed;
+        ToolSignatureRecord& rec = m_recentToolSignatures.back();
+        rec.failed        = failed;
+        rec.resolved      = true;
+        rec.hasOutputHash = !failed;   // output hash only meaningful on success
+        rec.outputHash    = outHash;
     }
 
     if (!failed) {
@@ -1205,11 +1270,28 @@ void AgentController::ResolveToolSignatureOutcome(const ToolInvocation& inv,
         // python_create_script -> run(ok) is the canonical transcript).
         // Purge those failed records so a later legitimate identical
         // call is not hard-blocked or soft-hinted as a "stuck loop".
-        // Successful records stay, keeping the identical-successful-call
-        // doom-loop guard intact.
+        //
+        // Phase 7e (progress detection): a success whose OUTPUT differs
+        // from an earlier success of the same call proves the call is
+        // doing real work -- same question, different answer means the
+        // world is moving (scroll -> snapshot paging through a long
+        // page is the canonical transcript).  Purge those stale
+        // successful records too.  Successful records whose output
+        // MATCHES the new one stay, so identical-successful-call doom
+        // loops (same question, same answer, repeated -- the original
+        // Phase 7 motivation) still accumulate and trip the guard at
+        // the unchanged threshold.  Records never resolved (loop ended
+        // mid-flight) keep the conservative pre-7e behavior: they stay.
         for (size_t i = 0; i + 1 < m_recentToolSignatures.size(); ) {
-            if (m_recentToolSignatures[i].failed &&
-                m_recentToolSignatures[i].signature == sig) {
+            const ToolSignatureRecord& rec = m_recentToolSignatures[i];
+            const bool sameSig = (rec.signature == sig);
+
+            const bool purgeFailed = sameSig && rec.failed;
+            const bool purgeProgressed =
+                sameSig && rec.resolved && !rec.failed &&
+                rec.hasOutputHash && rec.outputHash != outHash;
+
+            if (purgeFailed || purgeProgressed) {
                 m_recentToolSignatures.erase(
                     m_recentToolSignatures.begin() +
                     static_cast<std::ptrdiff_t>(i));
@@ -1237,6 +1319,18 @@ void AgentController::EmitToolCallEvent(const ToolInvocation& inv,
 //  Request building
 // ═══════════════════════════════════════════════════════════════════
 
+// See Callbacks::resolveWireModel in the header for why this must not
+// read AppState::GetModel() directly.  The fallback preserves the old
+// behaviour when no callback was installed.
+std::string AgentController::ResolveWireModel() const
+{
+    if (m_cb.resolveWireModel) {
+        std::string pinned = m_cb.resolveWireModel();
+        if (!pinned.empty()) return pinned;
+    }
+    return m_appState ? m_appState->GetModel() : std::string();
+}
+
 std::string AgentController::BuildRequestBody()
 {
     // ChatHistory::BuildChatRequestJson accepts an optional system
@@ -1254,7 +1348,7 @@ std::string AgentController::BuildRequestBody()
     // (via Phase 3b detection) to support native function calling.
     // On Xml/Unknown protocol we leave the field empty and the
     // builder produces the historical XML-only request shape.
-    std::string model     = m_appState->GetModel();
+    std::string model     = ResolveWireModel();
     std::string sysPrompt = m_cb.buildSystemPrompt
                               ? m_cb.buildSystemPrompt()
                               : std::string();
@@ -1435,6 +1529,48 @@ bool AgentController::DispatchAndContinue(const ToolInvocation& inv)
     std::string signature;
     int repeatCount = 0;
     if (WouldTripLoopGuard(inv, signature, repeatCount)) {
+        // Phase 7e: checkpoint before the hard block.  With output-hash
+        // progress purging in ResolveToolSignatureOutcome, reaching the
+        // threshold means the SAME call has already returned IDENTICAL
+        // output on its previous successful runs (progressing repeats
+        // were purged and never accumulate).  Give the model exactly one
+        // model-facing challenge to change course; the challenged call
+        // is NOT dispatched and NOT recorded, so re-issuing the same
+        // signature trips the guard again and hard-blocks below.
+        if (signature != m_challengedLoopGuardSignature) {
+            m_challengedLoopGuardSignature = signature;
+
+            ToolInvocationResult r;
+            r.toolTag       = inv.name.empty() ? "tool" : inv.name;
+            r.invocationRaw = inv.rawBlock;
+            r.iconUtf8      = "\xE2\x9A\xA0";  // ⚠
+            r.toolName      = "Loop Guard";
+            r.commandEcho   = tool_approval::CommandEcho(inv);
+            r.chips         = { "blocked", "loop guard", "checkpoint" };
+            r.errorBody     =
+                "Loop-guard checkpoint: this exact tool call has been "
+                "requested " + std::to_string(repeatCount) +
+                " times in the recent window, and its previous identical "
+                "runs returned identical output. Repeating it unchanged "
+                "will not produce a different result; the next identical "
+                "request will hard-stop the agent. Do one of these "
+                "instead: change the arguments, use a different tool, use "
+                "/wait if you are waiting for something external to "
+                "change (a completed wait re-legitimizes an identical "
+                "re-check), or ask the user for direction. This call was "
+                "not executed.";
+
+            // Same shape as the user-deny path: answer this call, skip
+            // the rest of the batch (later calls may depend on this
+            // one), then let the model re-plan with the full picture.
+            FeedResultOnly(r, /*countTowardIterationCap=*/false);
+            DrainQueuedInvocationsWithSkippedResults(
+                "the loop-guard checkpoint stopped this batch before "
+                "this call ran.");
+            ContinueLoop();
+            return true;
+        }
+
         ToolInvocationResult r;
         r.toolTag       = inv.name.empty() ? "tool" : inv.name;
         r.invocationRaw = inv.rawBlock;
@@ -1445,7 +1581,8 @@ bool AgentController::DispatchAndContinue(const ToolInvocation& inv)
         r.errorBody     =
             "Agent stopped before dispatch: the same tool call was requested " +
             std::to_string(repeatCount) +
-            " times within the recent loop window. Tool was not executed.";
+            " times within the recent loop window and was repeated again "
+            "after a checkpoint warning. Tool was not executed.";
 
         EmitAndStoreTerminalToolResult(r, true);
         DrainQueuedInvocationsWithSkippedResults(
@@ -1457,6 +1594,41 @@ bool AgentController::DispatchAndContinue(const ToolInvocation& inv)
 
     int cycleDistinctCount = 0;
     if (WouldTripCycleGuard(inv, signature, cycleDistinctCount)) {
+        // Phase 7e: one checkpoint per agent turn for the cycle guard.
+        // Note that progress purging already keeps legitimately-
+        // progressing A/B/A/B patterns (scroll/snapshot alternation)
+        // out of the window: each new-output success purges its stale
+        // predecessor, so no progressing signature reaches the
+        // kCycleGuardMinRepeats floor.  Reaching this point means the
+        // window really is churning without progress.
+        if (!m_cycleGuardChallenged) {
+            m_cycleGuardChallenged = true;
+
+            ToolInvocationResult r;
+            r.toolTag       = inv.name.empty() ? "tool" : inv.name;
+            r.invocationRaw = inv.rawBlock;
+            r.iconUtf8      = "\xE2\x9A\xA0";  // ⚠
+            r.toolName      = "Loop Guard";
+            r.commandEcho   = tool_approval::CommandEcho(inv);
+            r.chips         = { "blocked", "loop guard", "cycle",
+                                "checkpoint" };
+            r.errorBody     =
+                "Cycle-guard checkpoint: the recent tool window is "
+                "cycling across " + std::to_string(cycleDistinctCount) +
+                " repeated calls without producing new results. Another "
+                "cycling call will hard-stop the agent. Break the cycle: "
+                "take a genuinely different action, use /wait if you are "
+                "waiting for something external, or ask the user for "
+                "direction. This call was not executed.";
+
+            FeedResultOnly(r, /*countTowardIterationCap=*/false);
+            DrainQueuedInvocationsWithSkippedResults(
+                "the cycle-guard checkpoint stopped this batch before "
+                "this call ran.");
+            ContinueLoop();
+            return true;
+        }
+
         ToolInvocationResult r;
         r.toolTag       = inv.name.empty() ? "tool" : inv.name;
         r.invocationRaw = inv.rawBlock;
@@ -1467,7 +1639,8 @@ bool AgentController::DispatchAndContinue(const ToolInvocation& inv)
         r.errorBody     =
             "Agent stopped before dispatch: the recent tool window appears "
             "to be cycling across " + std::to_string(cycleDistinctCount) +
-            " repeated tool calls. Tool was not executed.";
+            " repeated tool calls after a checkpoint warning. Tool was "
+            "not executed.";
 
         EmitAndStoreTerminalToolResult(r, true);
         DrainQueuedInvocationsWithSkippedResults(
@@ -1541,15 +1714,24 @@ bool AgentController::DispatchApprovedAndContinue(const ToolInvocation& inv,
         !m_recentToolSignatures.empty() &&
         m_recentToolSignatures.back().signature == signature;
 
+    // Phase 7e: the hint now fires only when the previous identical
+    // call FAILED (the original notes_read/missing-path motivation).
+    // Successful repeats no longer get the nag: a progressing repeat
+    // (different output each time) is legitimate and is purged by
+    // ResolveToolSignatureOutcome, and a non-progressing one runs into
+    // the loop-guard checkpoint above, which is the real warning.
     if (consecutiveRepeat &&
+        m_recentToolSignatures.back().resolved &&
+        m_recentToolSignatures.back().failed &&
         repeatCount == kLoopGuardRepeatThreshold - 1 &&
         repeatCount >= 2) {
         m_pendingSoftHint +=
-            "\n\n[notice] You just repeated this exact tool call. One more "
-            "identical call will trip the loop guard and stop the agent. "
-            "Try a different approach: call notes_read if a saved path may "
-            "exist, ask the user where the file lives, or use a different "
-            "tool. Do NOT repeat this exact call.";
+            "\n\n[notice] You just repeated an exact tool call that "
+            "previously FAILED. One more identical call will trip the "
+            "loop guard. Try a different approach: fix the cause of the "
+            "failure first, call notes_read if a saved path may exist, "
+            "ask the user where the file lives, or use a different tool. "
+            "Do NOT repeat this exact call.";
     }
 
     // Phase 7 loop guard bookkeeping happens HERE — at the moment the
@@ -1565,6 +1747,15 @@ bool AgentController::DispatchApprovedAndContinue(const ToolInvocation& inv,
     // observers/tests/loggers.  Emit at the approved-dispatch point so
     // trace durations do not include approval wait time or denied calls.
     EmitToolCallEvent(inv, dispatchSignature);
+
+    // wait is agent-loop-owned: no worker, no process -- the frame's
+    // WaitExecutor arms a one-shot timer and the loop suspends on
+    // m_awaitingAsyncResult until the timer (or Stop) posts the
+    // completion event.  Intercepted before DispatchInvocation; the
+    // router's DoWait body only serves non-agent paths.
+    if (inv.name == tool_names::kWait) {
+        return StartWaitTool(inv, ctx);
+    }
 
     // Filesystem tools are synchronous at the router layer, but reads,
     // listings, writes, and Python syntax checks can all block on
@@ -1600,8 +1791,10 @@ bool AgentController::FinishDispatchedInvocation(
         case DispatchStatus::Completed:
             // Phase 7d: resolve the just-recorded signature's outcome so
             // the loop guards can distinguish failure loops from
-            // legitimate successful repeats.
-            ResolveToolSignatureOutcome(inv, !out.result.errorBody.empty());
+            // legitimate successful repeats.  Phase 7e: the success body
+            // rides along so progress purging can compare outputs.
+            ResolveToolSignatureOutcome(inv, !out.result.errorBody.empty(),
+                                        out.result.body);
 
             if (inv.name == tool_names::kPythonCreateScript &&
                 out.result.errorBody.empty() &&
@@ -1701,7 +1894,8 @@ bool AgentController::HandleToolWorkerComplete(
         // for another step.
         ResolveToolSignatureOutcome(
             inv, workerResult.outcome.status != DispatchStatus::Completed ||
-                 !workerResult.outcome.result.errorBody.empty());
+                 !workerResult.outcome.result.errorBody.empty(),
+            workerResult.outcome.result.body);
         return FinishAsyncToolResult(
             inv, workerResult.outcome.result, /*cancelled=*/true);
     }
@@ -1823,7 +2017,11 @@ void AgentController::ContinueLoop()
     // beginNextIteration callback.  The frame uses it to reset
     // streaming state, render the assistant prefix, and re-arm the
     // streaming flag.
-    std::string model = m_appState->GetModel();
+    // Pinned, not app-global: this names the assistant turn in the
+    // saved transcript AND rides along to sendRequest.  Reading the
+    // global here made window A's transcript credit whichever model
+    // window B had just loaded.
+    std::string model = ResolveWireModel();
     m_history->AddAssistantPlaceholder(model);
 
     unsigned long genId = m_cb.bumpGenerationId ? m_cb.bumpGenerationId() : 0;
@@ -2417,7 +2615,8 @@ std::string AgentController::ProjectStructuredArgs(
 
 bool AgentController::FinishAsyncToolResult(const ToolInvocation&       inv,
                                             const ToolInvocationResult& r,
-                                            bool                        cancelled)
+                                            bool                        cancelled,
+                                            bool countTowardIterationCap)
 {
     if (cancelled) {
         // Still render the (likely-partial) result so the user sees
@@ -2440,9 +2639,12 @@ bool AgentController::FinishAsyncToolResult(const ToolInvocation&       inv,
     // Phase 7d: async outcome lands here; resolve before continuing so
     // a successful retry-after-fix purges the earlier failed records of
     // the same call (e.g. python_run_script after python_create_script).
-    ResolveToolSignatureOutcome(inv, !r.errorBody.empty());
+    // Phase 7e: the success body rides along so progress purging can
+    // compare outputs (python_run_script snapshot/scroll paging is the
+    // canonical beneficiary).
+    ResolveToolSignatureOutcome(inv, !r.errorBody.empty(), r.body);
 
-    FeedResultAndIterate(r);
+    FeedResultAndIterate(r, countTowardIterationCap);
     return true;
 }
 
@@ -2534,6 +2736,194 @@ bool AgentController::HandleCmdComplete(const CmdResult& cmdResult)
     r.presentedFiles = cmdResult.presentedFiles;
 
     return FinishAsyncToolResult(inv, r, m_cancelled || cmdResult.cancelled);
+}
+
+// ─── wait tool ───────────────────────────────────────────────────
+//
+// StartWaitTool runs at agent dispatch (after approval, signature
+// recording, and the ToolCall trace event; before DispatchInvocation).
+// HandleWaitComplete consumes the WaitExecutor's completion event.
+//
+// Budget policy: waits are exempt from the tool-step cap -- they
+// consume wall-clock budget (m_waitSecondsUsed vs m_waitBudgetSeconds)
+// instead of steps, because the step cap protects against runaway
+// token burn and a wait burns none.  A budget-exceeded wait feeds an
+// uncounted control message so the model can wrap up with the
+// evidence it has; repeated retries of the identical denied wait are
+// backstopped by the ordinary repeat guard.
+
+bool AgentController::ParseWaitArgs(const std::string& args,
+                                    int&               secondsOut,
+                                    std::string&       reasonOut)
+{
+    secondsOut = 0;
+    reasonOut.clear();
+
+    // First whitespace-delimited token is the seconds; everything
+    // after it (trimmed) is an optional human-readable reason.
+    size_t start = args.find_first_not_of(" \t\r\n");
+    if (start == std::string::npos) return false;
+    size_t end = args.find_first_of(" \t\r\n", start);
+    const std::string tok = (end == std::string::npos)
+        ? args.substr(start) : args.substr(start, end - start);
+
+    long v = 0;
+    if (tok.empty()) return false;
+    for (char c : tok) {
+        if (c < '0' || c > '9') return false;
+        v = v * 10 + (c - '0');
+        if (v > 100000) break;   // fails the range check below
+    }
+    if (v < kMinWaitSecondsPerCall || v > kMaxWaitSecondsPerCall)
+        return false;
+    secondsOut = static_cast<int>(v);
+
+    if (end != std::string::npos) {
+        size_t rs = args.find_first_not_of(" \t\r\n", end);
+        if (rs != std::string::npos) {
+            size_t re = args.find_last_not_of(" \t\r\n");
+            reasonOut = args.substr(rs, re - rs + 1);
+        }
+    }
+    return true;
+}
+
+bool AgentController::StartWaitTool(const ToolInvocation& inv,
+                                    const ToolContext&    ctx)
+{
+    auto makeWaitResult = [&]() {
+        ToolInvocationResult r;
+        r.toolTag       = tool_names::kWait;
+        r.invocationRaw = inv.rawBlock;
+        r.iconUtf8      = tool_approval::ToolIcon(inv.name);
+        r.toolName      = tool_approval::ToolDisplayName(inv.name);
+        r.commandEcho   = tool_approval::CommandEcho(inv);
+        return r;
+    };
+
+    int seconds = 0;
+    std::string reason;
+    if (!ParseWaitArgs(inv.args, seconds, reason)) {
+        // Shape-level validation normally catches this upstream; this
+        // covers protocol paths that skip ValidateToolArgs.
+        ResolveToolSignatureOutcome(inv, /*failed=*/true);
+        ToolInvocationResult r = makeWaitResult();
+        r.chips     = { "error" };
+        r.errorBody =
+            "wait args must be '<seconds> [reason]' with seconds " +
+            std::to_string(kMinWaitSecondsPerCall) + "-" +
+            std::to_string(kMaxWaitSecondsPerCall) + ".";
+        FeedResultAndIterate(r, /*countTowardIterationCap=*/false);
+        return true;
+    }
+
+    // Per-turn budget.  Denials are uncounted control messages (the
+    // recovery-message precedent), not tool work.
+    const int remaining = m_waitBudgetSeconds - m_waitSecondsUsed;
+    if (seconds > remaining) {
+        ResolveToolSignatureOutcome(inv, /*failed=*/true);
+        ToolInvocationResult r = makeWaitResult();
+        r.chips     = { "blocked", "wait budget" };
+        r.errorBody =
+            "Wait budget exhausted for this turn (" +
+            std::to_string(m_waitSecondsUsed) + "s used of " +
+            std::to_string(m_waitBudgetSeconds) + "s; " +
+            std::to_string(remaining > 0 ? remaining : 0) +
+            "s remaining, " + std::to_string(seconds) +
+            "s requested). Do not call wait again this turn. Report the "
+            "current status of the monitored work from the evidence you "
+            "already have, tell the user it is still in progress, and "
+            "suggest they ask you to check again later. The user can raise "
+            "the budget with /wait_budget <seconds>.";
+        FeedResultAndIterate(r, /*countTowardIterationCap=*/false);
+        return true;
+    }
+
+    if (!m_waitExec || !m_waitExec->Start(seconds, reason)) {
+        ResolveToolSignatureOutcome(inv, /*failed=*/true);
+        ToolInvocationResult r = MakeAsyncLaunchErrorResult(
+            inv, "The wait timer is unavailable or already running.");
+        FeedResultAndIterate(r, /*countTowardIterationCap=*/false);
+        return true;
+    }
+
+    // Budget is consumed at grant time: a cancelled wait ends the
+    // loop anyway, so refunding the unused remainder buys nothing.
+    m_waitSecondsUsed += seconds;
+
+    m_awaitingAsyncResult    = true;
+    m_pendingAsyncInvocation = inv;
+    m_pendingAsyncContext    = ctx;
+    EmitPendingToolBlock(inv);
+    return true;
+}
+
+bool AgentController::HandleWaitComplete(const WaitResult& waitResult)
+{
+    if (!m_active || !m_awaitingAsyncResult) return false;
+
+    // Defensive: only consume the event if THIS controller armed the
+    // wait -- same mis-attribution guard as the other handlers.
+    if (m_pendingAsyncInvocation.name != tool_names::kWait)
+        return false;
+
+    m_awaitingAsyncResult = false;
+    ToolInvocation inv = m_pendingAsyncInvocation;
+    m_pendingAsyncInvocation = ToolInvocation{};
+    m_pendingAsyncContext = ToolContext{};
+
+    const bool cancelled = m_cancelled || waitResult.cancelled;
+
+    std::vector<std::string> chips;
+    if (cancelled) {
+        chips.push_back("cancelled");
+    } else {
+        chips.push_back("waited");
+    }
+    {
+        std::ostringstream ts;
+        ts << std::fixed;
+        ts.precision(waitResult.elapsedSec < 10.0 ? 2 : 0);
+        ts << waitResult.elapsedSec << "s";
+        chips.push_back(ts.str());
+    }
+
+    ToolInvocationResult r;
+    r.toolTag       = tool_names::kWait;
+    r.invocationRaw = inv.rawBlock;
+    r.iconUtf8      = tool_approval::ToolIcon(inv.name);
+    r.toolName      = tool_approval::ToolDisplayName(inv.name);
+    r.commandEcho   = tool_approval::CommandEcho(inv);
+    r.chips         = chips;
+    {
+        std::ostringstream body;
+        body << "Waited " << waitResult.requestedSeconds << " seconds";
+        if (!waitResult.reason.empty())
+            body << " (" << waitResult.reason << ")";
+        body << ".";
+        if (!cancelled) {
+            body << " Wait budget this turn: " << m_waitSecondsUsed
+                 << "s used of " << m_waitBudgetSeconds
+                 << "s. Run ONE status check now; if the work is still "
+                    "in progress, you may wait again.";
+        }
+        r.body = body.str();
+    }
+
+    // Policy: a completed wait clears the loop-guard signature
+    // window.  The guards catch state-free repetition -- re-asking
+    // the same question expecting a different answer.  A wait
+    // changes the one input that makes an identical re-check
+    // legitimate: time.  Without this, wait -> poll -> wait -> poll
+    // trips the cycle guard on the third poll and identical polls
+    // trip the repeat guard, killing exactly the monitoring pattern
+    // the tool exists for.  The per-call floor plus the wait budget
+    // keep tiny spam waits from resetting the guards for free.
+    if (!cancelled)
+        m_recentToolSignatures.clear();
+
+    return FinishAsyncToolResult(inv, r, cancelled,
+                                 /*countTowardIterationCap=*/false);
 }
 
 // ─── controlled Python helper completion ─────────────────────────

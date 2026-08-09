@@ -69,6 +69,21 @@ public:
     // this replacement does not shift any later rich-text ranges.
     bool MarkCopyLinkCopied(size_t blockIndex);
 
+    // ── Position maintenance ──────────────────────────────────────
+    // m_copyLinks holds ABSOLUTE offsets into the shared
+    // wxRichTextCtrl document.  Any mutation elsewhere in that
+    // document (tool-block expand/collapse, approval-row removal,
+    // cancelled-turn pruning) invalidates them, so ChatDisplay must
+    // drive these two the same way it drives ShiftOtherRegions.
+    //
+    // ShiftCopyLinks: every link at or past |pivot| moves by |delta|.
+    // PruneCopyLinksFrom: drop links starting at or past |pivot|,
+    // for ranges about to be removed from the document entirely.
+    // Their m_codeBlocks slots are deliberately left orphaned rather
+    // than reindexed -- same policy as Reset().
+    void ShiftCopyLinks(long pivot, long delta);
+    void PruneCopyLinksFrom(long pivot);
+
     // ── File chip callback ────────────────────────────────────────
     // When a fenced code block closes, the renderer packages it into a
     // PresentedFile and invokes this callback.  ChatDisplay wires it to
@@ -76,6 +91,16 @@ public:
     // shared with future producers (PowerShell tool, etc.).
     using FileCallback = std::function<void(const PresentedFile&)>;
     void SetFileCallback(FileCallback cb) { m_fileCallback = std::move(cb); }
+
+    // ── Sticky autoscroll ─────────────────────────────────────────
+    // Optional predicate consulted before every live-streaming
+    // ShowPosition() scroll.  ChatDisplay wires this to its follow-mode
+    // flag so a user who has scrolled up to read is not yanked back to
+    // the bottom on every delta.  Unset (default) preserves the old
+    // always-scroll behavior.  Bulk/replay mode skips these scrolls
+    // entirely and never consults the predicate.
+    void SetAutoScrollPredicate(std::function<bool()> pred)
+    { m_autoScroll = std::move(pred); }
 
 private:
     wxRichTextCtrl* m_ctrl;
@@ -86,6 +111,12 @@ private:
     std::string m_codeBlockLang;       // Language tag from opening fence (just "cpp", etc.)
     std::string m_codeBlockFilename;   // Filename parsed from opening fence (may be empty)
     long        m_partialLineStart;    // Character position where partial line begins (-1 = none)
+    // How many bytes of m_lineBuffer are currently drawn as the preview.
+    // Invariant: when m_partialLineStart >= 0, the on-screen preview is
+    // exactly m_lineBuffer.substr(0, m_partialLineRenderedLen).  Lets
+    // ProcessDelta append just the new suffix instead of deleting and
+    // rewriting the whole preview on every token.
+    size_t      m_partialLineRenderedLen;
     bool        m_bulkMode;            // Replay mode: skip partial-line preview + per-call scroll
 
     // ── Colors ───────────────────────────────────────────────────
@@ -101,6 +132,10 @@ private:
 
     // ── File chip callback ────────────────────────────────────────
     FileCallback              m_fileCallback;        // Invoked when a fenced block closes
+    std::function<bool()>     m_autoScroll;          // Empty = always scroll (legacy)
+
+    bool ShouldAutoScroll() const
+    { return !m_autoScroll || m_autoScroll(); }
 
     // ── Block-level rendering ────────────────────────────────────
     void RenderCompleteLine(const std::string& line, const wxColour& baseColor);

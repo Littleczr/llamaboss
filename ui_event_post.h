@@ -26,6 +26,27 @@ inline std::mutex& UiPostMutex()
     return m;
 }
 
+// ── Payload reclamation on the rejected-event path ───────────────
+// wxCommandEvent does NOT own its client object: wx/event.h keeps a
+// raw m_clientObject pointer and no wx destructor touches it (it
+// exists to point at control-owned listbox item data).  So when we
+// reject an event because the target is gone, `delete ev` frees the
+// event but leaks whatever the producer attached via
+// SetClientObject() -- a full CmdResult, PythonRunResult,
+// WebFetchResult, conversation SaveSnapshot, etc.
+//
+// Every producer in LlamaBoss attaches payloads to wxCommandEvent
+// (or a subclass), so a single downcast covers all of them.  Events
+// with no client object are unaffected: GetClientObject() returns
+// nullptr and `delete nullptr` is a no-op.
+inline void ReclaimClientObject(wxEvent* ev)
+{
+    if (auto* cmd = dynamic_cast<wxCommandEvent*>(ev)) {
+        delete cmd->GetClientObject();
+        cmd->SetClientObject(nullptr);
+    }
+}
+
 inline void MarkDead(const std::shared_ptr<std::atomic<bool>>& aliveToken)
 {
     std::lock_guard<std::mutex> lock(UiPostMutex());
@@ -40,6 +61,7 @@ inline bool QueueIfAlive(wxEvtHandler* handler,
 {
     if (!ev) return false;
     if (!handler) {
+        ReclaimClientObject(ev);
         delete ev;
         return false;
     }
@@ -48,6 +70,7 @@ inline bool QueueIfAlive(wxEvtHandler* handler,
 
     auto alive = aliveToken.lock();
     if (!alive || !alive->load(std::memory_order_acquire)) {
+        ReclaimClientObject(ev);
         delete ev;
         return false;
     }

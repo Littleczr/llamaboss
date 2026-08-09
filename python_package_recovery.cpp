@@ -166,6 +166,49 @@ bool LbFindMissingPythonPackage(const std::string& stdoutText,
     return true;
 }
 
+// Detect whether a missing-module diagnostic came from a REMOTE
+// machine whose output was merely relayed through a local wrapper
+// script (the runPod skill's runpod_ssh.py is the canonical case:
+// verify_env.py fails on the pod, its ModuleNotFoundError traceback
+// rides home inside the wrapper's stdout, and the recovery card then
+// wrongly suggests python_install_package — which installs LOCALLY
+// and cannot fix the pod).  Observed in production 2026-08-03.
+//
+// Two independent signals:
+//   1. Relay envelope markers: runpod_ssh.py prints a JSON envelope
+//      containing "remote_exit_code" and a "Remote command finished
+//      on <target>" line around relayed output.
+//   2. Traceback frame origin: a traceback produced on THIS machine
+//      (Windows) cites drive-letter frames (File "C:\...).  A
+//      traceback whose File "..." frames are exclusively POSIX
+//      absolute paths (File "/usr/..., File "/workspace/...) was
+//      produced on another OS and therefore another machine.
+// Frames like File "<frozen importlib._bootstrap>" match neither
+// pattern and are ignored by both tests.
+bool LbLooksLikeRemoteExecutionOutput(const std::string& text)
+{
+    const std::string lower = LbLowerAscii(text);
+    if (lower.find("\"remote_exit_code\"") != std::string::npos) return true;
+    if (lower.find("remote command finished on ") != std::string::npos) return true;
+
+    const bool hasPosixFrame = text.find("File \"/") != std::string::npos;
+    if (!hasPosixFrame) return false;
+
+    size_t pos = 0;
+    while ((pos = text.find("File \"", pos)) != std::string::npos) {
+        pos += 6;
+        if (pos + 2 < text.size()) {
+            const char d = text[pos];
+            const bool driveLetter =
+                ((d >= 'A' && d <= 'Z') || (d >= 'a' && d <= 'z')) &&
+                text[pos + 1] == ':' &&
+                (text[pos + 2] == '\\' || text[pos + 2] == '/');
+            if (driveLetter) return false;   // local frame present
+        }
+    }
+    return true;   // POSIX frames only: the failure happened remotely
+}
+
 } // anonymous namespace
 
 void ApplyMissingPythonPackageRecovery(ToolInvocationResult&  r,
@@ -185,6 +228,37 @@ void ApplyMissingPythonPackageRecovery(ToolInvocationResult&  r,
     }
 
     r.iconUtf8 = "\xF0\x9F\x93\xA6"; // 📦
+
+    // Remote relays get their own card BEFORE the local-install
+    // suggestion is composed: coaching python_install_package here
+    // would install the package on THIS machine while the failure
+    // lives on the remote host.  A small model follows that bait,
+    // installs locally, retries, hits the identical remote failure,
+    // and loops.  Name the right move instead.
+    if (LbLooksLikeRemoteExecutionOutput(py.stdoutText + "\n" + py.stderrText)) {
+        const std::string& shown =
+            installable ? packageName : importName;
+        r.toolName = "Missing Remote Python Package";
+
+        std::ostringstream remoteBody;
+        remoteBody
+            << "The failed run reports `" << shown
+            << "` missing \xE2\x80\x94 but the traceback comes from a "
+               "REMOTE machine whose output was relayed through this "
+               "script, not from this computer's Python.\n\n"
+            << "Do NOT use `python_install_package` \xE2\x80\x94 it installs "
+               "locally and cannot fix the remote host. Install the package "
+               "on the remote machine through the same channel that ran "
+               "this command (for example `python -m pip install " << shown
+            << "` via the remote helper), then retry the failed step once.";
+        if (!r.body.empty()) {
+            remoteBody << "\n\nOriginal stdout:\n" << r.body;
+        }
+        r.body = remoteBody.str();
+        r.bodyLang = "markdown";
+        return;
+    }
+
     r.toolName = installable ? std::string("Missing Python Package")
                              : std::string("Unsupported Python Package");
 

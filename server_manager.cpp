@@ -1,6 +1,7 @@
 // server_manager.cpp
 #include "server_manager.h"
 #include "path_safety.h"
+#include "gguf_metadata.h"
 
 #include <wx/filename.h>
 #include <wx/dir.h>
@@ -28,6 +29,7 @@
 #include <chrono>
 #include <set>
 #include <cctype>
+#include <cstdint>
 #include <cstdlib>
 #include <initializer_list>
 #include "ui_event_post.h"
@@ -128,10 +130,67 @@ static bool IsBundledModelPath(const std::string& ggufPath)
     return IsBundledModelFolder(ModelFolderForGgufPath(ggufPath));
 }
 
-// Phase 3 stabilization: only the specific "retry without --jinja"
-// recovery path should use MaybeRetryWithoutJinja(). Earlier builds
-// retried on every server-start failure, which could hide unrelated
+// Startup fallback classifiers are intentionally specific.  Earlier
+// builds retried on every server-start failure, which could hide unrelated
 // problems such as a bad model path, CUDA/DLL failure, or port conflict.
+static bool LooksLikeMtpFailure(const std::string& error)
+{
+    const std::string e = ToLowerAscii(error);
+
+    // Prefer direct llama.cpp startup diagnostics when present.
+    if (ContainsAny(e, {
+            "failed to create mtp context",
+            "failed to create draft context",
+            "failed to initialize mtp",
+            "failed to initialize draft",
+            "failed to load mtp",
+            "failed to load draft model"})) {
+        return true;
+    }
+
+    // Do not blame MTP for a clear Jinja/template diagnostic merely
+    // because normal startup logging also mentioned draft-mtp.  Direct
+    // MTP failures above still take precedence when both are present.
+    if (ContainsAny(e, {
+            "--jinja",
+            "jinja",
+            "chat template",
+            "chat_template",
+            "chat-template",
+            "template compile",
+            "template parsing"})) {
+        return false;
+    }
+
+    // Some backend failures end in an assertion/allocation error after
+    // the log has only announced creation of the MTP draft context.
+    // Require both an MTP/speculative marker and a fatal-looking marker
+    // so unrelated model-load errors do not trigger a second launch.
+    const bool hasMtpMarker = ContainsAny(e, {
+        "draft-mtp",
+        "mtp context",
+        "mtp draft",
+        "nextn_predict_layers",
+        "common_speculative_impl_draft_mtp",
+        "creating speculative implementation"});
+
+    const bool hasFailureMarker = ContainsAny(e, {
+        "failed",
+        "failure",
+        "fatal",
+        "error",
+        "assert",
+        "abort",
+        "exception",
+        "out of memory",
+        "not enough memory",
+        "cannot allocate",
+        "could not allocate",
+        "cuda error"});
+
+    return hasMtpMarker && hasFailureMarker;
+}
+
 static bool LooksLikeJinjaOrTemplateFailure(const std::string& error)
 {
     const std::string e = ToLowerAscii(error);
@@ -250,11 +309,45 @@ ServerHealthThread::ServerHealthThread(wxEvtHandler* handler,
     // while this detached thread is still running — closing a handle
     // someone else is waiting on is undefined. With a duplicate,
     // both sides can close independently.
+    //
+    // The return value matters: on failure Windows may leave the target
+    // as NULL rather than untouched, and NULL passes an
+    // `!= INVALID_HANDLE_VALUE` guard.  That fed WaitForSingleObject(NULL)
+    // every poll and CloseHandle(NULL) on the way out (which raises under
+    // a debugger with handle verification on).  Normalize explicitly.
     if (processHandle != INVALID_HANDLE_VALUE) {
-        DuplicateHandle(GetCurrentProcess(), processHandle,
-                        GetCurrentProcess(), &m_processHandle,
-                        0, FALSE, DUPLICATE_SAME_ACCESS);
+        if (!DuplicateHandle(GetCurrentProcess(), processHandle,
+                             GetCurrentProcess(), &m_processHandle,
+                             0, FALSE, DUPLICATE_SAME_ACCESS)) {
+            m_processHandle = INVALID_HANDLE_VALUE;
+        }
+        else if (m_processHandle == nullptr) {
+            m_processHandle = INVALID_HANDLE_VALUE;
+        }
     }
+#endif
+}
+
+#ifdef __WXMSW__
+// Idempotent: nulls the member after closing so Entry() and the
+// destructor can both call it without any double-close risk.
+void ServerHealthThread::CloseProcessHandle()
+{
+    if (m_processHandle != INVALID_HANDLE_VALUE) {
+        CloseHandle(m_processHandle);
+        m_processHandle = INVALID_HANDLE_VALUE;
+    }
+}
+#endif
+
+ServerHealthThread::~ServerHealthThread()
+{
+#ifdef __WXMSW__
+    // Normally a no-op: Entry() already closed and nulled the handle.
+    // This catches the paths where Entry() never ran at all -- a failed
+    // wxThread::Create() or Run() in StartServer, which deletes this
+    // object directly.
+    CloseProcessHandle();
 #endif
 }
 
@@ -292,8 +385,7 @@ wxThread::ExitCode ServerHealthThread::Entry()
             ev->SetString(wxString::FromUTF8(msg));
             SafePost(ev);
 #ifdef __WXMSW__
-            if (m_processHandle != INVALID_HANDLE_VALUE)
-                CloseHandle(m_processHandle);
+            CloseProcessHandle();
 #endif
             return (ExitCode)0;
         }
@@ -316,7 +408,7 @@ wxThread::ExitCode ServerHealthThread::Entry()
             SetServerEventGeneration(*ev, m_generation);
             ev->SetString(wxString::FromUTF8(msg));
             SafePost(ev);
-            CloseHandle(m_processHandle);
+            CloseProcessHandle();
             return (ExitCode)0;
         }
 #endif
@@ -351,8 +443,7 @@ wxThread::ExitCode ServerHealthThread::Entry()
                 if (!m_cancelFlag->load())
                     VerifySingleSlot(m_baseUrl, m_logger);
 #ifdef __WXMSW__
-                if (m_processHandle != INVALID_HANDLE_VALUE)
-                    CloseHandle(m_processHandle);
+                CloseProcessHandle();
 #endif
                 return (ExitCode)0;
             }
@@ -368,8 +459,7 @@ wxThread::ExitCode ServerHealthThread::Entry()
     }
 
 #ifdef __WXMSW__
-    if (m_processHandle != INVALID_HANDLE_VALUE)
-        CloseHandle(m_processHandle);
+    CloseProcessHandle();
 #endif
     return (ExitCode)0;
 }
@@ -402,6 +492,13 @@ wxThread::ExitCode ServerHealthThread::Entry()
 // under the same mutex that guards the queue.
 
 struct SlotAction {
+    // Launch identity of the server this action was enqueued
+    // against.  Without it a queued action outlives the server it
+    // was meant for: kill server A, start B on the same port, and
+    // the stale action POSTs model A's KV filename at model B.  The
+    // worker drops any action whose generation no longer matches the
+    // queue's live generation.
+    ServerLaunchGeneration generation = kInvalidServerLaunchGeneration;
     std::string baseUrl;
     std::string action;     // "save" | "restore"
     std::string filename;
@@ -417,7 +514,47 @@ struct SlotActionQueue {
     std::deque<SlotAction> items;
     bool                   workerRunning = false;
     bool                   stop          = false;   // set by ~ServerManager
+
+    // The launch generation currently owning the port.  Set when a
+    // server process starts; reset to invalid whenever one is
+    // stopped.  Anything popped with a different generation is
+    // dropped instead of executed.
+    ServerLaunchGeneration liveGeneration = kInvalidServerLaunchGeneration;
+
+    // The session the worker is blocked on right now, if any.
+    // Published so the UI thread can abort() it at stop time rather
+    // than letting a multi-GB save run out its 120s timeout against
+    // a process that no longer exists.  Poco's abort() closes the
+    // socket from another thread; the blocking call then throws and
+    // lands in the worker's existing catch(...).
+    std::shared_ptr<Poco::Net::HTTPClientSession> inFlight;
 };
+
+// Clear queued actions, invalidate the live generation, and abort
+// whatever the worker is blocked on.  Safe to call with a null queue.
+static void AbandonSlotQueue(const std::shared_ptr<SlotActionQueue>& q,
+                             Poco::Logger* logger)
+{
+    if (!q) return;
+
+    std::shared_ptr<Poco::Net::HTTPClientSession> inFlight;
+    bool purged = false;
+    {
+        std::lock_guard<std::mutex> lock(q->mutex);
+        purged = !q->items.empty();
+        q->items.clear();
+        q->liveGeneration = kInvalidServerLaunchGeneration;
+        inFlight = q->inFlight;
+    }
+
+    if (inFlight) {
+        try { inFlight->abort(); } catch (...) { /* already dead */ }
+    }
+
+    if (logger && (purged || inFlight))
+        logger->information(
+            "kvslot: queue abandoned (server stopping)");
+}
 
 ServerManager::ServerManager(wxEvtHandler* eventHandler,
                              std::weak_ptr<std::atomic<bool>> aliveToken,
@@ -425,6 +562,12 @@ ServerManager::ServerManager(wxEvtHandler* eventHandler,
     : m_eventHandler(eventHandler)
     , m_aliveToken(aliveToken)
     , m_logger(logger)
+    // Lifecycle state, not optional work state.  Creating the queue here
+    // guarantees StartServer() can stamp every successful launch with its
+    // generation before the first save/restore is ever enqueued.  The old
+    // lazy construction path created the queue after launch and left
+    // liveGeneration invalid, so every first-launch KV action was dropped.
+    , m_slotQueue(std::make_shared<SlotActionQueue>())
 {
 }
 
@@ -435,9 +578,16 @@ ServerManager::~ServerManager()
     // StopServer() is about to kill.  No join — the worker owns a
     // shared_ptr to the queue block, so this never blocks the UI
     // thread on a network timeout.
+    std::shared_ptr<Poco::Net::HTTPClientSession> inFlight;
     if (m_slotQueue) {
         std::lock_guard<std::mutex> lock(m_slotQueue->mutex);
         m_slotQueue->stop = true;
+        m_slotQueue->liveGeneration = kInvalidServerLaunchGeneration;
+        m_slotQueue->items.clear();
+        inFlight = m_slotQueue->inFlight;
+    }
+    if (inFlight) {
+        try { inFlight->abort(); } catch (...) { /* already dead */ }
     }
 
     StopServer();
@@ -456,12 +606,53 @@ std::string ServerManager::GetBaseUrl() const
 // slot helpers here precede the directory-accessor cluster.
 static std::string GetKvSlotCacheDir();
 
+// ── KV cache key hashing ─────────────────────────────────────────
+// FNV-1a/64 over a byte string.  Not cryptographic and doesn't need
+// to be: the cache dir holds ~6 live files (see PruneKvSlotCacheDir),
+// so collision probability is negligible, and the only property
+// required is that it be stable across runs and across machines.
+// Written inline rather than pulled from Poco so the value can never
+// drift with a dependency version.
+static uint64_t KvKeyHash(const std::string& s)
+{
+    uint64_t h = 1469598103934665603ULL;          // FNV offset basis
+    for (unsigned char c : s) {
+        h ^= static_cast<uint64_t>(c);
+        h *= 1099511628211ULL;                    // FNV prime
+    }
+    return h;
+}
+
+static std::string KvKeyHashHex(const std::string& s)
+{
+    static const char* kHex = "0123456789abcdef";
+    uint64_t h = KvKeyHash(s);
+    std::string out(16, '0');
+    for (int i = 15; i >= 0; --i) { out[i] = kHex[h & 0xF]; h >>= 4; }
+    return out;
+}
+
 // Cache filename for a (model, conversation) pair.  Keyed by BOTH so
 // a conversation reopened under a different model simply finds no
 // state file — restoring KV serialized by another model into the
 // running one would be undefined behavior at best.  Sanitized to
 // [A-Za-z0-9._-] because llama-server treats the filename as a path
 // component under --slot-save-path.
+//
+// The key is a hash of the FULL normalized paths, not the file stems.
+// Stems alone are not unique: D:\Models\A\model.gguf and
+// D:\Models\B\model.gguf share a stem, as do same-named conversations
+// in different folders, and the 60-char truncation merged long names
+// that differed only past that point (quant variants of one base
+// model are the realistic case).  Any of those collisions meant one
+// conversation silently overwriting another's KV state, or restoring
+// state serialized by a different model — the exact undefined
+// behavior the (model, conversation) keying exists to prevent.
+//
+// The stems are retained purely so the cache dir stays readable when
+// inspected by hand; uniqueness lives entirely in the hash, so they
+// are truncated harder than before to keep the total path well clear
+// of Windows' MAX_PATH.
 static std::string SlotCacheFilenameFor(const std::string& modelGgufPath,
                                         const std::string& conversationPath)
 {
@@ -475,14 +666,72 @@ static std::string SlotCacheFilenameFor(const std::string& modelGgufPath,
                             (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-';
             if (!ok) c = '-';
         }
-        if (out.size() > 60) out.resize(60);
+        if (out.size() > 32) out.resize(32);
         return out;
     };
+
+    // Normalize before hashing so the same file referenced with mixed
+    // separators or mixed case yields the same key.  Deliberately does
+    // NOT collapse duplicate slashes: merging "//server/share" with
+    // "/server/share" would introduce a new collision source, and a
+    // spurious cache MISS (slow but correct) is always preferable to a
+    // spurious HIT (wrong KV state restored).
+    auto normalizeForHash = [](const std::string& path) -> std::string {
+        std::string out = path;
+        for (char& c : out) {
+            if (c == '\\') c = '/';
+#ifdef __WXMSW__
+            c = static_cast<char>(
+                std::tolower(static_cast<unsigned char>(c)));
+#endif
+        }
+        return out;
+    };
+
+    // Model identity beyond its path: replacing a .gguf in place —
+    // re-downloading a different quant under the same filename — must
+    // produce a different key, because llama.cpp's state header does
+    // not carry model identity and will happily load mismatched KV.
+    //
+    // Deliberately NOT applied to the conversation file: that one is
+    // rewritten on every message, so folding its mtime into the key
+    // would miss the cache on literally every turn.  Both probes are
+    // best-effort; if the stat fails the key simply falls back to
+    // paths alone.
+    std::string modelIdentity;
+    {
+        wxFileName mf(wxString::FromUTF8(modelGgufPath));
+        const wxULongLong sz = mf.GetSize();
+        if (sz != wxInvalidSize) {
+            modelIdentity += "|sz=";
+            modelIdentity += sz.ToString().ToUTF8().data();
+        }
+        wxDateTime mtime;
+        if (mf.GetTimes(nullptr, &mtime, nullptr) && mtime.IsValid()) {
+            modelIdentity += "|mt=";
+            modelIdentity += std::to_string(
+                static_cast<long long>(mtime.GetTicks()));
+        }
+    }
+
+    // Schema tag is part of the hashed payload: any future change to
+    // what goes into the key can bump this and every stale file ages
+    // out of the prune window on its own, with no migration code.
+    //
+    // Separator is a char constant, not a "\x1f" string literal: a hex
+    // escape in a string consumes every hex digit that follows it, so
+    // appending a literal beginning with [0-9a-f] to one would silently
+    // change the escape rather than concatenate. A path fragment can
+    // easily start with a hex digit.
+    const char kSep = '\x1f';
+    const std::string payload =
+        std::string("kvslot-v2") + kSep + normalizeForHash(modelGgufPath) +
+        modelIdentity + kSep + normalizeForHash(conversationPath);
 
     std::string m = stem(modelGgufPath);
     std::string c = stem(conversationPath);
     if (m.empty() || c.empty()) return "";
-    return m + "__" + c + ".kvbin";
+    return m + "__" + c + "__" + KvKeyHashHex(payload) + ".kvbin";
 }
 
 // ── Slot-action response helpers ─────────────────────────────────
@@ -537,12 +786,66 @@ static std::string SanitizeLogSnippet(std::string s)
 // equivalent to "no fast path this time" with full reprocess as the
 // fallback, and each outcome is logged so the fast path's actual hit
 // rate is measurable instead of an article of faith.
-static void ExecuteSlotAction(const SlotAction& a)
+static void ExecuteSlotAction(const SlotAction& a,
+                              const std::shared_ptr<SlotActionQueue>& q)
 {
+    // Publishes/retracts the session under the queue mutex so a
+    // concurrent stop can abort it.  RAII so an exception anywhere
+    // below cannot leave a dangling handle behind.
+    struct InFlightGuard {
+        std::shared_ptr<SlotActionQueue> q;
+        ~InFlightGuard() {
+            if (!q) return;
+            std::lock_guard<std::mutex> lock(q->mutex);
+            q->inFlight.reset();
+        }
+    } guard{ q };
+
     try {
         Poco::URI uri(a.baseUrl + "/slots/0?action=" + a.action);
-        Poco::Net::HTTPClientSession sess(uri.getHost(), uri.getPort());
+        auto sessPtr = std::make_shared<Poco::Net::HTTPClientSession>(
+            uri.getHost(), uri.getPort());
+        Poco::Net::HTTPClientSession& sess = *sessPtr;
         sess.setTimeout(Poco::Timespan(120, 0));   // multi-GB states take seconds
+
+        // Authoritative generation check and in-flight publication must be
+        // one atomic operation under the queue mutex.  The worker already
+        // checks when it pops the action, but StopServer() can invalidate the
+        // launch in the gap between that check and session creation.  By
+        // re-checking while publishing the session, either:
+        //   * stop wins first and this stale action is never sent, or
+        //   * this action wins first and stop sees/aborts this exact session
+        //     before killing the old server and allowing a replacement launch.
+        ServerLaunchGeneration live = kInvalidServerLaunchGeneration;
+        bool queueStopped = false;
+        bool claimed = false;
+        if (q) {
+            std::lock_guard<std::mutex> lock(q->mutex);
+            live = q->liveGeneration;
+            queueStopped = q->stop;
+            if (!queueStopped && live == a.generation) {
+                q->inFlight = sessPtr;
+                claimed = true;
+            }
+        }
+
+        if (!claimed) {
+            if (a.logger) {
+                std::string reason;
+                if (!q)
+                    reason = "queue unavailable";
+                else if (queueStopped)
+                    reason = "queue stopped";
+                else
+                    reason = "generation " + std::to_string(a.generation) +
+                             " != live " + std::to_string(live);
+
+                a.logger->information(
+                    "kvslot: dropped stale " + a.action + " \"" +
+                    a.filename + "\" before send (" + reason + ")");
+            }
+            return;
+        }
 
         const std::string body = "{\"filename\":\"" + a.filename + "\"}";
 
@@ -593,15 +896,21 @@ void ServerManager::EnqueueSlotAction(const std::string& action,
     if (m_logger)
         m_logger->information("kvslot: dispatch " + action + " \"" + filename + "\"");
 
-    if (!m_slotQueue)
+    // Defensive fallback for future code that may explicitly reset the
+    // queue.  Normal construction is eager, but any replacement queue must
+    // inherit the launch that currently owns the port before accepting work.
+    if (!m_slotQueue) {
         m_slotQueue = std::make_shared<SlotActionQueue>();
+        m_slotQueue->liveGeneration = m_launchGeneration;
+    }
 
     std::shared_ptr<SlotActionQueue> q = m_slotQueue;
 
     bool spawnWorker = false;
     {
         std::lock_guard<std::mutex> lock(q->mutex);
-        q->items.push_back({ GetBaseUrl(), action, filename, m_logger });
+        q->items.push_back({ m_launchGeneration, GetBaseUrl(),
+                             action, filename, m_logger });
         if (!q->workerRunning) {
             q->workerRunning = true;
             spawnWorker = true;
@@ -612,6 +921,7 @@ void ServerManager::EnqueueSlotAction(const std::string& action,
         std::thread([q]() {
             for (;;) {
                 SlotAction a;
+                ServerLaunchGeneration live = kInvalidServerLaunchGeneration;
                 {
                     std::lock_guard<std::mutex> lock(q->mutex);
                     if (q->stop || q->items.empty()) {
@@ -620,8 +930,24 @@ void ServerManager::EnqueueSlotAction(const std::string& action,
                     }
                     a = std::move(q->items.front());
                     q->items.pop_front();
+                    live = q->liveGeneration;
                 }
-                ExecuteSlotAction(a);
+
+                // Stale: the server this was queued for is gone, and
+                // whatever owns the port now is a different launch.
+                // Executing would restore model A's KV into model B,
+                // or overwrite model A's cache file with B's slot.
+                if (a.generation != live) {
+                    if (a.logger)
+                        a.logger->information(
+                            "kvslot: dropped stale " + a.action + " \"" +
+                            a.filename + "\" (generation " +
+                            std::to_string(a.generation) + " != live " +
+                            std::to_string(live) + ")");
+                    continue;
+                }
+
+                ExecuteSlotAction(a, q);
             }
         }).detach();
     }
@@ -1596,17 +1922,19 @@ std::string ServerManager::FindMatchingMmproj(const std::string& modelGgufPath,
 // on localhost a live server answers in microseconds — if nothing is
 // listening, connect fails instantly (ECONNREFUSED), so the timeout
 // is only ever felt in pathological half-open states.
-bool ServerManager::IsPortAnswering() const
+bool ServerManager::IsPortAnswering(int port) const
 {
     try {
-        Poco::Net::HTTPClientSession sess("127.0.0.1", m_port);
+        Poco::Net::HTTPClientSession sess("127.0.0.1", port);
         sess.setTimeout(Poco::Timespan(0, 250 * 1000));
         Poco::Net::HTTPRequest req(Poco::Net::HTTPRequest::HTTP_GET, "/health");
         sess.sendRequest(req);
         Poco::Net::HTTPResponse resp;
-        std::istream& in = sess.receiveResponse(resp);
-        std::string body;
-        Poco::StreamCopier::copyToString(in, body);
+        sess.receiveResponse(resp);
+        // Headers are enough: something owns the port.  Reading the
+        // body would add a blocking read on the UI thread for
+        // information we discard.  The session destructor closes the
+        // socket without draining it.
         return true;   // any HTTP response at all means the port is taken
     }
     catch (...) {
@@ -1617,18 +1945,18 @@ bool ServerManager::IsPortAnswering() const
 bool ServerManager::StartServer(const std::string& ggufPath, const ServerConfig& config)
 {
 #ifdef __WXMSW__
-    // A no-jinja retry is the one deliberate path where m_jinjaForceOff
-    // should survive into StartServer().  If the user switches models while
-    // a retry is pending/loading, treat that as a fresh launch and restore
-    // the normal "try --jinja first" behavior.
+    // Force-off flags may survive only while retrying the exact same
+    // (model, config).  Any user-driven change is a fresh launch and
+    // restores the normal "try MTP and --jinja first" behavior.
+    const bool sameRetryArgs =
+        ggufPath == m_lastGgufPath && config == m_lastConfig;
+    const bool retryingWithoutMtp =
+        sameRetryArgs && m_mtpForceOff && m_mtpRetryAttempted;
     const bool retryingWithoutJinja =
-        m_jinjaForceOff &&
-        m_jinjaRetryAttempted &&
-        ggufPath == m_lastGgufPath &&
-        config == m_lastConfig;
+        sameRetryArgs && m_jinjaForceOff && m_jinjaRetryAttempted;
 
-    if (!retryingWithoutJinja) {
-        ResetJinjaRetryState();
+    if (!retryingWithoutMtp && !retryingWithoutJinja) {
+        ResetStartupRetryState();
     }
 
     // Invalidate every older queued lifecycle event immediately, before any
@@ -1651,15 +1979,15 @@ bool ServerManager::StartServer(const std::string& ggufPath, const ServerConfig&
     // IsProcessRunning() distinguishes "our own server from a prior
     // load" (normal switch path — StopServer below handles it) from
     // "a server we never launched" (foreign).
-    if (!IsProcessRunning() && IsPortAnswering()) {
+    if (!IsProcessRunning() && IsPortAnswering(config.port)) {
         const std::string msg =
             "Another LlamaBoss instance is already running a local "
-            "server on port " + std::to_string(m_port) + ".\n\n"
+            "server on port " + std::to_string(config.port) + ".\n\n"
             "Close the other LlamaBoss window (or use remote "
             "endpoints in this one) and try again.";
         if (m_logger)
             m_logger->error("StartServer refused: foreign server "
-                            "detected on port " + std::to_string(m_port));
+                            "detected on port " + std::to_string(config.port));
         auto* ev = new wxCommandEvent(wxEVT_SERVER_ERROR);
         SetServerEventGeneration(*ev, launchGeneration);
         ev->SetString(wxString::FromUTF8(msg));
@@ -1671,14 +1999,15 @@ bool ServerManager::StartServer(const std::string& ggufPath, const ServerConfig&
     // allocated above, so cleanup must not advance it again.
     StopServerInternal(false);
 
-    // Cache the launch args so MaybeRetryWithoutJinja() can re-invoke
-    // us with the same (model, config) minus the --jinja flag.
+    // Cache the launch args so startup fallback can re-invoke us
+    // with the same (model, config) and one optional feature removed.
     m_lastGgufPath = ggufPath;
     m_lastConfig   = config;
 
     // Capture the launch mode before any later retry-state cleanup.
-    // This is the truth for the server process we are about to start.
+    // These become the truth for the server process we are about to start.
     const bool launchJinjaEnabled = !m_jinjaForceOff;
+    bool       launchMtpEnabled   = false;
 
     // Detect backend and find binary
     Backend backend = DetectBackend();
@@ -1746,7 +2075,7 @@ bool ServerManager::StartServer(const std::string& ggufPath, const ServerConfig&
     // Llama 3.x, etc.).  Cost on non-tool models is one Jinja render
     // per chat completion — negligible on a modern GPU.  If the
     // server fails to start with this flag (rare; some custom chat
-    // templates don't compile under Jinja), MaybeRetryWithoutJinja
+    // templates don't compile under Jinja), startup fallback
     // re-launches without it and we fall back to the existing XML
     // tool-call protocol for that model.
     if (launchJinjaEnabled) {
@@ -1825,19 +2154,80 @@ bool ServerManager::StartServer(const std::string& ggufPath, const ServerConfig&
     // ── Speculative-decoding draft (bundle convention) ────────────
     // A single *draft*.gguf in the model's bundle attaches as the
     // speculative draft, fully offloaded.  llama-server's own draft
-    // defaults govern acceptance windows.  Gated like cache-reuse:
-    // speculative decoding and a multimodal projector are mutually
-    // unsupported.  A vocab-incompatible draft fails the launch with
-    // a clear server error (the health thread surfaces the log tail);
+    // defaults govern acceptance windows.  Keep this separate-draft
+    // path text-only until it has been validated with multimodal
+    // launches.  A vocab-incompatible draft fails the launch with a
+    // clear server error (the health thread surfaces the log tail);
     // removing or renaming the draft file is the fix.  Bundle layout
     // only — flat/power folders have no ownership structure to pair by.
+    bool bundleDraftAttached = false;
     if (launchMmproj.empty()) {
         wxString bundleFolder = ModelFolderForGgufPath(ggufPath);
         if (IsBundledModelFolder(bundleFolder)) {
             std::string draft = ResolveBundleDraft(bundleFolder, m_logger);
-            if (!draft.empty())
+            if (!draft.empty()) {
                 cmd << " -md \"" << draft << "\" -ngld 99";
+                bundleDraftAttached = true;
+            }
         }
+    }
+
+    // ── Multi-token prediction (self-drafting) ───────────────────
+    // Models with embedded MTP heads advertise
+    // {arch}.nextn_predict_layers > 0 in GGUF metadata.  That is a
+    // launch candidate signal, not a compatibility guarantee: a bad
+    // conversion, backend limitation, or extra draft-context memory
+    // requirement can still make llama-server reject the attempt.
+    // MaybeRetryAfterStartupFailure() handles MTP-looking startup
+    // failures by retrying once without MTP while keeping --jinja.
+    //
+    // Embedded MTP may be combined with an mmproj.  Treat that path as
+    // experimental because the target model, MTP draft context, image
+    // embeddings, projector, and KV cache all compete for memory.
+    // Keep the projector on the CPU initially to preserve dedicated
+    // GPU memory.  Text generation remains GPU accelerated, while
+    // image encoding may be slower.  An explicit bundle *draft*.gguf
+    // still wins over embedded MTP so speculative modes are not stacked.
+    //
+    // Use a conservative draft length of 2 for the initial LlamaBoss
+    // implementation.  This limits additional memory and verification
+    // work while still allowing multi-token acceptance.
+    if (!bundleDraftAttached &&
+        config.mtpEnabled &&
+        !m_mtpForceOff) {
+        // ggufPath arrives as a UTF-8 std::string (same bytes the -m
+        // argument above is built from), which is exactly the encoding
+        // GgufNextnPredictLayers expects — it widens internally on
+        // Windows for the actual file open.
+        const int nextn = GgufNextnPredictLayers(ggufPath);
+        if (nextn > 0) {
+            const bool mtpVisionEnabled = !launchMmproj.empty();
+
+            if (mtpVisionEnabled) {
+                // llama.cpp offloads the multimodal projector to the GPU
+                // by default.  CPU offload is the safer first setting for
+                // MTP + vision on a 32 GiB card.
+                cmd << " --no-mmproj-offload";
+
+                if (m_logger) {
+                    m_logger->warning(
+                        "mtp: enabling experimental MTP + vision; "
+                        "mmproj will remain on CPU");
+                }
+            }
+
+            cmd << " --spec-type draft-mtp --spec-draft-n-max 2";
+            launchMtpEnabled = true;
+
+            if (m_logger) {
+                m_logger->information("mtp: " + std::to_string(nextn) +
+                    " nextn layer(s) detected, enabling draft-mtp");
+            }
+        }
+    }
+    else if (m_mtpForceOff && config.mtpEnabled && m_logger) {
+        m_logger->information(
+            "mtp: disabled for this retry attempt after startup failure");
     }
 
     // ── Single-slot pinning ──────────────────────────────────────
@@ -2044,10 +2434,20 @@ bool ServerManager::StartServer(const std::string& ggufPath, const ServerConfig&
     m_jobHandle           = jobHandle;
     m_processId           = pi.dwProcessId;
     m_port                = config.port;
+
+    // This launch now owns the port; slot actions enqueued from here
+    // carry this generation and anything older is dropped by the
+    // worker.
+    if (m_slotQueue) {
+        std::lock_guard<std::mutex> lock(m_slotQueue->mutex);
+        m_slotQueue->liveGeneration = launchGeneration;
+    }
+
     m_loadedModel         = ggufPath;
     m_slotOwner.clear();       // fresh process, fresh (empty) slot
     m_slotDirty = false;
     m_loadedMmproj        = launchMmproj;
+    m_currentMtpEnabled   = launchMtpEnabled;
     m_currentJinjaEnabled = launchJinjaEnabled;
 
     if (m_logger)
@@ -2144,9 +2544,16 @@ void ServerManager::StopServerInternal(bool invalidateGeneration)
         m_healthCancelFlag.reset();
     }
 
+    // Drop queued slot actions and cut short anything in flight
+    // BEFORE the process dies.  The old code only set the stop flag
+    // in ~ServerManager, so a normal model switch left queued
+    // actions alive to be delivered to the next server.
+    AbandonSlotQueue(m_slotQueue, m_logger);
+
     KillProcess();
     m_loadedModel.clear();
     m_loadedMmproj.clear();
+    m_currentMtpEnabled = false;
     m_currentJinjaEnabled = false;
     m_slotOwner.clear();
     m_slotDirty = false;
@@ -2155,113 +2562,117 @@ void ServerManager::StopServerInternal(bool invalidateGeneration)
 void ServerManager::StopServer()
 {
     StopServerInternal(true);
+
+    // A user cancellation, model detach, or shutdown ends the current
+    // load attempt.  Do not let a force-off retry flag leak into a later
+    // user-driven reload of the same model and configuration.
+    ResetStartupRetryState();
 }
 
-// ── --jinja retry (Phase 3a) ────────────────────────────────────
+// ── Startup feature fallback retries ────────────────────────────
 //
-// MyFrame::OnServerError calls this BEFORE delegating to the
-// ModelSwitcher.  When llama-server fails to start with --jinja
-// (most commonly because the active model's chat_template doesn't
-// compile cleanly under our Jinja runtime), we fall back to a
-// jinja-off relaunch with the same model and config.  The user
-// sees a brief log line and the model loads normally; only if the
-// no-jinja attempt ALSO fails does the original error surface to
-// the UI.
+// ModelService calls this before publishing a permanent startup error.
+// Retries are deliberately bounded and ordered:
 //
-// This is per-load-attempt only.  Once a load succeeds (or both
-// attempts fail), the retry state resets and the next StartServer
-// call tries jinja first again.  Persistent "this model never
-// supports jinja" caching is Phase 3b's job.
+//   1. An actual draft-mtp attempt with an MTP-looking failure is
+//      relaunched once with MTP force-disabled and --jinja unchanged.
+//   2. A Jinja/template-looking failure is relaunched once without
+//      --jinja.  If step 1 already ran, MTP stays force-disabled.
 //
-// Returns true iff a retry was kicked off.  The caller suppresses
-// the user-visible error in that case.
-bool ServerManager::MaybeRetryWithoutJinja(const std::string& error)
+// The persisted MTP preference is never changed.  Force-off state is
+// scoped to this one (model, config) load attempt and is cleared after
+// success or when the fallback chain is exhausted.
+bool ServerManager::MaybeRetryAfterStartupFailure(const std::string& error)
 {
-    // Already retried this load attempt — give up and surface the
-    // error.  (Belt-and-braces: also covers the case where the
-    // no-jinja retry itself fails.)
-    if (m_jinjaRetryAttempted) {
-        ResetJinjaRetryState();
-        return false;
-    }
-
-    // Jinja was off this attempt — nothing to fall back from.  This
-    // can happen if the user is on a build that has m_jinjaForceOff
-    // wired by some future setting, or if MaybeRetryWithoutJinja was
-    // called when it shouldn't have been.
-    if (m_jinjaForceOff) {
-        ResetJinjaRetryState();
-        return false;
-    }
-
-    // No model cached — we were never asked to start anything, or
-    // StopServer cleared things out.  Surface the error.
     if (m_lastGgufPath.empty()) {
+        ResetStartupRetryState();
         return false;
     }
 
-    // Only retry without --jinja when the failure actually looks like
-    // a Jinja/chat-template problem. Otherwise we would hide unrelated
-    // failures by launching a second server attempt that can produce a
-    // different, more confusing error.
-    if (!LooksLikeJinjaOrTemplateFailure(error)) {
+    // First preference: preserve native Jinja/tool support and remove
+    // only the feature implicated by the failure.
+    if (m_currentMtpEnabled &&
+        !m_mtpForceOff &&
+        !m_mtpRetryAttempted &&
+        LooksLikeMtpFailure(error)) {
         if (m_logger) {
             m_logger->warning(
-                "Server failed while --jinja was enabled, but the error "
-                "does not look Jinja/template-related; not retrying without "
-                "--jinja. Error: " + error);
+                "mtp: startup failed with an MTP-related error; retrying "
+                "normally without MTP. Original error: " + error);
         }
-        ResetJinjaRetryState();
+
+        m_mtpForceOff       = true;
+        m_mtpRetryAttempted = true;
+
+        const std::string retryPath = m_lastGgufPath;
+        const ServerConfig retryConfig = m_lastConfig;
+        const bool ok = StartServer(retryPath, retryConfig);
+        if (!ok && m_logger) {
+            m_logger->error(
+                "mtp: synchronous retry without MTP also failed; awaiting "
+                "the retry error event.");
+        }
+
+        return true;   // consume the original error
+    }
+
+    // A no-jinja attempt has already failed, so the bounded fallback
+    // chain is exhausted.  Reset for the next user-driven load and
+    // surface this final error.
+    if (m_jinjaRetryAttempted || m_jinjaForceOff) {
+        ResetStartupRetryState();
+        return false;
+    }
+
+    // Only remove --jinja for errors that actually implicate Jinja or
+    // the chat template.  Unrelated startup failures should not be
+    // hidden behind a second, potentially more confusing attempt.
+    if (!m_currentJinjaEnabled ||
+        !LooksLikeJinjaOrTemplateFailure(error)) {
+        if (m_logger && m_currentJinjaEnabled) {
+            m_logger->warning(
+                "Server startup failed while --jinja was enabled, but the "
+                "error does not look Jinja/template-related; not retrying "
+                "without --jinja. Error: " + error);
+        }
+        ResetStartupRetryState();
         return false;
     }
 
     if (m_logger) {
         m_logger->warning(
-            "Server failed to start with --jinja/template error; retrying "
-            "without --jinja.  Original error: " + error);
+            "Server failed to start with a Jinja/template error; retrying "
+            "without --jinja. Original error: " + error);
     }
 
-    // Set the retry flags BEFORE re-invoking StartServer, since
-    // StartServer reads m_jinjaForceOff and respects it (and the
-    // !m_jinjaForceOff branch in StartServer that resets
-    // m_jinjaRetryAttempted is bypassed when the flag is set).
     m_jinjaForceOff       = true;
     m_jinjaRetryAttempted = true;
 
-    bool ok = StartServer(m_lastGgufPath, m_lastConfig);
-    if (!ok) {
-        // Synchronous failure on the retry — clean up the retry
-        // state so the next user-driven load tries jinja again.
-        // The error from StartServer's own wxEVT_SERVER_ERROR post
-        // will reach OnServerError, which will see
-        // m_jinjaRetryAttempted == true and return false here,
-        // allowing the error to propagate to the user normally.
-        if (m_logger) {
-            m_logger->error("Retry without --jinja also failed.");
-        }
-        // Don't reset state here — let the inevitable
-        // wxEVT_SERVER_ERROR for the retry pass through OnServerError
-        // and trigger the m_jinjaRetryAttempted == true branch above,
-        // which calls ResetJinjaRetryState().
+    const std::string retryPath = m_lastGgufPath;
+    const ServerConfig retryConfig = m_lastConfig;
+    const bool ok = StartServer(retryPath, retryConfig);
+    if (!ok && m_logger) {
+        m_logger->error(
+            "Synchronous retry without --jinja also failed; awaiting the "
+            "retry error event.");
     }
 
-    return true;   // We took ownership of the error; suppress UI.
+    return true;   // consume the original error
 }
 
-void ServerManager::ResetJinjaRetryState()
+void ServerManager::ResetStartupRetryState()
 {
-    m_jinjaForceOff       = false;
-    m_jinjaRetryAttempted = false;
+    m_mtpForceOff          = false;
+    m_mtpRetryAttempted    = false;
+    m_jinjaForceOff        = false;
+    m_jinjaRetryAttempted  = false;
 }
 
 void ServerManager::NotifyServerReady()
 {
-    // Successful start (whether on the first --jinja attempt or on
-    // the retry without it) clears the per-load retry state so the
-    // next user-initiated load attempt starts fresh and tries --jinja.
-    // Do NOT clear m_currentJinjaEnabled here; it describes the actual
-    // process currently running and is used by protocol detection.
-    ResetJinjaRetryState();
+    // Successful start clears only retry intent.  The current feature
+    // flags describe the actual running process and remain intact.
+    ResetStartupRetryState();
 }
 
 bool ServerManager::IsProcessRunning() const

@@ -17,6 +17,7 @@
 #include "tool_edit.h"
 #include "tool_delete.h"
 #include "tool_notes.h"
+#include "reminder_store.h"
 #include "tool_web_fetch.h"
 #include "cmd_executor.h"
 #include "python_runner.h"
@@ -823,6 +824,28 @@ constexpr const char* kPowerShellAllowedShapeSummary =
     "Pipelines are allowed when every stage's head fits one of these. Use "
     "Select-Object -ExpandProperty for projections instead of script blocks.";
 
+// wait: the agent loop intercepts this tool BEFORE DispatchInvocation
+// (AgentController::StartWaitTool arms the frame-owned WaitExecutor
+// timer and manages the per-turn wait budget), so this dispatch body
+// only serves non-agent paths — where a timed pause has nothing to
+// resume and is therefore rejected with an explanation.
+DispatchOutcome DoWait(const ToolInvocation& inv,
+                       const ToolContext&    /*ctx*/,
+                       const DispatchDeps&   /*deps*/)
+{
+    DispatchOutcome out;
+    out.status               = DispatchStatus::Invalid;
+    out.result.toolTag       = tool_names::kWait;
+    out.result.invocationRaw = inv.rawBlock;
+    out.result.iconUtf8      = "\xE2\x8F\xB3";   // ⏳
+    out.result.toolName      = "Wait";
+    out.result.commandEcho   = MakeCommandEcho(inv.name, inv.args);
+    out.result.errorBody     =
+        "wait runs inside the agent loop only: it pauses the loop and "
+        "resumes it automatically. It is not available as a direct command.";
+    return out;
+}
+
 DispatchOutcome DoPowerShell(const ToolInvocation& inv,
                              const ToolContext&    ctx,
                              const DispatchDeps&   deps)
@@ -871,7 +894,8 @@ DispatchOutcome DoPowerShell(const ToolInvocation& inv,
     // by the caller before this point (agent approval card, or slash/user-
     // typed command as self-approved). Once DoPowerShell is reached, dispatch
     // is intentional.
-    if (!deps.cmdExec->Start(inv.args, ctx.cwd, ctx.timeoutMs)) {
+    if (!deps.cmdExec->Start(inv.args, ctx.cwd, ctx.timeoutMs,
+                             ctx.activeProjectRoot)) {
         out.status            = DispatchStatus::Invalid;
         out.result.errorBody  = "Could not start PowerShell "
                                 "(another command is already running).";
@@ -1469,7 +1493,11 @@ bool NormalizePythonScriptFilename(const std::string& requested,
     if (name.find('/') != std::string::npos ||
         name.find('\\') != std::string::npos ||
         name.find(':') != std::string::npos) {
-        errorOut = "python_create_script accepts a filename only, not a path. Scripts are always saved in the conversation Scripts folder.";
+        errorOut = "python_create_script accepts a filename only, not a path. "
+                   "Scripts are saved in the conversation Scripts folder — or, "
+                   "in a project chat, directly in the active project's "
+                   "Workflows folder — and are runnable from there by bare "
+                   "filename with python_run_script.";
         return false;
     }
 
@@ -1613,7 +1641,10 @@ bool NormalizePythonRunScriptFilename(const std::string& requested,
             if (workflowName.find('\\') != std::string::npos ||
                 workflowName.find('/')  != std::string::npos ||
                 workflowName.find(':')  != std::string::npos) {
-                errorOut = "python_run_script Workflows\\... accepts a single .py filename only.";
+                errorOut = "python_run_script Workflows\\... takes one filename "
+                           "(Workflows\\<script>.py) \xE2\x80\x94 project workflow "
+                           "scripts are not nested. For a script elsewhere on "
+                           "disk, pass its absolute path.";
                 return false;
             }
 
@@ -2204,6 +2235,58 @@ DispatchOutcome DoNotesAppend(const ToolInvocation& inv,
 }
 
 
+DispatchOutcome DoReminderCreate(const ToolInvocation& inv,
+                                 const ToolContext&    /*ctx*/,
+                                 const DispatchDeps&   /*deps*/)
+{
+    DispatchOutcome out = PreFill(inv, tool_names::kReminderCreate, "Reminder");
+    out.result.iconUtf8    = "\xE2\x8F\xB0";   // alarm clock
+    out.result.commandEcho = FirstLineEcho("reminder_create", inv.args);
+
+    lb_reminders::ReminderToolResult r =
+        lb_reminders::GetReminderStore().CreateFromArgs(inv.args);
+    out.result.chips     = r.chips;
+    out.result.body      = r.body;
+    out.result.errorBody = r.errorBody;
+    out.result.bodyLang  = r.bodyLang;
+    return out;
+}
+
+DispatchOutcome DoReminderList(const ToolInvocation& inv,
+                               const ToolContext&    /*ctx*/,
+                               const DispatchDeps&   /*deps*/)
+{
+    DispatchOutcome out = PreFill(inv, tool_names::kReminderList, "Reminders");
+    out.result.iconUtf8    = "\xE2\x8F\xB0";
+    out.result.commandEcho = "reminder_list";
+
+    lb_reminders::ReminderToolResult r =
+        lb_reminders::GetReminderStore().ListPending();
+    out.result.chips     = r.chips;
+    out.result.body      = r.body;
+    out.result.errorBody = r.errorBody;
+    out.result.bodyLang  = r.bodyLang;
+    return out;
+}
+
+DispatchOutcome DoReminderCancel(const ToolInvocation& inv,
+                                 const ToolContext&    /*ctx*/,
+                                 const DispatchDeps&   /*deps*/)
+{
+    DispatchOutcome out = PreFill(inv, tool_names::kReminderCancel, "Reminder");
+    out.result.iconUtf8    = "\xE2\x8F\xB0";
+    out.result.commandEcho = MakeCommandEcho("reminder_cancel", inv.args);
+
+    lb_reminders::ReminderToolResult r =
+        lb_reminders::GetReminderStore().Cancel(inv.args);
+    out.result.chips     = r.chips;
+    out.result.body      = r.body;
+    out.result.errorBody = r.errorBody;
+    out.result.bodyLang  = r.bodyLang;
+    return out;
+}
+
+
 DispatchOutcome DoProjectNotesRead(const ToolInvocation& inv,
                                    const ToolContext&    ctx,
                                    const DispatchDeps&   /*deps*/)
@@ -2284,6 +2367,27 @@ bool ValPwd(const std::string&, std::string&) {
 bool ValPowerShell(const std::string& a, std::string& r) {
     return ValRequireNonEmpty(a, r,
         "powershell requires a command in args");
+}
+bool ValWait(const std::string& a, std::string& r) {
+    const std::string s = Trim(a);
+    if (s.empty()) {
+        r = "wait requires args: '<seconds> [reason]' with seconds 15-600";
+        return false;
+    }
+    const size_t sep = s.find_first_of(" \t\r\n");
+    const std::string tok = (sep == std::string::npos) ? s : s.substr(0, sep);
+    long v = 0;
+    bool digits = !tok.empty();
+    for (char c : tok) {
+        if (c < '0' || c > '9') { digits = false; break; }
+        v = v * 10 + (c - '0');
+        if (v > 100000) break;   // absurd input; fails the range check
+    }
+    if (!digits || v < 15 || v > 600) {
+        r = "wait seconds must be an integer 15-600; got '" + tok + "'";
+        return false;
+    }
+    return true;
 }
 bool ValPythonHealth(const std::string& a, std::string& r) {
     if (!Trim(a).empty()) {
@@ -2549,6 +2653,25 @@ bool ValNotesRead(const std::string& a, std::string& r) {
 bool ValNotesAppend(const std::string& a, std::string& r) {
     return ValRequireNonEmpty(a, r,
         "notes_append requires the entry text in args");
+}
+
+
+bool ValReminderCreate(const std::string& a, std::string& r) {
+    return ValRequireNonEmpty(a, r,
+        "reminder_create requires '<schedule>\\n<message>' or '<schedule> | <message>'. Schedule examples: 'in 2 hours' or 'at 2026-08-07 09:30'");
+}
+
+bool ValReminderList(const std::string& a, std::string& r) {
+    if (!Trim(a).empty()) {
+        r = "reminder_list does not accept args";
+        return false;
+    }
+    return true;
+}
+
+bool ValReminderCancel(const std::string& a, std::string& r) {
+    return ValRequireNonEmpty(a, r,
+        "reminder_cancel requires a reminder ID such as rem_123456789_1");
 }
 
 
@@ -2860,6 +2983,23 @@ constexpr const char* kSchemaNotesAppend = R"({
 "required":["args"]
 })";
 
+constexpr const char* kSchemaReminderCreate = R"({
+"type":"object",
+"properties":{"args":{"type":"string","description":"Create a REAL persistent in-app LlamaBoss reminder. First line is the schedule; remaining line(s) are the message. Relative schedule: 'in <number> <seconds|minutes|hours|days>' (example: 'in 2 hours'). Absolute schedule: 'at YYYY-MM-DD HH:MM' in local 24-hour time (example: 'at 2026-08-07 09:30'). Example args: 'in 2 hours\\nCheck for new payroll discrepancy requests'. Use only when the user actually asks to be reminded. The reminder fires while LlamaBoss is running; overdue reminders appear after the next launch."}},
+"required":["args"]
+})";
+
+constexpr const char* kSchemaReminderList = R"({
+"type":"object",
+"properties":{}
+})";
+
+constexpr const char* kSchemaReminderCancel = R"({
+"type":"object",
+"properties":{"args":{"type":"string","description":"Reminder ID returned by reminder_create or reminder_list, for example rem_1786061234567_1."}},
+"required":["args"]
+})";
+
 constexpr const char* kSchemaProjectNotesRead = R"({
 "type":"object",
 "properties":{}
@@ -2877,12 +3017,18 @@ constexpr const char* kSchemaWebFetchUrl = R"({
 "required":["args"]
 })";
 
+constexpr const char* kSchemaWait = R"({
+"type":"object",
+"properties":{"args":{"type":"string","description":"First token: seconds to pause the agent loop (integer, 15-600). Optional remaining text: a short reason label shown on the tool card, e.g. '120 waiting for model download'. Use for monitoring long-running external work: start the job detached, then alternate wait with ONE status-check call per cycle. Total wait time per turn is budgeted."}},
+"required":["args"]
+})";
+
 // ─── Spec construction ──────────────────────────────────────────
 
 std::vector<ToolSpec> BuildBuiltinSpecs()
 {
     std::vector<ToolSpec> specs;
-    specs.reserve(37);
+    specs.reserve(40);
 
     auto add = [&](const char* name,
                    const char* description,
@@ -2958,6 +3104,23 @@ std::vector<ToolSpec> BuildBuiltinSpecs()
             kSchemaPowerShell,
             std::move(psSafety),
             ValPowerShell, DoPowerShell);
+    }
+
+    {
+        // NOT isAsync / NOT dispatchOnWorker: in agent mode the loop
+        // intercepts wait before DispatchInvocation and drives the
+        // frame-owned WaitExecutor timer itself; in non-agent paths
+        // DoWait synchronously returns an Invalid "agent-only"
+        // explanation.  Neither route uses a specialized worker.
+        ToolSafetyProfile waitSafety;
+        waitSafety.tier     = RiskTier::Safe;
+        waitSafety.readOnly = true;
+        waitSafety.summary  = "Pauses the agent loop for a bounded number of seconds (15-600 per call, budgeted per turn) so long-running external work can be monitored with wait -> single-status-check cycles. No filesystem, process, or network access.";
+        add(tool_names::kWait,
+            "Pause the agent loop for N seconds, then resume automatically. Args: '<seconds> [optional reason]' with seconds 15-600. Use between status checks when monitoring long-running external work (downloads, builds, remote jobs): start the job detached so the starting call returns immediately, then alternate wait with ONE status-check call per cycle instead of embedding sleep loops in commands.",
+            kSchemaWait,
+            std::move(waitSafety),
+            ValWait, DoWait);
     }
 
     {
@@ -3299,6 +3462,54 @@ std::vector<ToolSpec> BuildBuiltinSpecs()
             ValNotesAppend, DoNotesAppend);
     }
 
+    // ── in-app reminders ────────────────────────────────────────
+    // Fixed-target local reminder store.  Creation/cancellation mutate only
+    // %USERPROFILE%\LlamaBoss\REMINDERS.json; delivery is driven by a wxTimer
+    // in MyFrame and therefore requires LlamaBoss to be running.  Overdue
+    // reminders remain pending and are presented after the next launch.
+    {
+        ToolSafetyProfile reminderCreateSafety;
+        reminderCreateSafety.tier         = RiskTier::Moderate;
+        reminderCreateSafety.mutatesFiles = true;
+        reminderCreateSafety.writesInsideCwdOnly = false;
+        reminderCreateSafety.summary =
+            "Creates one persistent local in-app reminder in the fixed LlamaBoss reminder store. "
+            "No network access, process launch, or arbitrary filesystem path.";
+        add(tool_names::kReminderCreate,
+            "Create a real persistent in-app reminder when the user explicitly asks to be reminded. Args are '<schedule>\\n<message>' (or '<schedule> | <message>' for slash use). Schedule supports 'in 2 hours' and local absolute 'at YYYY-MM-DD HH:MM'. Fires while LlamaBoss is running; overdue reminders are shown after next launch.",
+            kSchemaReminderCreate,
+            std::move(reminderCreateSafety),
+            ValReminderCreate, DoReminderCreate);
+    }
+
+    {
+        ToolSafetyProfile reminderListSafety;
+        reminderListSafety.tier                 = RiskTier::Safe;
+        reminderListSafety.readOnly             = true;
+        reminderListSafety.mayInspectOutsideCwd = true;
+        reminderListSafety.summary =
+            "Read-only listing of the fixed local LlamaBoss reminder store.";
+        add(tool_names::kReminderList,
+            "List pending LlamaBoss in-app reminders, including their IDs and due times.",
+            kSchemaReminderList,
+            std::move(reminderListSafety),
+            ValReminderList, DoReminderList);
+    }
+
+    {
+        ToolSafetyProfile reminderCancelSafety;
+        reminderCancelSafety.tier         = RiskTier::Moderate;
+        reminderCancelSafety.mutatesFiles = true;
+        reminderCancelSafety.writesInsideCwdOnly = false;
+        reminderCancelSafety.summary =
+            "Cancels one reminder by ID in the fixed local LlamaBoss reminder store.";
+        add(tool_names::kReminderCancel,
+            "Cancel one pending LlamaBoss reminder by the ID returned from reminder_create or reminder_list.",
+            kSchemaReminderCancel,
+            std::move(reminderCancelSafety),
+            ValReminderCancel, DoReminderCancel);
+    }
+
     {
         ToolSafetyProfile projectNotesReadSafety;
         projectNotesReadSafety.tier                 = RiskTier::Safe;
@@ -3368,6 +3579,7 @@ std::vector<ToolSpec> BuildBuiltinSpecs()
         { tool_names::kGrep,                 "\xF0\x9F\x94\x8D", "Grep" },                    // 🔍
         { tool_names::kOpen,                 "\xE2\x96\xB6",     "Open" },                    // ▶
         { tool_names::kPowerShell,           "\xE2\x9A\x99",     "PowerShell" },              // ⚙
+        { tool_names::kWait,                 "\xE2\x8F\xB3",     "Wait" },                    // ⏳
         { tool_names::kPythonHealth,         "\xF0\x9F\x90\x8D", "Python Health" },           // 🐍
         { tool_names::kCsvInspect,           "\xF0\x9F\x93\x8A", "CSV Inspect" },             // 📊
         { tool_names::kCsvReport,            "\xF0\x9F\x93\x9D", "CSV Report" },              // 📝
@@ -3393,6 +3605,9 @@ std::vector<ToolSpec> BuildBuiltinSpecs()
         { tool_names::kDelete,               "\xF0\x9F\x97\x91", "Delete" },                  // 🗑
         { tool_names::kNotesRead,            "\xF0\x9F\x93\x92", "Notes" },                   // 📒
         { tool_names::kNotesAppend,          "\xF0\x9F\x93\x92", "Notes" },                   // 📒
+        { tool_names::kReminderCreate,       "\xE2\x8F\xB0",     "Reminder" },                  // ⏰
+        { tool_names::kReminderList,         "\xE2\x8F\xB0",     "Reminders" },                 // ⏰
+        { tool_names::kReminderCancel,       "\xE2\x8F\xB0",     "Reminder" },                  // ⏰
         { tool_names::kProjectNotesRead,     "\xF0\x9F\x93\x93", "Project Notes" },           // 📓
         { tool_names::kProjectNotesAppend,   "\xF0\x9F\x93\x93", "Project Notes" },           // 📓
         { tool_names::kWebFetchUrl,          "\xF0\x9F\x8C\x90", "Web Page Inspect" },        // 🌐

@@ -6,11 +6,14 @@
 //
 // Layout model:
 //   ▼ <Project Name>
-//       chat row
-//       chat row
+//       TODAY
+//         chat card      [Project tag]
+//       PREVIOUS 7 DAYS
+//         chat card      [Project tag]
 //   ▶ <Other Project>   (5)
 //   ▼ Unassigned
-//       chat row
+//       TODAY
+//         chat card      (neutral styling)
 //
 // Selection model (file-explorer style):
 //   Click          = select one, load it
@@ -100,8 +103,15 @@ public:
     // activeFilePath: the currently loaded conversation (highlighted).
     void Refresh(const std::string& activeFilePath);
 
-    // ── Selection ────────────────────────────────────────────────
+    // ── Selection / management state ─────────────────────────────
     void ClearSelection();
+    bool AreAllPinned(const std::vector<std::string>& paths) const;
+    bool IsShowingArchived() const { return m_showArchived; }
+
+    // Force selected paths to be reparsed on the next Refresh(). Metadata-only
+    // rewrites can retain the same byte size, so mtime+size alone is not a
+    // sufficient cache key on every filesystem.
+    void InvalidateMetadata(const std::vector<std::string>& paths);
 
     // ── Theming ──────────────────────────────────────────────────
     void ApplyTheme(const ThemeData& theme);
@@ -137,6 +147,14 @@ private:
         std::string filePath;
         std::string title;
         wxDateTime  modTime;
+        // True only when modTime came from a parsed updated_at (the
+        // conversation activity clock).  False means we fell back to the
+        // filesystem mtime because no timestamp could be parsed — mtime is
+        // fine for the newest-first sort tiebreak but must NOT drive date
+        // bucketing, since a metadata-only rewrite (pin/archive) legitimately
+        // moves mtime.  DateBucketIdFor consults this to bucket such entries
+        // as "older" instead of silently borrowing mtime.
+        bool        hasActivityTime = false;
         std::string projectId;     // Empty → Unassigned or Goals group
         std::string projectName;   // Display name; mirrors what's in the JSON
         std::string goalObjective; // Non-empty → chat has a goal.  Drives the
@@ -144,13 +162,19 @@ private:
                                    // is kept for a future objective-subgrouping
                                    // pass; the section header itself is just
                                    // "Goals" today.
+        bool        pinned = false;
+        bool        archived = false;
     };
 
     struct RowWidgets {
         wxPanel*      panel = nullptr;
+        wxPanel*      accentBar = nullptr;   // Thin active/selection indicator
+        wxPanel*      iconPanel = nullptr;   // Compact conversation icon tile
+        wxStaticText* iconLabel = nullptr;
         wxStaticText* titleLabel = nullptr;
         wxStaticText* timeLabel = nullptr;
-        wxStaticText* deleteBtn = nullptr;   // Trash icon — visible on hover
+        wxPanel*      projectTag = nullptr;  // Custom-painted project/goal pill
+        wxStaticText* menuBtn = nullptr;     // Fixed-width ASCII three-dot actions control
 
         std::string filePath;
         std::string displayedTitle;
@@ -160,22 +184,46 @@ private:
         std::string searchTitleLower;
         std::string displayedTime;
         wxDateTime  modTime;
+        // Mirrors ConversationEntry::hasActivityTime so the row-level
+        // re-bucketing in UpdateRow/CreateRow matches the scan-time bucketing
+        // and never lets filesystem mtime drive the date section.
+        bool        hasActivityTime = false;
+
+        // Project/date metadata drives the Phase 3 color coding, project
+        // tag, and time-section visibility without reparsing JSON during
+        // hover/search/repaint paths.
+        std::string projectId;
+        std::string projectName;
+        bool        hasGoal = false;
+        bool        pinned = false;
+        bool        archived = false;
+        std::string dateBucketId;
 
         // The group this row currently belongs to.  Used so a collapse
         // toggle can find every chat row under a header in O(rows).
-        std::string groupId;        // Real project id, or kUnassignedId
+        std::string groupId;        // Real project id, kGoalsId, or kUnassignedId
     };
 
     struct HeaderWidgets {
         wxPanel*      panel = nullptr;
         wxStaticText* triangle = nullptr;   // ▼ / ▶
         wxStaticText* nameLabel = nullptr;
-        wxStaticText* countLabel = nullptr; // " (N)" while collapsed; empty otherwise
+        wxPanel*      countBadge = nullptr; // Custom-painted rounded chat-count pill
 
-        std::string groupId;        // Real project id, or kUnassignedId
+        std::string groupId;        // Real project id, kGoalsId, or kUnassignedId
         std::string displayName;
         int         chatCount = 0;
         bool        collapsed = false;
+    };
+
+    struct DateHeaderWidgets {
+        wxPanel*      panel = nullptr;
+        wxStaticText* label = nullptr;
+
+        std::string key;            // groupId + separator + dateBucketId
+        std::string groupId;
+        std::string dateBucketId;
+        std::string displayLabel;
     };
 
     // ── UI widgets ───────────────────────────────────────────────
@@ -188,19 +236,26 @@ private:
     int  m_dragStartX = 0;
     int  m_dragStartWidth = 0;
     static constexpr int BORDER_WIDTH = 5;
-    static constexpr int MIN_WIDTH = 180;
+    // The redesigned conversation cards need enough horizontal room for
+    // the icon tile, title, metadata, and hover actions without becoming
+    // cramped.  The sidebar remains resizable and still caps at 600 px.
+    static constexpr int MIN_WIDTH = 300;
     static constexpr int MAX_WIDTH = 600;
     wxButton*         m_newChatButton;    // "+ New Chat" button
     wxButton*         m_newWindowButton;  // "+ New Window" button (secondary weight)
     wxTextCtrl*       m_searchBox;        // Search/filter conversations
+    bool              m_searchHintActive = false; // Custom high-contrast placeholder
     wxScrolledWindow* m_listWindow;       // Scrollable conversation list
     wxBoxSizer*       m_listSizer;        // Sizer inside m_listWindow
+    wxButton*         m_archiveButton;    // Toggle normal / archived conversations
 
     // ── State ────────────────────────────────────────────────────
     Callbacks    m_callbacks;
     const ThemeData* m_theme;             // Current theme (not owned)
     std::string  m_activeFilePath;        // Currently loaded conversation
     std::string  m_searchFilter;          // Current search text (lowercase)
+    bool         m_showArchived = false;   // Archive browser mode
+    size_t       m_archivedCount = 0;
 
     // ── Multi-select state ───────────────────────────────────────
     std::set<std::string>  m_selected;    // Set of selected file paths
@@ -219,6 +274,12 @@ private:
     // create on first sighting, update display on subsequent refreshes,
     // destroy when the group disappears.
     std::unordered_map<std::string, HeaderWidgets> m_projectHeaders;
+
+    // Cached non-interactive date headers (Pinned / Today / Yesterday /
+    // Previous 7 Days / Older), keyed per project section.  Keeping them
+    // separate from project headers preserves project collapse, DnD, and
+    // context-menu behavior while adding the time hierarchy from the mockup.
+    std::unordered_map<std::string, DateHeaderWidgets> m_dateHeaders;
 
     // Project ids whose section is currently collapsed.  Mirrors what
     // the host frame has persisted in AppState; mutated locally on click,
@@ -246,6 +307,9 @@ private:
         std::string        projectId;
         std::string        projectName;
         std::string        goalObjective;
+        bool               pinned = false;
+        bool               archived = false;
+        long long          activityTimeMs = 0; // parsed JSON updated_at; chat ordering/age
         long long          mtimeMs = 0;   // ms since epoch, from wxDateTime::GetValue()
         unsigned long long size    = 0;   // file size in bytes — a second change-check
                                           // so two saves within the same wall-clock
@@ -272,6 +336,17 @@ private:
                              bool collapsed);
     void RemoveProjectHeader(const std::string& groupId);
     void OnProjectHeaderClicked(const std::string& groupId);
+
+    // Time-section header CRUD.  Date headers are display-only; project
+    // headers remain the sole collapse/context-menu/drop targets.
+    DateHeaderWidgets CreateDateHeader(const std::string& groupId,
+                                       const std::string& dateBucketId,
+                                       const std::string& displayLabel);
+    void UpdateDateHeader(DateHeaderWidgets& header,
+                          const std::string& displayLabel);
+    void RemoveDateHeader(const std::string& key);
+    static std::string MakeDateHeaderKey(const std::string& groupId,
+                                         const std::string& dateBucketId);
     bool IsGroupCollapsed(const std::string& groupId) const;
     std::vector<std::string> CollapsedGroupsAsVector() const;
 
@@ -299,19 +374,30 @@ private:
     void OnChatsDroppedOnHeader(const std::vector<std::string>& paths,
                                 const std::string& groupId);
 
-    // Selection helpers
+    // Selection / keyboard helpers
     void SelectRange(const std::string& from, const std::string& to);
     void RebuildOrderedPathsFromVisibleRows();
     bool IsSelected(const std::string& path) const;
+    void SelectVisiblePath(const std::string& path, bool openConversation);
+    void NavigateVisibleRows(int delta, bool openConversation = false);
+    void ScrollPathIntoView(const std::string& path);
     wxColour GetRowBackground(const std::string& filePath) const;
+    void ApplyRowAppearance(RowWidgets& row, bool hovered = false);
     void RefreshAllRowBackgrounds();
 
     // Search helpers
     void FilterRows();
+    void UpdateArchiveButton();
+    void ShowSearchHint();
+    void HideSearchHint();
     void ClearSearch();
+    void FocusSearchBox();
 
     // Walk up from a child widget to find the panel holding the .json path
     static std::string PathFromWidget(wxWindow* win, wxWindow* stop);
 
     static std::string RelativeTimeString(const wxDateTime& dt);
+    static std::string DateBucketIdFor(const wxDateTime& dt, bool pinned,
+                                       bool hasActivityTime);
+    static std::string DateBucketLabel(const std::string& bucketId);
 };

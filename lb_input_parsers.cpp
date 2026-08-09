@@ -78,6 +78,9 @@ static const SlashEntry kToolSlashTable[] = {
     { "/web_fetch_url",          tool_names::kWebFetchUrl },
     { "/notes_read",             tool_names::kNotesRead },
     { "/notes_append",           tool_names::kNotesAppend },
+    { "/reminder_create",        tool_names::kReminderCreate },
+    { "/reminder_list",          tool_names::kReminderList },
+    { "/reminder_cancel",        tool_names::kReminderCancel },
     { "/project_notes_read",     tool_names::kProjectNotesRead },
     { "/project_notes_append",   tool_names::kProjectNotesAppend },
 

@@ -6160,29 +6160,48 @@ bool ResolveRunnableScriptPath(const std::string& requested,
             }
             workflowName = workflowName.substr(wa, wb - wa + 1);
 
-            // Prefix form is a lane selector, not an arbitrary nested path.
-            if (workflowName.find('\\') != std::string::npos ||
-                workflowName.find('/')  != std::string::npos ||
-                workflowName.find(':')  != std::string::npos) {
-                errorOut = "python_run_script Workflows\\... accepts a single .py filename only.";
+            // Drive-letter forms don't belong in the lane selector.
+            if (workflowName.find(':') != std::string::npos) {
+                errorOut = "python_run_script Workflows\\... does not accept "
+                           "drive-letter paths. Use Workflows\\<script>.py, "
+                           "Workflows\\<folder>\\<script>.py, or the script's "
+                           "absolute path.";
                 return false;
             }
 
-            size_t dot = workflowName.find_last_of('.');
+            // Nested forms (Workflows\<folder>\<script>.py) are handled by
+            // ResolveProjectWorkflowScript, which resolves the last
+            // component and verifies the pinned folder.  Sanitize only the
+            // final filename component here.
+            std::string workflowLeaf = workflowName;
+            {
+                const size_t lastSep = workflowLeaf.find_last_of("\\/");
+                if (lastSep != std::string::npos) {
+                    workflowLeaf = workflowLeaf.substr(lastSep + 1);
+                }
+            }
+            if (workflowLeaf.empty()) {
+                errorOut = "python_run_script Workflows\\... path must end "
+                           "in a script filename.";
+                return false;
+            }
+
+            size_t dot = workflowLeaf.find_last_of('.');
             if (dot == std::string::npos) {
                 workflowName += ".py";
-            } else if (LowerLocal(workflowName.substr(dot)) != ".py") {
+                workflowLeaf += ".py";
+            } else if (LowerLocal(workflowLeaf.substr(dot)) != ".py") {
                 errorOut = "python_run_script Workflows\\... paths must point to a .py file.";
                 return false;
             }
 
-            std::string safe = path_safety::SanitizeFilename(workflowName, "");
-            if (safe.empty() || safe != workflowName) {
-                errorOut = "Unsafe Python workflow script filename: " + workflowName;
+            std::string safe = path_safety::SanitizeFilename(workflowLeaf, "");
+            if (safe.empty() || safe != workflowLeaf) {
+                errorOut = "Unsafe Python workflow script filename: " + workflowLeaf;
                 return false;
             }
-            if (python_arg_policy::IsReservedBuiltInPythonHelperName(workflowName)) {
-                errorOut = "Reserved Python helper filename: " + workflowName +
+            if (python_arg_policy::IsReservedBuiltInPythonHelperName(workflowLeaf)) {
+                errorOut = "Reserved Python helper filename: " + workflowLeaf +
                            ". Built-in helpers are run through their tool names, not through python_run_script.";
                 return false;
             }
@@ -6221,12 +6240,37 @@ bool ResolveRunnableScriptPath(const std::string& requested,
             }
             skillName = skillName.substr(sa, sb - sa + 1);
 
-            // Prefix form is a lane selector, not an arbitrary nested path.
-            if (skillName.find('\\') != std::string::npos ||
-                skillName.find('/')  != std::string::npos ||
-                skillName.find(':')  != std::string::npos) {
-                errorOut = "python_run_script Skills\\... accepts a single .py filename only.";
+            // Nested skill paths are the natural on-disk form
+            // (Skills\runPod\scripts\runpod_ops.py) and the form models
+            // copy out of SKILL.md files.  Observed 2026-08-03: GPT-5
+            // emitted exactly that, got "accepts a single .py filename
+            // only", and had to fall back to an absolute path.  Accept
+            // the nested form: remember the FIRST component as the
+            // pinned skill folder, resolve the LAST component through
+            // the normal skill-script search, then verify the resolved
+            // script actually lives under the pinned folder — keeping
+            // the lane selector's explicit-pinning promise intact.
+            if (skillName.find(':') != std::string::npos) {
+                errorOut = "python_run_script Skills\\... does not accept "
+                           "drive-letter paths. Use Skills\\<skill>\\<script>.py, "
+                           "Skills\\<script>.py, or the script's absolute path.";
                 return false;
+            }
+            std::string pinnedSkillFolder;
+            {
+                const size_t firstSep = skillName.find_first_of("\\/");
+                if (firstSep != std::string::npos) {
+                    pinnedSkillFolder = skillName.substr(0, firstSep);
+                    const size_t lastSep = skillName.find_last_of("\\/");
+                    skillName = skillName.substr(lastSep + 1);
+                    size_t na = skillName.find_first_not_of(" \t\r\n");
+                    if (pinnedSkillFolder.empty() || na == std::string::npos) {
+                        errorOut = "python_run_script Skills\\... path must end "
+                                   "in a script filename, e.g. "
+                                   "Skills\\<skill>\\<script>.py.";
+                        return false;
+                    }
+                }
             }
 
             size_t dot = skillName.find_last_of('.');
@@ -6255,6 +6299,24 @@ bool ResolveRunnableScriptPath(const std::string& requested,
                     ? ("Python skill script not found: " + skillName)
                     : globalError;
                 return false;
+            }
+
+            // Nested-form pinning check: Skills\runPod\...\x.py must
+            // resolve into the runPod skill folder, not a same-named
+            // script that happens to live in another skill.
+            if (!pinnedSkillFolder.empty()) {
+                std::string resolvedLower = LowerLocal(script.path);
+                std::replace(resolvedLower.begin(), resolvedLower.end(), '/', '\\');
+                const std::string needle =
+                    "\\" + LowerLocal(pinnedSkillFolder) + "\\";
+                if (resolvedLower.find(needle) == std::string::npos) {
+                    errorOut = "Skill script " + skillName +
+                               " resolved outside the requested Skills\\" +
+                               pinnedSkillFolder + "\\ folder (found: " +
+                               script.path + "). Use the bare form Skills\\" +
+                               skillName + " or the script's absolute path.";
+                    return false;
+                }
             }
 
             pathOut = script.path;
@@ -6291,7 +6353,10 @@ bool ResolveRunnableScriptPath(const std::string& requested,
             if (scriptName.find('\\') != std::string::npos ||
                 scriptName.find('/')  != std::string::npos ||
                 scriptName.find(':')  != std::string::npos) {
-                errorOut = "python_run_script Scripts\\... accepts a single .py filename only.";
+                errorOut = "python_run_script Scripts\\... takes one filename "
+                           "(Scripts\\<script>.py) \xE2\x80\x94 the conversation "
+                           "Scripts folder is flat. For a script elsewhere on "
+                           "disk, pass its absolute path.";
                 return false;
             }
 
@@ -6626,6 +6691,30 @@ struct HandleGuard {
     HandleGuard& operator=(const HandleGuard&) = delete;
     HANDLE release() { HANDLE r = h; h = nullptr; return r; }
 };
+
+// Unblock a reader thread that is parked in a synchronous ReadFile.
+//
+// The job-object kill normally closes the last pipe writer and the
+// reader returns cleanly.  It does not when something outside the job
+// still holds an inherited write handle -- a grandchild the script
+// spawned and detached, most often.  Without this the join() below
+// never returns, the detached tool worker wedges, and because
+// ToolWorkerExecutor clears m_isRunning only after that join, every
+// later worker-dispatched tool in the frame is refused for the rest of
+// the session.
+//
+// Resolved dynamically for the same reason cmd_executor.cpp does it:
+// keeps the import table clean and degrades to a no-op rather than a
+// load failure if the export is ever absent.
+void CancelThreadSynchronousIoLocal(HANDLE threadHandle)
+{
+    if (!threadHandle) return;
+    using Fn = BOOL (WINAPI *)(HANDLE);
+    HMODULE kernel = GetModuleHandleW(L"kernel32.dll");
+    if (!kernel) return;
+    auto* fn = reinterpret_cast<Fn>(GetProcAddress(kernel, "CancelSynchronousIo"));
+    if (fn) fn(threadHandle);
+}
 
 void ReaderLoop(HANDLE readEnd,
                 std::string& dest,
@@ -7334,7 +7423,19 @@ private:
             return true;
         }
 
-        ResumeThread(thr.h);
+        // An unchecked ResumeThread left the child suspended, which then
+        // burned the entire m_timeoutMs before surfacing as a generic
+        // "timed out" -- hiding the real failure.  Match server_manager's
+        // handling and report it directly.
+        if (ResumeThread(thr.h) == (DWORD)-1) {
+            DWORD err = GetLastError();
+            TerminateProcess(proc.h, 1);
+            result.stderrText = "ResumeThread failed, error=" +
+                                std::to_string(err);
+            result.exitCode = -1;
+            return true;
+        }
+
         CloseHandle(outW.release());
         CloseHandle(errW.release());
 
@@ -7373,8 +7474,21 @@ private:
         }
 
         if (killIt) {
+            // Closing the job handle triggers KILL_ON_JOB_CLOSE across
+            // the whole process tree.
             CloseHandle(job.release());
-            WaitForSingleObject(proc.h, 2000);
+            // Give the OS a beat to deliver the kill so the readers see
+            // EOF and unblock on their own.
+            DWORD killed = WaitForSingleObject(proc.h, 2000);
+            if (killed == WAIT_TIMEOUT) {
+                // A stubborn process or a leaked writer is still holding a
+                // pipe open.  Cancel the in-flight ReadFile calls so the
+                // joins below cannot park this detached worker forever.
+                if (outThread.joinable())
+                    CancelThreadSynchronousIoLocal(outThread.native_handle());
+                if (errThread.joinable())
+                    CancelThreadSynchronousIoLocal(errThread.native_handle());
+            }
         }
 
         if (outThread.joinable()) outThread.join();

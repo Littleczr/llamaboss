@@ -15,6 +15,7 @@
 
 #include "chat_history.h"
 #include "lb_string_utils.h"   // ProjectSource_HumanBytes
+#include "skill_authoring_support.h"   // LbReadSkillFrontmatterDescription
 
 namespace {
 
@@ -192,7 +193,7 @@ void ProjectContextBuilder::AppendSkillsBlock(std::ostringstream& p) const
       << "  Folder: " << ProjectManager::GetSkillsDir() << "\n"
       << "  Skill execution grounding rule: when the user asks to use, run, invoke, or continue a named Skill, the first tool call for that Skill request MUST read the listed SKILL.md contract path, even if that Skill was just drafted or used earlier in this same chat. Do not run a Skill helper, PowerShell step, or one-off replacement before reading the saved Skill contract.\n"
       << "  After the saved SKILL.md is read, treat that contract and the saved files in the Skill folder as the source of truth. Do not substitute temporary workspace scripts, design-time test scripts, or remembered helper names from an earlier Skill-design conversation unless the saved SKILL.md explicitly directs that exact file.\n"
-      << "  Use a Skill by reading its SKILL.md contract first, then following its steps using normal tools and approval rules. python_run_script can run a same-folder .py helper by filename or in-lane path. If the helper needs runtime inputs, put the helper filename/path on the first args line and each optional command-line argument on its own later line; never call python_run_script with only data arguments and no .py script filename/path. Skill helper scripts are files, not tool names: never call the .py filename or Skill name directly as a tool. If an active project has a project workflow with the same name, the project workflow takes precedence.\n";
+      << "  Use a Skill by reading its SKILL.md contract first, then following its steps using normal tools and approval rules. python_run_script can run a Skill's .py helper (same folder or its scripts subfolder) by filename or in-lane path. If the helper needs runtime inputs, put the helper filename/path on the first args line and each optional command-line argument on its own later line; never call python_run_script with only data arguments and no .py script filename/path. Skill helper scripts are files, not tool names: never call the .py filename or Skill name directly as a tool. If an active project has a project workflow with the same name, the project workflow takes precedence.\n";
 
     if (!skills.empty()) {
         p << "  Skills (read the listed SKILL.md contract path before using one):\n";
@@ -200,6 +201,21 @@ void ProjectContextBuilder::AppendSkillsBlock(std::ostringstream& p) const
             p << "    - " << LbSkillDisplayNameFromContractPath(skill)
               << " contract (" << ProjectSource_HumanBytes(skill.sizeBytes) << ")\n"
               << "      SKILL.md: " << skill.path << "\n";
+
+            // Agent Skills progressive disclosure: surface each skill's
+            // frontmatter description so the model can pick the right
+            // skill from the list without reading every contract.  The
+            // full SKILL.md is still read on use (grounding rule above).
+            // Legacy skills without frontmatter return empty and print
+            // nothing.  Cache safety: this runs only on context-cache
+            // rebuilds, and FingerprintItems already mixes each SKILL.md
+            // mtime into the signature, so an edited description
+            // invalidates the cached prompt.
+            const std::string description =
+                LbReadSkillFrontmatterDescription(skill.path);
+            if (!description.empty()) {
+                p << "      Description: " << description << "\n";
+            }
         }
     }
 

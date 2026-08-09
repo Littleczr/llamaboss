@@ -92,6 +92,7 @@ SettingsDialog::SettingsDialog(wxWindow* parent,
                                bool currentAgentDefaultOn,
                                bool currentContextMeterOn,
                                bool currentKvCacheQ8,
+                               bool currentMtpEnabled,
                                const ThemeData& theme,
                                SecretsStore* secretsStore,
                                EndpointStore* endpointStore)
@@ -109,6 +110,7 @@ SettingsDialog::SettingsDialog(wxWindow* parent,
     , m_selectedAgentDefault(currentAgentDefaultOn)
     , m_selectedContextMeter(currentContextMeterOn)
     , m_selectedKvCacheQ8(currentKvCacheQ8)
+    , m_selectedMtpEnabled(currentMtpEnabled)
     , m_originalModel(currentModelPath)
     , m_originalTheme(currentTheme)
     , m_originalCtxSize(currentCtxSize)
@@ -116,6 +118,7 @@ SettingsDialog::SettingsDialog(wxWindow* parent,
     , m_originalAgentDefault(currentAgentDefaultOn)
     , m_originalContextMeter(currentContextMeterOn)
     , m_originalKvCacheQ8(currentKvCacheQ8)
+    , m_originalMtpEnabled(currentMtpEnabled)
     , m_originalFolderOverride(ServerManager::GetModelsDirOverride())
     , m_theme(&theme)
 {
@@ -367,6 +370,28 @@ void SettingsDialog::CreateControls()
         "VRAM. Changing this reloads the model.");
     { wxFont kh = kvHint->GetFont(); kh.SetPointSize(10); kvHint->SetFont(kh); }
     bodySizer->Add(kvHint, 0, wxBOTTOM, 14);
+
+    // Multi-token prediction lives in the Context section with the
+    // other launch-argument controls (same restart semantics as the
+    // ctx slider and KV cache toggle above).
+    m_mtpCheckBox = new wxCheckBox(
+        body, wxID_ANY, "Multi-token prediction (auto)");
+    { wxFont mf = m_mtpCheckBox->GetFont();
+      mf.SetPointSize(11);
+      m_mtpCheckBox->SetFont(mf); }
+    m_mtpCheckBox->SetValue(m_selectedMtpEnabled);
+    bodySizer->Add(m_mtpCheckBox, 0, wxBOTTOM, 4);
+
+    auto* mtpHint = new wxStaticText(body, wxID_ANY,
+        "Speeds up generation on models with built-in MTP heads "
+        "(GLM 4.5/4.6, Qwen MTP builds). Detected automatically; has "
+        "no effect on other models. Changing this reloads the model.");
+    { wxFont mh = mtpHint->GetFont(); mh.SetPointSize(10); mtpHint->SetFont(mh); }
+    // Keep this long hint from widening the vertical-only scrolled body.
+    // Without wrapping, FitInside() uses the text's full best width and
+    // pushes right-aligned Manage buttons outside the visible viewport.
+    mtpHint->Wrap(520);
+    bodySizer->Add(mtpHint, 0, wxBOTTOM, 14);
 
     // ─────────────────────────────────────────────────────────────
     //  SECTION 3 — BEHAVIOR
@@ -657,6 +682,10 @@ void SettingsDialog::ApplyTheme()
         m_kvCacheQ8CheckBox->SetForegroundColour(t.textPrimary);
         m_kvCacheQ8CheckBox->SetBackgroundColour(t.bgDialogSurface);
     }
+    if (m_mtpCheckBox) {
+        m_mtpCheckBox->SetForegroundColour(t.textPrimary);
+        m_mtpCheckBox->SetBackgroundColour(t.bgDialogSurface);
+    }
     if (m_agentDefaultCheckBox) {
         m_agentDefaultCheckBox->SetForegroundColour(t.textPrimary);
         m_agentDefaultCheckBox->SetBackgroundColour(t.bgDialogSurface);
@@ -775,6 +804,8 @@ void SettingsDialog::OnOK(wxCommandEvent&)
         m_selectedContextMeter = m_contextMeterCheckBox->GetValue();
     if (m_kvCacheQ8CheckBox)
         m_selectedKvCacheQ8 = m_kvCacheQ8CheckBox->GetValue();
+    if (m_mtpCheckBox)
+        m_selectedMtpEnabled = m_mtpCheckBox->GetValue();
 
     // Sliders keep m_selectedCtxSize / m_selectedFontSize live via their
     // onChange callbacks — nothing to do here beyond diff'ing.
@@ -785,6 +816,7 @@ void SettingsDialog::OnOK(wxCommandEvent&)
     m_agentDefaultChanged = (m_selectedAgentDefault  != m_originalAgentDefault);
     m_contextMeterChanged = (m_selectedContextMeter  != m_originalContextMeter);
     m_kvCacheQ8Changed    = (m_selectedKvCacheQ8     != m_originalKvCacheQ8);
+    m_mtpEnabledChanged   = (m_selectedMtpEnabled    != m_originalMtpEnabled);
 
     // Folder override was committed live by Change/Reset; compare current
     // value to what we captured at construction.

@@ -181,6 +181,16 @@ LbThemedSingleChoiceDialog::LbThemedSingleChoiceDialog(wxWindow* parent,
     m_list->SetForegroundColour(m_theme.textPrimary);
     top->Add(m_list, 1, wxLEFT | wxRIGHT | wxBOTTOM | wxEXPAND, 12);
 
+    // Optional per-item detail line.  Created hidden; SetItemDetails()
+    // shows it.  Fixed-height reserve (two wrapped lines) so switching
+    // selections doesn't resize the dialog.
+    m_detail = new wxStaticText(this, wxID_ANY, wxEmptyString,
+                                wxDefaultPosition, wxSize(560, 34),
+                                wxST_NO_AUTORESIZE);
+    m_detail->SetForegroundColour(m_theme.textMuted);
+    m_detail->Hide();
+    top->Add(m_detail, 0, wxLEFT | wxRIGHT | wxBOTTOM | wxEXPAND, 12);
+
     auto* line = new wxPanel(this, wxID_ANY,
                              wxDefaultPosition, wxSize(-1, 1));
     line->SetBackgroundColour(m_theme.borderSubtle);
@@ -213,6 +223,7 @@ LbThemedSingleChoiceDialog::LbThemedSingleChoiceDialog(wxWindow* parent,
 
     m_list->Bind(wxEVT_LISTBOX, [this](wxCommandEvent&) {
         UpdateOkButton();
+        UpdateDetailText();
     });
     m_list->Bind(wxEVT_LISTBOX_DCLICK, [this](wxCommandEvent&) {
         if (m_okButton && m_okButton->IsEnabled()) {
@@ -245,6 +256,32 @@ void LbThemedSingleChoiceDialog::SetDeleteHandler(DeleteHandler handler)
     m_deleteHandler = std::move(handler);
 }
 
+void LbThemedSingleChoiceDialog::SetItemDetails(const wxArrayString& details)
+{
+    m_details = details;
+    if (m_detail) {
+        m_detail->Show();
+        Layout();
+    }
+    UpdateDetailText();
+}
+
+void LbThemedSingleChoiceDialog::UpdateDetailText()
+{
+    if (!m_detail || !m_detail->IsShown() || !m_list) return;
+
+    wxString text;
+    const int sel = m_list->GetSelection();
+    if (sel != wxNOT_FOUND &&
+        static_cast<size_t>(sel) < m_details.GetCount()) {
+        text = m_details[static_cast<size_t>(sel)];
+    }
+    m_detail->SetLabel(text);
+    // Re-wrap for the reserved two-line area.  Wrap() mutates the label,
+    // so it must run after every SetLabel.
+    m_detail->Wrap(560);
+}
+
 void LbThemedSingleChoiceDialog::UpdateOkButton()
 {
     if (!m_okButton || !m_list) return;
@@ -271,6 +308,9 @@ bool LbThemedSingleChoiceDialog::TryDeleteSelection()
     if (!m_deleteHandler(sel, label)) return true;
 
     m_list->Delete(static_cast<unsigned int>(sel));
+    if (static_cast<size_t>(sel) < m_details.GetCount()) {
+        m_details.RemoveAt(static_cast<size_t>(sel));
+    }
     const unsigned int count = m_list->GetCount();
     if (count > 0) {
         const unsigned int next = static_cast<unsigned int>(
@@ -278,5 +318,6 @@ bool LbThemedSingleChoiceDialog::TryDeleteSelection()
         m_list->SetSelection(next);
     }
     UpdateOkButton();
+    UpdateDetailText();
     return true;
 }

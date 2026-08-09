@@ -190,6 +190,7 @@
     <ClCompile Include="tool_protocol.cpp" />
     <ClCompile Include="command_policy.cpp" />
     <ClCompile Include="agent_controller.cpp" />
+    <ClCompile Include="wait_executor.cpp" />
     <ClCompile Include="conversation_sidebar.cpp" />
     <ClCompile Include="markdown_renderer.cpp" />
     <ClCompile Include="LlamaBoss.cpp" />
@@ -197,6 +198,7 @@
     <ClCompile Include="theme.cpp" />
     <ClCompile Include="model_manager.cpp" />
     <ClCompile Include="server_manager.cpp" />
+    <ClCompile Include="gguf_metadata.cpp" />
     <ClCompile Include="update_checker.cpp" />
     <ClCompile Include="ui_builder.cpp" />
     <ClCompile Include="model_switcher.cpp" />
@@ -269,6 +271,7 @@
     <ClInclude Include="agent_event.h" />
     <ClInclude Include="command_policy.h" />
     <ClInclude Include="agent_controller.h" />
+    <ClInclude Include="wait_executor.h" />
     <ClInclude Include="conversation_sidebar.h" />
     <ClInclude Include="markdown_renderer.h" />
     <ClInclude Include="resource.h" />
@@ -276,6 +279,7 @@
     <ClInclude Include="theme.h" />
     <ClInclude Include="model_manager.h" />
     <ClInclude Include="server_manager.h" />
+    <ClInclude Include="gguf_metadata.h" />
     <ClInclude Include="update_checker.h" />
     <ClInclude Include="widgets.h" />
     <ClInclude Include="ui_event_post.h" />
@@ -308,6 +312,7 @@
     <ClInclude Include="project_context_builder.h" />
     <ClInclude Include="lb_input_parsers.h" />
     <ClInclude Include="lb_themed_dialogs.h" />
+    <ClInclude Include="reminder_store.h" />
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="LlamaBoss.rc" />

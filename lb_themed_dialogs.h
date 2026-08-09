@@ -45,13 +45,22 @@ public:
     int GetSelection() const;
     void SetDeleteHandler(DeleteHandler handler);
 
+    // Optional per-item detail line (muted, wrapped) shown under the list
+    // and updated on selection change.  details must parallel `choices` by
+    // index; missing/empty entries simply show nothing.  Used by the Skill
+    // pickers to surface each skill's frontmatter description.
+    void SetItemDetails(const wxArrayString& details);
+
 private:
     void UpdateOkButton();
+    void UpdateDetailText();
     void OnCharHook(wxKeyEvent& event);
     bool TryDeleteSelection();
 
     ThemeData     m_theme;
     wxListBox*    m_list = nullptr;
+    wxStaticText* m_detail = nullptr;
+    wxArrayString m_details;
     wxButton*     m_okButton = nullptr;
     DeleteHandler m_deleteHandler;
 };

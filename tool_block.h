@@ -46,4 +46,22 @@ struct ToolBlock {
     // rendering.  The typed fallback in TryHandlePendingApprovalInput
     // remains as a keyboard safety net.
     bool requiresApproval = false;
+
+    // ── Live progress metadata ───────────────────────────────────
+    // Set ONLY by AgentController::EmitPendingToolBlock.  isPending
+    // marks this card as the start-of-async acknowledgement (worker
+    // dispatch or wait), telling the frame to arm the ChatDisplay
+    // live progress line right after rendering it.  A terminal
+    // result block leaves these at their defaults, so rendering it
+    // both removes the line (DisplayToolBlock clears defensively)
+    // and does not restart it.
+    //
+    // pendingWaitTotalSec > 0 selects the countdown-bar mode for the
+    // wait tool (total requested seconds); 0 selects the generic
+    // spinner + elapsed mode.  pendingWaitReason is the model's
+    // optional human-readable wait label, shown after the bar.
+    // UI-only — none of this is serialized into chat history.
+    bool        isPending          = false;
+    int         pendingWaitTotalSec = 0;
+    std::string pendingWaitReason;
 };

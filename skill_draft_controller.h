@@ -63,8 +63,7 @@ public:
 
     // ── Design-session state ───────────────────────────────────────
     void StartDesignSession(const std::string& skillName,
-                            const std::string& skillPath,
-                            bool requestedPythonScript);
+                            const std::string& skillPath);
     bool HasActiveDesignSession() const;
     bool IsDesignSessionForSkillPath(const std::string& skillPath) const;
     void ClearDesignSession();
@@ -77,8 +76,9 @@ public:
     // "draft this Skill".
     std::string BuildPendingSkillDesignConversationBrief() const;
 
-    // Stores the brief and derives the optional helper path if the user created
-    // the Skill via "New Skill with Python Script".
+    // Stores the brief and reserves the Skill's helper-script path
+    // (scripts subfolder).  The builder decides at draft time whether a
+    // helper actually ships; Python is always available, never forced.
     void PrepareDraftFromDesignConversationBrief(const std::string& authoringBrief);
 
     // ── Hidden builder turn ────────────────────────────────────────
@@ -91,7 +91,6 @@ public:
 private:
     struct PendingSkillAuthoring {
         bool        active = false;
-        bool        requestedPythonScript = false;
         std::string skillName;
         std::string skillPath;
         std::string pythonHelperPath;

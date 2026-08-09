@@ -223,6 +223,50 @@ bool ModelSwitcher::IsServerReady() const
     return m_service.IsServerReady() && IsConversationTargetActive();
 }
 
+bool ModelSwitcher::SessionUsesLocalServer() const
+{
+    const std::string& key = m_conversationSelectionKey.empty()
+        ? m_service.GetActiveSelectionKey()
+        : m_conversationSelectionKey;
+    return !IsRemoteModelKey(key);
+}
+
+InferenceTarget ModelSwitcher::ResolveTargetForConversation()
+{
+    // Local conversations (and frames with no preference yet) ride
+    // the app-global target exactly as before.
+    if (!IsRemoteModelKey(m_conversationSelectionKey))
+        return m_service.ResolveTarget();
+
+    // Remote conversations resolve their own endpoint per send,
+    // without installing it as the app-global target.  SecretsStore
+    // is UI-thread-only; every caller (main send, agent sendRequest,
+    // goal sends, skill draft) dispatches from the main thread, and
+    // the resolved target is copied into the worker as usual.
+    std::string endpointId;
+    std::string wireModel;
+    if (ParseRemoteModelKey(m_conversationSelectionKey,
+                            endpointId, wireModel)) {
+        EndpointStore* endpoints = m_appState.GetEndpointStore();
+        SecretsStore*  secrets   = m_appState.GetSecretsStore();
+        InferenceTarget target;
+        std::string reason;
+        if (endpoints && secrets &&
+            endpoints->ResolveTarget(endpointId, wireModel, *secrets,
+                                     target, reason)) {
+            return target;
+        }
+        if (auto* logger = m_appState.GetLogger())
+            logger->information(
+                "ResolveTargetForConversation: remote key '" +
+                m_conversationSelectionKey + "' failed to resolve (" +
+                reason + "); falling back to the app-global target");
+    }
+    // Fallback preserves the pre-pinning behavior (global target)
+    // when the endpoint was deleted or the key is malformed.
+    return m_service.ResolveTarget();
+}
+
 void ModelSwitcher::MarkServerNotReady()
 {
     // Shared readiness is service-owned.  This legacy helper now affects only
@@ -355,10 +399,14 @@ bool ModelSwitcher::ActivateConversationPreferredRemoteTarget()
     if (!NeedsRemoteActivationForConversation())
         return IsServerReady();
 
-    if (m_service.AnyOtherWindowBusy(m_parentFrame)) {
+    // Going remote retires the local server, so only windows whose
+    // session depends on that server are at risk; remote-busy
+    // windows are pinned to their own endpoint and unaffected.
+    if (m_service.AnyOtherWindowBusyOnLocalServer(m_parentFrame)) {
         const int r = wxMessageBox(
-            "Another window is generating a response. Activating this "
-            "conversation's remote model will interrupt it.\n\nSwitch anyway?",
+            "Another window is generating on the local model. Activating "
+            "this conversation's remote model will interrupt it.\n\n"
+            "Switch anyway?",
             "Model Switch", wxYES_NO | wxICON_WARNING, m_parentFrame);
         if (r != wxYES) return false;
     }
@@ -760,10 +808,12 @@ void ModelSwitcher::SwitchToModel(const std::string& newModel)
 
         // ── Multi-window courtesy check (Phase 3c) ───────────────
         // Going remote retires the local server, which kills any
-        // stream another window has in flight.  Confirm first.
-        if (m_service.AnyOtherWindowBusy(m_parentFrame)) {
+        // LOCAL stream another window has in flight.  Remote-busy
+        // windows are pinned to their own endpoint
+        // (ResolveTargetForConversation) and unaffected — no confirm.
+        if (m_service.AnyOtherWindowBusyOnLocalServer(m_parentFrame)) {
             const int r = wxMessageBox(
-                "Another window is generating a response. Switching "
+                "Another window is generating on the local model. Switching "
                 "models will interrupt it.\n\nSwitch anyway?",
                 "Model Switch", wxYES_NO | wxICON_WARNING, m_parentFrame);
             if (r != wxYES) return;
@@ -819,12 +869,13 @@ void ModelSwitcher::SwitchToModel(const std::string& newModel)
     }
 
     // ── Multi-window courtesy check (Phase 3c) ───────────────────
-    // Restarting the local server kills any stream another window
-    // has in flight.  Confirm before doing that to someone else's
-    // response.
-    if (m_service.AnyOtherWindowBusy(m_parentFrame)) {
+    // Restarting the local server kills any LOCAL stream another
+    // window has in flight.  Remote-busy windows are pinned to their
+    // own endpoint (ResolveTargetForConversation) and unaffected —
+    // loading a local model under a remote stream just proceeds.
+    if (m_service.AnyOtherWindowBusyOnLocalServer(m_parentFrame)) {
         const int r = wxMessageBox(
-            "Another window is generating a response. Switching "
+            "Another window is generating on the local model. Switching "
             "models will interrupt it.\n\nSwitch anyway?",
             "Model Switch", wxYES_NO | wxICON_WARNING, m_parentFrame);
         if (r != wxYES) return;
