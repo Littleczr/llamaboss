@@ -33,13 +33,197 @@
 
 #include <memory>
 #include <sstream>
+#include <chrono>
+#include <cstddef>
+#include <string>
+#include <algorithm>
+#include <istream>
 #include "ui_event_post.h"
 #include "lb_ssl.h"
+
+// ═══════════════════════════════════════════════════════════════════
+//  Stream limits
+// ═══════════════════════════════════════════════════════════════════
+// Everything below arrives from a remote endpoint we do not control.
+// A malfunctioning or hostile server could previously hand us an
+// unterminated SSE line, an endless tool-argument fragment, or a
+// multi-gigabyte error body, all of which grew a std::string until
+// the process died. These are deliberately generous - the point is
+// that a ceiling EXISTS, not that it is tight.
+namespace {
+
+// One SSE line. Generous because a whole generated image arrives on
+// a single line as a base64 data URL, and a provider may pack
+// several into one chunk.
+constexpr std::size_t kMaxSseLineBytes = 64ull * 1024 * 1024;
+
+// Total bytes read off one response. Bounds fullReply transitively:
+// a reply cannot exceed what we were willing to read.
+constexpr std::size_t kMaxStreamBytes = 512ull * 1024 * 1024;
+
+// Non-200 error body. Only ever shown in a message box.
+constexpr std::size_t kMaxErrorBodyBytes = 64ull * 1024;
+
+// Accumulated function-call arguments, per tool-call slot. Real tool
+// arguments are hundreds of bytes; anything past this is a stuck
+// generation, not a payload.
+constexpr std::size_t kMaxToolArgBytes = 4ull * 1024 * 1024;
+
+// Generated images: per data URL, and across the whole response.
+constexpr std::size_t kMaxImageDataUrlBytes = 48ull * 1024 * 1024;
+constexpr std::size_t kMaxTotalImageBytes   = 192ull * 1024 * 1024;
+
+// Delta coalescing (see queueDelta in Entry). Flush on whichever
+// comes first.
+constexpr std::size_t kDeltaFlushBytes = 4096;
+constexpr int         kDeltaFlushMs    = 12;
+
+// Bounded replacement for std::getline.
+//
+// Returns false only at a clean EOF with nothing buffered. Sets
+// `overflow` when the line hit maxBytes without a newline - the
+// caller treats that as a protocol error rather than growing the
+// buffer without limit.
+//
+// Reads through the streambuf rather than istream::get() so an empty
+// line (which SSE uses as its event boundary) does not trip failbit,
+// and so the per-byte cost stays a pointer bump in the common case.
+bool ReadLineBounded(std::istream& in, std::string& out,
+                     std::size_t maxBytes, bool& overflow)
+{
+    out.clear();
+    overflow = false;
+
+    std::streambuf* sb = in.rdbuf();
+    if (!sb) return false;
+
+    bool any = false;
+    for (;;) {
+        const int c = sb->sbumpc();
+        if (c == std::char_traits<char>::eof()) {
+            in.setstate(std::ios::eofbit);
+            return any;
+        }
+        any = true;
+        if (c == '\n') return true;
+        if (out.size() >= maxBytes) { overflow = true; return true; }
+        out.push_back(static_cast<char>(c));
+    }
+}
+
+// Bounded body read, for error responses we only intend to display.
+std::string ReadBodyBounded(std::istream& in, std::size_t maxBytes)
+{
+    std::string out;
+    char buf[4096];
+
+    while (out.size() < maxBytes && in.good()) {
+        const std::size_t want =
+            (std::min)(sizeof(buf), maxBytes - out.size());
+        in.read(buf, static_cast<std::streamsize>(want));
+        const std::streamsize n = in.gcount();
+        if (n <= 0) break;
+        out.append(buf, static_cast<std::size_t>(n));
+    }
+
+    if (out.size() >= maxBytes)
+        out += " ... (truncated)";
+    return out;
+}
+
+// Length of the longest prefix of s that ends on a complete UTF-8
+// sequence. Used so a coalesced flush never cuts a multi-byte
+// character in half - llama-server happily splits a CJK glyph or an
+// emoji across two deltas, and each half converted separately through
+// wxString::FromUTF8 renders as a replacement character.
+std::size_t Utf8SafeCut(const std::string& s)
+{
+    if (s.empty()) return 0;
+
+    std::size_t i = s.size();
+    int walked = 0;
+    while (i > 0 && walked < 4) {
+        const unsigned char c = static_cast<unsigned char>(s[i - 1]);
+        if ((c & 0xC0) == 0x80) { --i; ++walked; continue; }  // continuation
+
+        std::size_t need = 0;
+        if      (c < 0x80)          need = 1;
+        else if ((c & 0xE0) == 0xC0) need = 2;
+        else if ((c & 0xF0) == 0xE0) need = 3;
+        else if ((c & 0xF8) == 0xF0) need = 4;
+        else return s.size();   // invalid lead byte; pass it through
+
+        const std::size_t have = s.size() - (i - 1);
+        return (have >= need) ? s.size() : (i - 1);
+    }
+    return s.size();
+}
+
+} // namespace
 
 // Define custom events
 wxDEFINE_EVENT(wxEVT_ASSISTANT_DELTA, wxCommandEvent);
 wxDEFINE_EVENT(wxEVT_ASSISTANT_COMPLETE, wxCommandEvent);
 wxDEFINE_EVENT(wxEVT_ASSISTANT_ERROR, wxCommandEvent);
+
+// ═══════════════════════════════════════════════════════════════════
+// ChatRequestControl Implementation
+// ═══════════════════════════════════════════════════════════════════
+
+void ChatRequestControl::Cancel()
+{
+    // Flag first, abort second.  Every error path in
+    // ChatWorkerThread::Entry() is guarded on IsCancelled(), so setting
+    // the flag before tearing the socket down is what keeps a user Stop
+    // from surfacing as an "API Error" / "Stream ended unexpectedly"
+    // message.
+    m_cancelled.store(true, std::memory_order_release);
+
+    // Copy the pointer out under the lock, abort outside it.  Holding
+    // our own shared_ptr means the session cannot be destroyed mid-abort
+    // even if the worker reaches DetachSession() first.
+    std::shared_ptr<Poco::Net::HTTPClientSession> session;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        session = m_session;
+    }
+    if (!session) return;
+
+    // abort() shuts the socket down from this thread, which is what
+    // unblocks the worker's std::getline().  It throws when the session
+    // never actually connected (Stop pressed during DNS/connect, where
+    // Poco's socket has no descriptor to shut down).  Nothing to clean up
+    // in that case -- the worker unwinds through its own handlers and the
+    // cancelled flag keeps it quiet -- so swallow it.
+    try { session->abort(); } catch (...) {}
+}
+
+bool ChatRequestControl::AttachSession(
+    const std::shared_ptr<Poco::Net::HTTPClientSession>& session)
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+
+    // Lost the race: Cancel() ran between this worker being started and
+    // its session being built, so there was no session to abort and the
+    // abort has already happened (to nothing).  Refuse to register;
+    // the worker abandons the request instead of entering a blocking
+    // read that no longer has an interrupter.
+    if (m_cancelled.load(std::memory_order_acquire)) return false;
+
+    m_session = session;
+    return true;
+}
+
+void ChatRequestControl::DetachSession()
+{
+    // Release outside the lock so the session destructor (socket close)
+    // never runs while m_mutex is held.
+    std::shared_ptr<Poco::Net::HTTPClientSession> released;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        released.swap(m_session);
+    }
+}
 
 // ═══════════════════════════════════════════════════════════════════
 // ChatWorkerThread Implementation
@@ -48,14 +232,14 @@ wxDEFINE_EVENT(wxEVT_ASSISTANT_ERROR, wxCommandEvent);
 ChatWorkerThread::ChatWorkerThread(wxEvtHandler* eventHandler,
     InferenceTarget target,
     std::string requestBody,
-    std::shared_ptr<std::atomic<bool>> cancelFlag,
+    std::shared_ptr<ChatRequestControl> control,
     std::weak_ptr<std::atomic<bool>> aliveToken,
     unsigned long generationId)
     : wxThread(wxTHREAD_DETACHED)
     , m_eventHandler(eventHandler)
     , m_target(std::move(target))
     , m_requestBody(std::move(requestBody))
-    , m_cancelFlag(cancelFlag)
+    , m_control(std::move(control))
     , m_aliveToken(aliveToken)
     , m_generationId(generationId)
 {
@@ -119,10 +303,17 @@ wxThread::ExitCode ChatWorkerThread::Entry()
     // case a provider repeats the array across chunks.
     std::vector<std::string> imageDataUrls;
 
+    // Running total so a provider that streams image after image
+    // cannot walk us out of memory one "valid" entry at a time.
+    std::size_t imageBytes = 0;
+
     auto collectImageUrl = [&](const std::string& url) {
         if (url.empty()) return;
+        if (url.size() > kMaxImageDataUrlBytes) return;
+        if (imageBytes + url.size() > kMaxTotalImageBytes) return;
         for (const auto& existing : imageDataUrls)
             if (existing == url) return;
+        imageBytes += url.size();
         imageDataUrls.push_back(url);
     };
 
@@ -149,7 +340,63 @@ wxThread::ExitCode ChatWorkerThread::Entry()
         return &toolCalls[(size_t)idx];
     };
 
-    auto isCancelled = [this]() { return m_cancelFlag->load(); };
+    auto isCancelled = [this]() { return m_control->IsCancelled(); };
+
+    // ── Delta coalescing ─────────────────────────────────────────
+    // The UI already batches on a 16 ms timer, but the worker used to
+    // allocate one wxCommandEvent and run one UTF-8 -> UTF-16
+    // conversion PER TOKEN, then the UI converted each one straight
+    // back. A fast local model turns that into thousands of
+    // allocations and conversions for a single answer.
+    //
+    // Buffer here instead and flush on 4 KiB or 12 ms, whichever
+    // comes first - below the UI's 16 ms tick, so perceived streaming
+    // smoothness is unchanged. The flush is held back to the last
+    // complete UTF-8 boundary so a split multi-byte character is
+    // rejoined rather than rendered as two replacement characters.
+    std::string pendingDelta;
+    auto lastFlush = std::chrono::steady_clock::now();
+
+    auto flushDelta = [&](bool force) -> bool {
+        if (pendingDelta.empty()) return true;
+
+        const std::size_t cut =
+            force ? pendingDelta.size() : Utf8SafeCut(pendingDelta);
+        if (cut == 0) return true;   // nothing but a partial character yet
+
+        wxCommandEvent* event = new wxCommandEvent(wxEVT_ASSISTANT_DELTA);
+        event->SetString(wxString::FromUTF8(pendingDelta.data(), cut));
+        pendingDelta.erase(0, cut);
+        lastFlush = std::chrono::steady_clock::now();
+        return SafeQueueEvent(event);
+    };
+
+    auto queueDelta = [&](const std::string& text) -> bool {
+        if (text.empty()) return true;
+        pendingDelta += text;
+
+        if (pendingDelta.size() >= kDeltaFlushBytes)
+            return flushDelta(false);
+
+        const auto age = std::chrono::steady_clock::now() - lastFlush;
+        if (age >= std::chrono::milliseconds(kDeltaFlushMs))
+            return flushDelta(false);
+
+        return true;
+    };
+
+    // Every terminal event must be preceded by a forced flush, or the
+    // tail of the reply is queued behind an event the UI treats as
+    // final - or never queued at all.
+    auto postError = [&](const std::string& message) {
+        flushDelta(true);
+        wxCommandEvent* event = new wxCommandEvent(wxEVT_ASSISTANT_ERROR);
+        event->SetString(wxString::FromUTF8(message));
+        SafeQueueEvent(event);
+    };
+
+    // Bytes pulled off this response, for the overall budget.
+    std::size_t streamBytes = 0;
 
     try {
         // ── Connect to the target's OpenAI-compatible endpoint ──
@@ -163,16 +410,34 @@ wxThread::ExitCode ChatWorkerThread::Entry()
         if (port == 0)
             port = m_target.useTls ? 443 : 80;
 
-        std::unique_ptr<Poco::Net::HTTPClientSession> sess;
+        // Shared rather than unique: ChatRequestControl holds a reference
+        // for as long as the request is registered, so a Stop arriving
+        // mid-teardown aborts a session that is guaranteed to still exist.
+        std::shared_ptr<Poco::Net::HTTPClientSession> sess;
         if (m_target.useTls) {
             // SSL is initialized lazily and once per process; only the
             // TLS branch pays for it, so local-only users never load it.
             lb::EnsureSSLInitialized();
-            sess.reset(new Poco::Net::HTTPSClientSession(uri.getHost(), port));
+            sess = std::make_shared<Poco::Net::HTTPSClientSession>(
+                uri.getHost(), port);
         } else {
-            sess.reset(new Poco::Net::HTTPClientSession(uri.getHost(), port));
+            sess = std::make_shared<Poco::Net::HTTPClientSession>(
+                uri.getHost(), port);
         }
         sess->setTimeout(Poco::Timespan(120, 0)); // 2min timeout for large models
+
+        // ── Register the transport for cancellation ──────────────
+        // From here until the scope guard fires, StopGeneration() can
+        // abort this socket and break the blocking read below.  Before
+        // this point there is nothing to abort, which is why Attach
+        // reports a cancellation that already happened.
+        if (!m_control->AttachSession(sess))
+            return (ExitCode)0;
+
+        struct SessionScope {
+            ChatRequestControl* control;
+            ~SessionScope() { if (control) control->DetachSession(); }
+        } sessionScope{ m_control.get() };
 
         Poco::Net::HTTPRequest req(
             Poco::Net::HTTPRequest::HTTP_POST,
@@ -202,8 +467,7 @@ wxThread::ExitCode ChatWorkerThread::Entry()
         std::istream& in = sess->receiveResponse(resp);
 
         if (resp.getStatus() != Poco::Net::HTTPResponse::HTTP_OK) {
-            std::string err;
-            Poco::StreamCopier::copyToString(in, err);
+            const std::string err = ReadBodyBounded(in, kMaxErrorBodyBytes);
 
             wxCommandEvent* event = new wxCommandEvent(wxEVT_ASSISTANT_ERROR);
             event->SetString(wxString::FromUTF8(
@@ -225,6 +489,14 @@ wxThread::ExitCode ChatWorkerThread::Entry()
         bool sawAnySseData = false;
         std::string line;
 
+        // One parser for the whole stream, reset between chunks.
+        // Constructing a Poco::JSON::Parser allocates its handler and
+        // internal state; doing that per SSE event meant building and
+        // tearing one down 100+ times a second at MTP generation speeds,
+        // for the entire duration of every reply.  reset() returns it to
+        // a fresh state far more cheaply than reconstruction.
+        Poco::JSON::Parser sseParser;
+
         // The read loop gets its own guard: once sawTerminalEvent is
         // set, the only thing still being read is the optional trailing
         // usage chunk / [DONE] marker.  A transport exception in that
@@ -233,7 +505,25 @@ wxThread::ExitCode ChatWorkerThread::Entry()
         // complete reply to a stream error.  Pre-terminal exceptions
         // are real failures and are rethrown to the handlers below.
         try {
-        while (std::getline(in, line) && !isCancelled()) {
+        for (;;) {
+            bool lineOverflow = false;
+            if (!ReadLineBounded(in, line, kMaxSseLineBytes, lineOverflow))
+                break;
+            if (isCancelled()) break;
+
+            streamBytes += line.size() + 1;
+
+            if (lineOverflow) {
+                postError("Stream aborted: the server sent a single line "
+                          "larger than this client will buffer.");
+                return (ExitCode)0;
+            }
+            if (streamBytes > kMaxStreamBytes) {
+                postError("Stream aborted: response exceeded the maximum "
+                          "size this client will accept.");
+                return (ExitCode)0;
+            }
+
             // Strip trailing \r
             if (!line.empty() && line.back() == '\r')
                 line.pop_back();
@@ -259,8 +549,9 @@ wxThread::ExitCode ChatWorkerThread::Entry()
             sawAnySseData = true;
 
             try {
-                Poco::JSON::Parser parser;
-                auto obj = parser.parse(data).extract<Poco::JSON::Object::Ptr>();
+                sseParser.reset();
+                auto obj = sseParser.parse(data)
+                               .extract<Poco::JSON::Object::Ptr>();
 
                 // Mid-stream error (OOM, context overflow, model unload, etc.)
                 // llama-server emits `{"error": {"message": "..."}}` as a
@@ -281,9 +572,7 @@ wxThread::ExitCode ChatWorkerThread::Entry()
                     if (errMsg.empty())
                         errMsg = "Server returned an error mid-stream";
 
-                    wxCommandEvent* event = new wxCommandEvent(wxEVT_ASSISTANT_ERROR);
-                    event->SetString(wxString::FromUTF8("Stream error: " + errMsg));
-                    SafeQueueEvent(event);
+                    postError("Stream error: " + errMsg);
                     return (ExitCode)0;
                 }
 
@@ -364,9 +653,7 @@ wxThread::ExitCode ChatWorkerThread::Entry()
                         out += reasoningDelta;
                         fullReply += out;
 
-                        wxCommandEvent* event = new wxCommandEvent(wxEVT_ASSISTANT_DELTA);
-                        event->SetString(wxString::FromUTF8(out));
-                        if (!SafeQueueEvent(event))
+                        if (!queueDelta(out))
                             return (ExitCode)0;
                     }
 
@@ -388,9 +675,7 @@ wxThread::ExitCode ChatWorkerThread::Entry()
 
                         fullReply += content;
 
-                        wxCommandEvent* event = new wxCommandEvent(wxEVT_ASSISTANT_DELTA);
-                        event->SetString(wxString::FromUTF8(content));
-                        if (!SafeQueueEvent(event))
+                        if (!queueDelta(content))
                             return (ExitCode)0;
                     }
 
@@ -489,7 +774,19 @@ wxThread::ExitCode ChatWorkerThread::Entry()
                                                 if (fn->has("arguments")) {
                                                     try {
                                                         std::string s = fn->getValue<std::string>("arguments");
-                                                        slot->arguments += s;
+                                                        // A model stuck in a
+                                                        // generation loop emits
+                                                        // arguments forever.
+                                                        // Stop appending rather
+                                                        // than grow without
+                                                        // bound; the truncated
+                                                        // call fails to parse
+                                                        // downstream, which is
+                                                        // the correct outcome.
+                                                        if (slot->arguments.size() + s.size()
+                                                                <= kMaxToolArgBytes) {
+                                                            slot->arguments += s;
+                                                        }
                                                     } catch (...) { /* skip */ }
                                                 }
                                             }
@@ -552,13 +849,10 @@ wxThread::ExitCode ChatWorkerThread::Entry()
         }
 
         if (!isCancelled() && !sawTerminalEvent) {
-            wxCommandEvent* event = new wxCommandEvent(wxEVT_ASSISTANT_ERROR);
-            event->SetString(wxString::FromUTF8(
+            postError(
                 sawAnySseData
                     ? "Stream ended unexpectedly before the server sent a terminal event."
-                    : "Stream ended before the server sent any response data."
-            ));
-            SafeQueueEvent(event);
+                    : "Stream ended before the server sent any response data.");
             return (ExitCode)0;
         }
 
@@ -574,9 +868,7 @@ wxThread::ExitCode ChatWorkerThread::Entry()
                 inReasoningBlock = false;
                 fullReply += "</think>";
 
-                wxCommandEvent* event = new wxCommandEvent(wxEVT_ASSISTANT_DELTA);
-                event->SetString(wxString::FromUTF8("</think>"));
-                if (!SafeQueueEvent(event))
+                if (!queueDelta("</think>"))
                     return (ExitCode)0;
             }
 
@@ -625,6 +917,11 @@ wxThread::ExitCode ChatWorkerThread::Entry()
                 }
             }
 
+            // Ordering is load-bearing: the UI accumulates deltas and
+            // treats COMPLETE as "everything has arrived". Anything
+            // still buffered here has to go out first.
+            flushDelta(true);
+
             wxCommandEvent* event = new wxCommandEvent(wxEVT_ASSISTANT_COMPLETE);
             event->SetString(wxString::FromUTF8(fullReply));
             event->SetClientObject(new AssistantCompletePayload(
@@ -634,32 +931,16 @@ wxThread::ExitCode ChatWorkerThread::Entry()
         }
     }
     catch (const Poco::Net::HTTPException& ex) {
-        if (!isCancelled()) {
-            wxCommandEvent* event = new wxCommandEvent(wxEVT_ASSISTANT_ERROR);
-            event->SetString(wxString::FromUTF8("HTTP Error: " + ex.displayText()));
-            SafeQueueEvent(event);
-        }
+        if (!isCancelled()) postError("HTTP Error: " + ex.displayText());
     }
     catch (const Poco::Net::NetException& ex) {
-        if (!isCancelled()) {
-            wxCommandEvent* event = new wxCommandEvent(wxEVT_ASSISTANT_ERROR);
-            event->SetString(wxString::FromUTF8("Network Error: " + ex.displayText()));
-            SafeQueueEvent(event);
-        }
+        if (!isCancelled()) postError("Network Error: " + ex.displayText());
     }
     catch (const Poco::Exception& ex) {
-        if (!isCancelled()) {
-            wxCommandEvent* event = new wxCommandEvent(wxEVT_ASSISTANT_ERROR);
-            event->SetString(wxString::FromUTF8("Poco Error: " + ex.displayText()));
-            SafeQueueEvent(event);
-        }
+        if (!isCancelled()) postError("Poco Error: " + ex.displayText());
     }
     catch (const std::exception& ex) {
-        if (!isCancelled()) {
-            wxCommandEvent* event = new wxCommandEvent(wxEVT_ASSISTANT_ERROR);
-            event->SetString(wxString::FromUTF8(std::string("Error: ") + ex.what()));
-            SafeQueueEvent(event);
-        }
+        if (!isCancelled()) postError(std::string("Error: ") + ex.what());
     }
 
     return (ExitCode)0;
@@ -691,15 +972,15 @@ bool ChatClient::SendMessage(const InferenceTarget& target,
     }
 
     m_isStreaming = true;
-    m_cancelFlag = std::make_shared<std::atomic<bool>>(false);
+    m_activeRequest = std::make_shared<ChatRequestControl>();
 
     auto* thread = new ChatWorkerThread(
         m_eventHandler, target, requestBody,
-        m_cancelFlag, m_aliveToken, generationId);
+        m_activeRequest, m_aliveToken, generationId);
 
     if (thread->Run() != wxTHREAD_NO_ERROR) {
         delete thread;
-        m_cancelFlag.reset();
+        m_activeRequest.reset();
         m_isStreaming = false;
         return false;
     }
@@ -720,15 +1001,27 @@ bool ChatClient::SendMessage(const std::string& model,
 
 void ChatClient::StopGeneration()
 {
-    if (m_isStreaming && m_cancelFlag) {
-        m_cancelFlag->store(true);
-        m_cancelFlag.reset();
+    if (m_isStreaming && m_activeRequest) {
+        // Cancel() closes the socket; it does not merely raise a flag.
+        // The worker is almost always parked in std::getline() on the SSE
+        // stream and only re-checks the flag between lines, so without the
+        // abort a stopped generation kept running -- holding llama-server's
+        // only slot (--parallel 1) and delaying the next send behind it.
+        m_activeRequest->Cancel();
+
+        // Drop our handle immediately so a new SendMessage() can start
+        // while the old worker is still unwinding.  The worker keeps the
+        // control object alive through its own shared_ptr.
+        m_activeRequest.reset();
         m_isStreaming = false;
     }
 }
 
 void ChatClient::ResetStreamingState()
 {
+    // Normal-completion path -- release the handle WITHOUT cancelling.
+    // The transport has already closed itself and the worker is done or
+    // nearly so; calling Cancel() here would be harmless but misleading.
     m_isStreaming = false;
-    m_cancelFlag.reset();
+    m_activeRequest.reset();
 }

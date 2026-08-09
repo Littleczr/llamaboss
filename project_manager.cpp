@@ -15,13 +15,23 @@
 #include <wx/utils.h>
 #include <wx/dir.h>
 #include <wx/filefn.h>
+#include <wx/wfstream.h>   // wxFFileInputStream/OutputStream (skill zip import/export)
+#include <wx/zipstrm.h>    // wxZipInputStream/OutputStream (skill zip import/export)
 
 #include <algorithm>
 #include <cctype>
 #include <fstream>
+#include <functional>
 #include <iterator>
+#include <memory>
 #include <sstream>
 #include <utility>
+
+#include "skill_authoring_support.h"   // frontmatter read/ensure/rewrite for skill import
+
+#ifdef __WXMSW__
+#include <windows.h>   // GetFileAttributesW — reparse-point check in skill import
+#endif
 
 namespace {
 
@@ -294,6 +304,36 @@ std::vector<ProjectWorkflowScriptInfo> ListWorkflowScriptsInDir(const std::strin
     wxDir dir(wxString::FromUTF8(workflowsDir));
     if (!dir.IsOpened()) return scripts;
 
+    // Flat top-level *.py files are first-class runnable scripts.
+    // python_create_script in a project chat writes DIRECTLY into the
+    // project's Workflows folder (tool_router: "create reusable
+    // workflow scripts directly in the active project's Workflows
+    // folder"), and models also drop scripts there with
+    // write/overwrite_file.  Before this scan, the resolver only saw
+    // per-workflow FOLDERS, so a freshly created flat script was
+    // unfindable by bare name or Workflows\<name>.py — the creator and
+    // the resolver disagreed about the on-disk layout (observed
+    // 2026-08-03: create → run → "not found" → PowerShell
+    // copy-to-Scripts workaround, repeated after every edit).  The
+    // flat lane has no instruction-doc requirement: a runnable .py is
+    // the whole contract.
+    {
+        wxString fileName;
+        bool moreFiles = dir.GetFirst(&fileName, wxEmptyString, wxDIR_FILES);
+        while (moreFiles) {
+            const std::string fileUtf8 = std::string(fileName.ToUTF8().data());
+            if (HasLowerSuffix(fileUtf8, ".py")) {
+                const std::string path = JoinProjectPath(workflowsDir, fileUtf8);
+                ProjectWorkflowScriptInfo info;
+                info.name = fileUtf8;
+                info.path = path;
+                info.sizeBytes = FileSizeBytes(path);
+                scripts.push_back(info);
+            }
+            moreFiles = dir.GetNext(&fileName);
+        }
+    }
+
     wxString folderName;
     bool cont = dir.GetFirst(&folderName, wxEmptyString, wxDIR_DIRS);
     while (cont) {
@@ -322,6 +362,41 @@ std::vector<ProjectWorkflowScriptInfo> ListWorkflowScriptsInDir(const std::strin
                     scripts.push_back(info);
                 }
                 innerCont = inner.GetNext(&fileName);
+            }
+        }
+
+        // Also enumerate the conventional scripts\ subfolder.  Larger
+        // skills keep their helpers there (Skills\runPod\scripts\
+        // runpod_ssh.py); before this scan, those helpers were invisible
+        // to bare-name and Skills\-prefixed resolution and could only be
+        // run through an absolute path (observed 2026-08-03).  info.name
+        // stays the bare filename so resolution-by-name is unchanged;
+        // same-named scripts across skills surface as the existing
+        // "ambiguous" error rather than a silent pick.
+        {
+            const std::string scriptsSubdir =
+                JoinProjectPath(folderPath, "scripts");
+            if (wxDirExists(wxString::FromUTF8(scriptsSubdir))) {
+                wxDir scriptsDir(wxString::FromUTF8(scriptsSubdir));
+                if (scriptsDir.IsOpened()) {
+                    wxString fileName;
+                    bool moreFiles = scriptsDir.GetFirst(
+                        &fileName, wxEmptyString, wxDIR_FILES);
+                    while (moreFiles) {
+                        const std::string fileUtf8 =
+                            std::string(fileName.ToUTF8().data());
+                        if (HasLowerSuffix(fileUtf8, ".py")) {
+                            const std::string path =
+                                JoinProjectPath(scriptsSubdir, fileUtf8);
+                            ProjectWorkflowScriptInfo info;
+                            info.name = fileUtf8;
+                            info.path = path;
+                            info.sizeBytes = FileSizeBytes(path);
+                            scripts.push_back(info);
+                        }
+                        moreFiles = scriptsDir.GetNext(&fileName);
+                    }
+                }
             }
         }
 
@@ -361,31 +436,239 @@ bool IsWorkflowDocFileName(const std::string& fileName)
 
 std::string UniqueWorkflowStem(const std::string& dir,
                                const std::string& baseName,
-                               bool createPythonScript)
+                               bool kebabSuffix)
 {
     // Phase 2 layout: each skill lives in its own folder, so the
     // collision check is "does <dir>/<stem>/ already exist?" rather
     // than the old "does <dir>/<stem>.workflow.md already exist?".
-    // The createPythonScript flag is still respected -- the python
-    // script lives INSIDE the skill folder, so if the folder name
-    // is free, the script slot inside it is too.
+    // kebabSuffix (Skills lane) makes the collision suffix "-2"
+    // instead of " (2)" so skill folder names stay valid Agent Skills
+    // kebab-case names; project workflows keep the legacy suffix.
     for (int i = 1; i < 10000; ++i) {
         std::ostringstream stem;
         stem << baseName;
-        if (i > 1) stem << " (" << i << ")";
+        if (i > 1) {
+            if (kebabSuffix) stem << "-" << i;
+            else             stem << " (" << i << ")";
+        }
 
         const std::string candidateStem = stem.str();
         const std::string folderPath = JoinProjectPath(dir, candidateStem);
 
         if (!FileOrDirExists(folderPath)) {
-            (void)createPythonScript;  // intentionally unused -- see comment above
             return candidateStem;
         }
     }
 
     std::ostringstream fallback;
-    fallback << baseName << " (10000)";
+    fallback << baseName;
+    if (kebabSuffix) fallback << "-10000";
+    else             fallback << " (10000)";
     return fallback.str();
+}
+
+// Agent Skills `name` rule: lowercase letters, digits, and hyphens.
+// Applied to the Skills lane only, at creation time, after
+// SanitizeFilename has already removed filesystem-illegal characters.
+// Legacy skill folders keep their existing names; the listers and
+// resolvers do not require kebab-case.
+std::string KebabCaseAsciiStem(const std::string& in)
+{
+    std::string out;
+    out.reserve(in.size());
+    for (char ch : in) {
+        const unsigned char u = static_cast<unsigned char>(ch);
+        if ((u >= 'a' && u <= 'z') || (u >= '0' && u <= '9')) {
+            out.push_back(ch);
+        } else if (u >= 'A' && u <= 'Z') {
+            out.push_back(static_cast<char>(u - 'A' + 'a'));
+        } else {
+            // Spaces, underscores, dots, and any other separator all
+            // collapse to a single hyphen.
+            if (!out.empty() && out.back() != '-') out.push_back('-');
+        }
+    }
+    while (!out.empty() && out.back() == '-') out.pop_back();
+    // Agent Skills caps `name` at 64 chars.
+    if (out.size() > 64) {
+        out.resize(64);
+        while (!out.empty() && out.back() == '-') out.pop_back();
+    }
+    if (out.empty()) out = "skill";
+    return out;
+}
+
+// ── Skill import walk ─────────────────────────────────────────────
+// Bounded recursive walk shared by ProbeSkillImportFolder (counting)
+// and ImportSkillFolder (copying).  Deliberately conservative: skips
+// reparse points / junctions (a linked folder must not smuggle content
+// from elsewhere on disk into Skills), skips VCS/cache junk, and caps
+// depth, file count, and total bytes so picking the wrong folder (a
+// repo root, a Downloads dir) fails fast with a clear error instead of
+// copying gigabytes.
+
+constexpr int                kSkillImportMaxDepth    = 8;
+constexpr std::size_t        kSkillImportMaxFiles    = 400;
+constexpr unsigned long long kSkillImportMaxBytes    = 64ull * 1024 * 1024;
+
+bool IsReparsePointOrSymlink(const std::string& path)
+{
+#ifdef __WXMSW__
+    const DWORD attrs =
+        ::GetFileAttributesW(path_safety::Utf8ToWide(path).c_str());
+    if (attrs == INVALID_FILE_ATTRIBUTES) return false;
+    return (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+#else
+    (void)path;
+    return false;
+#endif
+}
+
+bool SkillImportSkipsDirName(const std::string& name)
+{
+    const std::string lower = LowerAscii(name);
+    return lower == ".git" || lower == ".vs" || lower == "__pycache__" ||
+           lower == "node_modules" || lower == ".venv" || lower == "venv";
+}
+
+// Walk `dirPath` recursively.  relPrefix is "" at the root and grows
+// "sub\" per level.  onDir/onFile may be null (probe mode).  Returns
+// false with outError set on any cap violation or callback failure.
+bool WalkSkillImportTree(
+    const std::string& dirPath,
+    const std::string& relPrefix,
+    int depth,
+    std::size_t& fileCount,
+    unsigned long long& totalBytes,
+    const std::function<bool(const std::string& relDir)>& onDir,
+    const std::function<bool(const std::string& absFile,
+                             const std::string& relFile)>& onFile,
+    std::string& outError)
+{
+    if (depth > kSkillImportMaxDepth) {
+        outError = "Skill folder is nested deeper than " +
+                   std::to_string(kSkillImportMaxDepth) +
+                   " levels; this does not look like a Skill folder.";
+        return false;
+    }
+
+    wxDir dir(wxString::FromUTF8(dirPath));
+    if (!dir.IsOpened()) {
+        outError = "Could not open folder: " + dirPath;
+        return false;
+    }
+
+    wxString name;
+    bool cont = dir.GetFirst(&name, wxEmptyString, wxDIR_FILES);
+    while (cont) {
+        const std::string fileUtf8 = std::string(name.ToUTF8().data());
+        const std::string absFile = JoinProjectPath(dirPath, fileUtf8);
+        if (!IsReparsePointOrSymlink(absFile)) {
+            ++fileCount;
+            totalBytes += FileSizeBytes(absFile);
+            if (fileCount > kSkillImportMaxFiles) {
+                outError = "Skill folder has more than " +
+                           std::to_string(kSkillImportMaxFiles) +
+                           " files; this does not look like a Skill folder.";
+                return false;
+            }
+            if (totalBytes > kSkillImportMaxBytes) {
+                outError = "Skill folder is larger than 64 MB; this does "
+                           "not look like a Skill folder.";
+                return false;
+            }
+            if (onFile && !onFile(absFile, relPrefix + fileUtf8)) {
+                outError = "Could not copy file: " + absFile;
+                return false;
+            }
+        }
+        cont = dir.GetNext(&name);
+    }
+
+    cont = dir.GetFirst(&name, wxEmptyString, wxDIR_DIRS);
+    while (cont) {
+        const std::string dirUtf8 = std::string(name.ToUTF8().data());
+        const std::string absDir = JoinProjectPath(dirPath, dirUtf8);
+        if (!SkillImportSkipsDirName(dirUtf8) &&
+            !IsReparsePointOrSymlink(absDir)) {
+            const std::string relDir = relPrefix + dirUtf8;
+            if (onDir && !onDir(relDir)) {
+                outError = "Could not create folder: " + relDir;
+                return false;
+            }
+            if (!WalkSkillImportTree(absDir,
+                                     relDir + std::string(1, wxFILE_SEP_PATH),
+                                     depth + 1,
+                                     fileCount,
+                                     totalBytes,
+                                     onDir,
+                                     onFile,
+                                     outError)) {
+                return false;
+            }
+        }
+        cont = dir.GetNext(&name);
+    }
+
+    return true;
+}
+
+// Leaf folder name of a directory path ("C:\x\My Skill" -> "My Skill").
+std::string LeafFolderName(const std::string& dirPath)
+{
+    std::string p = dirPath;
+    while (!p.empty() && (p.back() == '\\' || p.back() == '/')) p.pop_back();
+    const size_t sep = p.find_last_of("\\/");
+    return sep == std::string::npos ? p : p.substr(sep + 1);
+}
+
+// ── Skill zip entry validation ────────────────────────────────────
+// Zip entry names come from the archive, i.e. from outside the trust
+// boundary.  Normalize backslashes (Windows-made archives use them) and
+// reject anything that could escape the extraction root: absolute
+// paths, drive letters, empty/dot/dot-dot components, or names deeper
+// than the import depth cap.  On success, outRelPath is the cleaned
+// forward-slash relative path.
+bool SkillZipEntryNameIsSafe(const std::string& rawName,
+                             std::string& outRelPath)
+{
+    outRelPath.clear();
+    if (rawName.empty()) return false;
+
+    std::string name = rawName;
+    std::replace(name.begin(), name.end(), '\\', '/');
+
+    if (name.front() == '/') return false;              // absolute
+    if (name.find(':') != std::string::npos) return false; // drive / ADS
+
+    // Component-wise validation.
+    int depth = 0;
+    size_t pos = 0;
+    while (pos <= name.size()) {
+        const size_t sep = name.find('/', pos);
+        const std::string part =
+            name.substr(pos, sep == std::string::npos
+                                 ? std::string::npos
+                                 : sep - pos);
+        const bool last = sep == std::string::npos;
+        if (part.empty()) {
+            // Empty component: "a//b" anywhere, or a trailing "/" that
+            // marks a directory entry (allowed only at the end).
+            if (!last) return false;
+        } else if (part == "." || part == "..") {
+            return false;
+        } else {
+            ++depth;
+            if (depth > kSkillImportMaxDepth) return false;
+        }
+        if (last) break;
+        pos = sep + 1;
+    }
+    if (depth == 0) return false;
+
+    while (!name.empty() && name.back() == '/') name.pop_back();
+    outRelPath = name;
+    return !outRelPath.empty();
 }
 
 void MoveLegacySkillFilesIfNeeded(const std::string& skillsDir)
@@ -968,7 +1251,13 @@ bool CreateWorkflowInternal(const std::string& workflowsDir,
     baseName = std::string(baseFn.GetName().ToUTF8().data());
     if (baseName.empty()) baseName = "workflow";
 
-    const std::string uniqueStem = UniqueWorkflowStem(workflowsDir, baseName, createPythonScript);
+    // Skills lane: Agent Skills standard names are kebab-case, and the
+    // folder stem IS the skill's `name` (mirrored into the frontmatter
+    // below).  Project workflows keep their user-typed names.
+    if (isGlobal) baseName = KebabCaseAsciiStem(baseName);
+
+    const std::string uniqueStem =
+        UniqueWorkflowStem(workflowsDir, baseName, /*kebabSuffix=*/isGlobal);
 
     // Phase 2 layout: skill / workflow lives in its own folder.
     //     <workflowsDir>/<uniqueStem>/<docName>   (SKILL.md or WORKFLOW.md)
@@ -996,6 +1285,21 @@ bool CreateWorkflowInternal(const std::string& workflowsDir,
     }
 
     std::ostringstream md;
+    if (isGlobal) {
+        // Agent Skills frontmatter.  This starter description is a
+        // deliberate placeholder: the Skill draft builder overwrites the
+        // whole file (frontmatter included) with a real description at
+        // draft time.  It matters only for skills that never get
+        // drafted, where it still tells the model what the file is.
+        // uniqueStem (not the raw typed name) keeps the plain YAML
+        // scalar safe: no colons, quotes, or leading indicators.
+        md << "---\n"
+           << "name: " << uniqueStem << "\n"
+           << "description: Starter contract for the " << uniqueStem
+           << " Skill. Not yet designed; the description is filled in "
+              "when the Skill is drafted.\n"
+           << "---\n\n";
+    }
     md << "# " << trimmedName << (isGlobal ? " Skill" : " Workflow") << "\n\n";
     if (isGlobal) {
         md << "This file defines a reusable LlamaBoss Skill. A Skill is available across all "
@@ -1383,9 +1687,26 @@ bool ProjectManager::ResolveProjectWorkflowScript(const std::string& rootPath,
         return false;
     }
 
-    if (query.find('/') != std::string::npos || query.find('\\') != std::string::npos) {
-        outError = "Project workflow script reference must be a filename, not a nested path.";
-        return false;
+    // Nested forms (Workflows\<folder>\<script>.py) are the layout the
+    // flat-to-folder migration itself creates, so a model that /ls'es
+    // the Workflows folder will naturally emit them.  Mirror the
+    // Skills-lane rule: remember the FIRST component as the pinned
+    // folder, resolve the LAST component through the normal search,
+    // then verify the resolved script lives under the pinned folder.
+    std::string pinnedFolder;
+    {
+        const size_t firstSep = query.find_first_of("\\/");
+        if (firstSep != std::string::npos) {
+            pinnedFolder = query.substr(0, firstSep);
+            const size_t lastSep = query.find_last_of("\\/");
+            query = query.substr(lastSep + 1);
+            if (pinnedFolder.empty() || query.empty()) {
+                outError = "Project workflow script path must end in a "
+                           "script filename, e.g. "
+                           "Workflows\\<folder>\\<script>.py.";
+                return false;
+            }
+        }
     }
 
     if (query.find('.') == std::string::npos) query += ".py";
@@ -1396,11 +1717,33 @@ bool ProjectManager::ResolveProjectWorkflowScript(const std::string& rootPath,
 
     const auto scripts = ListProjectWorkflowScripts(rootPath, 0);
     if (scripts.empty()) {
-        outError = "This project has no Python Skill scripts in Workflows/.";
+        outError = "This project has no runnable workflow scripts (.py) "
+                   "in Workflows/ — checked flat files, workflow folders, "
+                   "and their scripts\\ subfolders. Create one with "
+                   "python_create_script.";
         return false;
     }
 
-    return ResolveWorkflowScriptInList(scripts, query, "project workflow script", outScript, outError);
+    if (!ResolveWorkflowScriptInList(scripts, query, "project workflow script",
+                                     outScript, outError)) {
+        return false;
+    }
+
+    if (!pinnedFolder.empty()) {
+        std::string resolvedLower = LowerAscii(outScript.path);
+        std::replace(resolvedLower.begin(), resolvedLower.end(), '/', '\\');
+        const std::string needle = "\\" + LowerAscii(pinnedFolder) + "\\";
+        if (resolvedLower.find(needle) == std::string::npos) {
+            outError = "Project workflow script " + query +
+                       " resolved outside the requested Workflows\\" +
+                       pinnedFolder + "\\ folder (found: " + outScript.path +
+                       "). Use the bare form " + query +
+                       " or the script's absolute path.";
+            outScript = ProjectWorkflowScriptInfo{};
+            return false;
+        }
+    }
+    return true;
 }
 
 // ── Skills public API ─────────────────────────────────────────────
@@ -1427,26 +1770,6 @@ bool ProjectManager::CreateSkill(const std::string& skillName,
                                   /*createPythonScript=*/false,
                                   outSkill,
                                   nullptr,
-                                  outError);
-}
-
-bool ProjectManager::CreateSkillWithScript(const std::string& skillName,
-                                           SkillInfo& outSkill,
-                                           SkillScriptInfo& outScript,
-                                           std::string& outError)
-{
-    if (!EnsureSkillsRoot()) {
-        outError = "Could not create the LlamaBoss Skills folder.";
-        outSkill = SkillInfo{};
-        outScript = SkillScriptInfo{};
-        return false;
-    }
-    return CreateWorkflowInternal(GetSkillsDir(),
-                                  /*isGlobal=*/true,
-                                  skillName,
-                                  /*createPythonScript=*/true,
-                                  outSkill,
-                                  &outScript,
                                   outError);
 }
 
@@ -1527,6 +1850,422 @@ bool ProjectManager::ResolveSkillScript(const std::string& requested,
     }
 
     return ResolveWorkflowScriptInList(scripts, query, "Skill script", outScript, outError);
+}
+
+// ── Skill import ──────────────────────────────────────────────────
+
+bool ProjectManager::ProbeSkillImportFolder(const std::string& sourceFolder,
+                                            SkillImportProbe& outProbe,
+                                            std::string& outError)
+{
+    outProbe = SkillImportProbe{};
+    outError.clear();
+
+    if (sourceFolder.empty() ||
+        !wxDirExists(wxString::FromUTF8(sourceFolder))) {
+        outError = "The selected path is not a folder.";
+        return false;
+    }
+
+    const std::string docPath = JoinProjectPath(sourceFolder, kSkillDocName);
+    if (!wxFileExists(wxString::FromUTF8(docPath))) {
+        outError = "The selected folder has no SKILL.md, so it is not a "
+                   "Skill folder. Pick the folder that contains SKILL.md "
+                   "directly (not its parent).";
+        return false;
+    }
+
+    // Refuse sources that overlap the Skills root in either direction:
+    // a folder already inside Skills is already loaded, and a folder
+    // CONTAINING Skills would copy Skills into itself mid-walk.
+    const std::string skillsNorm =
+        NormalizeExistingPathForCompare(GetSkillsDir());
+    const std::string srcNorm =
+        NormalizeExistingPathForCompare(sourceFolder);
+    if (!skillsNorm.empty() && !srcNorm.empty()) {
+        if (srcNorm == skillsNorm ||
+            srcNorm.rfind(skillsNorm + "/", 0) == 0) {
+            outError = "That folder is already inside your LlamaBoss "
+                       "Skills folder.";
+            return false;
+        }
+        if (skillsNorm.rfind(srcNorm + "/", 0) == 0) {
+            outError = "That folder contains your LlamaBoss Skills "
+                       "folder; pick the single Skill folder instead.";
+            return false;
+        }
+    }
+
+    // Authored Agent Skills name wins; the source folder name is the
+    // fallback.  Either way the LlamaBoss folder stem is kebab-cased.
+    const std::string fmName = LbReadSkillFrontmatterName(docPath);
+    outProbe.description = LbReadSkillFrontmatterDescription(docPath);
+    outProbe.hasFrontmatter =
+        !fmName.empty() || !outProbe.description.empty();
+    outProbe.proposedName = KebabCaseAsciiStem(
+        !fmName.empty() ? fmName : LeafFolderName(sourceFolder));
+    // Advisory collision preview for the confirm dialog; the import
+    // recomputes the stem authoritatively at copy time.
+    outProbe.finalName = UniqueWorkflowStem(GetSkillsDir(),
+                                            outProbe.proposedName,
+                                            /*kebabSuffix=*/true);
+
+    // Count what a copy would take; the walker enforces the caps.
+    return WalkSkillImportTree(sourceFolder,
+                               std::string(),
+                               /*depth=*/1,
+                               outProbe.fileCount,
+                               outProbe.totalBytes,
+                               /*onDir=*/nullptr,
+                               /*onFile=*/nullptr,
+                               outError);
+}
+
+bool ProjectManager::ImportSkillFolder(const std::string& sourceFolder,
+                                       SkillInfo& outSkill,
+                                       std::string& outError)
+{
+    outSkill = SkillInfo{};
+    outError.clear();
+
+    SkillImportProbe probe;
+    if (!ProbeSkillImportFolder(sourceFolder, probe, outError)) return false;
+
+    if (!EnsureSkillsRoot()) {
+        outError = "Could not create the LlamaBoss Skills folder.";
+        return false;
+    }
+
+    const std::string skillsDir = GetSkillsDir();
+    const std::string destStem =
+        UniqueWorkflowStem(skillsDir, probe.proposedName, /*kebabSuffix=*/true);
+    const std::string destRoot = JoinProjectPath(skillsDir, destStem);
+
+    if (!wxFileName::Mkdir(wxString::FromUTF8(destRoot),
+                           wxS_DIR_DEFAULT, wxPATH_MKDIR_FULL)
+        && !wxDirExists(wxString::FromUTF8(destRoot))) {
+        outError = "Could not create the Skill folder: " + destRoot;
+        return false;
+    }
+
+    // Copy.  On any failure, remove the partial destination so a
+    // half-imported skill never shows up in the Skills list.
+    std::size_t fileCount = 0;
+    unsigned long long totalBytes = 0;
+    const bool copied = WalkSkillImportTree(
+        sourceFolder,
+        std::string(),
+        /*depth=*/1,
+        fileCount,
+        totalBytes,
+        /*onDir=*/[&destRoot](const std::string& relDir) {
+            const std::string abs = JoinProjectPath(destRoot, relDir);
+            return wxFileName::Mkdir(wxString::FromUTF8(abs),
+                                     wxS_DIR_DEFAULT, wxPATH_MKDIR_FULL)
+                   || wxDirExists(wxString::FromUTF8(abs));
+        },
+        /*onFile=*/[&destRoot](const std::string& absFile,
+                               const std::string& relFile) {
+            const std::string abs = JoinProjectPath(destRoot, relFile);
+            return wxCopyFile(wxString::FromUTF8(absFile),
+                              wxString::FromUTF8(abs),
+                              /*overwrite=*/true);
+        },
+        outError);
+
+    if (!copied) {
+        wxFileName::Rmdir(wxString::FromUTF8(destRoot),
+                          wxPATH_RMDIR_RECURSIVE);
+        if (outError.empty()) outError = "Copying the Skill folder failed.";
+        return false;
+    }
+
+    // Normalize the imported contract: synthesize frontmatter when the
+    // source has none, and align `name:` with the final folder stem
+    // (which is authoritative in LlamaBoss and may carry a "-N"
+    // collision suffix the author could not have known about).
+    const std::string destDoc = JoinProjectPath(destRoot, kSkillDocName);
+    {
+        std::ifstream f(path_safety::Utf8ToWide(destDoc),
+                        std::ios::in | std::ios::binary);
+        if (f.is_open()) {
+            std::string body((std::istreambuf_iterator<char>(f)),
+                             std::istreambuf_iterator<char>());
+            f.close();
+            std::string normalized =
+                LbRewriteSkillFrontmatterName(
+                    LbEnsureSkillFrontmatter(body, destStem),
+                    destStem);
+            if (normalized != body) {
+                // Best-effort: a failed rewrite leaves the verbatim
+                // import, which is still a working (legacy-style) skill.
+                WriteUtf8File(destDoc, normalized);
+            }
+        }
+    }
+
+    // Same synthetic display-name shape ListWorkflowsInDir produces.
+    outSkill.name = destStem + ".workflow.md";
+    outSkill.path = destDoc;
+    outSkill.sizeBytes = FileSizeBytes(destDoc);
+    return true;
+}
+
+bool ProjectManager::ExtractSkillZipToTemp(const std::string& zipPath,
+                                           std::string& outTempRoot,
+                                           std::string& outSkillFolder,
+                                           std::string& outError)
+{
+    outTempRoot.clear();
+    outSkillFolder.clear();
+    outError.clear();
+
+    if (zipPath.empty() || !wxFileExists(wxString::FromUTF8(zipPath))) {
+        outError = "The selected .zip file does not exist.";
+        return false;
+    }
+
+    // Fresh temp root per extraction; the caller always removes it.
+    const std::string tempBase =
+        std::string(wxFileName::GetTempDir().ToUTF8().data());
+    std::string tempRoot;
+    for (int i = 0; i < 64; ++i) {
+        std::ostringstream stem;
+        stem << "LbSkillImport-" << ::wxGetProcessId() << "-" << i;
+        const std::string candidate = JoinProjectPath(tempBase, stem.str());
+        if (!FileOrDirExists(candidate)) { tempRoot = candidate; break; }
+    }
+    if (tempRoot.empty() ||
+        (!wxFileName::Mkdir(wxString::FromUTF8(tempRoot),
+                            wxS_DIR_DEFAULT, wxPATH_MKDIR_FULL)
+         && !wxDirExists(wxString::FromUTF8(tempRoot)))) {
+        outError = "Could not create a temporary extraction folder.";
+        return false;
+    }
+
+    // Stream the archive out with the same caps the folder walker
+    // enforces, counting UNCOMPRESSED bytes so a zip bomb trips the cap
+    // instead of filling the disk.
+    bool ok = true;
+    std::size_t fileCount = 0;
+    unsigned long long totalBytes = 0;
+    {
+        wxFFileInputStream in(wxString::FromUTF8(zipPath));
+        if (!in.IsOk()) {
+            outError = "Could not open the .zip file.";
+            ok = false;
+        } else {
+            wxZipInputStream zip(in);
+            std::unique_ptr<wxZipEntry> entry;
+            while (ok && (entry.reset(zip.GetNextEntry()), entry)) {
+                std::string rel;
+                const std::string rawName =
+                    std::string(entry->GetName(wxPATH_UNIX).ToUTF8().data());
+                if (!SkillZipEntryNameIsSafe(rawName, rel)) {
+                    outError = "The archive contains an unsafe entry name: " +
+                               rawName;
+                    ok = false;
+                    break;
+                }
+
+                const std::string dest = JoinProjectPath(tempRoot, rel);
+                if (entry->IsDir()) {
+                    if (!wxFileName::Mkdir(wxString::FromUTF8(dest),
+                                           wxS_DIR_DEFAULT, wxPATH_MKDIR_FULL)
+                        && !wxDirExists(wxString::FromUTF8(dest))) {
+                        outError = "Could not create folder: " + dest;
+                        ok = false;
+                    }
+                    continue;
+                }
+
+                ++fileCount;
+                if (fileCount > kSkillImportMaxFiles) {
+                    outError = "The archive has more than " +
+                               std::to_string(kSkillImportMaxFiles) +
+                               " files; this does not look like a Skill.";
+                    ok = false;
+                    break;
+                }
+
+                // Parent dirs may not have their own entries.
+                {
+                    const wxFileName fn(wxString::FromUTF8(dest));
+                    const wxString parent = fn.GetPath();
+                    if (!parent.IsEmpty() && !wxDirExists(parent)) {
+                        wxFileName::Mkdir(parent, wxS_DIR_DEFAULT,
+                                          wxPATH_MKDIR_FULL);
+                    }
+                }
+
+                std::ofstream outFile(path_safety::Utf8ToWide(dest),
+                                      std::ios::binary | std::ios::trunc);
+                if (!outFile.is_open()) {
+                    outError = "Could not write file: " + dest;
+                    ok = false;
+                    break;
+                }
+                char buffer[64 * 1024];
+                while (ok && !zip.Eof()) {
+                    zip.Read(buffer, sizeof(buffer));
+                    const size_t got = zip.LastRead();
+                    if (got == 0) break;
+                    totalBytes += got;
+                    if (totalBytes > kSkillImportMaxBytes) {
+                        outError = "The archive expands past 64 MB; this "
+                                   "does not look like a Skill.";
+                        ok = false;
+                        break;
+                    }
+                    outFile.write(buffer, static_cast<std::streamsize>(got));
+                    if (!outFile) {
+                        outError = "Could not write file: " + dest;
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if (ok && fileCount == 0) {
+                outError = "The archive contains no files.";
+                ok = false;
+            }
+        }
+    }
+
+    if (!ok) {
+        wxFileName::Rmdir(wxString::FromUTF8(tempRoot),
+                          wxPATH_RMDIR_RECURSIVE);
+        if (outError.empty()) outError = "Extracting the .zip failed.";
+        return false;
+    }
+
+    // Locate the skill folder: SKILL.md at the extraction root, or inside
+    // exactly one top-level folder (the layout ExportSkillToZip writes).
+    std::string skillFolder;
+    if (wxFileExists(wxString::FromUTF8(
+            JoinProjectPath(tempRoot, kSkillDocName)))) {
+        skillFolder = tempRoot;
+    } else {
+        wxDir dir(wxString::FromUTF8(tempRoot));
+        if (dir.IsOpened()) {
+            wxString name;
+            bool cont = dir.GetFirst(&name, wxEmptyString, wxDIR_DIRS);
+            while (cont) {
+                const std::string sub =
+                    JoinProjectPath(tempRoot,
+                                    std::string(name.ToUTF8().data()));
+                if (wxFileExists(wxString::FromUTF8(
+                        JoinProjectPath(sub, kSkillDocName)))) {
+                    if (!skillFolder.empty()) {
+                        skillFolder.clear();   // ambiguous: several skills
+                        break;
+                    }
+                    skillFolder = sub;
+                }
+                cont = dir.GetNext(&name);
+            }
+        }
+    }
+
+    if (skillFolder.empty()) {
+        wxFileName::Rmdir(wxString::FromUTF8(tempRoot),
+                          wxPATH_RMDIR_RECURSIVE);
+        outError = "The archive does not contain exactly one Skill "
+                   "(no SKILL.md at the root or in a single top-level "
+                   "folder).";
+        return false;
+    }
+
+    outTempRoot = tempRoot;
+    outSkillFolder = skillFolder;
+    return true;
+}
+
+bool ProjectManager::ExportSkillToZip(const std::string& skillContractPath,
+                                      const std::string& zipPath,
+                                      std::string& outError)
+{
+    outError.clear();
+
+    if (zipPath.empty()) {
+        outError = "No destination .zip path was given.";
+        return false;
+    }
+
+    std::string skillFolder;
+    {
+        const size_t sep = skillContractPath.find_last_of("\\/");
+        if (sep == std::string::npos) {
+            outError = "Not a Skill contract path.";
+            return false;
+        }
+        skillFolder = skillContractPath.substr(0, sep);
+    }
+    if (skillFolder.empty() ||
+        !wxDirExists(wxString::FromUTF8(skillFolder)) ||
+        !wxFileExists(wxString::FromUTF8(
+            JoinProjectPath(skillFolder, kSkillDocName)))) {
+        outError = "The Skill folder or its SKILL.md could not be found.";
+        return false;
+    }
+    const std::string stem = LeafFolderName(skillFolder);
+
+    wxFFileOutputStream fileOut(wxString::FromUTF8(zipPath));
+    if (!fileOut.IsOk()) {
+        outError = "Could not create the .zip file: " + zipPath;
+        return false;
+    }
+    wxZipOutputStream zip(fileOut);
+
+    // Reuse the bounded import walker: same junk-dir skips, reparse-point
+    // skips, and caps apply to exports.  Entries are rooted "<stem>/..."
+    // so the archive re-imports via the single-top-level-folder path.
+    std::size_t fileCount = 0;
+    unsigned long long totalBytes = 0;
+    const bool walked = WalkSkillImportTree(
+        skillFolder,
+        std::string(),
+        /*depth=*/1,
+        fileCount,
+        totalBytes,
+        /*onDir=*/nullptr,   // wxZipOutputStream creates parents implicitly
+        /*onFile=*/[&zip, &stem](const std::string& absFile,
+                                 const std::string& relFile) {
+            std::string rel = relFile;
+            std::replace(rel.begin(), rel.end(), '\\', '/');
+            if (!zip.PutNextEntry(
+                    wxString::FromUTF8(stem + "/" + rel))) {
+                return false;
+            }
+            std::ifstream in(path_safety::Utf8ToWide(absFile),
+                             std::ios::binary);
+            if (!in.is_open()) return false;
+            char buffer[64 * 1024];
+            while (in) {
+                in.read(buffer, sizeof(buffer));
+                const std::streamsize got = in.gcount();
+                if (got <= 0) break;
+                if (!zip.WriteAll(buffer, static_cast<size_t>(got)))
+                    return false;
+            }
+            return !in.bad();
+        },
+        outError);
+
+    if (!walked) {
+        zip.Close();
+        fileOut.Close();
+        ::wxRemoveFile(wxString::FromUTF8(zipPath));
+        if (outError.empty()) outError = "Zipping the Skill folder failed.";
+        return false;
+    }
+
+    if (!zip.Close() || !fileOut.Close()) {
+        ::wxRemoveFile(wxString::FromUTF8(zipPath));
+        outError = "Finalizing the .zip file failed.";
+        return false;
+    }
+    return true;
 }
 
 bool ProjectManager::ReadProjectInstructions(const std::string& rootPath,

@@ -23,6 +23,7 @@ MarkdownRenderer::MarkdownRenderer(wxRichTextCtrl* ctrl)
     : m_ctrl(ctrl)
     , m_inCodeBlock(false)
     , m_partialLineStart(-1)
+    , m_partialLineRenderedLen(0)
     , m_bulkMode(false)
     , m_codeColor(232, 184, 77)
     , m_headingColor(232, 232, 232)         // Near-white (#E8E8E8)
@@ -52,6 +53,7 @@ void MarkdownRenderer::Reset()
     m_codeBlockLang.clear();
     m_codeBlockFilename.clear();
     m_partialLineStart = -1;
+    m_partialLineRenderedLen = 0;
     // Note: m_codeBlocks is intentionally NOT cleared here —
     // old code blocks from previous messages must remain accessible.
     // Call ClearCodeBlocks() explicitly when the entire chat is cleared.
@@ -77,6 +79,23 @@ int MarkdownRenderer::HitTestCopyLink(long pos) const
             return static_cast<int>(link.blockIndex);
     }
     return -1;
+}
+
+void MarkdownRenderer::ShiftCopyLinks(long pivot, long delta)
+{
+    if (delta == 0) return;
+    for (auto& link : m_copyLinks) {
+        if (link.startPos >= pivot) link.startPos += delta;
+        if (link.endPos   >= pivot) link.endPos   += delta;
+    }
+}
+
+void MarkdownRenderer::PruneCopyLinksFrom(long pivot)
+{
+    m_copyLinks.erase(
+        std::remove_if(m_copyLinks.begin(), m_copyLinks.end(),
+            [pivot](const CopyLink& link) { return link.startPos >= pivot; }),
+        m_copyLinks.end());
 }
 
 bool MarkdownRenderer::MarkCopyLinkCopied(size_t blockIndex)
@@ -126,9 +145,74 @@ bool MarkdownRenderer::MarkCopyLinkCopied(size_t blockIndex)
 //  Streaming Interface
 // ═══════════════════════════════════════════════════════════════════
 
+// True when `s` is a self-contained UTF-8 run: it neither opens with a
+// continuation byte nor ends mid-sequence.  Guards the append-only path
+// below -- see the rationale there.
+static bool IsSelfContainedUtf8(const std::string& s)
+{
+    size_t i = 0;
+    while (i < s.size()) {
+        const unsigned char c = static_cast<unsigned char>(s[i]);
+        size_t len;
+        if      (c < 0x80)          len = 1;
+        else if ((c & 0xE0) == 0xC0) len = 2;
+        else if ((c & 0xF0) == 0xE0) len = 3;
+        else if ((c & 0xF8) == 0xF0) len = 4;
+        else return false;                       // continuation byte or invalid lead
+        if (i + len > s.size()) return false;    // truncated tail
+        for (size_t k = 1; k < len; ++k) {
+            if ((static_cast<unsigned char>(s[i + k]) & 0xC0) != 0x80) return false;
+        }
+        i += len;
+    }
+    return true;
+}
+
 void MarkdownRenderer::ProcessDelta(const std::string& delta, const wxColour& baseColor)
 {
     if (delta.empty()) return;
+
+    // ── Append-only fast path ────────────────────────────────────
+    // The overwhelmingly common delta carries no '\n' at all, which
+    // means the permanent part of the document is untouched and the
+    // ONLY change is that the preview at the end got longer.
+    //
+    // The old code still did RemovePartialLine() + a full
+    // RenderPartialLine(m_lineBuffer) every single time.  For a line of
+    // final length L arriving over N deltas that is O(N*L) rich-text
+    // insert+remove, and every one of those invalidates wxRichTextBuffer
+    // layout.  Models routinely emit a 1000-2000 char paragraph as one
+    // unbroken line, so streaming visibly slowed down as the line grew.
+    //
+    // m_lineBuffer only ever grows until a newline consumes a prefix, so
+    // the text already on screen is a strict prefix of the new text:
+    // append the suffix and leave the rest of the document alone.
+    // WriteStyled builds a self-contained attr and appends at the end,
+    // so the result is byte-identical to the full rewrite.
+    //
+    // The UTF-8 guard matters: the old full-rewrite path self-healed a
+    // delta split mid-codepoint on the next call (wxString::FromUTF8
+    // returns EMPTY for invalid UTF-8 on wxMSW).  Appending cannot
+    // self-heal, so anything not standalone-valid falls through to the
+    // rewrite and behaves exactly as it always did.
+    if (!m_bulkMode &&
+        m_partialLineStart >= 0 &&
+        m_partialLineRenderedLen == m_lineBuffer.size() &&
+        delta.find('\n') == std::string::npos &&
+        IsSelfContainedUtf8(delta))
+    {
+        m_lineBuffer += delta;
+
+        m_ctrl->Freeze();
+        if (m_inCodeBlock) WriteStyled(delta, m_codeColor, false, false, true);
+        else               WriteStyled(delta, baseColor);
+        m_partialLineRenderedLen = m_lineBuffer.size();
+        m_ctrl->Thaw();
+
+        if (ShouldAutoScroll())
+            m_ctrl->ShowPosition(m_ctrl->GetLastPosition());
+        return;
+    }
 
     m_ctrl->Freeze();
 
@@ -169,8 +253,10 @@ void MarkdownRenderer::ProcessDelta(const std::string& delta, const wxColour& ba
     // Per-call scroll is for live streaming only. In bulk/replay mode the
     // ShowPosition() — which forces a layout pass that scales with document
     // size — is suppressed; ChatDisplay's replay batch scrolls once at the
-    // end. (See SetBulkMode in the header.)
-    if (!m_bulkMode) {
+    // end. (See SetBulkMode in the header.)  Live streaming additionally
+    // consults the follow-mode predicate so a user reading upstream isn't
+    // yanked back down on every delta.
+    if (!m_bulkMode && ShouldAutoScroll()) {
         m_ctrl->ShowPosition(m_ctrl->GetLastPosition());
     }
 }
@@ -204,8 +290,10 @@ void MarkdownRenderer::Flush(const wxColour& baseColor)
     m_ctrl->Thaw();
 
     // See ProcessDelta: in bulk/replay mode the single scroll-to-end is
-    // performed by ChatDisplay's replay batch, not per message.
-    if (!m_bulkMode) {
+    // performed by ChatDisplay's replay batch, not per message.  Live
+    // completion honors follow mode too — finishing a long reply must
+    // not yank a user who scrolled up mid-stream.
+    if (!m_bulkMode && ShouldAutoScroll()) {
         m_ctrl->ShowPosition(m_ctrl->GetLastPosition());
     }
 }
@@ -223,6 +311,9 @@ void MarkdownRenderer::RemovePartialLine()
         }
         m_partialLineStart = -1;
     }
+    // Nothing is previewed now, so the append-only path in ProcessDelta
+    // must not believe it can extend anything.
+    m_partialLineRenderedLen = 0;
 }
 
 void MarkdownRenderer::RenderPartialLine(const std::string& text, const wxColour& baseColor)
@@ -237,6 +328,11 @@ void MarkdownRenderer::RenderPartialLine(const std::string& text, const wxColour
     else {
         WriteStyled(text, baseColor);
     }
+
+    // Establishes the invariant the append-only path relies on: the
+    // preview on screen corresponds to the first
+    // m_partialLineRenderedLen bytes of m_lineBuffer.
+    m_partialLineRenderedLen = text.size();
 }
 
 // ═══════════════════════════════════════════════════════════════════

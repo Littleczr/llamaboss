@@ -40,7 +40,7 @@ ModelService::~ModelService()
 
 void ModelService::AttachFrameSink(wxEvtHandler* handler,
                                    std::weak_ptr<std::atomic<bool>> aliveToken,
-                                   std::function<bool()> busyProbe)
+                                   std::function<FrameBusyKind()> busyProbe)
 {
     wxASSERT(wxIsMainThread());
     if (!handler) return;
@@ -61,7 +61,20 @@ bool ModelService::AnyOtherWindowBusy(const wxEvtHandler* self) const
         if (sink.handler == self || !sink.busyProbe) continue;
         auto alive = sink.alive.lock();
         if (!alive || !alive->load()) continue;
-        if (sink.busyProbe()) return true;
+        if (sink.busyProbe() != FrameBusyKind::Idle) return true;
+    }
+    return false;
+}
+
+bool ModelService::AnyOtherWindowBusyOnLocalServer(
+    const wxEvtHandler* self) const
+{
+    wxASSERT(wxIsMainThread());
+    for (const auto& sink : m_sinks) {
+        if (sink.handler == self || !sink.busyProbe) continue;
+        auto alive = sink.alive.lock();
+        if (!alive || !alive->load()) continue;
+        if (sink.busyProbe() == FrameBusyKind::BusyLocal) return true;
     }
     return false;
 }
@@ -209,7 +222,7 @@ void ModelService::OnServerEvent(wxCommandEvent& ev)
         // Exactly one component adjudicates retry state.  A retry starts a new
         // launch generation; the original event is consumed and never reaches
         // frame handlers.
-        if (m_serverManager->MaybeRetryWithoutJinja(error)) {
+        if (m_serverManager->MaybeRetryAfterStartupFailure(error)) {
             m_serverReady = false;
             m_activeProtocol = ToolProtocol::Unknown;
             PublishState(ModelServiceChange::LoadingLocal);
@@ -265,7 +278,7 @@ void ModelService::NoteSlotOwner(const wxEvtHandler* self,
                                  const std::string& conversationPath)
 {
     wxASSERT(wxIsMainThread());
-    if (AnyOtherWindowBusy(self)) {
+    if (AnyOtherWindowBusyOnLocalServer(self)) {
         // This request queues behind another window's stream inside
         // llama-server, so the slot can't verifiably end up holding
         // this conversation's KV.  Invalidate instead of claiming —
@@ -286,7 +299,7 @@ void ModelService::SaveSlotStateForConversation(
     const wxEvtHandler* self, const std::string& conversationPath)
 {
     wxASSERT(wxIsMainThread());
-    if (AnyOtherWindowBusy(self)) {
+    if (AnyOtherWindowBusyOnLocalServer(self)) {
         // Don't fire a /slots save against the slot another window's
         // stream is actively using.  ServerManager's ownership guard
         // usually skips this anyway (the other window's guarded stamp
@@ -304,7 +317,7 @@ void ModelService::RestoreSlotStateForConversation(
     const wxEvtHandler* self, const std::string& conversationPath)
 {
     wxASSERT(wxIsMainThread());
-    if (AnyOtherWindowBusy(self)) {
+    if (AnyOtherWindowBusyOnLocalServer(self)) {
         // Restoring would overwrite the KV the other window's stream
         // is generating into.  Skip; the load proceeds without the
         // fast path and the first send re-stamps ownership (guarded).

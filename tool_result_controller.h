@@ -57,6 +57,7 @@ public:
     void OnWebFetchComplete(wxCommandEvent& evt);
     void OnWebFetchError(wxCommandEvent& evt);
     void OnToolWorkerComplete(wxCommandEvent& evt);
+    void OnWaitComplete(wxCommandEvent& evt);
 
     // Renders a tool result as a chat card and appends it to history as a
     // user-role message.  Shared by the handlers above and the frame's

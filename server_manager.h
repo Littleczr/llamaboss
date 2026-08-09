@@ -26,6 +26,8 @@ struct ServerConfig
     int  threads    = 0;       // 0 = auto-detect
     bool flashAttn  = true;
     bool kvCacheQ8  = true;    // -ctk/-ctv q8_0; requires flashAttn
+    bool mtpEnabled = true;    // auto-detect GGUF MTP metadata and try
+                               // --spec-type draft-mtp with safe fallback
 
     bool operator==(const ServerConfig& other) const
     {
@@ -34,7 +36,8 @@ struct ServerConfig
                ctxSize == other.ctxSize &&
                threads == other.threads &&
                flashAttn == other.flashAttn &&
-               kvCacheQ8 == other.kvCacheQ8;
+               kvCacheQ8 == other.kvCacheQ8 &&
+               mtpEnabled == other.mtpEnabled;
     }
 };
 
@@ -86,6 +89,15 @@ public:
                        ServerLaunchGeneration generation,
                        int timeoutMs = 60000,
                        Poco::Logger* logger = nullptr);
+
+    // Entry() closes the duplicated process handle on every one of its
+    // exit paths and nulls it out.  This destructor is the backstop for
+    // the paths where Entry() NEVER RUNS -- specifically StartServer's
+    // `delete healthThread;` after a failed Create() or Run().  Without
+    // it the duplicate leaked, and because a live duplicate keeps the
+    // process object alive it also weakened job-object teardown.
+    ~ServerHealthThread() override;
+
 protected:
     ExitCode Entry() override;
 private:
@@ -94,7 +106,11 @@ private:
     std::shared_ptr<std::atomic<bool>> m_cancelFlag;
     std::weak_ptr<std::atomic<bool>> m_aliveToken;
 #ifdef __WXMSW__
-    HANDLE        m_processHandle;   // duplicated — owned by this thread, closed in Entry()
+    // Duplicated -- owned by this thread.  Closed by CloseProcessHandle(),
+    // which nulls the member, so Entry() and ~ServerHealthThread() can both
+    // call it without any risk of a double close.
+    HANDLE        m_processHandle;
+    void CloseProcessHandle();
 #endif
     std::string   m_logPath;
     ServerLaunchGeneration m_generation;
@@ -118,32 +134,38 @@ public:
     void StopServer();
     bool IsProcessRunning() const;
 
-    // Foreign-server guard: true if anything answers HTTP on our
-    // port right now.  StartServer refuses to spawn when this is
-    // true and the answering process isn't ours — see the guard
+    // Foreign-server guard: true if anything answers HTTP on the
+    // given port right now.  StartServer refuses to spawn when this
+    // is true and the answering process isn't ours — see the guard
     // block there for why silent attach is the failure mode.
-    bool IsPortAnswering() const;
-
-    // ── Phase 3a: --jinja with fallback retry ────────────────────
-    // llama-server's native function-calling support requires the
-    // --jinja flag.  We add it by default (Phase 1's commitment to
-    // "snappy + state-of-the-art") and fall back gracefully if the
-    // active model's chat template doesn't compile under Jinja or
-    // the server otherwise refuses to start.
     //
-    // Call this from MyFrame::OnServerError BEFORE delegating to
-    // ModelSwitcher.  Returns true iff a retry was kicked off — in
-    // that case the caller suppresses the user-visible error and
-    // waits for the next wxEVT_SERVER_READY / wxEVT_SERVER_ERROR.
-    // Returns false if no retry is possible (already retried, jinja
-    // wasn't on this attempt, no model loaded, etc.) and the caller
-    // should display the error normally.
-    bool MaybeRetryWithoutJinja(const std::string& error);
+    // Takes the port explicitly.  It used to read m_port, which is
+    // not assigned from config.port until AFTER process creation —
+    // so on any launch with a non-default port the guard probed the
+    // PREVIOUS port and missed exactly the collision it exists to
+    // catch.
+    bool IsPortAnswering(int port) const;
 
-    // Call this from MyFrame::OnServerReady so the retry state is
-    // cleared on success.  Without this, a successful retry leaves
-    // m_jinjaForceOff = true and the next user-initiated load would
-    // skip jinja for the wrong model.
+    // ── Startup fallback retries ────────────────────────────────
+    // LlamaBoss normally tries the best available launch features:
+    // embedded MTP self-drafting when advertised by GGUF metadata,
+    // plus --jinja for native tool-aware templates.  Metadata and
+    // templates are not guarantees, so startup failures are handled
+    // by a bounded feature fallback chain:
+    //
+    //   1. If an MTP-looking failure occurs on an actual draft-mtp
+    //      attempt, retry once with MTP disabled but keep --jinja.
+    //   2. If a Jinja/template-looking failure remains, retry once
+    //      more without --jinja (and keep MTP disabled if step 1 ran).
+    //
+    // ModelService calls this before publishing a permanent error.
+    // Returns true iff a retry was started and the current error must
+    // be consumed; false means the error should reach the UI.
+    bool MaybeRetryAfterStartupFailure(const std::string& error);
+
+    // Call this after wxEVT_SERVER_READY so per-load retry state is
+    // cleared.  The actual running process feature flags remain
+    // available for runtime protocol decisions.
     void NotifyServerReady();
 
     // True only for the currently running llama-server process when
@@ -336,10 +358,11 @@ private:
     // Serialized slot-action worker state (queue + flags), shared
     // with the worker thread so ServerManager can be destroyed while
     // an action is in flight without blocking the UI thread on a
-    // join.  Defined in server_manager.cpp; created lazily on first
-    // enqueue; the destructor sets its stop flag so a pending worker
-    // exits after the current action instead of POSTing to a server
-    // that StopServer just killed.
+    // join.  Defined in server_manager.cpp and created eagerly in the
+    // constructor so StartServer() can stamp the launch generation
+    // before the first KV action is enqueued.  The destructor sets its
+    // stop flag so a pending worker exits instead of POSTing to a
+    // server that StopServer just killed.
     std::shared_ptr<struct SlotActionQueue> m_slotQueue;
 
     // Append a slot action to the serialized queue and make sure a
@@ -357,27 +380,26 @@ private:
     ServerLaunchGeneration m_launchGeneration = kInvalidServerLaunchGeneration;
     std::chrono::steady_clock::time_point m_launchStartedAt{};
 
-    // ── Retry-without-jinja state (Phase 3a) ─────────────────────
-    // Cached args for the in-flight load attempt, so MaybeRetryWith
-    // outJinja can re-launch with the same model and config minus
-    // the --jinja flag.  m_jinjaForceOff is consulted by StartServer
-    // when building the command line; it's set during a retry and
-    // cleared by ResetJinjaRetryState() at the start of a fresh
-    // StartServer call (so a brand-new model load always tries
-    // jinja first).
+    // ── Per-load startup fallback state ─────────────────────────
+    // Cached args allow a failed launch to be repeated with one
+    // optional feature removed.  Force-off flags survive only while
+    // retrying the same (model, config); a fresh user-driven launch
+    // resets them and tries the preferred feature set again.
     std::string   m_lastGgufPath;
     ServerConfig  m_lastConfig;
-    bool          m_jinjaForceOff       = false;
-    bool          m_jinjaRetryAttempted = false;
+    bool          m_mtpForceOff          = false;
+    bool          m_mtpRetryAttempted    = false;
+    bool          m_jinjaForceOff        = false;
+    bool          m_jinjaRetryAttempted  = false;
 
-    // Tracks the actual running server process. This intentionally
-    // survives NotifyServerReady()/ResetJinjaRetryState(), because those
-    // reset per-load retry flags while the process may still be the
-    // no-jinja fallback server.
+    // Actual feature set of the process most recently spawned.  These
+    // intentionally survive NotifyServerReady()/ResetStartupRetryState(),
+    // because they describe the running server rather than retry intent.
+    bool          m_currentMtpEnabled   = false;
     bool          m_currentJinjaEnabled = false;
 
     ServerLaunchGeneration AdvanceLaunchGeneration();
     void StopServerInternal(bool invalidateGeneration);
-    void ResetJinjaRetryState();
+    void ResetStartupRetryState();
     void KillProcess();
 };

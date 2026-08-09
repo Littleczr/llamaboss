@@ -49,11 +49,9 @@ void SkillDraftController::SetCallbacks(Callbacks cb)
 }
 
 void SkillDraftController::StartDesignSession(const std::string& skillName,
-                                              const std::string& skillPath,
-                                              bool requestedPythonScript)
+                                              const std::string& skillPath)
 {
     m_pending.active = true;
-    m_pending.requestedPythonScript = requestedPythonScript;
     m_pending.skillName = skillName;
     m_pending.skillPath = skillPath;
     m_pending.pythonHelperPath.clear();
@@ -155,15 +153,13 @@ void SkillDraftController::PrepareDraftFromDesignConversationBrief(
     if (!m_pending.active) return;
 
     m_pending.userDescription = authoringBrief;
-    // Only offer the builder a candidate Python helper path when the user picked
-    // "New Skill with Python Script" at creation. Otherwise the builder's
-    // "no Python helper" branch fires and no .py is emitted.
-    if (m_pending.requestedPythonScript) {
-        m_pending.pythonHelperPath =
-            LbSkillPythonHelperPathFromContractPath(m_pending.skillPath);
-    } else {
-        m_pending.pythonHelperPath.clear();
-    }
+    // A helper path is always reserved (Agent Skills layout: the
+    // scripts subfolder inside the Skill folder).  Whether a helper
+    // actually ships is the builder's call, made through the
+    // implementation-path preference in the system prompt.  The old
+    // with/without-script creation split is retired.
+    m_pending.pythonHelperPath =
+        LbSkillPythonHelperPathFromContractPath(m_pending.skillPath);
 }
 
 void SkillDraftController::BeginDraftBuildFromPendingDescription()
@@ -182,7 +178,9 @@ void SkillDraftController::BeginDraftBuildFromPendingDescription()
         return;
     }
 
-    const std::string model = m_appState.GetModel();
+    // Conversation-pinned, not app-global: a model switch in another
+    // window must not retarget an in-flight skill-draft send.
+    const std::string model = m_modelSwitcher.GetConversationModelForSave();
     if (model.empty()) {
         m_chatDisplay->DisplaySystemMessage(
             "Skill drafting was skipped because no model is selected. "
@@ -231,7 +229,10 @@ void SkillDraftController::BeginDraftBuildFromPendingDescription()
         "Skill builder is drafting the initial Skill definition and deciding whether a reusable Python helper belongs with it.");
 
     if (!m_chatClient.SendMessage(
-            m_appState.GetActiveTarget(), body, genId)) {
+            // Pinned: honor this conversation's preferred model even
+            // if another window flipped the app-global target.
+            m_modelSwitcher.ResolveTargetForConversation(),
+            body, genId)) {
         m_draftBuilderInFlight = false;
         m_cb.setStreamingUi(false);
         m_chatDisplay->DisplaySystemMessage(
@@ -300,6 +301,14 @@ void SkillDraftController::HandleDraftBuilderComplete(const std::string& builder
         return;
     }
 
+    // Standard-compliance backstop: guarantee the Agent Skills YAML
+    // frontmatter block (name + description) even when a smaller model
+    // ignored the frontmatter instruction.  No-op when the builder
+    // already emitted one.
+    markdown = LbEnsureSkillFrontmatter(
+        std::move(markdown),
+        LbSkillFolderNameFromContractPath(m_pending.skillPath));
+
     if (markdown.empty() || markdown.back() != '\n')
         markdown.push_back('\n');
     if (generatedPythonHelper &&
@@ -338,7 +347,7 @@ void SkillDraftController::HandleDraftBuilderComplete(const std::string& builder
     msg << "Skill definition drafted and saved:\n"
         << savedPath;
     if (pythonHelperCreated) {
-        msg << "\n\nThe Skill builder determined that reusable Python code would help here, so I created a Python helper script for this Skill:\n"
+        msg << "\n\nThe Skill builder determined that reusable Python code would help here, so I created a Python helper script in the Skill's scripts folder:\n"
             << pythonHelperPath;
     } else if (pythonHelperWriteFailed) {
         msg << "\n\nThe Skill builder drafted a Python helper for this Skill, but LlamaBoss could not save the `.py` file. "
@@ -349,7 +358,9 @@ void SkillDraftController::HandleDraftBuilderComplete(const std::string& builder
     msg << "\n\nYou can now ask me to use this Skill whenever you are ready, or open it from the Skills menu to review it. I will not run it until you ask.";
 
     const std::string completion = msg.str();
-    const std::string model = m_appState.GetModel();
+    // Names the completion in the transcript -- must match the model
+    // that actually answered, not whatever is globally active now.
+    const std::string model = m_modelSwitcher.GetConversationModelForSave();
     m_chatDisplay->DisplayAssistantMessage(
         ServerManager::ModelDisplayName(model),
         completion,

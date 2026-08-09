@@ -65,7 +65,21 @@ public:
     // Pass durable=true when history is about to be cleared or replaced
     // (window close, New Chat, conversation switch, model/folder change): the
     // queue is drained first, then the final write is synchronously flushed.
-    void AutoSaveConversation(bool refreshSidebar = true, bool durable = false);
+    // touchActivityTimestamp=false is reserved for metadata-only changes;
+    // content saves should use the default true.
+    void AutoSaveConversation(bool refreshSidebar = true,
+                              bool durable = false,
+                              bool touchActivityTimestamp = true);
+
+    // ── Sidebar conversation management ─────────────────────────
+    // Rename is single-chat; pin/archive support multi-selection.
+    // Paths open in another LlamaBoss window are skipped to avoid
+    // racing that window's next autosave.
+    void RenameConversation(const std::string& path);
+    void SetConversationsPinned(const std::vector<std::string>& paths,
+                                bool pinned);
+    void SetConversationsArchived(const std::vector<std::string>& paths,
+                                  bool archived);
 
     // ── Batch delete ─────────────────────────────────────────────
     // Paths open in another window are skipped (Phase 3b guard).

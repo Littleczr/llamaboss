@@ -165,7 +165,16 @@ TopBarWidgets BuildTopBar(wxWindow* parent, wxBoxSizer* mainSizer,
     sizer->Add(w.newChatButton, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
 
     // ── Right: Settings gear ──
-    wxString gear = wxString::FromUTF8("\xE2\x9A\x99\xEF\xB8\x8F");
+    // U+2699 GEAR followed by U+FE0E VARIATION SELECTOR-15, which asks
+    // for TEXT presentation.  The trailing selector used to be U+FE0F
+    // (VS16), the emoji-presentation request -- Windows honoured it,
+    // pulled the glyph from Segoe UI Emoji, and drew a full-colour gear
+    // that carried its own palette and therefore ignored the
+    // SetForegroundColour(theme.textMuted) two lines down.  That made it
+    // the only glyph in the toolbar that did not track the active theme.
+    // Do not drop the selector entirely: U+2699 defaults to emoji
+    // presentation on Windows, so the request has to be explicit.
+    wxString gear = wxString::FromUTF8("\xE2\x9A\x99\xEF\xB8\x8E");
     w.settingsButton = new wxButton(w.toolbarPanel, wxID_ANY, gear,
         wxDefaultPosition, wxSize(52, 44), wxBORDER_NONE);
     w.settingsButton->SetBackgroundColour(theme.bgToolbar);

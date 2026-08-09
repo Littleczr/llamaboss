@@ -354,6 +354,30 @@ private:
     void SetInsertionPointToEnd();
     void EnsureVisibleAtEnd();
 
+    // ── Sticky autoscroll (follow mode) ───────────────────────────
+    // While the user is at (or near) the bottom, streamed content
+    // auto-scrolls to stay visible.  Any user scroll input (wheel or
+    // scrollbar) re-evaluates follow: scrolling up disengages it so
+    // the user can read while the model keeps typing below; scrolling
+    // back to the bottom — or any deliberate jump (sending a message,
+    // ScrollToBottom, replay end, Clear) — re-engages it.  Mirrors
+    // Claude/ChatGPT streaming behavior.
+    //
+    // EnsureVisibleAtEnd() stays the FORCED jump (and re-engages
+    // follow); EnsureVisibleAtEndIfFollowing() is the gated variant
+    // used by streaming-driven call sites (deltas, tool blocks,
+    // thinking indicator, stream completion, animation frames).
+    static constexpr int kFollowSlackPx = 64;
+    bool IsNearBottom() const;
+    void UpdateFollowFromScrollPosition();
+    void EnsureVisibleAtEndIfFollowing();
+    bool m_followStream = true;
+
+    // Expiry token for the deferred (CallAfter) scroll-position
+    // checks: destroyed with this object, so a check that fires after
+    // this ChatDisplay is gone no-ops instead of touching freed state.
+    std::shared_ptr<int> m_followCheckAlive = std::make_shared<int>(0);
+
     // Image thumbnail limits for inline display.
     // Bumped from 300 — at modern resolutions (1440p ultrawide and up)
     // 300px thumbnails read as postage stamps.

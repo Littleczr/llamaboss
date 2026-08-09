@@ -250,6 +250,35 @@ bool StartsWithLocal(const std::string& s, const std::string& prefix)
     return s.size() >= prefix.size() && s.compare(0, prefix.size(), prefix) == 0;
 }
 
+std::string WxToUtf8Local(const wxString& value)
+{
+    wxScopedCharBuffer utf8 = value.ToUTF8();
+    return utf8 ? std::string(utf8.data()) : std::string();
+}
+
+std::string NormalizePathForCompareLocal(const std::string& path)
+{
+    if (path.empty()) return std::string();
+
+    wxFileName fn(wxString::FromUTF8(path));
+    fn.Normalize(wxPATH_NORM_DOTS | wxPATH_NORM_ABSOLUTE);
+
+    std::string normalized = WxToUtf8Local(fn.GetFullPath());
+    std::replace(normalized.begin(), normalized.end(), '/', '\\');
+    normalized = LowerForOutputLocal(normalized);
+    return TrimTrailingSeparatorsLocal(normalized);
+}
+
+bool IsPathUnderRootLocal(const std::string& path, const std::string& root)
+{
+    std::string p = NormalizePathForCompareLocal(path);
+    std::string r = NormalizePathForCompareLocal(root);
+    if (p.empty() || r.empty()) return false;
+    if (p == r) return true;
+    if (r.back() != '\\') r.push_back('\\');
+    return p.size() > r.size() && p.compare(0, r.size(), r) == 0;
+}
+
 std::string WorkflowRootFromCwdLocal(const std::string& cwd)
 {
     std::string clean = TrimTrailingSeparatorsLocal(cwd);
@@ -483,6 +512,122 @@ bool IsBlankTextLocal(const std::string& s)
     return true;
 }
 
+bool IsRegularFileLocal(const std::string& path)
+{
+    DWORD attrs = GetFileAttributesW(Utf8ToWide(path).c_str());
+    return attrs != INVALID_FILE_ATTRIBUTES &&
+           (attrs & FILE_ATTRIBUTE_DIRECTORY) == 0;
+}
+
+std::string TrimArtifactValueLocal(const std::string& raw)
+{
+    size_t first = raw.find_first_not_of(" \t\r\n`\"'");
+    if (first == std::string::npos) return std::string();
+    size_t last = raw.find_last_not_of(" \t\r\n`\"'");
+    return raw.substr(first, last - first + 1);
+}
+
+bool ResolveExplicitArtifactPathLocal(const std::string& raw,
+                                      const std::string& cwd,
+                                      const std::string& activeProjectRoot,
+                                      std::string& pathOut)
+{
+    std::string value = TrimArtifactValueLocal(raw);
+    if (value.empty()) return false;
+
+    wxFileName fn(wxString::FromUTF8(value));
+    if (!fn.IsAbsolute()) {
+        const std::string& base = !activeProjectRoot.empty()
+            ? activeProjectRoot : cwd;
+        if (base.empty()) return false;
+        fn.MakeAbsolute(wxString::FromUTF8(base));
+    }
+    fn.Normalize(wxPATH_NORM_DOTS | wxPATH_NORM_ABSOLUTE);
+    pathOut = WxToUtf8Local(fn.GetFullPath());
+    if (!IsRegularFileLocal(pathOut)) return false;
+
+    const std::string workflowRoot = WorkflowRootFromCwdLocal(cwd);
+    return IsPathUnderRootLocal(pathOut, cwd) ||
+           IsPathUnderRootLocal(pathOut, workflowRoot) ||
+           IsPathUnderRootLocal(pathOut, activeProjectRoot);
+}
+
+bool PresentedFileAlreadyAddedLocal(const CmdResult& result,
+                                    const std::string& path)
+{
+    const std::string wanted = NormalizePathForCompareLocal(path);
+    for (const auto& file : result.presentedFiles) {
+        if (!file.diskPath.empty() &&
+            NormalizePathForCompareLocal(file.diskPath) == wanted) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Successful PowerShell workflows may explicitly nominate user-facing files
+// with one line per file:
+//
+//   ARTIFACT_FILE: C:\\absolute\\path\\to\\result.mp4
+//
+// The marker is deliberately narrow: only existing regular files under the
+// conversation or active-project roots are accepted. Explicit artifacts are
+// disk-backed cards, so large media files do not need to be read into memory
+// and are not subject to the automatic workspace-delta 25 MiB noise cap.
+void AttachExplicitPowerShellArtifactsLocal(CmdResult& result,
+                                             const std::string& cwd,
+                                             const std::string& activeProjectRoot)
+{
+    if (result.exitCode != 0 || result.timedOut || result.cancelled ||
+        result.stdoutText.empty()) {
+        return;
+    }
+
+    constexpr int kMaxExplicitArtifacts = 12;
+    int attached = 0;
+    std::ostringstream cleaned;
+    bool firstOutputLine = true;
+
+    for (const std::string& originalLine : SplitLinesLocal(result.stdoutText)) {
+        std::string probe = originalLine;
+        size_t first = probe.find_first_not_of(" \t");
+        if (first != std::string::npos) probe.erase(0, first);
+        std::string lower = LowerForOutputLocal(probe);
+
+        const std::string marker = "artifact_file:";
+        const bool isMarker = StartsWithLocal(lower, marker);
+        bool consumed = false;
+
+        if (isMarker && attached < kMaxExplicitArtifacts) {
+            std::string path;
+            if (ResolveExplicitArtifactPathLocal(
+                    probe.substr(marker.size()), cwd, activeProjectRoot, path)) {
+                if (!PresentedFileAlreadyAddedLocal(result, path)) {
+                    PresentedFile file;
+                    file.displayName = BaseNameLocal(path);
+                    file.language    = LanguageForCreatedFileLocal(path);
+                    file.diskPath    = path;
+                    file.sizeBytes   = FileSizeLocal(path);
+                    file.lineCount   = 0;
+                    result.presentedFiles.push_back(std::move(file));
+                    ++attached;
+                }
+                consumed = true;
+            }
+        }
+
+        // Valid markers are control records, not model-facing output. Keep an
+        // invalid or disallowed marker visible so the agent can diagnose it.
+        if (!consumed) {
+            if (!firstOutputLine) cleaned << "\r\n";
+            cleaned << originalLine;
+            firstOutputLine = false;
+        }
+    }
+
+    result.stdoutText = cleaned.str();
+}
+
 // Attaches PresentedFile cards for files CREATED by the command and
 // returns the manifest text to append to stdout after externalization.
 // Modified files are reported by name only (no card) — re-attaching a
@@ -505,6 +650,8 @@ std::string ApplyWorkspaceDeltaLocal(CmdResult&                       result,
         const unsigned long long size =
             (it != after.files.end()) ? it->second.sizeBytes : 0;
         if (size == 0 || size > kMaxCardBytes) continue;   // still listed in manifest
+
+        if (PresentedFileAlreadyAddedLocal(result, path)) continue;
 
         PresentedFile f;
         f.displayName = BaseNameLocal(path);
@@ -678,6 +825,7 @@ public:
     CmdWorkerThread(wxEvtHandler* evtHandler,
                     const std::string& command,
                     const std::string& cwd,
+                    const std::string& activeProjectRoot,
                     unsigned long      timeoutMs,
                     std::shared_ptr<std::atomic<bool>> cancelFlag,
                     std::shared_ptr<std::atomic<bool>> runningFlag,
@@ -686,6 +834,7 @@ public:
         , m_evtHandler(evtHandler)
         , m_command(command)
         , m_cwd(cwd)
+        , m_activeProjectRoot(activeProjectRoot)
         , m_timeoutMs(timeoutMs ? timeoutMs : CmdExecutor::kDefaultTimeoutMs)
         , m_cancelFlag(std::move(cancelFlag))
         , m_runningFlag(std::move(runningFlag))
@@ -979,6 +1128,9 @@ private:
             wsManifest = ApplyWorkspaceDeltaLocal(result, wsBefore, m_cwd);
         }
 
+        AttachExplicitPowerShellArtifactsLocal(
+            result, m_cwd, m_activeProjectRoot);
+
         ApplyLargeOutputHandlingLocal(result, m_cwd);
 
         if (!wsManifest.empty()) {
@@ -1020,6 +1172,7 @@ private:
     wxEvtHandler*                      m_evtHandler;
     std::string                        m_command;
     std::string                        m_cwd;        // UTF-8; empty -> %USERPROFILE%
+    std::string                        m_activeProjectRoot; // trusted artifact root
     unsigned long                      m_timeoutMs;  // resolved (>0)
     std::shared_ptr<std::atomic<bool>> m_cancelFlag;
     std::shared_ptr<std::atomic<bool>> m_runningFlag;
@@ -1047,12 +1200,13 @@ CmdExecutor::~CmdExecutor() {
 }
 
 bool CmdExecutor::Start(const std::string& command) {
-    return Start(command, std::string{}, kDefaultTimeoutMs);
+    return Start(command, std::string{}, kDefaultTimeoutMs, std::string{});
 }
 
 bool CmdExecutor::Start(const std::string& command,
                         const std::string& cwd,
-                        unsigned long      timeoutMs)
+                        unsigned long      timeoutMs,
+                        const std::string& activeProjectRoot)
 {
     // Reject empty / whitespace-only input.
     bool anyNonWs = false;
@@ -1074,6 +1228,7 @@ bool CmdExecutor::Start(const std::string& command,
         m_eventHandler,
         command,
         cwd,
+        activeProjectRoot,
         timeoutMs,
         m_cancelFlag,
         m_isRunning,

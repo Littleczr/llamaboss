@@ -38,6 +38,7 @@ public:
                    bool currentAgentDefaultOn,
                    bool currentContextMeterOn,
                    bool currentKvCacheQ8,
+                   bool currentMtpEnabled,
                    const ThemeData& theme,
                    SecretsStore* secretsStore = nullptr,
                    EndpointStore* endpointStore = nullptr);
@@ -51,6 +52,7 @@ public:
     bool        GetSelectedAgentDefault() const { return m_selectedAgentDefault; }
     bool        GetSelectedContextMeter() const { return m_selectedContextMeter; }
     bool        GetSelectedKvCacheQ8()    const { return m_selectedKvCacheQ8; }
+    bool        GetSelectedMtpEnabled()   const { return m_selectedMtpEnabled; }
 
     // Change flags
     bool WasModelChanged()        const { return m_modelChanged; }
@@ -61,6 +63,7 @@ public:
     bool WasAgentDefaultChanged() const { return m_agentDefaultChanged; }
     bool WasContextMeterChanged() const { return m_contextMeterChanged; }
     bool WasKvCacheQ8Changed()    const { return m_kvCacheQ8Changed; }
+    bool WasMtpEnabledChanged()   const { return m_mtpEnabledChanged; }
 
 private:
     void OnOK(wxCommandEvent& event);
@@ -106,6 +109,7 @@ private:
     wxCheckBox*   m_agentDefaultCheckBox = nullptr;
     wxCheckBox*   m_contextMeterCheckBox = nullptr;
     wxCheckBox*   m_kvCacheQ8CheckBox = nullptr;
+    wxCheckBox*   m_mtpCheckBox = nullptr;
     wxButton*     m_okBtn          = nullptr;
     wxButton*     m_cancelBtn      = nullptr;
 
@@ -142,6 +146,7 @@ private:
     bool        m_selectedAgentDefault = false;
     bool        m_selectedContextMeter = true;
     bool        m_selectedKvCacheQ8 = true;
+    bool        m_selectedMtpEnabled = true;
 
     std::string m_originalModel;
     std::string m_originalTheme;
@@ -150,6 +155,7 @@ private:
     bool        m_originalAgentDefault = false;
     bool        m_originalContextMeter = true;
     bool        m_originalKvCacheQ8 = true;
+    bool        m_originalMtpEnabled = true;
 
     // Folder-override change tracking.
     // Change/Reset commit to wxFileConfig immediately so the combo can scan
@@ -166,6 +172,7 @@ private:
     bool m_agentDefaultChanged = false;
     bool m_contextMeterChanged = false;
     bool        m_kvCacheQ8Changed = false;
+    bool        m_mtpEnabledChanged = false;
 
     const ThemeData* m_theme;
 

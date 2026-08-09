@@ -74,7 +74,8 @@ public:
                    const std::string& destPath,
                    long long          expectedBytes,
                    std::shared_ptr<std::atomic<bool>> cancelFlag,
-                   std::weak_ptr<std::atomic<bool>>   aliveToken);
+                   std::weak_ptr<std::atomic<bool>>   aliveToken,
+                   long               generation);
 protected:
     ExitCode Entry() override;
 private:
@@ -86,6 +87,15 @@ private:
     long long     m_expectedBytes;
     std::shared_ptr<std::atomic<bool>> m_cancelFlag;
     std::weak_ptr<std::atomic<bool>>   m_aliveToken;
+
+    // Identifies which download operation this worker belongs to. Stamped
+    // onto every event via wxCommandEvent::SetInt so the dialog can reject
+    // a late event from a cancelled/superseded worker instead of applying
+    // it to whatever row is active now. Also disambiguates the temp file
+    // (see Entry): a cancelled worker may still be blocked in socket I/O
+    // for up to its receive timeout, so a fresh retry must not share its
+    // ".download" scratch path.
+    long          m_generation;
 };
 
 // ── Per-row UI handles ────────────────────────────────────────────
@@ -177,6 +187,16 @@ private:
 
     int                                m_activeRow = -1;
     bool                               m_hadSuccess = false;
+
+    // Monotonic download-operation counter. Bumped every time a new
+    // download (or a chained mmproj stage) starts. The current value is
+    // handed to the DownloadThread and echoed back on every event; the
+    // three event handlers ignore any event whose generation != this,
+    // so a stale event from a cancelled worker that is still unwinding
+    // can never be applied to a later download's row. Starts at 0; the
+    // first real operation is generation 1, so a default-constructed
+    // event (GetInt() == 0) is never mistaken for a live one.
+    long                               m_downloadGeneration = 0;
 
     // True while the active row's mmproj (projector) download is in flight.
     // The main .gguf download completes first, then we kick off the mmproj

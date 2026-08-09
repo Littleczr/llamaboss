@@ -152,6 +152,19 @@ public:
     // the budget intact.
     int GetLastBuildElidedCount() const { return m_lastBuildElidedCount; }
 
+    // True when the most recent BuildChatRequestJson emitted a
+    // multimodal content array for the image-carrier user message
+    // (Phase 1c projection).  Read by the send path to skip the
+    // legacy AttachmentManager::InjectImagesIntoRequest fallback,
+    // whose only remaining job on a projected body is to Poco-parse
+    // the entire request (multi-MB once base64 data URIs are aboard)
+    // and discover the content is already structured.  False when
+    // projection could not run (unsaved conversation → no workflow
+    // dir, or attachment rows without a persisted storage_path) —
+    // in those cases the injector is still the only way images
+    // reach the wire.
+    bool LastBuildProjectedImages() const { return m_lastBuildProjectedImages; }
+
     // ── Streaming support methods ─────────────────────────────────
     void AddAssistantPlaceholder(const std::string& model = "");
     void AppendToLastAssistantMessage(const std::string& delta);
@@ -212,6 +225,8 @@ public:
         std::string projectId;
         std::string projectName;
         std::string projectRoot;
+        bool pinned = false;
+        bool archived = false;
         GoalState goalState;
         std::vector<std::string> models;
         std::vector<SaveMessageSnapshot> messages;
@@ -221,7 +236,8 @@ public:
 
     bool CreateSaveSnapshot(const std::string& filePath,
                             const std::vector<std::string>& models,
-                            SaveSnapshot& outSnapshot);
+                            SaveSnapshot& outSnapshot,
+                            bool touchActivityTimestamp = true);
     static bool WriteSaveSnapshot(const SaveSnapshot& snapshot,
                                   bool durable = false);
     void CommitSaveSnapshot(const SaveSnapshot& snapshot);
@@ -243,11 +259,17 @@ public:
     // in-memory history is about to be cleared or replaced (close, New
     // Chat, conversation switch, model/folder change) — at those points
     // the file becomes the only copy.
+    // touchActivityTimestamp controls whether updated_at advances. Normal
+    // content saves leave this true. Sidebar-only metadata operations such as
+    // rename, pin, archive, and project reassignment pass false so the chat's
+    // displayed age and chronological position remain tied to message activity.
     bool SaveToFile(const std::string& filePath, const std::vector<std::string>& models,
-                    bool durable = true);
+                    bool durable = true,
+                    bool touchActivityTimestamp = true);
     // Convenience overload for single-model save (wraps into vector).
     bool SaveToFile(const std::string& filePath, const std::string& model,
-                    bool durable = true);
+                    bool durable = true,
+                    bool touchActivityTimestamp = true);
 
     // Load conversation from a JSON file.
     // outModels: populated with the model(s) stored in the file.
@@ -263,10 +285,43 @@ public:
     // Dirty tracking — true when content has changed since last save/load
     bool IsDirty() const { return m_dirty; }
 
+    // Drop-import contract: a dropped file has been copied into this
+    // conversation's Workspace folder.  That copy is durable,
+    // user-visible on-disk state even though no message was added, so
+    // the conversation must persist — otherwise the freshly minted
+    // workflow folder (EnsureConversationWorkflow) is orphaned: no JSON
+    // is written, the chat never appears in the sidebar, and the
+    // DeleteConversation cleanup that removes workflow dirs is
+    // unreachable forever.  Marking dirty lets AutoSaveConversation
+    // write the JSON and keeps the existing cleanup path in play.
+    void NoteWorkspaceSideEffect() { MarkDirty(); }
+
     // Conversation metadata
     std::string GetTitle() const { return m_title; }
-    void SetTitle(const std::string& title) { m_title = title; }
+    void SetTitle(const std::string& title) {
+        if (title != m_title) {
+            m_title = title;
+            MarkDirty();
+        }
+    }
     std::string GetCreatedAt() const { return m_createdAt; }
+
+    // Sidebar organization metadata.  Omitted from legacy conversation
+    // files when false, so older builds continue to load the chat body.
+    bool IsPinned() const { return m_pinned; }
+    void SetPinned(bool pinned) {
+        if (pinned != m_pinned) {
+            m_pinned = pinned;
+            MarkDirty();
+        }
+    }
+    bool IsArchived() const { return m_archived; }
+    void SetArchived(bool archived) {
+        if (archived != m_archived) {
+            m_archived = archived;
+            MarkDirty();
+        }
+    }
 
     // ── Project association (Projects Phase 1) ───────────────────
     // Optional long-lived project attached to this conversation.  A
@@ -563,11 +618,17 @@ private:
     // every build.
     int m_lastBuildElidedCount = 0;
 
+    // Whether the most recent BuildChatRequestJson projected persisted
+    // image attachments into a multimodal content array (Phase 1c
+    // carrier).  Reset at the start of every build and of every
+    // stringify pass, so the value always reflects the FINAL body.
+    bool m_lastBuildProjectedImages = false;
+
     // File persistence state
     std::string m_filePath;     // Current file path (empty = unsaved)
     std::string m_title;        // Conversation title
     std::string m_createdAt;    // ISO timestamp of creation
-    std::string m_updatedAt;    // ISO timestamp of last save
+    std::string m_updatedAt;    // ISO timestamp of last content activity
     bool        m_dirty = false; // True when content changed since last save/load
     std::uint64_t m_revision = 0; // Monotonic mutation generation for async save commits
 
@@ -589,6 +650,10 @@ private:
     std::string m_projectId;
     std::string m_projectName;
     std::string m_projectRoot;
+
+    // Sidebar organization metadata (Phase 4).
+    bool m_pinned = false;
+    bool m_archived = false;
 
     // Per-conversation approval memory (in-memory only; cleared on
     // Clear() and on conversation load).  Lives here rather than on

@@ -63,6 +63,9 @@
     <ClCompile Include="server_manager.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="gguf_metadata.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="update_checker.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -154,6 +157,9 @@
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="agent_controller.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="wait_executor.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="path_safety.cpp">
@@ -281,6 +287,9 @@
     <ClInclude Include="server_manager.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="gguf_metadata.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="update_checker.h">
       <Filter>Header Files</Filter>
     </ClInclude>
@@ -392,6 +401,9 @@
     <ClInclude Include="agent_controller.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="wait_executor.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="tool_block.h">
       <Filter>Header Files</Filter>
     </ClInclude>
@@ -468,6 +480,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="lb_themed_dialogs.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="reminder_store.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>

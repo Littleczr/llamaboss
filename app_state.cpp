@@ -28,6 +28,7 @@ const char* AppState::CONFIG_FONT_SIZE_KEY = "ChatFontSize";
 const char* AppState::CONFIG_AGENT_DEFAULT_ON_KEY = "AgentDefaultOn";
 const char* AppState::CONFIG_CONTEXT_METER_KEY = "ContextMeterOn";
 const char* AppState::CONFIG_KV_CACHE_Q8_KEY = "KvCacheQ8";
+const char* AppState::CONFIG_MTP_ENABLED_KEY = "MtpEnabled";
 const char* AppState::CONFIG_AGENT_MAX_TOOL_STEPS_KEY = "AgentMaxToolSteps";
 const char* AppState::CONFIG_FIRST_RUN_KEY = "FirstRunCompleted";
 const char* AppState::CONFIG_LAST_SELECTION_KEY = "LastSelection";
@@ -267,6 +268,17 @@ void AppState::SetKvCacheQ8(bool on)
     }
 }
 
+void AppState::SetMtpEnabled(bool on)
+{
+    if (m_mtpEnabled != on) {
+        m_mtpEnabled = on;
+        SaveSettings();
+        if (m_logger)
+            m_logger->information(std::string("Multi-token prediction changed to ") +
+                (on ? "ON" : "OFF"));
+    }
+}
+
 void AppState::SetAgentMaxToolSteps(int steps)
 {
     // Mirror AgentController::SetMaxToolSteps clamping so a hand-edited
@@ -287,8 +299,9 @@ void AppState::SetAgentMaxToolSteps(int steps)
 ServerConfig AppState::MakeServerConfig() const
 {
     ServerConfig cfg;       // defaults for port / gpuLayers / threads / flashAttn
-    cfg.ctxSize   = m_ctxSize;
-    cfg.kvCacheQ8 = m_kvCacheQ8;
+    cfg.ctxSize    = m_ctxSize;
+    cfg.kvCacheQ8  = m_kvCacheQ8;
+    cfg.mtpEnabled = m_mtpEnabled;
     return cfg;
 }
 
@@ -317,6 +330,7 @@ void AppState::SaveSettings()
         cfg.Write(CONFIG_AGENT_DEFAULT_ON_KEY, m_agentDefaultOn);
         cfg.Write(CONFIG_CONTEXT_METER_KEY, m_contextMeterOn);
         cfg.Write(CONFIG_KV_CACHE_Q8_KEY, m_kvCacheQ8);
+        cfg.Write(CONFIG_MTP_ENABLED_KEY, m_mtpEnabled);
         cfg.Write(CONFIG_AGENT_MAX_TOOL_STEPS_KEY, (long)m_agentMaxToolSteps);
         cfg.Flush();
 
@@ -502,7 +516,7 @@ void AppState::RestoreWindowState(wxFrame* frame)
 int AppState::GetSidebarWidth() const
 {
     wxFileConfig cfg(CONFIG_APP_NAME);
-    int w = 260;
+    int w = 360;
     cfg.Read("SidebarWidth", &w);
     return w;
 }
@@ -687,6 +701,15 @@ void AppState::LoadSettings()
     bool savedKvCacheQ8 = true;
     if (cfg.Read(CONFIG_KV_CACHE_Q8_KEY, &savedKvCacheQ8)) {
         m_kvCacheQ8 = savedKvCacheQ8;
+    }
+
+    // Multi-token prediction: bool, absent on fresh installs (falls
+    // through to the m_mtpEnabled = true initializer — on by default;
+    // it is inert on models without MTP heads, so like the KV cache
+    // toggle it exists as a kill switch, not an opt-in).
+    bool savedMtpEnabled = true;
+    if (cfg.Read(CONFIG_MTP_ENABLED_KEY, &savedMtpEnabled)) {
+        m_mtpEnabled = savedMtpEnabled;
     }
 
     long savedMaxSteps = 0;

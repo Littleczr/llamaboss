@@ -7,6 +7,8 @@
 *.VC.db
 *.VC.VC.opendb
 ipch/
+vcpkg_installed/
+packages/
 
 # Build outputs
 Debug/
@@ -38,13 +40,20 @@ output/
 *.msi
 *.zip
 *.7z
+*.rar
 *.nupkg
+*.msix
+*.appx
 
 # Runtime/model files
 models/
 runtimes/
 *.gguf
 *.bin
+*.safetensors
+*.onnx
+*.pt
+*.pth
 
 # Local LlamaBoss data
 Workspace/
@@ -67,6 +76,8 @@ venv/
 # Secrets / local config
 .env
 *.env
+*.pem
+*.key
 secrets.json
 tokens.json
 credentials.json

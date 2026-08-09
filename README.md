@@ -4,11 +4,7 @@
 for local LLMs, real files, projects, reusable skills, and approval-gated
 tools.
 
-> Current milestone: **LlamaBoss Beta v0.1.10**
-
-<p align="center">
-  <img src="screenshot_beta_v0.1.10.png" alt="LlamaBoss Beta v0.1.10 screenshot (app UI)" width="100%">
-</p>
+> Current milestone: **LlamaBoss Beta v0.1.11**
 
 LlamaBoss is designed for people who want an AI assistant that can help with
 documents, spreadsheets, PDFs, scripts, project files, and repeatable workflows
@@ -65,6 +61,9 @@ copies of important documents.
 - Markdown-style rendering
 - File and vision/image attachment support
 - Context controls and KV-cache options
+- Persistent in-app reminders with dismiss and snooze controls
+- A bounded agent wait tool for checking long-running downloads, builds, and
+  remote jobs without embedding sleep loops in commands
 - Per-chat workspace folders
 - Conversation deletion with associated workflow-folder cleanup
 
@@ -96,8 +95,10 @@ Project support includes:
 ### Skills
 
 Skills are reusable global workflows stored under the LlamaBoss Skills folder.
-A Skill is usually a Markdown `.workflow.md` contract and may optionally
-include a same-stem Python helper script.
+Each Skill uses an Agent Skills-style folder with a `SKILL.md` contract. The
+builder automatically decides whether the Skill genuinely benefits from a
+Python helper under that Skill's `scripts/` subfolder; users no longer have to
+choose between separate "with script" and "without script" creation modes.
 
 Skills are intended for repeatable procedures that should be available across
 projects, such as:
@@ -147,6 +148,8 @@ Tool areas include:
 - PDF text extraction, PDF form inspection, and PDF form filling
 - DOCX text extraction and inspection
 - Global and project notes
+- Persistent reminder creation, listing, cancellation, snooze, and dismissal
+- Bounded waits for agent monitoring of long-running external work
 
 Riskier actions are gated by approval cards so the user can review what is
 about to happen before allowing it.
@@ -240,6 +243,7 @@ Create a small Python script
 Approve and run the script
 Create a Skill
 Run the Skill from a new chat
+Create and dismiss a short test reminder
 Delete a test chat and confirm the chat workflow folder is cleaned up
 ```
 
@@ -248,6 +252,7 @@ Delete a test chat and confirm the chat workflow folder is cleaned up
 Near-term focus:
 
 - Polish the Projects and Skills workflow experience
+- Expand reminder scheduling and background-task coordination
 - Improve model download and runtime setup UX
 - Tighten approval and artifact handling edge cases
 - Improve installer reliability

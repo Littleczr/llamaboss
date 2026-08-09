@@ -98,6 +98,16 @@ public:
     bool GetKvCacheQ8() const { return m_kvCacheQ8; }
     void SetKvCacheQ8(bool on);
 
+    // Multi-token prediction: when on, local launches auto-detect
+    // embedded MTP heads via GGUF metadata and pass --spec-type
+    // draft-mtp.  Inert on models without MTP heads — this is a
+    // master enable for the auto-detection, not a per-model flag.
+    // Launch-argument setting: changes require a server restart,
+    // handled by the Settings flow like ctx size and KV cache.
+    // Persisted across sessions.  Default: true.
+    bool GetMtpEnabled() const { return m_mtpEnabled; }
+    void SetMtpEnabled(bool on);
+
     // Maximum tool steps per agent turn (the iteration safety cap).
     // Persisted across sessions; AgentController clamps and applies it.
     // Default 12 matches the historical AgentController::kMaxIterations.
@@ -211,6 +221,7 @@ private:
     bool        m_agentDefaultOn = false;  // seed for new chats / app launches
     bool        m_contextMeterOn = true;   // top-bar context occupancy readout
     bool        m_kvCacheQ8 = true;        // q8_0 KV cache on local launches
+    bool        m_mtpEnabled = true;       // auto MTP detection on local launches
     int         m_agentMaxToolSteps = 12;  // agent tool-step safety cap
 
     // Application components
@@ -240,6 +251,7 @@ private:
     static const char* CONFIG_AGENT_DEFAULT_ON_KEY;
     static const char* CONFIG_CONTEXT_METER_KEY;
     static const char* CONFIG_KV_CACHE_Q8_KEY;
+    static const char* CONFIG_MTP_ENABLED_KEY;
     static const char* CONFIG_AGENT_MAX_TOOL_STEPS_KEY;
     static const char* CONFIG_FIRST_RUN_KEY;
     static const char* CONFIG_LAST_SELECTION_KEY;

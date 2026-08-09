@@ -326,6 +326,41 @@ static std::string LoadImageAsDataUriCached(const std::string& absPath,
     return uri;
 }
 
+// ─── Persisted-image probe ───────────────────────────────────────
+// True when a message's attachments sidecar contains at least one
+// image that actually made it to disk.  This is the SAME test the
+// image-carrier selection pass in BuildChatRequestJson uses, kept in
+// one place so the two can't drift: the wire-build loop uses it to
+// decide whether a blank-content user message is still meaningful,
+// and the carrier pass uses it to pick which turn's images ride the
+// request.
+//
+// Metadata only -- deliberately no filesystem check.  If the storage
+// files were deleted out from under the conversation, the projection
+// below already degrades gracefully (it skips unreadable images
+// individually), and adding disk I/O to this loop to catch that case
+// would cost more than it saves.
+static bool HasPersistedImageAttachment(const Poco::JSON::Object::Ptr& msg)
+{
+    if (!msg || !msg->has("attachments")) return false;
+    try {
+        Poco::JSON::Array::Ptr arr = msg->getArray("attachments");
+        if (!arr) return false;
+        for (unsigned k = 0; k < arr->size(); ++k) {
+            Poco::JSON::Object::Ptr a = arr->getObject(k);
+            if (a &&
+                a->optValue<std::string>("kind", "") == "image" &&
+                !a->optValue<std::string>("storage_path", "").empty()) {
+                return true;
+            }
+        }
+    } catch (...) {
+        // Malformed sidecar — treat as carrying no images rather than
+        // letting a bad attachments array abort the whole request build.
+    }
+    return false;
+}
+
 // ─── Reasoning stripping ─────────────────────────────────────────
 //
 // Model thinking is display/storage-only: it renders once in the
@@ -761,6 +796,8 @@ void ChatHistory::Clear()
     m_projectId.clear();
     m_projectName.clear();
     m_projectRoot.clear();
+    m_pinned = false;
+    m_archived = false;
     m_goalState.Reset();
     m_chatApprovedTools.clear();
     m_chatApprovalTrustEnabled = false;
@@ -789,6 +826,8 @@ bool ChatHistory::HasPersistableContent() const
     return !m_messages.empty()
         || HasProject()
         || m_goalState.HasGoal()
+        || m_pinned
+        || m_archived
         || !m_toolCwd.empty()
         || m_toolTimeoutMs != 0
         || HasFilePath();
@@ -841,6 +880,11 @@ std::string ChatHistory::BuildChatRequestJson(const std::string& model, bool str
     // Context meter: fresh count for this build; incremented by the
     // elision pass below when tool-result bodies are actually dropped.
     m_lastBuildElidedCount = 0;
+
+    // Image-carrier projection flag for this build; see
+    // LastBuildProjectedImages().  Also reset inside stringifyWire so
+    // a second (post-elision/sanitizer) pass always overwrites it.
+    m_lastBuildProjectedImages = false;
 
     // Make sure any in-flight streamed content is reflected in the JSON
     // objects before we build the wire request.  AppendToLastAssistantMessage
@@ -916,10 +960,24 @@ std::string ChatHistory::BuildChatRequestJson(const std::string& model, bool str
         // only when projecting a Native tool-calling transcript.  Under the
         // XML/plain protocol, sidecars are ignored, so keeping that row would
         // put an empty assistant turn on the wire after model switching.
+        //
+        // A blank USER message is a different case: attachments live in a
+        // sidecar array, not in content, so a message can be blank here and
+        // still carry a persisted image that the carrier pass below is
+        // supposed to project.  Dropping it was doubly wrong -- the image
+        // never reached the model, AND the carrier loop (which scans `wire`
+        // backwards for the newest real user message) then selected the
+        // PREVIOUS turn instead, re-sending stale images.  The UI injects
+        // default text ("What is in this image?") on the normal send path,
+        // so this only bites imported conversations and any future caller
+        // that skips that injection -- but it fails silently when it does.
         const bool hasToolCalls = msg->has("tool_calls");
         const bool blankContent =
             content.find_first_not_of(" \t\r\n") == std::string::npos;
-        if (blankContent && !(nativeProtocol && hasToolCalls)) continue;
+        const bool blankButCarriesImage =
+            blankContent && role == "user" && HasPersistedImageAttachment(msg);
+        if (blankContent && !(nativeProtocol && hasToolCalls) &&
+            !blankButCarriesImage) continue;
 
         WireMsg w;
         w.role         = std::move(role);
@@ -989,7 +1047,9 @@ std::string ChatHistory::BuildChatRequestJson(const std::string& model, bool str
         if (w.role != "user" || w.isToolResult || !w.toolCallId.empty())
             continue;
         // Newest real user message found — carrier iff it has at
-        // least one persisted image attachment.
+        // least one persisted image attachment.  Same probe the
+        // wire-build loop above uses to decide whether a blank
+        // message was worth keeping, so the two stay consistent.
         if (w.attachMeta) {
             for (unsigned k = 0; k < w.attachMeta->size(); ++k) {
                 Poco::JSON::Object::Ptr a = w.attachMeta->getObject(k);
@@ -1017,6 +1077,12 @@ std::string ChatHistory::BuildChatRequestJson(const std::string& model, bool str
     // that's the recent context the model needs to keep reasoning
     // coherently.
     auto stringifyWire = [&]() -> std::string {
+        // This lambda can run twice (initial build, then once more if
+        // elision or the native sanitizer dirtied the wire).  Reset the
+        // projection flag per pass so the last pass — the one whose
+        // output is actually returned — decides its value.
+        m_lastBuildProjectedImages = false;
+
         Poco::JSON::Object::Ptr root = new Poco::JSON::Object;
         root->set("model", model);
         root->set("stream", stream);
@@ -1140,13 +1206,23 @@ std::string ChatHistory::BuildChatRequestJson(const std::string& model, bool str
                         ++imageCount;
                     }
                     if (imageCount > 0) {
-                        Poco::JSON::Object::Ptr textPart =
-                            new Poco::JSON::Object;
-                        textPart->set("type", "text");
-                        textPart->set("text", w.content);
-                        parts->add(textPart);
+                        // Text part only when there is text.  Before the
+                        // blank-content fix in the wire-build loop this
+                        // could not be empty (blank messages never reached
+                        // here); now it can, and an empty {"type":"text",
+                        // "text":""} part is rejected outright by some
+                        // OpenAI-compatible providers.  Images alone are a
+                        // valid content array.
+                        if (!w.content.empty()) {
+                            Poco::JSON::Object::Ptr textPart =
+                                new Poco::JSON::Object;
+                            textPart->set("type", "text");
+                            textPart->set("text", w.content);
+                            parts->add(textPart);
+                        }
                         m->set("content", parts);
                         emittedParts = true;
+                        m_lastBuildProjectedImages = true;
                     }
                 }
                 if (!emittedParts)
@@ -1558,7 +1634,8 @@ bool ChatHistory::IsLastMessageRole(const std::string& role) const
 bool ChatHistory::CreateSaveSnapshot(
     const std::string& filePath,
     const std::vector<std::string>& models,
-    SaveSnapshot& outSnapshot)
+    SaveSnapshot& outSnapshot,
+    bool touchActivityTimestamp)
 {
     const std::string savePath = filePath.empty() ? m_filePath : filePath;
     if (savePath.empty() || !HasPersistableContent()) return false;
@@ -1568,7 +1645,13 @@ bool ChatHistory::CreateSaveSnapshot(
 
     try {
         if (m_createdAt.empty()) m_createdAt = CurrentTimestamp();
-        m_updatedAt = CurrentTimestamp();
+        // updated_at is the conversation's last meaningful activity time, not
+        // the JSON file's last rewrite time. Management-only saves preserve it
+        // so pinning, archiving, renaming, or moving a chat does not make an old
+        // conversation look newly active. Legacy files without updated_at get
+        // one here so the field is repaired on their next save.
+        if (touchActivityTimestamp || m_updatedAt.empty())
+            m_updatedAt = CurrentTimestamp();
 
         const std::string generatedTitle = GenerateTitle();
         const bool titleNeedsRepair =
@@ -1591,6 +1674,8 @@ bool ChatHistory::CreateSaveSnapshot(
         snapshot.projectId     = m_projectId;
         snapshot.projectName   = m_projectName;
         snapshot.projectRoot   = m_projectRoot;
+        snapshot.pinned        = m_pinned;
+        snapshot.archived      = m_archived;
         snapshot.goalState     = m_goalState;
         snapshot.models        = models;
         snapshot.revision      = m_revision;
@@ -1613,8 +1698,15 @@ bool ChatHistory::CreateSaveSnapshot(
             const bool hasToolCallId = msg->has("tool_call_id");
             const bool hasImages     = msg->has("images");
             const bool hasAttachments = msg->has("attachments");
+            // hasAttachments was computed here but left out of the skip
+            // condition, so an attachment-only message with empty text was
+            // dropped on save even though the branch below knows how to
+            // serialize its attachments array.  Normal UI turns substitute
+            // default text ("What is in this image?") for empty input, so
+            // this is mainly an import / round-trip guard -- but the loss
+            // is silent and unrecoverable when it happens.
             if (content.empty() && !hasToolCalls && !hasToolCallId &&
-                !hasImages) {
+                !hasImages && !hasAttachments) {
                 continue;
             }
 
@@ -1698,6 +1790,13 @@ bool ChatHistory::WriteSaveSnapshot(const SaveSnapshot& snapshot,
             root->set("project_name", snapshot.projectName);
             root->set("project_root", snapshot.projectRoot);
         }
+
+        // Sidebar organization metadata is sparse for backward
+        // compatibility: false values are omitted from the JSON.
+        if (snapshot.pinned)
+            root->set("pinned", true);
+        if (snapshot.archived)
+            root->set("archived", true);
 
         const GoalState& goal = snapshot.goalState;
         if (goal.HasGoal()) {
@@ -1857,10 +1956,12 @@ void ChatHistory::CommitSaveSnapshot(const SaveSnapshot& snapshot)
 
 bool ChatHistory::SaveToFile(const std::string& filePath,
                              const std::vector<std::string>& models,
-                             bool durable)
+                             bool durable,
+                             bool touchActivityTimestamp)
 {
     SaveSnapshot snapshot;
-    if (!CreateSaveSnapshot(filePath, models, snapshot)) return false;
+    if (!CreateSaveSnapshot(filePath, models, snapshot,
+                            touchActivityTimestamp)) return false;
     if (!WriteSaveSnapshot(snapshot, durable)) return false;
 
     // Synchronous Save/Save-As owns this transition and may intentionally
@@ -1872,9 +1973,11 @@ bool ChatHistory::SaveToFile(const std::string& filePath,
 }
 
 bool ChatHistory::SaveToFile(const std::string& filePath, const std::string& model,
-                             bool durable)
+                             bool durable,
+                             bool touchActivityTimestamp)
 {
-    return SaveToFile(filePath, std::vector<std::string>{ model }, durable);
+    return SaveToFile(filePath, std::vector<std::string>{ model }, durable,
+                      touchActivityTimestamp);
 }
 
 bool ChatHistory::LoadFromFile(const std::string& filePath, std::vector<std::string>& outModels)
@@ -1922,6 +2025,8 @@ bool ChatHistory::LoadFromFile(const std::string& filePath, std::vector<std::str
         std::string   newProjectId;
         std::string   newProjectName;
         std::string   newProjectRoot;
+        bool          newPinned = false;
+        bool          newArchived = false;
         GoalState     newGoal;                       // default == Reset() (no goal)
         std::vector<std::string>               newModels;
         std::vector<Poco::JSON::Object::Ptr>   newMessages;
@@ -1962,6 +2067,13 @@ bool ChatHistory::LoadFromFile(const std::string& filePath, std::vector<std::str
         }
         if (root->has("project_root")) {
             newProjectRoot = root->getValue<std::string>("project_root");
+        }
+
+        if (root->has("pinned")) {
+            newPinned = root->getValue<bool>("pinned");
+        }
+        if (root->has("archived")) {
+            newArchived = root->getValue<bool>("archived");
         }
 
         // Durable goal state (Goals Phase 5).  Older conversations simply
@@ -2122,6 +2234,8 @@ bool ChatHistory::LoadFromFile(const std::string& filePath, std::vector<std::str
         m_projectId      = std::move(newProjectId);
         m_projectName    = std::move(newProjectName);
         m_projectRoot    = std::move(newProjectRoot);
+        m_pinned         = newPinned;
+        m_archived       = newArchived;
         m_goalState      = std::move(newGoal);
         m_messages       = std::move(newMessages);
 

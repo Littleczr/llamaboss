@@ -168,11 +168,20 @@ void ProjectController::DeleteProjectByInfo(const ProjectInfo& project)
     }
 
     if (deletingActive) {
+        const std::string activePath = m_chatHistory->GetFilePath();
         m_chatHistory->ClearProject();
         m_projectContextBuilder.Invalidate();
         m_convController.UpdateWindowTitle();
-        m_convController.AutoSaveConversation();
+        m_convController.AutoSaveConversation(
+            /*refreshSidebar=*/false,
+            /*durable=*/true,
+            /*touchActivityTimestamp=*/false);
         m_cb.refreshProjectStrip();
+
+        if (m_sidebar && m_sidebar->IsVisible()) {
+            m_sidebar->InvalidateMetadata({ activePath });
+            m_sidebar->Refresh(activePath);
+        }
     }
 
     m_chatDisplay->DisplaySystemMessage(
@@ -180,7 +189,7 @@ void ProjectController::DeleteProjectByInfo(const ProjectInfo& project)
 
     // Sidebar will re-bucket any remaining chats that referenced
     // this project under Unassigned on its next refresh.
-    if (m_sidebar && m_sidebar->IsVisible()) {
+    if (!deletingActive && m_sidebar && m_sidebar->IsVisible()) {
         m_sidebar->Refresh(m_chatHistory->GetFilePath());
     }
 }
@@ -274,7 +283,10 @@ void ProjectController::MoveChatsToProject(const std::vector<std::string>& paths
             }
             m_projectContextBuilder.Invalidate();
             m_convController.UpdateWindowTitle();
-            m_convController.AutoSaveConversation(/*refreshSidebar=*/false);
+            m_convController.AutoSaveConversation(
+                /*refreshSidebar=*/false,
+                /*durable=*/true,
+                /*touchActivityTimestamp=*/false);
             ++moved;
         }
         else {
@@ -303,7 +315,9 @@ void ProjectController::MoveChatsToProject(const std::vector<std::string>& paths
                                targetProject.name,
                                targetProject.rootPath);
             }
-            if (!tmp.SaveToFile(path, models)) {
+            if (!tmp.SaveToFile(path, models,
+                                /*durable=*/true,
+                                /*touchActivityTimestamp=*/false)) {
                 ++skipped;
                 continue;
             }
@@ -313,25 +327,32 @@ void ProjectController::MoveChatsToProject(const std::vector<std::string>& paths
 
     // Single sidebar refresh at the end picks up every reassignment.
     if (m_sidebar && m_sidebar->IsVisible()) {
+        m_sidebar->InvalidateMetadata(paths);
         m_sidebar->Refresh(m_chatHistory->GetFilePath());
     }
     m_cb.refreshProjectStrip();
 
-    // Brief system message so the user gets visible confirmation.
-    // Only emitted when there's something interesting to report.
-    if (moved > 0) {
-        std::string destLabel = toUnassigned
-            ? std::string("Unassigned")
-            : targetProject.name;
-        std::string msg = "Moved " + std::to_string(moved) +
-                          (moved == 1 ? " chat" : " chats") +
-                          " to: " + destLabel;
-        if (skipped > 0) {
-            msg += "\n(" + std::to_string(skipped) +
-                   (skipped == 1 ? " chat" : " chats") +
-                   " skipped — already at destination or unreadable)";
+    // The destination project heading/tag changes immediately, so a success
+    // line in the chat surface is redundant and looks like conversation
+    // content.  Report only exceptional skips via a conventional dialog.
+    if (skipped > 0) {
+        std::string message;
+        if (moved > 0) {
+            message = "Moved " + std::to_string(moved) +
+                      (moved == 1 ? " chat. " : " chats. ");
         }
-        m_chatDisplay->DisplaySystemMessage(msg);
+        else {
+            message = "No chats were moved. ";
+        }
+        message += std::to_string(skipped) +
+                   (skipped == 1
+                       ? " chat was already at the destination or unreadable."
+                       : " chats were already at the destination or unreadable.");
+        wxMessageBox(
+            wxString::FromUTF8(message.c_str()),
+            "Move to Project",
+            wxOK | wxICON_INFORMATION,
+            m_frame);
     }
 }
 
@@ -510,11 +531,16 @@ void ProjectController::NewWorkflow(bool withPythonScript)
         return;
     }
 
-    wxTextEntryDialog dlg(
+    // Themed entry dialog + scrim, matching New Skill / New Project.  The
+    // native wxTextEntryDialog ignores the app palette on Windows and
+    // rendered as a detached light dialog with no scrim.
+    LbThemedTextEntryDialog dlg(
         m_frame,
+        m_appState.GetTheme(),
+        withPythonScript ? "New Project Workflow with Python Script" : "New Project Workflow",
         "Workflow name:",
-        withPythonScript ? "New Project Workflow with Python Script" : "New Project Workflow");
-    if (dlg.ShowModal() != wxID_OK) return;
+        "Create");
+    if (LbShowModalWithScrim(*m_frame, dlg) != wxID_OK) return;
 
     const std::string name = std::string(dlg.GetValue().ToUTF8().data());
     ProjectWorkflowInfo workflow;
@@ -641,5 +667,13 @@ void ProjectController::ClearProjectFromChat()
 
     // If this chat has messages, persist the cleared association.
     // A brand-new empty chat without project metadata has nothing to save.
-    m_convController.AutoSaveConversation();
+    const std::string activePath = m_chatHistory->GetFilePath();
+    m_convController.AutoSaveConversation(
+        /*refreshSidebar=*/false,
+        /*durable=*/true,
+        /*touchActivityTimestamp=*/false);
+    if (m_sidebar && m_sidebar->IsVisible()) {
+        m_sidebar->InvalidateMetadata({ activePath });
+        m_sidebar->Refresh(activePath);
+    }
 }

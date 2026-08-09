@@ -8,9 +8,13 @@
 #include <string>
 #include <memory>
 #include <atomic>
+#include <mutex>
 
 // Poco headers
 #include <Poco/Logger.h>
+// Already in pch.h; named here so ChatRequestControl's session member is
+// a complete type without relying on the precompiled header.
+#include <Poco/Net/HTTPClientSession.h>
 
 // Inference target descriptor (transport URL/path/tls/auth/protocol).
 #include "inference_target.h"
@@ -64,6 +68,16 @@ public:
     const std::vector<std::string>& ImageDataUrls() const
     { return m_imageDataUrls; }
 
+    // Destructive read for the one consumer that persists them.
+    // A generated image arrives as a base64 data URL, so a 4 MB PNG
+    // is ~5.5 MB of std::string per entry; the UI handler used to
+    // copy the whole vector out of the payload purely to read it
+    // once.  Call this instead when you are about to consume them.
+    // The payload is left empty afterwards, which is fine: the
+    // handler owns it via unique_ptr and drops it at end of scope.
+    std::vector<std::string> TakeImageDataUrls()
+    { return std::move(m_imageDataUrls); }
+
     // Exact token usage reported by the server for this turn, taken
     // from the SSE stream's `usage` object (llama-server includes it
     // on the final chunk; OpenAI-compatible providers include it on a
@@ -83,6 +97,68 @@ private:
 // Forward declarations
 class ChatClient;
 
+// ── Per-request cancellation control ─────────────────────────────
+// Replaces the bare shared_ptr<atomic<bool>> cancel flag.
+//
+// The flag alone could not actually stop a generation.  The worker
+// spends nearly all of its life blocked inside std::getline() on the
+// SSE stream and only re-checks the flag between lines, so a stalled
+// or slow generation ignored Stop until the next token arrived or the
+// 120s receive timeout expired.  Meanwhile llama-server is pinned to
+// --parallel 1 (see the single-slot rationale in server_manager.cpp),
+// so the abandoned generation kept holding the only slot and the next
+// send queued behind it.
+//
+// This object adds the missing half: the worker registers its live
+// transport here for the duration of the request, and Cancel() closes
+// the socket out from under the blocking read.  tool_web_fetch.cpp
+// solves the same problem for WinHTTP via a global registry keyed on
+// the cancel flag; chat has exactly one owner, so the state lives in
+// the control object itself rather than in a side table.
+//
+// Lifetime: owned by shared_ptr, held by BOTH ChatClient and the
+// detached worker, so it outlives whichever side finishes first.
+class ChatRequestControl
+{
+public:
+    // UI thread.  Marks the request cancelled, then aborts the live
+    // transport if one is registered.
+    //
+    // The ordering is load-bearing: the flag is set BEFORE the abort so
+    // that when the socket dies and the worker unwinds, every handler
+    // in ChatWorkerThread::Entry() -- all of which are already guarded
+    // on the cancelled state -- sees a deliberate cancellation and stays
+    // silent, instead of posting wxEVT_ASSISTANT_ERROR for a socket the
+    // user closed on purpose.
+    void Cancel();
+
+    bool IsCancelled() const
+    { return m_cancelled.load(std::memory_order_acquire); }
+
+    // Worker thread.  Registers the session for the life of the request.
+    //
+    // Returns false when Cancel() already ran -- i.e. Stop was pressed in
+    // the window between the worker starting and its session existing.
+    // The caller must abandon the request rather than connect, otherwise
+    // it would block in a read that nothing can now interrupt.
+    bool AttachSession(
+        const std::shared_ptr<Poco::Net::HTTPClientSession>& session);
+
+    // Worker thread.  Must run on EVERY exit path from the request,
+    // including exceptions, before the worker drops its own reference.
+    void DetachSession();
+
+private:
+    std::atomic<bool> m_cancelled{false};
+
+    // Guards m_session only.  Cancel() copies the pointer out under the
+    // lock and aborts outside it, so a slow abort never blocks a worker
+    // trying to detach, and the shared_ptr copy keeps the session alive
+    // for the duration of the abort regardless of what the worker does.
+    std::mutex m_mutex;
+    std::shared_ptr<Poco::Net::HTTPClientSession> m_session;
+};
+
 // Thread class for handling HTTP requests
 //
 // The worker no longer takes a bare (model, apiUrl) pair. It takes a
@@ -96,7 +172,7 @@ public:
     ChatWorkerThread(wxEvtHandler* eventHandler,
         InferenceTarget target,
         std::string requestBody,
-        std::shared_ptr<std::atomic<bool>> cancelFlag,
+        std::shared_ptr<ChatRequestControl> control,
         std::weak_ptr<std::atomic<bool>> aliveToken,
         unsigned long generationId);
 
@@ -107,7 +183,7 @@ private:
     wxEvtHandler* m_eventHandler;
     InferenceTarget m_target;
     std::string m_requestBody;
-    std::shared_ptr<std::atomic<bool>> m_cancelFlag;
+    std::shared_ptr<ChatRequestControl> m_control;
     std::weak_ptr<std::atomic<bool>> m_aliveToken;
     unsigned long m_generationId;
 
@@ -139,18 +215,22 @@ public:
         const std::string& requestBody,
         unsigned long generationId);
 
-    // Stop any current generation
+    // Stop any current generation.  Aborts the in-flight socket, not
+    // just a flag -- see ChatRequestControl.
     void StopGeneration();
 
     // Check if currently streaming
     bool IsStreaming() const { return m_isStreaming; }
 
-    // Reset streaming state (called when streaming completes)
+    // Reset streaming state (called when streaming completes).
+    // Deliberately does NOT cancel: this is the normal-completion path,
+    // where the transport has already closed itself.  Use
+    // StopGeneration() to interrupt a live request.
     void ResetStreamingState();
 
 private:
     wxEvtHandler* m_eventHandler;
     std::weak_ptr<std::atomic<bool>> m_aliveToken;
-    std::shared_ptr<std::atomic<bool>> m_cancelFlag;
+    std::shared_ptr<ChatRequestControl> m_activeRequest;
     bool m_isStreaming;
 };
