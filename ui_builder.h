@@ -22,6 +22,7 @@ struct TopBarWidgets {
     wxStaticText*  modelPillRightBracket;  // "]" — recolored on hover
     StatusDot*     statusDot;
     wxStaticText*  protocolChip;  // Phase 3b: "native" / "xml" / hidden
+    wxStaticText*  thinkingChip;  // ". Auto" segment inside the model pill; per-conversation /think override
     wxStaticText*  ctxMeter;      // context occupancy readout ("ctx 18.2k/32k")
     wxButton*      sidebarToggle;
     wxButton*      newChatButton;

@@ -1,0 +1,22 @@
+// python_helpers.rc2 - embeds LlamaBoss's built-in Python scripts as RCDATA.
+// Included from LlamaBoss.rc.  Hand-maintained (not touched by the Visual
+// Studio resource editor).  Resource name = file stem, upper-cased; the list
+// must match lb_pyres::kHelperNames + kKernelName in python_resources.h
+// (python_resources_tests.cpp checks this).  rc.exe embeds the bytes as-is,
+// so keep these files LF-only UTF-8 without a BOM.
+
+PYTHON_HEALTH         RCDATA "assets\\python\\python_health.py"
+CSV_INSPECT           RCDATA "assets\\python\\csv_inspect.py"
+CSV_REPORT            RCDATA "assets\\python\\csv_report.py"
+CSV_TO_XLSX           RCDATA "assets\\python\\csv_to_xlsx.py"
+XLSX_CREATE_WORKBOOK  RCDATA "assets\\python\\xlsx_create_workbook.py"
+XLSX_INSPECT          RCDATA "assets\\python\\xlsx_inspect.py"
+XLSX_REPORT           RCDATA "assets\\python\\xlsx_report.py"
+PDF_EXTRACT_TEXT      RCDATA "assets\\python\\pdf_extract_text.py"
+PDF_INSPECT_FORM      RCDATA "assets\\python\\pdf_inspect_form.py"
+PDF_FILL_FORM         RCDATA "assets\\python\\pdf_fill_form.py"
+DOCX_EXTRACT_TEXT     RCDATA "assets\\python\\docx_extract_text.py"
+DOCX_INSPECT          RCDATA "assets\\python\\docx_inspect.py"
+ZIP_INSPECT           RCDATA "assets\\python\\zip_inspect.py"
+ZIP_EXTRACT           RCDATA "assets\\python\\zip_extract.py"
+LB_KERNEL             RCDATA "assets\\python\\lb_kernel.py"

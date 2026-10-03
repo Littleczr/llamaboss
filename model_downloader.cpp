@@ -12,6 +12,7 @@
 
 #include <wx/filename.h>
 #include <wx/log.h>
+#include <wx/utils.h>   // wxGetProcessId
 
 // Poco HTTPS
 #include <Poco/Net/HTTPClientSession.h>
@@ -29,6 +30,7 @@
 #include "ui_event_post.h"
 #include <iomanip>
 #include <algorithm>
+#include <cctype>
 
 #ifdef __WXMSW__
 #ifndef NOMINMAX
@@ -135,20 +137,27 @@ void TintFlatMuted(wxButton* btn, const ThemeData& t)
 //  each model fits ("Ultra-light" / "Recommended" / "Top quality").
 //
 //  All from bartowski on HuggingFace — publicly downloadable, no
-//  account or license gate required.  Bartowski's newer uploads use
-//  the "<org>_" repo prefix (google_, Qwen_, openai_); the older
-//  Llama 3.2 entry keeps its original repo name.
+//  account or license gate required.  Repo naming is NOT uniform:
+//  bartowski's 2025–mid-2026 uploads use an "<org>_" prefix
+//  (google_gemma-4-E4B-it-GGUF, openai_gpt-oss-20b-GGUF), but his newer
+//  first-party uploads dropped it (gemma-4-12B-it-GGUF,
+//  Qwen3.8-27B-GGUF), and the older Llama 3.2 entry never had it.
+//  Copy repo + filename exactly from the HF "Files" tab; never infer.
 //
 //  Q4_K_M is the chosen quant for every entry — well-rounded quality
 //  vs size, default-recommended by bartowski himself, and works on
 //  every llama.cpp backend including Vulkan (unlike I-quants which
-//  the Vulkan backend cannot run).
+//  the Vulkan backend cannot run).  Projectors use the f16 file (not
+//  bf16) everywhere for the same backend-compatibility reason.
 //
 //  Exception: gpt-oss ships as MXFP4. Its feed-forward weights don't
 //  quantize well to anything else, so bartowski keeps the FFNs at
 //  MXFP4 in every quant — making MXFP4 the canonical file (all the
 //  other quants of that repo are the same size anyway). Smoke-test
 //  against the llama.cpp Vulkan backend before shipping this entry.
+//
+//  Last verified against HuggingFace: 2026-09-24.  Sizes are the HF
+//  listing (decimal GB) and only drive the progress bar / UI text.
 // ═══════════════════════════════════════════════════════════════════
 const std::vector<DownloadableModel> ModelDownloaderDialog::kModels =
 {
@@ -174,16 +183,30 @@ const std::vector<DownloadableModel> ModelDownloaderDialog::kModels =
         "Google's compact multimodal model. Vision and audio input. Low-spec friendly.",
         "bartowski", "google_gemma-4-E2B-it-GGUF",
         "google_gemma-4-E2B-it-Q4_K_M.gguf",
-        "3.1 GB", 3'100'000'000LL,
-        "mmproj-google_gemma-4-E2B-it-f16.gguf", "0.8 GB", 800'000'000LL
+        "3.5 GB", 3'460'000'000LL,
+        "mmproj-google_gemma-4-E2B-it-f16.gguf", "1.0 GB", 986'000'000LL
     },
     {
         "Gemma 4 E4B",   "Recommended",
         "Multimodal — vision and audio. Best balance of speed and quality for most users.",
         "bartowski", "google_gemma-4-E4B-it-GGUF",
         "google_gemma-4-E4B-it-Q4_K_M.gguf",
-        "5.0 GB", 5'000'000'000LL,
-        "mmproj-google_gemma-4-E4B-it-f16.gguf", "1.0 GB", 1'000'000'000LL
+        "5.4 GB", 5'410'000'000LL,
+        "mmproj-google_gemma-4-E4B-it-f16.gguf", "1.0 GB", 990'000'000LL
+    },
+    {
+        // Added 2026-09: the dense 12B Google released after the original
+        // Gemma 4 launch.  Fills the 5 GB -> 12 GB gap in the ladder.
+        // "Unified" = encoder-free: its projector is tiny (122 MB) because
+        // image patches go straight into the LLM.  Needs a llama.cpp build
+        // recent enough to know this projector type — smoke-test image
+        // input on the bundled llama-server before shipping.
+        "Gemma 4 12B",   "Step Up",
+        "Dense 12B — big quality jump over E4B. Vision-capable. Needs 10+ GB VRAM.",
+        "bartowski", "gemma-4-12B-it-GGUF",
+        "gemma-4-12B-it-Q4_K_M.gguf",
+        "7.7 GB", 7'660'000'000LL,
+        "mmproj-gemma-4-12B-it-f16.gguf", "0.1 GB", 122'000'000LL
     },
     {
         "gpt-oss 20B",   "Reasoning",
@@ -196,22 +219,22 @@ const std::vector<DownloadableModel> ModelDownloaderDialog::kModels =
     },
     {
         "Gemma 4 26B A4B", "Fast & Powerful",
-        "Mixture-of-Experts — 26B knowledge at 4B speed. Vision-capable. Needs 16+ GB VRAM.",
+        "Mixture-of-Experts — 26B knowledge at 4B speed. Vision-capable. Needs 18+ GB VRAM.",
         "bartowski", "google_gemma-4-26B-A4B-it-GGUF",
         "google_gemma-4-26B-A4B-it-Q4_K_M.gguf",
-        "16.0 GB", 16'000'000'000LL,
-        "mmproj-google_gemma-4-26B-A4B-it-f16.gguf", "1.2 GB", 1'200'000'000LL
+        "17.0 GB", 17'000'000'000LL,
+        "mmproj-google_gemma-4-26B-A4B-it-f16.gguf", "1.2 GB", 1'190'000'000LL
     },
     {
-        "Qwen 3.6 27B",  "Top All-Rounder",
-        "Alibaba's flagship. Frontier quality, vision-capable. Needs 20+ GB VRAM.",
-        "bartowski", "Qwen_Qwen3.6-27B-GGUF",
-        "Qwen_Qwen3.6-27B-Q4_K_M.gguf",
-        "17.5 GB", 17'530'000'000LL,
-        // NOTE: this repo's projector is bf16, not the f16 naming the
-        // Gemma entries use. Size below is approximate — confirm on
-        // first test download and tighten if needed.
-        "mmproj-Qwen_Qwen3.6-27B-bf16.gguf", "1.5 GB", 1'500'000'000LL
+        // Replaces Qwen 3.6 27B (2026-09).  Same decoder shape as 3.6,
+        // better weights; released Aug 14 2026, Apache 2.0.  Note the
+        // repo/file names carry no "Qwen_" prefix, unlike the 3.6 repo.
+        "Qwen 3.8 27B",  "Top All-Rounder",
+        "Alibaba's latest. Frontier quality, vision-capable. Needs 20+ GB VRAM.",
+        "bartowski", "Qwen3.8-27B-GGUF",
+        "Qwen3.8-27B-Q4_K_M.gguf",
+        "17.4 GB", 17'400'000'000LL,
+        "mmproj-Qwen3.8-27B-f16.gguf", "0.9 GB", 928'000'000LL
     },
     {
         "Gemma 4 31B",   "Top Quality",
@@ -343,6 +366,46 @@ static wxString FriendlyDownloadError(const std::string& raw)
 
     return msg;
 }
+
+// Every GGUF file starts with these four bytes.  Checked on the first
+// bytes of every download so an HTML error page or login page saved
+// under a .gguf name is caught immediately, not when llama-server
+// later refuses to load it.
+static bool HasGgufMagic(const std::string& head)
+{
+    return head.size() >= 4 && head.compare(0, 4, "GGUF") == 0;
+}
+
+static const char* kNotGgufMessage =
+    "The server sent something that isn't a GGUF model file (often a web "
+    "page or an error message). Check that the link points to a .gguf file.";
+
+// Plain-language reason for a failed HTTP status.  `url` is the URL that
+// returned the status: the gated-model wording only applies when Hugging
+// Face itself refused, not when its storage CDN rejected a signed link.
+static std::string HttpFailureMessage(int status, const std::string& reason,
+                                      const std::string& url)
+{
+    std::string host;
+    try { host = Poco::URI(url).getHost(); } catch (...) {}
+    for (char& c : host) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    const bool hf = host == "huggingface.co" || host == "www.huggingface.co" || host == "hf.co";
+
+    if ((status == 401 || status == 403) && hf)
+        return "This model is gated: Hugging Face requires signing in and "
+               "accepting its license before downloading, and LlamaBoss can't "
+               "sign in for you. Look for a community upload of the same model "
+               "(for example from bartowski or unsloth).";
+    if (status == 401 || status == 403)
+        return "The server refused access (HTTP " + std::to_string(status) + ").";
+    if (status == 404)
+        return "File not found (HTTP 404). Check the link: it should point to "
+               "a single .gguf file.";
+    if (status == 429)
+        return "The server is rate-limiting downloads (HTTP 429). Wait a few "
+               "minutes and try again.";
+    return "Server returned HTTP " + std::to_string(status) + " " + reason;
+}
 // ═══════════════════════════════════════════════════════════════════
 //  DownloadThread
 // ═══════════════════════════════════════════════════════════════════
@@ -353,12 +416,14 @@ DownloadThread::DownloadThread(wxEvtHandler*   handler,
                                long long          expectedBytes,
                                std::shared_ptr<std::atomic<bool>> cancelFlag,
                                std::weak_ptr<std::atomic<bool>>   aliveToken,
-                               long               generation)
+                               long               generation,
+                               bool               expectedBytesExact)
     : wxThread(wxTHREAD_DETACHED)
     , m_handler(handler)
     , m_url(url)
     , m_destPath(destPath)
     , m_expectedBytes(expectedBytes)
+    , m_expectedBytesExact(expectedBytesExact && expectedBytes > 0)
     , m_cancelFlag(cancelFlag)
     , m_aliveToken(aliveToken)
     , m_generation(generation)
@@ -388,10 +453,18 @@ wxThread::ExitCode DownloadThread::Entry()
     // in socket I/O for up to its 60s receive timeout, and it removes its
     // own temp file on the way out. A fresh retry must therefore NOT reuse
     // the same name, or the old worker's cleanup can delete (or its final
-    // write can truncate) the new attempt's file. Keying the temp name on
-    // the download generation keeps the two operations fully isolated.
-    std::string tempPath =
-        m_destPath + ".download." + std::to_string(m_generation);
+    // write can truncate) the new attempt's file.
+    //
+    // The name must NOT come from m_generation: that counter starts at 0 in
+    // every new dialog, so closing and reopening the downloader can pair a
+    // still-blocked old worker with a new one on the same ".download.1".
+    // A process-wide sequence (plus PID, in case two instances share a
+    // models folder) is unique for every worker ever started.
+    static std::atomic<unsigned long long> s_tempSeq{0};
+    const unsigned long long seq = ++s_tempSeq;
+    std::string tempPath = m_destPath + ".download." +
+        std::to_string(static_cast<unsigned long>(wxGetProcessId())) + "." +
+        std::to_string(seq);
 
     try
     {
@@ -403,18 +476,24 @@ wxThread::ExitCode DownloadThread::Entry()
             if (m_cancelFlag->load()) return (ExitCode)0;
 
             Poco::URI uri(currentUrl);
-            std::string scheme = uri.getScheme();
+            // HTTPS at every hop, not just the probe: a server can answer
+            // the 4-byte probe and the real transfer with different
+            // redirects, so the worker enforces the rule itself.
+            if (uri.getScheme() != "https") {
+                auto* ev = new wxCommandEvent(wxEVT_DOWNLOAD_ERROR);
+                ev->SetString(hop == 0
+                    ? "Use an https:// link. Plain http downloads are not allowed."
+                    : "The link redirected to a non-https address; download refused.");
+                SafePost(ev);
+                return (ExitCode)0;
+            }
             int port = uri.getPort();
-            if (port == 0) port = (scheme == "https") ? 443 : 80;
+            if (port == 0) port = 443;
 
             // ── Open session ─────────────────────────────────────
             std::unique_ptr<Poco::Net::HTTPClientSession> sess;
-            if (scheme == "https") {
+            {
                 auto* s = new Poco::Net::HTTPSClientSession(uri.getHost(), port);
-                s->setTimeout(Poco::Timespan(60, 0));
-                sess.reset(s);
-            } else {
-                auto* s = new Poco::Net::HTTPClientSession(uri.getHost(), port);
                 s->setTimeout(Poco::Timespan(60, 0));
                 sess.reset(s);
             }
@@ -461,8 +540,8 @@ wxThread::ExitCode DownloadThread::Entry()
             // ── Error response ───────────────────────────────────
             if (status != 200) {
                 auto* ev = new wxCommandEvent(wxEVT_DOWNLOAD_ERROR);
-                ev->SetString("Server returned HTTP "
-                    + std::to_string(status) + " " + resp.getReason());
+                ev->SetString(wxString::FromUTF8(
+                    HttpFailureMessage(status, resp.getReason(), currentUrl)));
                 SafePost(ev);
                 return (ExitCode)0;
             }
@@ -481,6 +560,21 @@ wxThread::ExitCode DownloadThread::Entry()
                 }
             }
 
+            // The probe already told us the exact size.  A response that
+            // declares a different length is refused before any data moves.
+            if (m_expectedBytesExact && declaredBytes >= 0 &&
+                declaredBytes != m_expectedBytes) {
+                auto* ev = new wxCommandEvent(wxEVT_DOWNLOAD_ERROR);
+                ev->SetString(
+                    "The server changed the file size between the check and "
+                    "the download (expected " + std::to_string(m_expectedBytes) +
+                    " bytes, now " + std::to_string(declaredBytes) +
+                    "). Nothing was saved. Try again.");
+                SafePost(ev);
+                return (ExitCode)0;
+            }
+            if (m_expectedBytesExact) totalBytes = m_expectedBytes;
+
             std::ofstream out(path_safety::Utf8ToWide(tempPath), std::ios::binary | std::ios::trunc);
             if (!out.is_open()) {
                 auto* ev = new wxCommandEvent(wxEVT_DOWNLOAD_ERROR);
@@ -492,6 +586,8 @@ wxThread::ExitCode DownloadThread::Entry()
             char      buf[65536];
             long long received   = 0;
             long long lastReport = -1;
+            std::string head;            // first 4 bytes, for the GGUF check
+            bool      magicChecked = false;
 
             while (!m_cancelFlag->load())
             {
@@ -499,6 +595,22 @@ wxThread::ExitCode DownloadThread::Entry()
                 std::streamsize n = in.gcount();
 
                 if (n > 0) {
+                    if (!magicChecked) {
+                        head.append(buf, static_cast<size_t>(
+                            std::min<std::streamsize>(n, 4 - static_cast<std::streamsize>(head.size()))));
+                        if (head.size() >= 4) {
+                            magicChecked = true;
+                            if (!HasGgufMagic(head)) {
+                                out.close();
+                                QuietRemoveFileUtf8(tempPath);
+                                auto* ev = new wxCommandEvent(wxEVT_DOWNLOAD_ERROR);
+                                ev->SetString(kNotGgufMessage);
+                                SafePost(ev);
+                                return (ExitCode)0;
+                            }
+                        }
+                    }
+
                     out.write(buf, n);
 
                     if (!out.good()) {
@@ -576,6 +688,16 @@ wxThread::ExitCode DownloadThread::Entry()
                 return (ExitCode)0;
             }
 
+            // Fewer than 4 bytes arrived, so the check above never ran.
+            if (!magicChecked) {
+                QuietRemoveFileUtf8(tempPath);
+
+                auto* ev = new wxCommandEvent(wxEVT_DOWNLOAD_ERROR);
+                ev->SetString(kNotGgufMessage);
+                SafePost(ev);
+                return (ExitCode)0;
+            }
+
             // Integrity check: if the server told us the exact Content-Length,
             // the received byte count must match exactly before we rename the file.
             if (declaredBytes >= 0 && received != declaredBytes) {
@@ -585,6 +707,20 @@ wxThread::ExitCode DownloadThread::Entry()
                 ev->SetString(
                     "Incomplete download.\nExpected " + std::to_string(declaredBytes) +
                     " bytes, received " + std::to_string(received) + " bytes.");
+                SafePost(ev);
+                return (ExitCode)0;
+            }
+
+            // Exact size from the probe: enforced even when this response
+            // sent no Content-Length, or one that matched a short body.
+            if (m_expectedBytesExact && received != m_expectedBytes) {
+                QuietRemoveFileUtf8(tempPath);
+
+                auto* ev = new wxCommandEvent(wxEVT_DOWNLOAD_ERROR);
+                ev->SetString(
+                    "Incomplete download.\nExpected " +
+                    std::to_string(m_expectedBytes) + " bytes, received " +
+                    std::to_string(received) + " bytes. The file was not saved.");
                 SafePost(ev);
                 return (ExitCode)0;
             }
@@ -666,6 +802,99 @@ wxThread::ExitCode DownloadThread::Entry()
     }
 
     return (ExitCode)0;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  ProbeModelUrl — size + GGUF check before a pasted-link download
+// ═══════════════════════════════════════════════════════════════════
+//
+// Asks for only the first 4 bytes (Range: bytes=0-3).  That follows the
+// same redirects a real download does (Hugging Face -> its storage CDN,
+// whose signed links accept GET but not always HEAD), returns the total
+// size in Content-Range, and gives us the GGUF magic bytes -- so a bad
+// link is rejected before a single gigabyte moves.  A server that
+// ignores Range answers 200 with the whole file; we read 4 bytes and
+// drop the connection.
+ModelUrlProbe ProbeModelUrl(const std::string& url)
+{
+    lb::EnsureSSLInitialized();
+    ModelUrlProbe out;
+    try {
+        std::string currentUrl = url;
+        for (int hop = 0; hop <= 8; ++hop) {
+            Poco::URI uri(currentUrl);
+            if (uri.getScheme() != "https") {
+                out.error = "The link redirected to a non-https address; download refused.";
+                return out;
+            }
+            int port = uri.getPort();
+            if (port == 0) port = 443;
+            Poco::Net::HTTPSClientSession sess(uri.getHost(), static_cast<Poco::UInt16>(port));
+            sess.setTimeout(Poco::Timespan(30, 0));
+
+            std::string path = uri.getPathAndQuery();
+            if (path.empty()) path = "/";
+            Poco::Net::HTTPRequest req(Poco::Net::HTTPRequest::HTTP_GET, path,
+                                       Poco::Net::HTTPMessage::HTTP_1_1);
+            req.set("User-Agent", "LlamaBoss/1.0");
+            req.set("Accept", "*/*");
+            req.set("Range", "bytes=0-3");
+            sess.sendRequest(req);
+
+            Poco::Net::HTTPResponse resp;
+            std::istream& in = sess.receiveResponse(resp);
+            const int status = static_cast<int>(resp.getStatus());
+
+            if (status == 301 || status == 302 || status == 303 ||
+                status == 307 || status == 308) {
+                if (!resp.has("Location")) { out.error = "Redirect with no Location header."; return out; }
+                const std::string loc = resp.get("Location");
+                if (loc.rfind("http", 0) != 0) {
+                    Poco::URI base(currentUrl);
+                    base.resolve(Poco::URI(loc));
+                    currentUrl = base.toString();
+                } else {
+                    currentUrl = loc;
+                }
+                continue;
+            }
+
+            if (status == 206) {
+                // Content-Range: bytes 0-3/123456789
+                if (resp.has("Content-Range")) {
+                    const std::string cr = resp.get("Content-Range");
+                    const size_t slash = cr.rfind('/');
+                    if (slash != std::string::npos) {
+                        try { out.sizeBytes = std::stoll(cr.substr(slash + 1)); } catch (...) {}
+                    }
+                }
+            } else if (status == 200) {
+                if (resp.has("Content-Length")) {
+                    try { out.sizeBytes = std::stoll(resp.get("Content-Length")); } catch (...) {}
+                }
+            } else {
+                out.error = HttpFailureMessage(status, resp.getReason(), currentUrl);
+                return out;
+            }
+
+            char head[4] = {};
+            in.read(head, 4);
+            if (!HasGgufMagic(std::string(head, static_cast<size_t>(in.gcount())))) {
+                out.error = kNotGgufMessage;
+                return out;
+            }
+            out.ok = true;
+            return out;   // session destructor closes the socket
+        }
+        out.error = "Too many redirects.";
+    }
+    catch (const Poco::Exception& ex) {
+        out.error = std::string(FriendlyDownloadError(ex.displayText()).utf8_str());
+    }
+    catch (const std::exception& ex) {
+        out.error = std::string(FriendlyDownloadError(ex.what()).utf8_str());
+    }
+    return out;
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -858,8 +1087,10 @@ void ModelDownloaderDialog::BuildModelRow(wxSizer* listSizer,
     // flex weight. The sub-sizer takes the flex instead.
     auto* nameArea = new wxBoxSizer(wxHORIZONTAL);
 
+    // EscapeMnemonics: wxStaticText treats '&' as an accelerator marker,
+    // which ate the ampersand in "Fast & Powerful" (rendered "Fast  Powerful").
     row.nameLabel = new wxStaticText(row.rowPanel, wxID_ANY,
-        wxString::FromUTF8(nameStr));
+        wxControl::EscapeMnemonics(wxString::FromUTF8(nameStr)));
     wxFont nf = row.nameLabel->GetFont();
     nf.SetWeight(wxFONTWEIGHT_BOLD);
     row.nameLabel->SetFont(nf);
@@ -897,8 +1128,14 @@ void ModelDownloaderDialog::BuildModelRow(wxSizer* listSizer,
     const ThemeData fallback = ThemeManager::GetDarkTheme();
     const ThemeData& t = m_theme ? *m_theme : fallback;
 
+    // Weights present but the vision projector missing (an earlier
+    // projector download failed or was cancelled): offer to fetch only
+    // the missing part instead of presenting the model as complete.
+    const bool visionMissing = !alreadyDone && IsWeightsDownloaded(model);
+
     std::string btnLabel = alreadyDone
-        ? "\xe2\x9c\x93 Downloaded" : "Download";
+        ? "\xe2\x9c\x93 Downloaded"
+        : (visionMissing ? "Get vision" : "Download");
 
     if (alreadyDone) {
         // Already-done rows start in the flat-muted disabled state.
@@ -925,7 +1162,10 @@ void ModelDownloaderDialog::BuildModelRow(wxSizer* listSizer,
 
     // ── Description / status line ────────────────────────────────
     row.statusLabel = new wxStaticText(row.rowPanel, wxID_ANY,
-        wxString::FromUTF8(model.description),
+        wxString::FromUTF8(visionMissing
+            ? "Model downloaded; vision component missing (" +
+              model.mmprojSizeDisplay + "). Text chat works now."
+            : model.description),
         wxDefaultPosition, wxDefaultSize, wxST_ELLIPSIZE_END);
     row.statusLabel->SetForegroundColour(textMuted);
     rowSizer->Add(row.statusLabel, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 14);
@@ -1030,6 +1270,23 @@ void ModelDownloaderDialog::OnDownloadClicked(size_t idx)
     }
 
     const DownloadableModel& model = kModels[idx];
+
+    // Weights already on disk and only the projector missing (a failed
+    // or cancelled vision stage, now or in an earlier session): resume
+    // at the projector.  Retry used to re-download the multi-GB weights
+    // first.
+    if (!model.mmprojFilename.empty() &&
+        IsWeightsDownloaded(model) && !IsProjectorDownloaded(model)) {
+        wxFileName mmFn = wxFileName::FileName(
+            wxString::FromUTF8(BuildMmprojDestPath(model)));
+        wxFileName::Mkdir(mmFn.GetPath(), wxS_DIR_DEFAULT, wxPATH_MKDIR_FULL);
+
+        m_activeRow = static_cast<int>(idx);
+        SetRowDownloading(idx);
+        StartMmprojStage(idx);
+        return;
+    }
+
     std::string url      = BuildUrl(model);
     std::string destPath = BuildDestPath(model);
 
@@ -1065,6 +1322,50 @@ void ModelDownloaderDialog::OnDownloadClicked(size_t idx)
         m_activeRow = -1;
         SetRowError(idx, "Failed to start download thread");
     }
+}
+
+bool ModelDownloaderDialog::StartMmprojStage(size_t idx)
+{
+    const DownloadableModel& model = kModels[idx];
+
+    m_downloadingMmproj = true;
+    m_cancelFlag = std::make_shared<std::atomic<bool>>(false);
+
+    // Chained-but-distinct operation: give the projector stage its own
+    // generation so a cancel during the weights stage cannot let its
+    // worker post into the mmproj stage (or share its temp path).
+    ++m_downloadGeneration;
+
+    // Show the sub-stage to the user so progress makes sense.
+    ModelRow& row = m_rows[idx];
+    row.statusLabel->SetLabel(wxString::FromUTF8(
+        "Downloading vision component (" + model.mmprojSizeDisplay + ")..."));
+    row.gauge->SetValue(0);
+    row.gauge->Show();
+    row.rowPanel->Layout();
+
+    auto* thread = new DownloadThread(
+        this,
+        BuildMmprojUrl(model),
+        BuildMmprojDestPath(model),
+        model.mmprojSizeBytes,
+        m_cancelFlag,
+        std::weak_ptr<std::atomic<bool>>(m_handlerAlive),
+        m_downloadGeneration);
+
+    if (thread->Run() != wxTHREAD_NO_ERROR) {
+        delete thread;
+        m_cancelFlag.reset();
+        m_downloadingMmproj = false;
+        m_activeRow = -1;
+        // Not complete: the old code marked the row "✓ Downloaded" here
+        // and told the user to "retry later", with no retry path.  The
+        // weights stay on disk, so Retry fetches only the projector.
+        SetRowError(idx, "vision component could not start. The model "
+                         "works for text; Retry fetches only the vision part.");
+        return false;
+    }
+    return true;
 }
 
 void ModelDownloaderDialog::OnCancelClicked()
@@ -1140,45 +1441,11 @@ void ModelDownloaderDialog::OnDownloadComplete(wxCommandEvent& ev)
     const bool needsMmproj = !m_downloadingMmproj && !model.mmprojFilename.empty();
 
     if (needsMmproj) {
-        m_downloadingMmproj = true;
-        m_cancelFlag = std::make_shared<std::atomic<bool>>(false);
-
-        // Chained-but-distinct operation: give the projector stage its own
-        // generation so a cancel during the weights stage cannot let its
-        // worker post into the mmproj stage (or share its temp path).
-        ++m_downloadGeneration;
-
-        // Show the sub-stage to the user so progress makes sense.
-        ModelRow& row = m_rows[idx];
-        row.statusLabel->SetLabel(wxString::FromUTF8(
-            "Downloading vision component (" + model.mmprojSizeDisplay + ")..."));
-        row.gauge->SetValue(0);
-        row.gauge->Show();
-        row.rowPanel->Layout();
-
-        auto* thread = new DownloadThread(
-            this,
-            BuildMmprojUrl(model),
-            BuildMmprojDestPath(model),
-            model.mmprojSizeBytes,
-            m_cancelFlag,
-            std::weak_ptr<std::atomic<bool>>(m_handlerAlive),
-            m_downloadGeneration);
-
-        if (thread->Run() != wxTHREAD_NO_ERROR) {
-            delete thread;
-            m_cancelFlag.reset();
-            m_downloadingMmproj = false;
-            // Main weights are already on disk — treat the failure as
-            // a warning, not a total failure. User can download the
-            // projector later; text chat still works.
-            m_activeRow = -1;
-            m_hadSuccess = true;
-            SetRowComplete(idx);
-            wxMessageBox("Main model downloaded, but the vision component "
-                         "thread could not be started. You can retry later.",
-                         "Partial Download", wxOK | wxICON_INFORMATION, this);
-        }
+        // The weights are on disk and loadable for text chat, so this is
+        // already a successful download for the caller (Settings refreshes
+        // its model list on it), whatever happens to the projector stage.
+        m_hadSuccess = true;
+        StartMmprojStage(idx);
         return;
     }
 
@@ -1228,9 +1495,23 @@ void ModelDownloaderDialog::OnClose(wxCloseEvent& ev)
 //  Helpers
 // ─────────────────────────────────────────────────────────────────
 
-bool ModelDownloaderDialog::IsAlreadyDownloaded(const DownloadableModel& m) const
+bool ModelDownloaderDialog::IsWeightsDownloaded(const DownloadableModel& m) const
 {
     return wxFileExists(wxString::FromUTF8(BuildDestPath(m)));
+}
+
+bool ModelDownloaderDialog::IsProjectorDownloaded(const DownloadableModel& m) const
+{
+    if (m.mmprojFilename.empty()) return true;   // text-only: nothing to fetch
+    return wxFileExists(wxString::FromUTF8(BuildMmprojDestPath(m)));
+}
+
+bool ModelDownloaderDialog::IsAlreadyDownloaded(const DownloadableModel& m) const
+{
+    // Both components.  Checking only the .gguf marked a vision model
+    // whose projector failed or was cancelled as "✓ Downloaded" with the
+    // button disabled, leaving no way to fetch the projector.
+    return IsWeightsDownloaded(m) && IsProjectorDownloaded(m);
 }
 
 std::string ModelDownloaderDialog::BuildUrl(const DownloadableModel& m) const

@@ -7,9 +7,8 @@
 //      an existing user-owned file).
 //   2. Write the payload in chunks.
 //   3. FlushFileBuffers, then CloseHandle.
-//   4. MoveFileExW with MOVEFILE_WRITE_THROUGH (and, for tool_edit,
-//      MOVEFILE_REPLACE_EXISTING) to atomically promote the temp to
-//      the final path.
+//   4. PromoteSiblingTempFile to atomically rename the temp within its
+//      existing directory, without reopening the pinned parent for writes.
 //
 // Steps 1 and the temp-path construction in particular were copy-
 // pasted between tool_write.cpp and tool_edit.cpp.  Lifting them here
@@ -24,11 +23,15 @@
 #pragma once
 
 #include <string>
+#include <cstring>
+#include <utility>
+#include <vector>
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#include <winternl.h>
 
 #include "path_safety.h"   // path_safety::Utf8ToWide
 
@@ -125,6 +128,109 @@ inline StagedTempFile CreateStagedTempFile(const std::string& finalPath)
 
     out.error = ERROR_ALREADY_EXISTS;
     return out;
+}
+
+// Native tools hold parent directories open without share-write/delete to
+// prevent directory replacement and reparse-point changes. A full-path
+// MoveFileEx rename asks Windows to reopen the destination directory with
+// FILE_WRITE_DATA, conflicting with those very pins (ERROR_SHARING_VIOLATION).
+//
+// Staging is always in the target's own directory. The native rename contract
+// supports a simple filename with a null RootDirectory: rename in the source
+// directory, with no destination-directory open. Use NtSetInformationFile
+// directly because SetFileInformationByHandle resolves relative Win32 paths
+// against the process CWD. Never change CWD or release the directory pins.
+// https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/ns-ntifs-_file_rename_information
+//
+// Caller must close the staging writer, validate the target, and release its
+// target handle before calling. Failure leaves the staging file available.
+// Existing call sites have already flushed the staged bytes. This remains a
+// same-volume atomic rename; it is not a cross-volume copy/delete fallback.
+inline BOOL PromoteSiblingTempFile(const std::wstring& stagedPath,
+                                  const std::wstring& finalPath,
+                                  bool replaceExisting)
+{
+    std::wstring source = stagedPath;
+    std::wstring target = finalPath;
+    for (auto& c : source) if (c == L'/') c = L'\\';
+    for (auto& c : target) if (c == L'/') c = L'\\';
+    const auto sourceSep = source.find_last_of(L'\\');
+    const auto targetSep = target.find_last_of(L'\\');
+    if (sourceSep == std::wstring::npos || targetSep == std::wstring::npos ||
+        sourceSep == 0 || sourceSep != targetSep ||
+        source.compare(0, sourceSep + 1, target, 0, targetSep + 1) != 0 ||
+        sourceSep + 1 == source.size()) {
+        ::SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    const std::wstring leaf = target.substr(targetSep + 1);
+    if (leaf.empty() || leaf == L"." || leaf == L".." ||
+        leaf.back() == L'.' || leaf.back() == L' ' ||
+        leaf.find_first_of(L"\\/:*?\"<>|") != std::wstring::npos) {
+        ::SetLastError(ERROR_INVALID_NAME);
+        return FALSE;
+    }
+    for (wchar_t c : leaf) {
+        if (c < 32) {
+            ::SetLastError(ERROR_INVALID_NAME);
+            return FALSE;
+        }
+    }
+    if (leaf.size() > (MAXDWORD - sizeof(FILE_RENAME_INFO)) / sizeof(wchar_t) - 1) {
+        ::SetLastError(ERROR_FILENAME_EXCED_RANGE);
+        return FALSE;
+    }
+
+    using NtSetInformationFileFn = NTSTATUS (NTAPI *)(
+        HANDLE, PIO_STATUS_BLOCK, PVOID, ULONG, FILE_INFORMATION_CLASS);
+    using RtlNtStatusToDosErrorFn = ULONG (WINAPI *)(NTSTATUS);
+    const HMODULE ntdll = ::GetModuleHandleW(L"ntdll.dll");
+    const auto renameFile = ntdll ? reinterpret_cast<NtSetInformationFileFn>(
+        ::GetProcAddress(ntdll, "NtSetInformationFile")) : nullptr;
+    const auto statusToError = ntdll ? reinterpret_cast<RtlNtStatusToDosErrorFn>(
+        ::GetProcAddress(ntdll, "RtlNtStatusToDosError")) : nullptr;
+    if (!renameFile || !statusToError) {
+        ::SetLastError(ERROR_PROC_NOT_FOUND);
+        return FALSE;
+    }
+
+    // FILE_RENAME_INFO has the same layout as native FILE_RENAME_INFORMATION
+    // for the classic FileRenameInformation class (10). Allocate before the
+    // handle is opened so an allocation exception cannot leak the handle.
+    const DWORD nameBytes = static_cast<DWORD>(leaf.size() * sizeof(wchar_t));
+    const DWORD bufferBytes = static_cast<DWORD>(sizeof(FILE_RENAME_INFO) +
+                                               nameBytes + sizeof(wchar_t));
+    std::vector<unsigned char> buffer(bufferBytes, 0);
+    auto* info = reinterpret_cast<FILE_RENAME_INFO*>(buffer.data());
+    info->ReplaceIfExists = replaceExisting ? TRUE : FALSE;
+    info->RootDirectory = nullptr;
+    info->FileNameLength = nameBytes;
+    std::memcpy(info->FileName, leaf.data(), nameBytes);
+
+    HANDLE file = ::CreateFileW(source.c_str(), DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+        FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+        FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_WRITE_THROUGH, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return FALSE;
+    BY_HANDLE_FILE_INFORMATION identity{};
+    DWORD error = ERROR_SUCCESS;
+    BOOL ok = ::GetFileInformationByHandle(file, &identity);
+    if (!ok) {
+        error = ::GetLastError();
+    } else if (identity.dwFileAttributes &
+               (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) {
+        ok = FALSE;
+        error = ERROR_ACCESS_DENIED;
+    } else {
+        IO_STATUS_BLOCK io{};
+        const NTSTATUS status = renameFile(file, &io, info, bufferBytes,
+            static_cast<FILE_INFORMATION_CLASS>(10)); // FileRenameInformation
+        ok = status >= 0;
+        if (!ok) error = statusToError(status);
+    }
+    ::CloseHandle(file);
+    // CloseHandle must not hide the actual rename/validation failure.
+    ::SetLastError(error);
+    return ok;
 }
 
 } // namespace tool_staged_write

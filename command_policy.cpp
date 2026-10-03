@@ -26,8 +26,16 @@ constexpr std::array<const char*, 13> kVerbPrefixes = {
 // Read-only commands that don't follow the verb-prefix shape.
 // Out-File and Tee-Object are deliberately NOT here — they may still
 // be used, but only through the approval-gated PowerShell path.
-constexpr std::array<const char*, 9> kExactNames = {
-    "ForEach-Object",
+//
+// ForEach-Object is deliberately NOT here either.  Its positional
+// -MemberName form invokes a METHOD by name with no braces, parens, or
+// '$' for the scanner to catch:
+//     Get-ChildItem C:\Docs -Recurse -File | ForEach-Object Delete
+//     Get-Process | ForEach-Object Kill
+// The classifier cannot tell a property read from a method call
+// without type information, so ForEach-Object always routes to
+// approval.  Select-Object -ExpandProperty covers the read-only case.
+constexpr std::array<const char*, 8> kExactNames = {
     "Out-String", "Out-Default", "Out-Host", "Out-Null",
     "date", "whoami", "hostname", "echo"
 };
@@ -466,6 +474,57 @@ bool IsSafeSimpleAssignment(const std::string& stmt) {
 //
 // Single quotes are treated as literal PowerShell strings.  A doubled
 // single quote inside a single-quoted string is accepted and skipped.
+// PowerShell here-strings:
+//
+//   @'<line break>          @"<line break>
+//   ...literal body...      ...expandable body...
+//   <line break>'@          <line break>"@
+//
+// The opener is @' or @" followed only by spaces/tabs and a line break;
+// the closer is '@ or "@ at the very start of a line.  Inside the body,
+// quotes of either kind are ordinary characters, so a C++ literal such
+// as L'"' in a single-quoted here-string must NOT flip the scanner's
+// quote state.  Before this rule existed the scanner did exactly that,
+// drifted out of phase, and rejected valid scripts as "unterminated
+// double-quoted string".
+//
+// On entry `i` indexes the '@'.  Returns:
+//   kNotHereString  - not an opener; caller scans '@' normally
+//   kHereString     - consumed; `i` is the last char of the closer and
+//                     `quote`, `bodyStart`, `bodyEnd` describe the body
+//   kUnterminated   - opener with no closer
+enum class HereStringScan { kNotHereString, kHereString, kUnterminated };
+
+HereStringScan TryScanHereString(const std::string& cmd, size_t& i,
+                                 char& quote, size_t& bodyStart,
+                                 size_t& bodyEnd) {
+    if (cmd[i] != '@' || i + 1 >= cmd.size()) return HereStringScan::kNotHereString;
+    const char q = cmd[i + 1];
+    if (q != '\'' && q != '"') return HereStringScan::kNotHereString;
+
+    size_t j = i + 2;
+    while (j < cmd.size() && (cmd[j] == ' ' || cmd[j] == '\t')) ++j;
+    if (j >= cmd.size() || (cmd[j] != '\r' && cmd[j] != '\n'))
+        return HereStringScan::kNotHereString;
+
+    // Body begins after the opener's line break (CRLF or LF).
+    size_t body = j;
+    if (cmd[body] == '\r' && body + 1 < cmd.size() && cmd[body + 1] == '\n') ++body;
+    ++body;
+
+    // Closer: q '@' at the start of a line.  Searching from j (the
+    // opener's own line break) also accepts an empty body.
+    const std::string closer = std::string("\n") + q + "@";
+    const size_t close = cmd.find(closer, j);
+    if (close == std::string::npos) return HereStringScan::kUnterminated;
+
+    quote     = q;
+    bodyStart = body;
+    bodyEnd   = close;                    // body excludes the final line break
+    i         = close + closer.size() - 1;
+    return HereStringScan::kHereString;
+}
+
 ScanResult ScanAndSplitStages(const std::string& cmd) {
     ScanResult out;
 
@@ -480,9 +539,15 @@ ScanResult ScanAndSplitStages(const std::string& cmd) {
 
         // Backtick is PowerShell's escape/line-continuation character.
         // It remains valid for an approved command, but it is too rich
-        // for the silent read-only classifier.
+        // for the silent read-only classifier.  Outside single quotes it
+        // escapes the NEXT character, which must be skipped: otherwise
+        // `" inside "…" closes the string early and a valid command like
+        //   Write-Output "hello`""
+        // is rejected as unterminated.  Inside single quotes a backtick
+        // is literal (no escape), so nothing is skipped there.
         if (c == '`') {
             MarkApproval(out, "backtick escape syntax requires approval");
+            if (!inSingle && i + 1 < cmd.size()) ++i;
             continue;
         }
 
@@ -510,6 +575,67 @@ ScanResult ScanAndSplitStages(const std::string& cmd) {
         }
 
         // Outside quotes from here down.
+
+        // Comments.  Their text is inert, so quotes, pipes and ';' inside
+        // them must not be scanned: "Get-Item . # user's folder" used to
+        // be rejected as an unterminated single-quoted string.
+        //
+        //   * '#' at the start or after whitespace opens a line comment
+        //     that PowerShell ignores to end of line.  Skip to (not past)
+        //     the newline, so multi-line commands still require approval.
+        //     A '#' glued to other text (a#b, .#) is an ordinary character
+        //     in PowerShell and is left alone, so classification never
+        //     skips text PowerShell would run.
+        //   * '<#' opens a block comment: approval required, content
+        //     skipped, and an unterminated one stays a hard reject.
+        //     Belt and braces: a comment that contains command
+        //     separators still requires approval (as it did before this
+        //     rule existed), so skipping comment text can never widen
+        //     what auto-runs even if this rule and PowerShell disagreed.
+        if (c == '#' &&
+            (i == 0 || cmd[i - 1] == ' ' || cmd[i - 1] == '\t')) {
+            const size_t commentStart = i;
+            while (i + 1 < cmd.size() && cmd[i + 1] != '\n' && cmd[i + 1] != '\r')
+                ++i;
+            const std::string text = cmd.substr(commentStart, i + 1 - commentStart);
+            if (text.find_first_of(";|&`") != std::string::npos) {
+                MarkApproval(out, "comment containing command separators requires approval");
+            }
+            continue;
+        }
+        if (c == '<' && i + 1 < cmd.size() && cmd[i + 1] == '#') {
+            const size_t close = cmd.find("#>", i + 2);
+            if (close == std::string::npos) {
+                out.reason = "unterminated block comment";
+                return out;
+            }
+            MarkApproval(out, "block comment syntax requires approval");
+            i = close + 1;   // for-loop's ++i lands just past "#>"
+            continue;
+        }
+
+        // Here-strings span lines, so they always require approval (as
+        // any multi-line command already does).  Their bodies are skipped
+        // whole: no quote, separator or digraph inside one is scanned.
+        if (c == '@') {
+            char   q = 0;
+            size_t bodyStart = 0, bodyEnd = 0;
+            const HereStringScan hs = TryScanHereString(cmd, i, q, bodyStart, bodyEnd);
+            if (hs == HereStringScan::kUnterminated) {
+                // i still indexes the '@', so cmd[i + 1] is the quote.
+                out.reason = (cmd[i + 1] == '"')
+                    ? "unterminated double-quoted here-string (closing \"@ must start a line)"
+                    : "unterminated single-quoted here-string (closing '@ must start a line)";
+                return out;
+            }
+            if (hs == HereStringScan::kHereString) {
+                MarkApproval(out, q == '"'
+                    ? "double-quoted here-string (expandable) requires approval"
+                    : "here-string syntax requires approval");
+                continue;   // for-loop's ++i lands just past the closer
+            }
+        }
+
         if (c == '\'') {
             inSingle = true;
             continue;
@@ -713,9 +839,53 @@ std::vector<std::string> LintPowerShellHazards(const std::string& command)
     // a double-quoted context when the command never assigns them —
     // strong signal the author meant ${Shorter}_literal.
     std::vector<std::string> flagged;
+
+    // Shared $Name_With_Underscores check for one '$' inside an
+    // expandable context.  `i` indexes the '$'; on return it indexes the
+    // last character consumed.
+    auto checkDollar = [&](size_t& i) {
+        if (i + 1 >= command.size()) return;
+        const char n = command[i + 1];
+        if (n == '{' || n == '(') return;          // braced / subexpr: fine
+        if (!IsIdentStartChar(n)) return;
+        size_t j = i + 1;
+        std::string name;
+        while (j < command.size() && IsIdentChar(command[j])) {
+            name += command[j];
+            ++j;
+        }
+        i = j - 1;
+        if (name.size() < 2) return;               // skip $_ and 1-char
+        if (name.find('_') == std::string::npos) return;
+        for (const std::string& f : flagged) {
+            if (EqualsCi(f, name.c_str())) return;
+        }
+        if (!HasAssignmentTo(command, name)) flagged.push_back(name);
+    };
+
     bool inSingle = false, inDouble = false;
     for (size_t i = 0; i < command.size(); ++i) {
         const char c = command[i];
+
+        // Here-strings: skip literal bodies, scan expandable bodies for
+        // $ names, and never let quotes inside either flip the state.
+        if (!inSingle && !inDouble && c == '@') {
+            char   q = 0;
+            size_t bodyStart = 0, bodyEnd = 0;
+            size_t k = i;
+            if (TryScanHereString(command, k, q, bodyStart, bodyEnd) ==
+                HereStringScan::kHereString) {
+                if (q == '"') {
+                    for (size_t b = bodyStart; b < bodyEnd; ++b) {
+                        if (command[b] == '`') { ++b; continue; }
+                        if (command[b] == '$') checkDollar(b);
+                    }
+                }
+                i = k;
+                continue;
+            }
+        }
+
         if (inSingle) {
             if (c == '\'') {
                 if (i + 1 < command.size() && command[i + 1] == '\'') ++i;
@@ -730,27 +900,7 @@ std::vector<std::string> LintPowerShellHazards(const std::string& command)
                 else inDouble = false;
                 continue;
             }
-            if (c == '$' && i + 1 < command.size()) {
-                const char n = command[i + 1];
-                if (n == '{' || n == '(') continue;   // braced / subexpr: fine
-                if (!IsIdentStartChar(n)) continue;
-                size_t j = i + 1;
-                std::string name;
-                while (j < command.size() && IsIdentChar(command[j])) {
-                    name += command[j];
-                    ++j;
-                }
-                i = j - 1;
-                if (name.size() < 2) continue;         // skip $_ and 1-char
-                if (name.find('_') == std::string::npos) continue;
-                bool seen = false;
-                for (const std::string& f : flagged) {
-                    if (EqualsCi(f, name.c_str())) { seen = true; break; }
-                }
-                if (!seen && !HasAssignmentTo(command, name)) {
-                    flagged.push_back(name);
-                }
-            }
+            if (c == '$') checkDollar(i);
             continue;
         }
         if (c == '\'')      inSingle = true;

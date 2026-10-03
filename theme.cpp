@@ -12,7 +12,7 @@
 // ═══════════════════════════════════════════════════════════════════
 
 ThemeManager::ThemeManager()
-    : m_activeTheme(GetDarkTheme())  // Default to dark
+    : m_activeTheme(GetNordTheme())  // Default for fresh installs (no saved Theme key)
 {
 }
 

@@ -29,7 +29,10 @@
 //             "display_name": "Claude Sonnet 4.6" },
 //           { "id": "google/gemini-2.5-flash-image",
 //             "display_name": "Nano Banana",
-//             "image_output": true }
+//             "image_output": true },
+//           { "id": "gpt-5.6-luna",
+//             "display_name": "GPT-5.6 Luna",
+//             "no_tools": true }
 //         ]
 //       }
 //     ]
@@ -68,12 +71,30 @@ public:
         // "modalities": ["image", "text"] so the provider actually
         // returns image data.  Persisted as "image_output": true.
         bool imageOutput = false;
+
+        // True for chat/reasoning-only models that reject any request
+        // carrying function tools.  The selected model bypasses Agent
+        // mode for the turn: no native tools array, no XML tool prompt,
+        // and no AgentController loop.  Reasoning fields are otherwise
+        // unchanged.  Persisted as "no_tools": true.
+        bool noTools = false;
+
+        // Picker membership is independent of behavior. Hidden records
+        // remain available to existing chats and to the provider editor.
+        // Absent in older endpoints.json files means visible.
+        bool showInPicker = true;
     };
 
     // How the API key is presented on the wire.
     enum class AuthScheme {
         Bearer,     // Authorization: Bearer <key>   (OpenAI, OpenRouter)
-        XApiKey     // x-api-key: <key>              (Anthropic-native, future)
+        XApiKey,    // x-api-key: <key>              (Anthropic-native, future)
+        None        // no auth header at all — local or SSH-tunneled
+                    // servers with no credential check (FreeToken,
+                    // llama-server, vLLM without --api-key).
+                    // ResolveTarget skips the SecretsStore lookup
+                    // entirely, so no key needs to exist.
+                    // Persisted as "auth_scheme": "none".
     };
 
     struct Endpoint {
@@ -87,6 +108,23 @@ public:
         ToolProtocol protocol = ToolProtocol::Native;
         std::vector<std::pair<std::string, std::string>> extraHeaders;
         std::vector<Model> models;
+
+        // Optional reasoning-dialect override for /think, persisted as
+        // "reasoning_dialect" only when non-empty:
+        //   ""            -> auto: ResolveTarget sniffs the base URL
+        //                    (api.openai.com hosts get the OpenAI
+        //                    reasoning_effort string; everything else
+        //                    keeps the historical OpenRouter-style
+        //                    reasoning object)
+        //   "openai"      -> force reasoning_effort string field
+        //   "openrouter"  -> force reasoning object
+        //   "template"    -> force chat_template_kwargs.enable_thinking
+        //                    (remote servers that apply the model's own
+        //                    chat template: FreeToken, vLLM, SGLang)
+        // Editable in the endpoint dialog's Advanced pane ("Reasoning
+        // dialect"); values hand-edited into endpoints.json round-trip
+        // through the editor unchanged.
+        std::string reasoningDialect;
     };
 
     EndpointStore() = default;
@@ -100,11 +138,21 @@ public:
     // endpoint so the picker has something usable before the user opens
     // the editor. A present-but-empty file is respected as-is (so a user
     // who deletes every endpoint doesn't get one re-seeded). Malformed
-    // JSON logs a warning and starts from the seeded default.
+    // JSON (or an unreadable file) seeds the default in memory, keeps a
+    // copy of the file, and marks the store load-failed: Save() refuses
+    // to write until Load() succeeds or ResetAfterFailedLoad() is called.
     bool Load();
 
-    // Atomically rewrite endpoints.json from the in-memory list.
+    // Atomically rewrite endpoints.json from the in-memory list.  Returns
+    // false without writing while LoadFailed().
     bool Save();
+
+    // Load-failure state (see Load).  ResetAfterFailedLoad is the
+    // explicit "start fresh" choice: it re-enables Save().
+    bool LoadFailed() const { return m_loadFailed; }
+    const std::string& LoadError() const { return m_loadError; }
+    const std::string& LoadBackupPath() const { return m_loadBackupPath; }
+    void ResetAfterFailedLoad();
 
     const std::vector<Endpoint>& Endpoints() const { return m_endpoints; }
 
@@ -132,4 +180,7 @@ private:
 
     std::vector<Endpoint> m_endpoints;
     bool m_loaded = false;
+    bool m_loadFailed = false;
+    std::string m_loadError;
+    std::string m_loadBackupPath;
 };

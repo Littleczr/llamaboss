@@ -16,6 +16,16 @@
 // compatibility form too, so raw tool-call markup does not leak into
 // the chat and the requested tool still executes.
 //
+// Qwen models drift into their trained Qwen3-Coder tool format. When a
+// block has no <name> tag but opens with <function>NAME</name>,
+// <function=NAME</name>, <function>NAME</function>, <function=NAME> or
+// <function>NAME>,
+// followed only by a balanced <args>…</args> (or ONE native
+// <parameter=…>…</parameter>) and an optional </function>, NAME is
+// taken as the tool name. Name and args still pass the normal
+// IsKnownToolName / ValidateToolArgs gates. Looser shapes stay malformed,
+// with an error that quotes the <function> tag the model actually wrote.
+//
 // Only one block per assistant turn is honored.  If the model
 // emits more, additional blocks are left in the prose for the user
 // to see but do not trigger execution — simpler loop, and it
@@ -26,6 +36,32 @@
 // a well-formed literal example of the protocol can be indistinguishable
 // from an intentional tool call. Approval gates and tool risk tiers are
 // the safety layer above this parser.
+//
+// ─── Reasoning is never a tool call (2026-09-30) ─────────────────
+// ChatClient re-wraps delta.reasoning_content as inline
+// <think>…</think>, so the text both parse modes see includes the
+// model's reasoning.  Models routinely quote the protocol while
+// thinking ("I need to use the exact format: <tool_call><name>
+// powershell</name><args>...</args></tool_call>"), and before this
+// rule that example was dispatched as a real call (observed with a
+// Qwen 27B: PowerShell executed the literal "...").
+//
+// Openers are ignored when they sit in reasoning, in any of the three
+// shapes it arrives in (details at FindFirstOpenMarkerOutsideReasoning):
+//   * wrapped   <think>…</think>; an unterminated <think> hides the rest;
+//   * orphan    …reasoning…</think>  (template prefilled <think>);
+//   * leaked    reasoning that llama-server's splitter pushed into
+//               content at the first "<tool_call>" mention, closed by
+//               the model's own stray </think>.
+// A "</think>" inside the ARGS of a real call (writing source that
+// contains the tag) does not count, so such calls still dispatch.
+// Finally, a call whose entire args is a template placeholder ("...",
+// "ARGS") is returned invalid instead of executed.
+//
+// The streaming detector (display only) handles the same shapes, except
+// a complete quoted example followed later by a stray </think>: that
+// may be hidden while it streams, but it is never EXECUTED, because
+// dispatch is decided by the batch parser at completion.
 //
 // ─── Two parse modes ─────────────────────────────────────────────
 // Batch  : ParseAssistantResponse() — take a complete string,
@@ -99,6 +135,8 @@ std::string MakeToolCallDiagnosticPreview(const std::string& raw);
 
 // True if text contains a recognized tool-call opening marker. Used
 // by streaming UI cleanup to avoid flushing partial tool-call syntax.
+// Deliberately NOT reasoning-aware: it inspects the detector's small
+// held-back window, which carries no <think> context of its own.
 bool ContainsToolCallOpenMarker(const std::string& text);
 
 // ─── Streaming detector ──────────────────────────────────────────
@@ -143,6 +181,7 @@ private:
     ToolInvocation m_invocation;    // populated when m_complete flips true
     bool           m_complete = false;
     bool           m_insideBlock = false;    // past a tool-call opener
+    bool           m_inThink     = false;    // inside <think>…</think>; openers ignored
     size_t         m_blockStart  = 0;        // index of '<' in m_buffer
     size_t         m_openMarkerLen = 0;      // bytes consumed by the opener
 };

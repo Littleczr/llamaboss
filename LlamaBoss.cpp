@@ -1,5 +1,6 @@
 #define _CRT_SECURE_NO_WARNINGS
 
+#include "endpoints_dialog.h"
 #include <cassert>
 #include <cctype>
 #include <cstdio>    // snprintf (context meter's k-formatter)
@@ -11,6 +12,8 @@
 #include <wx/utils.h>
 #include <wx/thread.h>
 #include <wx/filedlg.h>
+#include <wx/file.h>
+#include <wx/datetime.h>
 #include <wx/filename.h>
 #include <wx/filefn.h>
 #include <wx/dcbuffer.h>
@@ -38,6 +41,8 @@
 #include <algorithm>
 #include <memory>
 #include <functional>
+#include <map>
+#include <iterator>
 #include <utility>
 #include <filesystem>
 #include <system_error>
@@ -62,8 +67,15 @@
 
 #include "settings.h"
 #include "chat_client.h"
+#include "context_hud.h"         // ctx meter click -> context details panel
+#include "bench_controller.h"     // /bench
+#include "prompt_prewarm.h"        // New Chat prompt-cache pre-warm
+#ifdef __WXMSW__
+#include <wx/msw/wrapwin.h>       // GetForegroundWindow (context panel visibility)
+#endif
 #include "chat_display.h"
 #include "chat_history.h"
+#include "reasoning_policy.h"
 #include "app_state.h"
 #include "conversation_sidebar.h"
 #include "attachment_manager.h"
@@ -71,6 +83,7 @@
 #include "server_manager.h"
 #include "cmd_executor.h"
 #include "python_runner.h"
+#include "python_session.h"
 #include "tool_path.h"
 #include "tool_grep.h"
 #include "tool_web_fetch.h"
@@ -83,41 +96,44 @@
 #include "project_manager.h"   // Projects Phase 1/2
 #include "project_attach_dialog.h"
 #include "project_status_strip.h"
+#include "activity_strip.h"     // live long-task progress strip above the composer
 #include "lb_themed_dialogs.h"
 #include "lb_input_parsers.h"
 #include "lb_project_ui_actions.h"
-#include "lb_update_ui.h"
 #include "lb_modal_scrim.h"
-#include "update_checker.h"
-
-wxDEFINE_EVENT(wxEVT_UPDATE_CHECK_RESULT, wxThreadEvent);
+#include "lb_about_dialog.h"
+#include "update_installer.h"
 
 // ── File-local support modules (extracted helpers) ───────────────
 #include "lb_string_utils.h"
 #include "skill_authoring_support.h"
 #include "agent_prompt_builder.h"
-#include "goal_verifier_support.h"
 #include "python_package_recovery.h"
 #include "artifact_presentation.h"
 #include "drop_import_controller.h"
 
 // ── Extracted widget & coordinator headers ────────────────────────
 #include "widgets.h"
+#include "attachment_chip.h"   // composer attachment cards
+#include "image_lightbox.h"    // full-size viewer for pending image cards
 #include "chat_input_ctrl.h"
 #include "chat_display_ctrl.h"
 #include "ui_builder.h"
+#include "settings_icon.h"
+#include "lb_hover_tile.h"
 #include "model_switcher.h"
+#include "path_safety.h"      // SameModelPath for queued-send matching
 #include "conversation_controller.h"
 #include "project_context_builder.h"
 #include "tool_result_controller.h"
 #include "reminder_store.h"
-#include "goal_controller.h"
 #include "skill_draft_controller.h"
 #include "project_controller.h"
 #include "ascii_animation.h"
+#include "var_store.h"
 
 // ─── Application version ─────────────────────────────────────
-static const char* LLAMABOSS_VERSION = "0.1.11";
+static const char* LLAMABOSS_VERSION = "0.1.20";
 
 // Native menu command ids. Keep above wxID_HIGHEST to avoid collisions
 // with stock wxWidgets commands.
@@ -125,6 +141,8 @@ enum {
     ID_ANIMATION_TIMER = wxID_HIGHEST + 2000,
     ID_ASSISTANT_DELTA_FLUSH_TIMER,
     ID_REMINDER_TIMER,
+    ID_PY_SESSION_REAP_TIMER,
+    ID_PENDING_SEND_PROTOCOL_TIMER,
 
     ID_PROJECT_NEW = wxID_HIGHEST + 2100,
     ID_PROJECT_ATTACH,
@@ -143,13 +161,7 @@ enum {
     ID_SKILL_IMPORT,
     ID_SKILL_EXPORT,
     ID_SKILL_OPEN,
-    ID_SKILL_OPEN_FOLDER,
-    ID_GOAL_SET,
-    ID_GOAL_STATUS,
-    ID_GOAL_PAUSE,
-    ID_GOAL_RESUME,
-    ID_GOAL_VERIFY,
-    ID_GOAL_CLEAR
+    ID_SKILL_OPEN_FOLDER
 };
 
 namespace {
@@ -256,66 +268,14 @@ std::string LbTraceTimestampForFilename()
     return now.Format("%Y%m%d_%H%M%S").ToStdString();
 }
 
-// Joins fire-and-forget background threads at process exit.
-//
-// CheckForUpdates() used to std::thread(...).detach().  If the user quit
-// while the HTTP check was stalled, the leftover thread kept running
-// through static destruction and could touch function-local statics
-// (ui_event_post's mutex) mid-teardown -- the classic sporadic
-// crash-on-exit that never reproduces under a debugger.
-//
-// Threads launched through the keeper behave exactly like detached ones
-// while the app runs; the keeper's destructor joins them at exit.  The
-// singleton is constructed lazily on first use (well after the statics
-// those threads depend on), so reverse-order static destruction
-// guarantees the join happens while everything they touch is still
-// alive.  UpdateChecker::CheckBlocking has a hard 8 s network timeout,
-// so the worst-case exit delay is bounded and small; typical exits see
-// no delay because no check is in flight.
-class LbBackgroundThreadKeeper
-{
-public:
-    static LbBackgroundThreadKeeper& Instance()
-    {
-        static LbBackgroundThreadKeeper keeper;
-        return keeper;
-    }
-
-    void Launch(std::function<void()> fn)
-    {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        m_threads.emplace_back(std::move(fn));
-    }
-
-    ~LbBackgroundThreadKeeper()
-    {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        for (auto& t : m_threads) {
-            if (t.joinable())
-                t.join();
-        }
-    }
-
-    LbBackgroundThreadKeeper(const LbBackgroundThreadKeeper&) = delete;
-    LbBackgroundThreadKeeper& operator=(const LbBackgroundThreadKeeper&) = delete;
-
-private:
-    LbBackgroundThreadKeeper() = default;
-
-    // Update checks are rare (gated by a per-frame in-flight flag), so the
-    // vector holds at most a handful of entries per session; finished
-    // threads join instantly at exit.
-    std::mutex m_mutex;
-    std::vector<std::thread> m_threads;
-};
+// LbBackgroundThreadKeeper moved to lb_background_threads.h (used by
+// the About dialog's update check / installer download).
 
 const wxColour& LbInteractiveAccentForTheme(const ThemeData& theme)
 {
-    // The original LlamaBoss Dark theme intentionally uses the mint assistant
-    // color for small interactive highlights (paperclip, robot, + New Chat).
-    // Other themes keep their author/palette-correct primary accent so assistant
-    // body text can remain a true foreground color instead of driving UI chrome.
-    return (theme.name == "dark") ? theme.chatAssistant : theme.accentButton;
+    // Single rule lives in theme.h so the toolbar, the settings cogwheel
+    // and the Project/Skills strip can never disagree about hover colour.
+    return LbInteractiveAccent(theme);
 }
 
 } // namespace
@@ -367,6 +327,7 @@ public:
         , m_attachments(std::make_unique<AttachmentManager>())
         , m_cmdExecutor(std::make_unique<CmdExecutor>(this, m_alive))
         , m_pythonRunner(std::make_unique<PythonRunner>(this, m_alive))
+        , m_pySessionManager(std::make_unique<PythonSessionManager>(this, m_alive))
         , m_grepExecutor(std::make_unique<GrepExecutor>(this, m_alive))
         , m_webFetchExecutor(std::make_unique<WebFetchExecutor>(this, m_alive))
         , m_toolWorker(std::make_unique<ToolWorkerExecutor>(this, m_alive))
@@ -403,6 +364,17 @@ public:
 
     void OnClose(wxCloseEvent& evt)
     {
+        // Keep the frame, event target, timers and workers usable if saving
+        // fails and the user cancels closing. Persistence must precede teardown.
+        if (m_isClosing) { evt.Skip(); return; }
+        if (!m_convController->SaveBeforeLeaving(evt.CanVeto())) {
+            if (evt.CanVeto()) { evt.Veto(); return; }
+            // Windows shutdown can disallow a veto; do not open a blocking
+            // recovery dialog then. A failed mandatory save remains logged.
+            if (auto* logger = m_appState->GetLogger())
+                logger->error("Forced close after conversation save failure.");
+        }
+
         LbMarkUiEventTargetDead(m_alive);
         // The dead token above already blocks rebroadcasts at post
         // time; detaching just removes the stale registry row.
@@ -435,16 +407,16 @@ public:
         if (m_cmdExecutor)    m_cmdExecutor->Cancel();
         if (m_grepExecutor)   m_grepExecutor->Cancel();
         if (m_pythonRunner)   m_pythonRunner->Cancel();
+        // Session kernels are long-lived by design, so frame close is
+        // where they die: Shutdown() raises the cancel flag for any
+        // in-flight exec and drops every session — each Job Object's
+        // KILL_ON_JOB_CLOSE reaps the kernel and its grandchildren.
+        m_pyReapTimer.Stop();
+        if (m_pySessionManager) m_pySessionManager->Shutdown();
         if (m_webFetchExecutor) m_webFetchExecutor->Cancel();
         if (m_toolWorker)       m_toolWorker->Cancel();
 
         m_isClosing = true;
-
-        // Durable: the window (and its in-memory history) is going away,
-        // so the file becomes the only copy.  No sidebar refresh — the
-        // frame is closing.
-        if (!m_chatHistory->IsEmpty())
-            m_convController->AutoSaveConversation(false, /*durable=*/true);
 
         m_appState->SaveWindowState(this);
 
@@ -476,14 +448,19 @@ public:
 
         wxFileName fname(wxString::FromUTF8(filePath));
         wxULongLong fileSize = fname.GetSize();
-        if (fileSize == wxInvalidSize ||
-            fileSize.GetValue() > AttachmentManager::kMaxTextFileBytes) {
-            const wxString limitText = wxString::FromUTF8(
-                ProjectSource_HumanBytes(AttachmentManager::kMaxTextFileBytes));
-            const wxString msg = wxString::FromUTF8("Text file too large (max ")
-                + limitText + wxString::FromUTF8(").");
-            wxMessageBox(msg, "Attachment Error", wxOK | wxICON_WARNING);
-            return false;
+        if (fileSize == wxInvalidSize) return false;
+
+        // RLM Phase B: small text inline-bakes exactly as before; large
+        // text routes like CSV/PDF — workspace import + handle card —
+        // instead of flooding the request (or, previously, being
+        // refused outright above 100 KB).  One threshold, shared with
+        // tool-result demotion, so "large" means the same thing on
+        // every path into the model's context.
+        if (fileSize.GetValue() > varstore::DemotionConfig{}.thresholdBytes) {
+            bool ok = m_dropImportController &&
+                      m_dropImportController->QueueLargeTextAttachmentFromDrop(filePath);
+            if (ok) RestoreComposerFocusDeferred();
+            return ok;
         }
 
         bool ok = m_attachments->AttachTextFile(filePath);
@@ -639,12 +616,6 @@ private:
         Bind(wxEVT_MENU, &MyFrame::OnSkillOpenFolder, this, ID_SKILL_OPEN_FOLDER);
         Bind(wxEVT_MENU, &MyFrame::OnProjectClear, this, ID_PROJECT_CLEAR);
         Bind(wxEVT_MENU, &MyFrame::OnProjectDelete, this, ID_PROJECT_DELETE);
-        Bind(wxEVT_MENU, &MyFrame::OnGoalSet,    this, ID_GOAL_SET);
-        Bind(wxEVT_MENU, &MyFrame::OnGoalStatus, this, ID_GOAL_STATUS);
-        Bind(wxEVT_MENU, &MyFrame::OnGoalPause,  this, ID_GOAL_PAUSE);
-        Bind(wxEVT_MENU, &MyFrame::OnGoalResume, this, ID_GOAL_RESUME);
-        Bind(wxEVT_MENU, &MyFrame::OnGoalVerify, this, ID_GOAL_VERIFY);
-        Bind(wxEVT_MENU, &MyFrame::OnGoalClear,  this, ID_GOAL_CLEAR);
     }
 
 
@@ -659,6 +630,7 @@ private:
         _modelPill      = tb.modelPill;
         _modelPillLeftBracket  = tb.modelPillLeftBracket;
         _modelLabel     = tb.modelLabel;
+        _thinkingChip   = tb.thinkingChip;
         _modelPillRightBracket = tb.modelPillRightBracket;
         _statusDot      = tb.statusDot;
         _protocolChip   = tb.protocolChip;
@@ -680,26 +652,9 @@ private:
         stripCallbacks.onSkillMenuRequested = [this](wxWindow* anchor) {
             ShowSkillPopupMenu(anchor);
         };
-        stripCallbacks.onAttachRequested = [this]() {
-            wxCommandEvent e;
-            OnProjectAttach(e);
-        };
-        // Goal action ([ Goal v ]) opens a state-aware popup menu, matching
-        // the project and skill affordances.  The menu items route through
-        // the same HandleSlashGoal / DisplayGoalStatus paths the /goal
-        // slash command uses, so behavior stays unified.
-        stripCallbacks.onGoalMenuRequested = [this](wxWindow* anchor) {
-            ShowGoalPopupMenu(anchor);
-        };
         m_projectStrip = std::make_unique<ProjectStatusStrip>(
             this, m_appState->GetTheme(), stripCallbacks);
         mainSizer->Add(m_projectStrip->GetPanel(), 0, wxEXPAND);
-
-        // NOTE: the old separate Goal status strip (BuildGoalStatusStrip)
-        // has been merged into ProjectStatusStrip as the right-hand pair
-        // on the same row.  RefreshGoalStatusStrip() is now a thin alias
-        // for RefreshProjectStrip() so the existing ~17 call sites keep
-        // working without churn.
 
         // ─── CONTENT AREA (sidebar + chat) ────────────────────────────
         _contentSizer = new wxBoxSizer(wxHORIZONTAL);
@@ -719,6 +674,18 @@ private:
             OpenNewWindow();
         };
         sidebarCallbacks.onDeleteRequested = [this](const std::vector<std::string>& paths) {
+            // Kill any persistent Python session keyed on a doomed
+            // conversation's workspace BEFORE the files go away, so
+            // the kernel can't hold handles inside a folder tree the
+            // delete is about to walk.  Best effort: a session keyed
+            // on a /cd override cwd isn't derivable here and is left
+            // for app close (S3's idle timeout is the general fix).
+            if (m_pySessionManager) {
+                for (const std::string& p : paths) {
+                    m_pySessionManager->CloseSessionFor(
+                        ChatHistory::GetConversationWorkspaceDir(p));
+                }
+            }
             m_convController->DeleteConversations(paths);
         };
         sidebarCallbacks.isBusy = [this]() {
@@ -777,17 +744,6 @@ private:
         _chatDisplayCtrl->BeginSuppressUndo();
         rightSizer->Add(_chatDisplayCtrl, 1, wxEXPAND | wxLEFT | wxRIGHT, 8);
 
-        // ─── ATTACHMENT CHIP BAR (hidden by default) ─────────────────
-        _attachChipBar = new wxPanel(_rightPanel, wxID_ANY);
-        _attachChipBar->SetBackgroundColour(m_appState->GetTheme().bgMain);
-        _attachChipSizer = new wxWrapSizer(wxHORIZONTAL);
-        _attachChipBar->SetSizer(_attachChipSizer);
-        _attachChipBar->Hide();
-        rightSizer->Add(_attachChipBar, 0, wxLEFT | wxTOP, 12);
-
-        m_attachments->SetLogger(m_appState->GetLogger());
-        m_attachments->SetOnChanged([this]() { RebuildAttachmentChips(); });
-
         // ─── INPUT AREA (via UIBuilder) ──────────────────────────────
         auto ia = UIBuilder::BuildInputArea(_rightPanel, rightSizer, m_appState->GetTheme());
         _inputContainer = ia.inputContainer;
@@ -797,6 +753,36 @@ private:
         _stopButton     = ia.stopButton;
         _attachButton   = ia.attachButton;
         _inputSizer     = ia.inputSizer;
+
+        // ─── ATTACHMENT CHIP BAR (hidden by default) ─────────────────
+        // Keep pending cards on the chat surface, immediately above the
+        // composer.  Parenting this bar to _inputContainer makes the whole
+        // full-width attachment row use bgInputArea as soon as the first
+        // chip is shown, which creates a visible horizontal band above the
+        // message field.  The separate bgMain strip preserves the original
+        // floating-card appearance while the input row remains unchanged.
+        _attachChipBar = new wxPanel(_rightPanel, wxID_ANY);
+        _attachChipBar->SetBackgroundColour(m_appState->GetTheme().bgMain);
+        _attachChipSizer = new wxWrapSizer(wxHORIZONTAL);
+        _attachChipBar->SetSizer(_attachChipSizer);
+        _attachChipBar->Hide();
+        rightSizer->Insert(
+            1, _attachChipBar, 0,
+            wxLEFT | wxTOP | wxRIGHT, FromDIP(10));
+
+        // ─── ACTIVITY STRIP (hidden by default) ──────────────────────
+        // One-row live status for a running async tool (powershell /
+        // wait / python): gauge + elapsed clock + latest output line.
+        // Sits directly above the composer so it reads as "the thing
+        // you're waiting on", not as part of the transcript.
+        m_activityStrip = std::make_unique<ActivityStrip>(
+            this, _rightPanel, m_appState->GetTheme());
+        rightSizer->Insert(
+            rightSizer->GetItemCount() - 1, m_activityStrip->GetPanel(), 0,
+            wxEXPAND | wxLEFT | wxRIGHT, 8);
+
+        m_attachments->SetLogger(m_appState->GetLogger());
+        m_attachments->SetOnChanged([this]() { RebuildAttachmentChips(); });
 
         // ─── Agent-mode toggle (Phase 4) ─────────────────────────────
         // Sits right after the attach button in _inputSizer.  Visual
@@ -867,6 +853,31 @@ private:
         m_chatDisplay->SetFont(codeFont);
         m_chatDisplay->ApplyTheme(m_appState->GetTheme());
 
+        // Live progress for pending async tools lives in the activity
+        // strip, not in the transcript.  The wait tool gets a countdown
+        // (elapsed / requested); everything else gets elapsed / timeout
+        // plus whatever the command last printed (wxEVT_CMD_OUTPUT).
+        m_chatDisplay->SetPendingToolCallbacks(
+            [this](const ToolBlock& block) {
+                if (!m_activityStrip) return;
+                ++m_activityRevision;
+                if (block.pendingWaitTotalSec > 0) {
+                    std::string title = "Waiting";
+                    if (!block.pendingWaitReason.empty())
+                        title += "  \xC2\xB7  " + block.pendingWaitReason;
+                    m_activityStrip->Begin(title, block.pendingWaitTotalSec,
+                                           /*countdown=*/true);
+                } else {
+                    m_activityStrip->Begin("Running " + block.toolName,
+                                           block.pendingTimeoutSec,
+                                           /*countdown=*/false);
+                }
+            },
+            [this]() {
+                ++m_activityRevision;
+                if (m_activityStrip) m_activityStrip->End();
+            });
+
         // Approval card buttons route back through HandleApprovalCommand
         // using the same chat-scoped semantics as the typed-command
         // fallback in TryHandlePendingApprovalInput.  Click and type both
@@ -895,7 +906,10 @@ private:
             return IsBusy();
         };
         dropImportCallbacks.displaySystemMessage = [this](const std::string& message) {
-            if (m_chatDisplay) m_chatDisplay->DisplaySystemMessage(message);
+            // Notice, not Message: the busy-drop rejection fires while a
+            // tool may be running and must not tear down its live card.
+            // With nothing live it renders identically.
+            if (m_chatDisplay) m_chatDisplay->DisplaySystemNotice(message);
         };
         dropImportCallbacks.resolveCurrentCwd = [this]() {
             return ResolveCurrentCwd();
@@ -908,8 +922,8 @@ private:
             // Workspace.  Mark the history dirty so AutoSaveConversation
             // writes the JSON even if the user never types: that puts
             // the chat in the sidebar and keeps DeleteConversation's
-            // workflow-dir cleanup reachable.  Without this the folder
-            // minted by EnsureConversationWorkflow is orphaned forever.
+            // chat-folder cleanup reachable.  Without this the folder
+            // minted by EnsureConversationChatFolder is orphaned forever.
             m_chatHistory->NoteWorkspaceSideEffect();
         };
         dropImportCallbacks.attachPdfFile =
@@ -931,6 +945,10 @@ private:
         dropImportCallbacks.attachZipFile =
             [this](const std::string& absPath, const std::string& relPath) {
                 return m_attachments->AttachZipFile(absPath, relPath);
+            };
+        dropImportCallbacks.attachTextFileRef =
+            [this](const std::string& absPath, const std::string& relPath) {
+                return m_attachments->AttachTextFileRef(absPath, relPath);
             };
         m_dropImportController =
             std::make_unique<DropImportController>(std::move(dropImportCallbacks));
@@ -963,6 +981,7 @@ private:
             m_grepExecutor.get(),
             m_cmdExecutor.get(),
             m_pythonRunner.get(),
+            m_pySessionManager.get(),
             m_webFetchExecutor.get(),
             m_toolWorker.get(),
             m_waitExecutor.get());
@@ -993,6 +1012,18 @@ private:
                 // bodies build correctly, and refresh the protocol chip.
                 _activeProtocol = proto;
                 if (_protocolChip) UpdateProtocolChip(proto);
+            },
+            /*appendThinkingSubmenu*/ [this](wxMenu& menu) {
+                if (!m_chatHistory) return;
+                auto* sub = new wxMenu;   // owned by the parent menu
+                BuildThinkingMenu(*sub);
+                // Show the current mode inline, "Thinking (Auto)", so the
+                // setting is readable without opening the submenu.
+                wxString mode = wxString::FromUTF8(
+                    ThinkingModeName(m_chatHistory->GetThinkOverride()));
+                mode = mode.Left(1).Upper() + mode.Mid(1);
+                menu.AppendSubMenu(sub, "Thinking (" + mode + ")",
+                    "Thinking override for this conversation");
             }
         });
         m_convController->SetCallbacks({
@@ -1007,13 +1038,34 @@ private:
                     m_chatHistory ? m_chatHistory->GetFilePath() : std::string();
                 if (histPath != m_ctxMeterHistoryPath) {
                     m_ctxMeterHistoryPath = histPath;
-                    InvalidateContextAnchor();
+                    // A path change is NOT always an identity change: a
+                    // new chat's first autosave assigns its path right
+                    // after the first completed turn, and rename/save-as
+                    // keep the same transcript.  Both used to drop the
+                    // exact anchor adopted seconds earlier (the "~" on
+                    // every new chat's first turn).  ChatHistory's
+                    // revision is the discriminator: Clear() and a load
+                    // reset it to 0, so an anchor whose revision is still
+                    // <= the current one describes this same transcript.
+                    const std::uint64_t rev =
+                        m_chatHistory ? m_chatHistory->GetRevision() : 0;
+                    const bool sameTranscript =
+                        m_ctxAnchorExact && rev > 0 &&
+                        rev >= m_ctxAnchorRevision;
+                    if (!sameTranscript) {
+                        InvalidateContextAnchor();
+                        // A loaded chat brings back its reply stats so
+                        // the HUD's "Last reply" / "This chat" aren't
+                        // blank until the next reply.
+                        RestoreTurnStatsFromLog();
+                    }
                 }
                 RefreshContextMeter();
             },
             /*cancelPendingSend*/     [this]() {
                 CancelPendingSendForConversationSwitch();
-            }
+            },
+            /*beforeDurableSave*/     [this]() { FlushPendingAssistantDelta(); }
         });
 
         // Initial strip render now that the controller can drive refreshes.
@@ -1033,9 +1085,18 @@ private:
                 // Pin agent iterations to this conversation's target:
                 // another window switching the app-global model mid-
                 // loop must not retarget iteration N+1.
-                return m_chatClient->SendMessage(
-                    m_modelSwitcher->ResolveTargetForConversation(),
-                    body, genId);
+                const InferenceTarget t =
+                    m_modelSwitcher->ResolveTargetForConversation();
+                // Keep the request builder's /think dialect in sync
+                // with the target actually being hit.  This body was
+                // already built (turn start set the dialect for it);
+                // the refresh covers the NEXT iteration's build.
+                if (m_chatHistory) {
+                    m_chatHistory->SetActiveReasoningDialect(
+                        t.reasoningDialect);
+                    m_chatHistory->SetActiveResponsesApi(t.responsesApi);
+                }
+                return m_chatClient->SendMessage(t, body, genId);
             },
             /*buildToolContext*/ [this]() { return BuildToolContext(); },
             /*buildSystemPrompt*/ [this]() { return BuildAgentSystemPrompt(); },
@@ -1069,39 +1130,6 @@ private:
             /*setStreamingState*/ [this](bool streaming) { SetStreamingState(streaming); },
             /*isClosing*/         [this]() { return m_isClosing; },
         });
-
-        // GoalController owns the goal lifecycle and drives frame-owned
-        // streaming/UI concerns through this callback seam.
-        m_goalController = std::make_unique<GoalController>(
-            m_chatHistory, m_chatDisplay.get(), *m_appState, *m_chatClient,
-            *m_modelSwitcher, *m_agentController, *m_convController);
-
-        m_goalController->SetCallbacks({
-            /*isBusy*/             [this]() { return IsBusy(); },
-            /*isClosing*/          [this]() { return m_isClosing; },
-            /*isAgentModeEnabled*/ [this]() { return m_agentModeEnabled; },
-            /*bumpGenerationId*/   [this]() { return ++m_generationId; },
-            /*setChatStateStreaming*/ [this]() { m_chatState = ChatState::Streaming; },
-            /*setStreamingUi*/     [this](bool s) { SetStreamingState(s); },
-            /*discardPendingAssistantDelta*/ [this]() { DiscardPendingAssistantDelta(); },
-            /*refreshGoalStatusStrip*/ [this]() { RefreshGoalStatusStrip(); },
-            /*buildAgentSystemPrompt*/ [this]() { return BuildAgentSystemPrompt(); },
-            /*skillsBlock*/        [this]() {
-                std::ostringstream s;
-                m_projectContextBuilder->AppendSkillsBlock(s);
-                return s.str();
-            },
-            /*getActiveProtocol*/  [this]() { return _activeProtocol; },
-            /*getCachedToolsArrayJson*/ [this]() { return GetCachedToolsArrayJson(); },
-            /*resetAgentToolStreamFilter*/ [this]() { ResetAgentToolStreamFilter(); },
-            /*callAfter*/          [this](std::function<void()> fn) {
-                CallAfter([this, fn = std::move(fn)]() mutable {
-                    if (m_isClosing) return;
-                    fn();
-                });
-            },
-        });
-
 
         // SkillDraftController owns the conversational Skill design-session
         // state plus the hidden Skill Draft Builder control turn.
@@ -1145,6 +1173,9 @@ private:
 
         // Animation timer
         Bind(wxEVT_TIMER, &MyFrame::OnAnimationTimer, this, m_animTimer.GetId());
+        Bind(wxEVT_TIMER, &MyFrame::OnPySessionReapTimer, this,
+             m_pyReapTimer.GetId());
+        m_pyReapTimer.Start(60 * 1000);   // sweep cadence, not the timeout
 
         // Streamed assistant chunks can arrive very quickly from local models.
         // Batch them into one UI update per frame-ish interval so wxRichTextCtrl
@@ -1158,81 +1189,141 @@ private:
         Bind(wxEVT_TIMER, &MyFrame::OnReminderTimer, this,
              m_reminderTimer.GetId());
 
+        // Queued-send safety net: fires only if tool-protocol detection
+        // never reports after the model became ready.
+        Bind(wxEVT_TIMER, &MyFrame::OnPendingSendProtocolTimeout, this,
+             m_pendingSendProtocolTimer.GetId());
 
-        // Attach (📎) button hover — use the theme's interactive accent.
-        _attachButton->Bind(wxEVT_ENTER_WINDOW, [this](wxMouseEvent& e) {
-            _attachButton->SetForegroundColour(LbInteractiveAccentForTheme(m_appState->GetTheme()));
-            _attachButton->Refresh();
-            e.Skip();
-            });
-        _attachButton->Bind(wxEVT_LEAVE_WINDOW, [this](wxMouseEvent& e) {
-            _attachButton->SetForegroundColour(m_appState->GetTheme().textMuted);
-            _attachButton->Refresh();
-            e.Skip();
-            });
+
+        // Attach (📎) button: sidebar-style hover tile plus the theme's
+        // interactive accent on the glyph.
         _attachButton->Bind(wxEVT_BUTTON, &MyFrame::OnAttachImage, this);
+        BindIconHover(_attachButton, &ThemeData::bgInputArea, true);
 
-        // Agent toggle — hover mirrors attach styling; click
-        // flips m_agentModeEnabled and re-tints.
-        _agentToggleButton->Bind(wxEVT_ENTER_WINDOW, [this](wxMouseEvent& e) {
-            if (!m_agentModeEnabled)
-                _agentToggleButton->SetForegroundColour(m_appState->GetTheme().textPrimary);
-            _agentToggleButton->Refresh();
-            e.Skip();
-        });
-        _agentToggleButton->Bind(wxEVT_LEAVE_WINDOW, [this](wxMouseEvent& e) {
-            _agentToggleButton->SetForegroundColour(
-                m_agentModeEnabled ? LbInteractiveAccentForTheme(m_appState->GetTheme())
-                                   : m_appState->GetTheme().textMuted);
-            _agentToggleButton->Refresh();
-            e.Skip();
-        });
+        // Agent toggle — same hover tile as attach; click flips
+        // m_agentModeEnabled and re-tints.  The glyph keeps its state
+        // colour (accent when ON); when OFF it brightens on hover.
         _agentToggleButton->Bind(wxEVT_BUTTON, &MyFrame::OnToggleAgentMode, this);
+        LbHoverTile::Bind(
+            _agentToggleButton,
+            [this]() -> const ThemeData& { return m_appState->GetTheme(); },
+            [](const ThemeData& t) { return t.bgInputArea; },
+            [this](bool hovered) {
+                const ThemeData& t = m_appState->GetTheme();
+                _agentToggleButton->SetForegroundColour(
+                    m_agentModeEnabled ? LbInteractiveAccentForTheme(t)
+                                       : (hovered ? t.textPrimary : t.textMuted));
+            });
         
         
         _userInputCtrl->Bind(wxEVT_TEXT_ENTER, &MyFrame::OnSendMessage, this);
         _userInputCtrl->Bind(wxEVT_TEXT, &MyFrame::OnUserInputChanged, this);
 
-        // Settings (⚙) button hover
-        _settingsButton->Bind(wxEVT_ENTER_WINDOW, [this](wxMouseEvent& e) {
-            _settingsButton->SetForegroundColour(m_appState->GetTheme().textPrimary);
-            _settingsButton->Refresh();
-            e.Skip();
-            });
-        _settingsButton->Bind(wxEVT_LEAVE_WINDOW, [this](wxMouseEvent& e) {
-            _settingsButton->SetForegroundColour(m_appState->GetTheme().textMuted);
-            _settingsButton->Refresh();
-            e.Skip();
-            });
+        // Native bitmap states handle the glyph's hover, focus, pressed and
+        // disabled colors; the hover tile adds the sidebar-style background.
         _settingsButton->Bind(wxEVT_BUTTON, &MyFrame::OnOpenSettings, this);
+        BindIconHover(_settingsButton, &ThemeData::bgToolbar, false);
 
-        // New Chat (+) button hover — use the theme's interactive accent.
-        _newChatButton->Bind(wxEVT_ENTER_WINDOW, [this](wxMouseEvent& e) {
-            _newChatButton->SetForegroundColour(LbInteractiveAccentForTheme(m_appState->GetTheme()));
-            _newChatButton->Refresh();
-            e.Skip();
-            });
-        _newChatButton->Bind(wxEVT_LEAVE_WINDOW, [this](wxMouseEvent& e) {
-            _newChatButton->SetForegroundColour(m_appState->GetTheme().textMuted);
-            _newChatButton->Refresh();
-            e.Skip();
-            });
+        // New Chat (+): hover tile + interactive accent glyph.
         _newChatButton->Bind(wxEVT_BUTTON, &MyFrame::OnNewChat, this);
+        BindIconHover(_newChatButton, &ThemeData::bgToolbar, true);
 
 
-        // Sidebar/history toggle hover — match New Chat's interactive accent affordance.
-        _sidebarToggle->Bind(wxEVT_ENTER_WINDOW, [this](wxMouseEvent& e) {
-            _sidebarToggle->SetForegroundColour(LbInteractiveAccentForTheme(m_appState->GetTheme()));
-            _sidebarToggle->Refresh();
-            e.Skip();
-            });
-        _sidebarToggle->Bind(wxEVT_LEAVE_WINDOW, [this](wxMouseEvent& e) {
-            _sidebarToggle->SetForegroundColour(m_appState->GetTheme().textMuted);
-            _sidebarToggle->Refresh();
-            e.Skip();
-            });
+        // Sidebar/history toggle (hamburger): same hover tile as + and ⚙.
         _sidebarToggle->Bind(wxEVT_BUTTON, &MyFrame::OnToggleSidebar, this);
+        BindIconHover(_sidebarToggle, &ThemeData::bgToolbar, true);
+        // About (i): same hover tile.
         _aboutButton->Bind(wxEVT_BUTTON, &MyFrame::OnAbout, this);
+        BindIconHover(_aboutButton, &ThemeData::bgToolbar, true);
+
+        // Pinned context panel follows the chat view's corner: window
+        // moves, chat view resizes (window resize, sidebar toggle, input
+        // area growing), and hides while the window is minimized.
+        Bind(wxEVT_MOVE, [this](wxMoveEvent& e) {
+            if (m_contextHud) m_contextHud->Reposition();
+            e.Skip();
+        });
+        if (_chatDisplayCtrl) {
+            _chatDisplayCtrl->Bind(wxEVT_SIZE, [this](wxSizeEvent& e) {
+                if (m_contextHud) CallAfter([this]() {
+                    if (m_contextHud) m_contextHud->Reposition();
+                });
+                e.Skip();
+            });
+        }
+        // On Windows a wxPopupWindow is WS_EX_TOPMOST: left alone it would
+        // float over other apps after you switch away, and over modal
+        // dialogs (Settings).  Hide it while LlamaBoss is not the active
+        // app/window; bring it back on reactivation.  A click on the panel
+        // itself may briefly make it the active window -- that is not a
+        // reason to hide.
+#ifndef __WXMSW__
+        Bind(wxEVT_ACTIVATE, [this](wxActivateEvent& e) {
+            if (m_contextHud) {
+                if (e.GetActive()) {
+                    if (!IsIconized() && !m_contextHud->IsShown()) {
+                        m_contextHud->Show();
+                        m_contextHud->Reposition();
+                    }
+                } else {
+                    CallAfter([this]() {
+                        if (!m_contextHud || IsActive()) return;
+                        if (wxGetActiveWindow() == m_contextHud) return;
+                        m_contextHud->Hide();
+                    });
+                }
+            }
+            e.Skip();
+        });
+#else
+        // Windows: the panel is topmost, so visibility follows one rule,
+        // polled: shown only while this frame (or the panel) is the
+        // foreground window and the frame isn't minimized.  Covers app
+        // switches, the Snipping Tool overlay, Settings and other dialogs
+        // without depending on which window happened to get the
+        // deactivate message.
+        m_contextHudVisTimer.SetOwner(this);
+        Bind(wxEVT_TIMER, [this](wxTimerEvent&) { SyncContextHudVisibility(); },
+             m_contextHudVisTimer.GetId());
+#endif
+        m_prewarmTimer.SetOwner(this);
+        Bind(wxEVT_TIMER, [this](wxTimerEvent&) {
+                 TryPromptPrewarm(m_prewarmReason);
+             }, m_prewarmTimer.GetId());
+        Bind(wxEVT_ICONIZE, [this](wxIconizeEvent& e) {
+            if (m_contextHud) {
+                if (e.IsIconized()) m_contextHud->Hide();
+                else CallAfter([this]() {
+                    if (m_contextHud) { m_contextHud->Show(); m_contextHud->Reposition(); }
+                });
+            }
+            e.Skip();
+        });
+
+        // ctx meter: click opens the context details panel; hover uses the
+        // shared accent except while the meter is showing amber/red.
+        if (_ctxMeter) {
+            _ctxMeter->SetCursor(wxCURSOR_HAND);
+            _ctxMeter->Bind(wxEVT_LEFT_UP, [this](wxMouseEvent&) { ToggleContextHud(); });
+            // Reopen the panel if it was open when the app last closed.
+            // CallAfter: the frame is shown and laid out by then, so the
+            // panel can anchor to the chat view's corner.
+            if (m_appState && m_appState->GetContextHudOpen() && m_appState->GetContextMeterOn())
+                CallAfter([this]() {
+                    if (!m_isClosing && !m_contextHud && IsShown() && !IsIconized())
+                        ToggleContextHud();
+                });
+            _ctxMeter->Bind(wxEVT_ENTER_WINDOW, [this](wxMouseEvent& e) {
+                m_ctxMeterHover = true;
+                RefreshContextMeter();
+                e.Skip();
+            });
+            _ctxMeter->Bind(wxEVT_LEAVE_WINDOW, [this](wxMouseEvent& e) {
+                m_ctxMeterHover = false;
+                RefreshContextMeter();
+                e.Skip();
+            });
+        }
         Bind(wxEVT_ACTIVATE, &MyFrame::OnFrameActivate, this);
 
         Bind(wxEVT_ASSISTANT_DELTA, &MyFrame::OnAssistantDelta, this);
@@ -1241,11 +1332,21 @@ private:
 
         // ─── /cmd (Phase 1 tool executor) ─────────────────────────
         Bind(wxEVT_CMD_COMPLETE, &ToolResultController::OnCmdComplete, m_toolResultController.get());
+        Bind(wxEVT_CMD_OUTPUT, [this](wxCommandEvent& e) {
+            if (m_isClosing || !m_activityStrip) return;
+            m_activityStrip->SetLiveLine(WxToUtf8(e.GetString()));
+        });
         Bind(wxEVT_CMD_ERROR,    &ToolResultController::OnCmdError,    m_toolResultController.get());
 
         // ─── controlled Python helper runner ─────────────────────
         Bind(wxEVT_PYTHON_COMPLETE, &ToolResultController::OnPythonComplete, m_toolResultController.get());
         Bind(wxEVT_PYTHON_ERROR,    &ToolResultController::OnPythonError,    m_toolResultController.get());
+
+        // ─── persistent Python session (RLM step 2) ──────────────
+        // S2: the py tool is router-registered, so completion routes
+        // through ToolResultController like every other async tool
+        // (agent loop first, slash card otherwise).
+        Bind(wxEVT_PY_SESSION_COMPLETE, &ToolResultController::OnPySessionComplete, m_toolResultController.get());
 
         // ─── /grep (Phase 3 threaded executor) ────────────────────
         Bind(wxEVT_GREP_COMPLETE, &ToolResultController::OnGrepComplete, m_toolResultController.get());
@@ -1253,6 +1354,36 @@ private:
         Bind(wxEVT_WEB_FETCH_ERROR,    &ToolResultController::OnWebFetchError,    m_toolResultController.get());
         Bind(wxEVT_TOOL_WORKER_COMPLETE, &ToolResultController::OnToolWorkerComplete, m_toolResultController.get());
         Bind(wxEVT_WAIT_COMPLETE, &ToolResultController::OnWaitComplete, m_toolResultController.get());
+
+        // Thinking chip: the ". Auto" segment of the model pill opens the
+        // thinking popup menu.  Same six modes as the model picker's
+        // "Thinking" submenu (see BuildThinkingMenu).
+        _thinkingChip->Bind(wxEVT_LEFT_UP, [this](wxMouseEvent&) {
+            if (!m_chatHistory || m_isClosing || IsBusy()) return;
+            wxMenu menu;
+            BuildThinkingMenu(menu);
+            // Popup menus run a nested event loop; BuildThinkingMenu's
+            // handler rechecks the guards before applying.
+            _thinkingChip->PopupMenu(&menu,
+                wxPoint(0, _thinkingChip->GetClientSize().GetHeight()));
+            if (!m_isClosing && _userInputCtrl) _userInputCtrl->SetFocus();
+        });
+        _thinkingChip->Bind(wxEVT_UPDATE_UI, [this](wxUpdateUIEvent&) {
+            RefreshThinkingSelector();
+        });
+        // Hover: the chip lights up on its own (it opens a different menu
+        // than the rest of the pill, so the brackets stay muted).
+        _thinkingChip->Bind(wxEVT_ENTER_WINDOW, [this](wxMouseEvent& e) {
+            _thinkingChip->SetForegroundColour(
+                LbInteractiveAccentForTheme(m_appState->GetTheme()));
+            _thinkingChip->Refresh();
+            e.Skip();
+        });
+        _thinkingChip->Bind(wxEVT_LEAVE_WINDOW, [this](wxMouseEvent& e) {
+            _thinkingChip->SetForegroundColour(m_appState->GetTheme().textMuted);
+            _thinkingChip->Refresh();
+            e.Skip();
+        });
 
         // Model pill click → delegate to ModelSwitcher
         auto pillClick = [this](wxMouseEvent&) {
@@ -1280,9 +1411,11 @@ private:
             _modelPillRightBracket->Bind(wxEVT_RIGHT_UP, pillRightClick);
         }
 
-        // Hover recoloring: brackets light up in mint when the pointer
-        // is anywhere over the pill (any child widget), back to muted
-        // on leave.  We bind on every child because wxWidgets does NOT
+        // Hover recoloring: brackets AND the model name light up in the
+        // interactive accent when the pointer is anywhere over the pill
+        // (any child widget); back to muted / primary on leave.  The
+        // thinking chip is excluded -- it opens its own menu and has its
+        // own hover.  We bind on every child because wxWidgets does NOT
         // propagate enter/leave events from children up to the parent
         // panel on MSW -- the panel-level enter would fire only when
         // the cursor entered the bare panel space, which is barely
@@ -1297,6 +1430,10 @@ private:
                 _modelPillRightBracket->SetForegroundColour(LbInteractiveAccentForTheme(th));
                 _modelPillRightBracket->Refresh();
             }
+            if (_modelLabel) {
+                _modelLabel->SetForegroundColour(LbInteractiveAccentForTheme(th));
+                _modelLabel->Refresh();
+            }
             e.Skip();
         };
         auto pillLeave = [this](wxMouseEvent& e) {
@@ -1308,6 +1445,10 @@ private:
             if (_modelPillRightBracket) {
                 _modelPillRightBracket->SetForegroundColour(th.textMuted);
                 _modelPillRightBracket->Refresh();
+            }
+            if (_modelLabel) {
+                _modelLabel->SetForegroundColour(th.textPrimary);
+                _modelLabel->Refresh();
             }
             e.Skip();
         };
@@ -1331,11 +1472,6 @@ private:
         // Phase 3b: tool protocol detection result
         Bind(wxEVT_TOOL_PROTOCOL_DETECTED,
              &MyFrame::OnToolProtocolDetected, this);
-
-        // Detached update-check worker result.  Posted through the
-        // alive-token gate, never CallAfter on a raw frame pointer.
-        Bind(wxEVT_UPDATE_CHECK_RESULT,
-             &MyFrame::OnUpdateCheckThreadResult, this);
     }
 
 
@@ -1353,6 +1489,14 @@ private:
             if (IsBusy()) return false;
             return TryPasteImageFromClipboard();
         });
+        _userInputCtrl->SetTextPasteHandler([this]() -> bool {
+            if (IsBusy() || m_isClosing) return false;
+            return TryPasteLargeTextFromClipboard();
+        });
+        _userInputCtrl->SetToolTip(
+            "Enter to send; Shift+Enter for a new line.\n"
+            "Large pastes become text attachments.\n"
+            "Ctrl+Shift+V pastes directly into the message instead.");
 
         // Keyboard shortcuts
         Bind(wxEVT_CHAR_HOOK, &MyFrame::OnCharHook, this);
@@ -1481,9 +1625,15 @@ private:
     wxButton*        _newChatButton;
     wxButton*        _sidebarToggle;
     wxButton*        _aboutButton;
-    std::atomic<bool> m_updateCheckInFlight{false};
     wxPanel*         _attachChipBar;
     wxWrapSizer*     _attachChipSizer;
+
+    // Decoded composer thumbnails, keyed by a cheap fingerprint of the
+    // pending item.  RebuildAttachmentChips() runs on every add, every
+    // remove, AND every theme change -- without this a 40 MB pasted
+    // screenshot would be base64-decoded and rescaled on each repaint
+    // of the strip.
+    std::map<std::string, wxImage> m_chipThumbCache;
     wxBoxSizer*      _inputSizer;
     wxBoxSizer*      _contentSizer;
 
@@ -1491,12 +1641,6 @@ private:
     wxStaticText*  _titleLabel;
     wxPanel*       _modelPill;
     wxPanel*       _topSeparator;
-
-    // Goals Phase 16: lightweight first-class Goal status strip shown
-    // directly below the existing Project strip.
-    // Goal strip widgets were removed -- merged into ProjectStatusStrip
-    // as the right-hand pair on the same row.  See TODO(rename) in
-    // project_status_strip.h.
 
     wxPanel*       _rightPanel;
     wxPanel*       _inputContainer;
@@ -1519,6 +1663,7 @@ private:
     bool m_isClosing;
 
     wxStaticText* _modelLabel;
+    wxStaticText* _thinkingChip = nullptr;   // ". Auto" segment of the model pill
     wxStaticText* _modelPillLeftBracket = nullptr;   // "[" — hover-recolored
     wxStaticText* _modelPillRightBracket = nullptr;  // "]" — hover-recolored
     StatusDot*    _statusDot;
@@ -1542,14 +1687,46 @@ private:
     //
     // Known bounded staleness (accepted for v1): a tool-protocol flip
     // changes the next request's shape by the tools-catalog size, and
-    // hidden goal/skill control turns do not update the anchor; both
+    // hidden skill control turns do not update the anchor; both
     // self-correct on the next transcript turn.
     wxStaticText* _ctxMeter = nullptr;
     long long m_ctxAnchorPromptTokens     = -1;   // -1 = no anchor
     long long m_ctxAnchorCompletionTokens = 0;
     bool      m_ctxAnchorExact            = false;
-    long long m_ctxHistoryEstimateTokens  = 0;    // fallback, cached at invalidation
+    // ChatHistory revision at anchor adoption; lets the path-change
+    // callback tell a first save / rename (same transcript, keep the
+    // anchor) from a load / New Chat (revision reset, drop it).
+    std::uint64_t m_ctxAnchorRevision     = 0;
+    // Fallback occupancy when the endpoint reports no usage: a size-based
+    // estimate of the history, re-priced whenever the history changes
+    // (keyed on object identity + ChatHistory revision) rather than only at
+    // New Chat / load, which left it stuck at the value from reset time.
+    // Mutable: filled lazily by the const ComputeContextUsage().
+    mutable long long           m_ctxHistoryEstimateTokens   = 0;
+    mutable bool                m_ctxFallbackWouldElide      = false;   // fallback estimate hit the elision cap
+    mutable const ChatHistory*  m_ctxEstimateHistory         = nullptr;
+    mutable std::uint64_t       m_ctxEstimateRevision        = 0;
     std::string m_ctxMeterHistoryPath;             // conversation-identity tracker
+    // Timings / speeds of the last completed transcript reply in this
+    // window (turn_stats.h).  Empty until the first reply; cleared with
+    // the context anchor on New Chat / load / model switch.
+    TurnStats m_lastTurnStats;
+    // Context details panel (click the ctx meter).  History of this chat's
+    // replies since the last anchor reset, and the request breakdown that
+    // produced the last reply -- captured together so the panel's
+    // per-section split always pairs with that reply's exact prompt count.
+    std::vector<TurnStats> m_chatTurnStats;
+    RequestBreakdown       m_lastRequestBreakdown;
+    ContextHud*            m_contextHud = nullptr;
+    // Windows only: re-checks every 250 ms whether the panel should be
+    // visible (see SyncContextHudVisibility).
+    wxTimer                m_contextHudVisTimer;
+    // New Chat prompt-cache pre-warm (prompt_prewarm.h).  One-shot,
+    // debounced so New Chat -> immediately open an old chat primes nothing.
+    wxTimer                m_prewarmTimer;
+    std::string            m_prewarmReason;
+    bool                   m_ctxMeterHover = false;
+    wxString  m_ctxMeterLastTooltip;
     wxString  m_ctxMeterLastLabel;                // skip redundant SetLabel churn
 
     // ─── Thread safety ────────────────────────────────────────────
@@ -1564,6 +1741,8 @@ private:
     // outlives ModelService, which outlives every frame.
     AppState*                      m_appState;
     std::unique_ptr<ChatClient>    m_chatClient;
+    // /bench runner (own ChatClient; never touches chat history).
+    std::unique_ptr<BenchController> m_bench;
     std::unique_ptr<ChatDisplay>   m_chatDisplay;
     std::unique_ptr<ChatHistory>   m_chatHistory;
     std::unique_ptr<AttachmentManager> m_attachments;
@@ -1574,6 +1753,7 @@ private:
     ModelService* m_modelService = nullptr;
     std::unique_ptr<CmdExecutor>   m_cmdExecutor;
     std::unique_ptr<PythonRunner>  m_pythonRunner;
+    std::unique_ptr<PythonSessionManager> m_pySessionManager;
     std::unique_ptr<GrepExecutor>  m_grepExecutor;
     std::unique_ptr<WebFetchExecutor> m_webFetchExecutor;
     std::unique_ptr<ToolWorkerExecutor> m_toolWorker;
@@ -1585,7 +1765,6 @@ private:
     std::unique_ptr<ProjectContextBuilder>  m_projectContextBuilder;
     std::unique_ptr<ToolResultController>   m_toolResultController;
     std::unique_ptr<AgentController>        m_agentController;
-    std::unique_ptr<GoalController>         m_goalController;
     std::unique_ptr<SkillDraftController>   m_skillDraftController;
     std::unique_ptr<ProjectController>      m_projectController;
     std::unique_ptr<DropImportController>   m_dropImportController;
@@ -1593,6 +1772,12 @@ private:
     // Project status strip — replaces the native menu bar; renders
     // current project state in a single line under the top toolbar.
     std::unique_ptr<ProjectStatusStrip>     m_projectStrip;
+    std::unique_ptr<ActivityStrip>          m_activityStrip;
+    // Main-thread operation identity. Begin AND End invalidate a modal
+    // Stop confirmation, even if another tool starts before it returns.
+    std::uint64_t m_activityRevision = 0;
+    // Filled by the synchronous setup tool; consumed after the agent loop ends.
+    std::string m_pendingSetupModel;
 
     // Agent mode — when true, the next user message begins an
     // agent loop via m_agentController->Begin().  Toggled by the
@@ -1607,20 +1792,90 @@ private:
     // loading.  |modelPath| records which model the prompt was queued under,
     // so a model switch between queueing and ready drops the prompt instead
     // of misdirecting it.
+    //
+    // The composer is the single source of truth for the queued text.  The
+    // prompt is NOT copied out of the input box: it stays there, visibly,
+    // until the matching model is ready and it is sent through the normal
+    // path.  Every cancel site therefore just clears the flag — the user's
+    // text is never lost, and no cancel path has to explain what it dropped.
     struct PendingSend {
         bool        active = false;
-        std::string userInput;
+        // Model is ready but tool-protocol detection has not resolved yet.
+        // The prompt fires from OnToolProtocolDetected (or the protocol
+        // wait timer) so the first request is built with the real protocol.
+        bool        awaitingProtocol = false;
         std::string modelPath;
     };
     PendingSend m_pendingSend;
 
+    // Safety net: if detection never reports (probe hang), fall back to
+    // XML and send anyway rather than leave the prompt stuck "Queued".
+    wxTimer m_pendingSendProtocolTimer{this, ID_PENDING_SEND_PROTOCOL_TIMER};
+    static constexpr int kPendingSendProtocolTimeoutMs = 15000;
+
+    // Flip the composer into / out of "queued behind a model load" state.
+    void SetPendingSendUi(bool queued)
+    {
+        if (!_sendButton) return;
+        _sendButton->SetLabel(queued ? "Queued" : "Send");
+        _sendButton->Enable(!queued);
+        if (auto* parent = _sendButton->GetParent()) parent->Layout();
+    }
+
+    void ClearPendingSend()
+    {
+        if (m_pendingSendProtocolTimer.IsRunning())
+            m_pendingSendProtocolTimer.Stop();
+        if (!m_pendingSend.active) return;
+        m_pendingSend = PendingSend{};
+        SetPendingSendUi(false);
+    }
+
+    // Fire the prompt that was queued behind a model load.  Caller has
+    // already verified the ready model matches m_pendingSend.modelPath
+    // and that the tool protocol is resolved (or deliberately defaulted).
+    void FlushPendingSend()
+    {
+        if (!m_pendingSend.active) return;
+        ClearPendingSend();
+
+        if (IsBusy() || HasPendingApproval()) {
+            m_chatDisplay->DisplaySystemNotice(
+                "Another operation started before the model finished "
+                "loading. Your message is still in the input box.");
+            return;
+        }
+
+        // Read the composer *now*: any edits the user made while
+        // waiting are exactly what should go out.
+        std::string queued = WxToUtf8(_userInputCtrl->GetValue());
+        const size_t firstNonWs = queued.find_first_not_of(" \t\r\n");
+        if (firstNonWs == std::string::npos) queued.clear();
+        else if (firstNonWs > 0)             queued.erase(0, firstNonWs);
+        DispatchUserTurn(queued);
+    }
+
+    void OnPendingSendProtocolTimeout(wxTimerEvent&)
+    {
+        if (m_isClosing) return;
+        if (!m_pendingSend.active || !m_pendingSend.awaitingProtocol) return;
+
+        if (_activeProtocol == ToolProtocol::Unknown) {
+            _activeProtocol = ToolProtocol::Xml;
+            if (_protocolChip) UpdateProtocolChip(ToolProtocol::Xml);
+            if (auto* logger = m_appState->GetLogger())
+                logger->warning(
+                    "Tool protocol detection did not report in time for a "
+                    "queued prompt - sending with xml");
+        }
+        FlushPendingSend();
+    }
+
     void CancelPendingSendForConversationSwitch()
     {
-        m_pendingSend = PendingSend{};
+        ClearPendingSend();
         if (m_skillDraftController)
             m_skillDraftController->CancelForChatSwitch(/*notifyUser=*/false);
-        if (m_goalController)
-            m_goalController->ResetTransientState();
     }
 
 
@@ -1631,6 +1886,7 @@ private:
     struct PendingSlashApproval {
         ToolInvocation invocation;
         ToolContext    context;
+        std::string    writeRootGrant;
         bool           active = false;
     };
     PendingSlashApproval m_pendingSlashApproval;
@@ -1812,14 +2068,12 @@ private:
         }
     }
 
-    // Goals Phase 10 captures the typed AgentEvent stream for the active
-    // goal; Phase 3 also tees the same stream to a per-loop JSONL trace.
-    // Both observers run before the default sink bridge fans events back out
-    // to existing UI callbacks, so renderer behavior stays unchanged.
+    // Phase 3 tees the typed AgentEvent stream to a per-loop JSONL trace
+    // before the default sink bridge fans events back out to existing UI
+    // callbacks, so renderer behavior stays unchanged.
     void OnAgentEvent(const AgentEvent& event) override
     {
         AppendAgentTraceEvent(event);
-        m_goalController->RecordStructuredAgentEvidence(event);
         AgentEventSink::OnAgentEvent(event);
     }
 
@@ -1830,10 +2084,6 @@ private:
     // a Stop-button enable, etc.).
     void OnAgentLoopBegin() override
     {
-        // Fresh per-turn observation. A goal continuation should only spin
-        // the outer verifier loop when real work occurred, unless this very
-        // loop was itself launched automatically by the goal verifier.
-        m_goalController->NoteAgentLoopBegin();
     }
 
     // Between iterations: the previous streaming worker has exited
@@ -1863,7 +2113,6 @@ private:
     void OnAgentToolBlock(const ToolBlock& block,
                           bool startExpanded) override
     {
-        m_goalController->NoteAgentToolOutput();
         m_chatDisplay->DisplayToolBlock(block, startExpanded);
     }
 
@@ -1922,23 +2171,33 @@ private:
             m_chatDisplay->DisplaySystemMessage(userFacingMessage);
         }
 
-        const bool savedInterruptedGoal =
-            m_goalController->NoteAgentLoopEnd(reason);
-
         m_chatClient->ResetStreamingState();
         ResetAgentToolStreamFilter();
         SetStreamingState(false);
         m_chatDisplay->ClearFilePersistenceContext();
-        if (!savedInterruptedGoal && !m_chatHistory->IsEmpty())
+        if (!m_chatHistory->IsEmpty())
             m_convController->AutoSaveConversation();
 
-        m_goalController->MaybeScheduleVerificationAfterLoopEnd();
+        if (!m_pendingSetupModel.empty()) {
+            const std::string modelToUse = std::move(m_pendingSetupModel);
+            m_pendingSetupModel.clear();
+            if (!m_isClosing && reason == AgentEndReason::Normal) {
+                // Streaming state and agent activity are now reset. Use the same
+                // switch path as the model picker, including multi-window checks.
+                m_modelSwitcher->SwitchToModel(modelToUse);
+                _userInputCtrl->SetFocus();
+            }
+            return;
+        }
     }
     // ─── Chat state machine ──────────────────────────────────────
     ChatState m_chatState;
 
     // ── ASCII Animation ──────────────────────────────────────────
     wxTimer                          m_animTimer{this, ID_ANIMATION_TIMER};
+    // Sweeps idle Python sessions every minute; a session is reaped
+    // after PythonSessionManager::kIdleReapAfterMs without an exec.
+    wxTimer                          m_pyReapTimer{this, ID_PY_SESSION_REAP_TIMER};
     std::unique_ptr<AsciiAnimation>  m_activeAnimation;
 
     // Assistant streaming delta batcher.  The worker still posts deltas as
@@ -1966,16 +2225,40 @@ private:
     std::string           m_agentTraceActiveToolName;
     std::string           m_agentTraceActiveSignature;
     std::string           m_agentTraceActiveCallId;
-    std::string           m_workflowRootEnsuredForFilePath;
+    std::string           m_chatFolderEnsuredForFilePath;
     std::string           m_workspaceDirEnsuredForFilePath;
 
     // ═════════════════════════════════════════════════════════════
     //  HELPERS
     // ═════════════════════════════════════════════════════════════
 
+    // Sidebar-style hover tile for a flat icon button.  `restingBg` names
+    // the ThemeData slot the button normally sits on.  With tintGlyph the
+    // glyph also switches to the interactive accent while hovered (the
+    // previous hover behavior), otherwise only the background changes
+    // (the settings cogwheel tints its own SVG via native bitmap states).
+    void BindIconHover(wxButton* button, wxColour ThemeData::* restingBg,
+                       bool tintGlyph)
+    {
+        std::function<void(bool)> glyph;
+        if (tintGlyph) {
+            glyph = [this, button](bool hovered) {
+                const ThemeData& t = m_appState->GetTheme();
+                button->SetForegroundColour(
+                    hovered ? LbInteractiveAccentForTheme(t) : t.textMuted);
+            };
+        }
+        LbHoverTile::Bind(
+            button,
+            [this]() -> const ThemeData& { return m_appState->GetTheme(); },
+            [restingBg](const ThemeData& t) { return t.*restingBg; },
+            glyph);
+    }
+
     void ApplyThemeToUI()
     {
         const ThemeData& t = m_appState->GetTheme();
+        if (m_contextHud) m_contextHud->ApplyTheme(t);
 
         SetBackgroundColour(t.bgMain);
 
@@ -1985,13 +2268,16 @@ private:
         _titleLabel->SetForegroundColour(t.textPrimary);
         _modelPill->SetBackgroundColour(t.bgToolbar);
         _modelLabel->SetForegroundColour(t.textPrimary);
+        if (_thinkingChip) {
+            _thinkingChip->SetForegroundColour(t.textMuted);
+            _thinkingChip->Refresh();
+        }
         if (_modelPillLeftBracket)  _modelPillLeftBracket->SetForegroundColour(t.textMuted);
         if (_modelPillRightBracket) _modelPillRightBracket->SetForegroundColour(t.textMuted);
         if (_protocolChip) UpdateProtocolChip(_activeProtocol);
         _newChatButton->SetBackgroundColour(t.bgToolbar);
         _newChatButton->SetForegroundColour(t.textMuted);
-        _settingsButton->SetBackgroundColour(t.bgToolbar);
-        _settingsButton->SetForegroundColour(t.textMuted);
+        LbSettingsIcon::Apply(_settingsButton, t);
         _aboutButton->SetBackgroundColour(t.bgToolbar);
         _aboutButton->SetForegroundColour(t.textMuted);
         _topSeparator->SetBackgroundColour(t.borderSubtle);
@@ -2003,12 +2289,9 @@ private:
             RefreshContextMeter();
         }
 
-        // Merged Project + Goal strip.  ApplyTheme() repaints both
-        // halves at once and also fixes the prior latent issue where
-        // the project strip itself was never re-themed (only the old
-        // separate goal strip was).
         if (m_projectStrip) m_projectStrip->ApplyTheme(t);
-        RefreshGoalStatusStrip();   // alias for RefreshProjectStrip()
+        if (m_activityStrip) m_activityStrip->ApplyTheme(t);
+        RefreshProjectStrip();
 
         if (m_sidebar) m_sidebar->ApplyTheme(t);
 
@@ -2040,13 +2323,121 @@ private:
         Update();
     }
 
+    // ── Composer attachment cards ──────────────────────────
+    //
+    // The pending-attachment strip shows a thumbnail card per queued
+    // image and a labelled file card for everything else.  Painting
+    // lives in AttachmentChip; the frame's job is turning a
+    // PendingAttachment into an AttachmentChipModel and keeping the
+    // decode off the repaint path.
+
+    static std::string ChipThumbKey(const PendingAttachment& item)
+    {
+        // Name + payload length + a 24-byte payload prefix separates two
+        // same-named pastes.  Hashing 40 MB of base64 would cost more
+        // than the decode the cache exists to avoid.
+        return item.name + "|" + std::to_string(item.data.size()) + "|" +
+               item.data.substr(0, std::min<size_t>(24, item.data.size()));
+    }
+
+    // Decode a pending image's base64 payload at full resolution.
+    // Returns an invalid image for anything wx can't parse.
+    static wxImage DecodePendingImage(const PendingAttachment& item)
+    {
+        std::string raw;
+        try {
+            std::istringstream b64(item.data);
+            Poco::Base64Decoder decoder(b64);
+            raw.assign(std::istreambuf_iterator<char>(decoder),
+                       std::istreambuf_iterator<char>());
+        } catch (...) {
+            return wxImage();
+        }
+        if (raw.empty()) return wxImage();
+
+        wxImage img;
+        {
+            // A corrupt or exotic payload is a fallback, not a dialog.
+            wxLogNull quiet;
+            wxMemoryInputStream ms(raw.data(), raw.size());
+            if (!img.LoadFile(ms, wxBITMAP_TYPE_ANY) || !img.IsOk())
+                return wxImage();
+        }
+        return img;
+    }
+
+    // Decode a pending image's base64 payload into a small preview
+    // (longest side <= 240 px).  Returns an invalid image for anything
+    // wx can't parse -- the chip falls back to a file card on its own.
+    wxImage GetChipThumbnail(const PendingAttachment& item)
+    {
+        const std::string key = ChipThumbKey(item);
+        if (auto it = m_chipThumbCache.find(key); it != m_chipThumbCache.end())
+            return it->second;
+
+        wxImage img = DecodePendingImage(item);
+        if (!img.IsOk()) return wxImage();
+
+        const int maxSide = 240;
+        const int w = img.GetWidth(), h = img.GetHeight();
+        if (w > maxSide || h > maxSide) {
+            const double s = std::min((double)maxSide / w, (double)maxSide / h);
+            img.Rescale(std::max(1, (int)(w * s)),
+                        std::max(1, (int)(h * s)), wxIMAGE_QUALITY_HIGH);
+        }
+
+        if (m_chipThumbCache.size() > 24) m_chipThumbCache.clear();
+        m_chipThumbCache[key] = img;
+        return img;
+    }
+
+    static std::string ChipKindLabel(const PendingAttachment& item)
+    {
+        switch (item.type) {
+            case PendingAttachment::Type::Image:           return "Image";
+            case PendingAttachment::Type::PdfFile:         return "PDF document";
+            case PendingAttachment::Type::SpreadsheetFile: return "Spreadsheet";
+            case PendingAttachment::Type::DocxFile:        return "Word document";
+            case PendingAttachment::Type::CsvFile:         return "CSV data";
+            case PendingAttachment::Type::ZipFile:         return "ZIP archive";
+            case PendingAttachment::Type::TextFileRef:     return "Text file (workspace)";
+            case PendingAttachment::Type::TextFile:        return "Text file";
+        }
+        return "File";
+    }
+
+    // Click on a pending image card → full-size lightbox, same viewer
+    // the transcript thumbnails use.  Decoded fresh at full resolution
+    // (the chip cache only holds 240 px previews).  The index is
+    // re-validated because this runs via CallAfter.
+    void OpenPendingImageViewer(size_t idx)
+    {
+        if (!m_attachments || idx >= m_attachments->GetCount()) return;
+
+        const PendingAttachment& item = m_attachments->GetAt(idx);
+        if (item.type != PendingAttachment::Type::Image) return;
+
+        const wxString name = wxString::FromUTF8(item.name);
+        wxImage full;
+        {
+            wxBusyCursor busy;   // a 40 MB paste takes a beat to decode
+            full = DecodePendingImage(item);
+        }
+        if (!full.IsOk()) { wxBell(); return; }
+
+        const ThemeData& t = m_appState->GetTheme();
+        LbShowImageLightbox(*this, std::move(full),
+                            t.bgMain, t.textPrimary, name);
+    }
+
     void RebuildAttachmentChips()
     {
         _attachChipSizer->Clear(true);
 
         if (!m_attachments->HasPending()) {
+            m_chipThumbCache.clear();
             _attachChipBar->Hide();
-            _rightPanel->GetSizer()->Layout();
+            LayoutInputAreaOnly();
             return;
         }
 
@@ -2054,20 +2445,29 @@ private:
 
         for (size_t i = 0; i < m_attachments->GetCount(); ++i) {
             const auto& item = m_attachments->GetAt(i);
-            std::string icon = (item.type == PendingAttachment::Type::Image)
-                ? "\xF0\x9F\x96\xBC" : "\xF0\x9F\x93\x84";
+
+            AttachmentChipModel model;
+            model.name      = item.name;
+            model.kindLabel = ChipKindLabel(item);
+            model.byteSize  = item.originalSize;
+            model.isImage   = (item.type == PendingAttachment::Type::Image);
+            if (model.isImage) model.preview = GetChipThumbnail(item);
 
             auto* chip = new AttachmentChip(
-                _attachChipBar, i, icon, item.name,
-                t.attachChipBg, t.attachIndicator, t.textMuted,
-                [this](size_t idx) { m_attachments->RemoveAt(idx); }
-            );
-            _attachChipSizer->Add(chip, 0, wxRIGHT | wxBOTTOM, 6);
+                _attachChipBar, i, std::move(model), t,
+                [this](size_t idx) { m_attachments->RemoveAt(idx); },
+                [this](size_t idx) { OpenPendingImageViewer(idx); });
+
+            _attachChipSizer->Add(chip, 0, wxRIGHT | wxBOTTOM, FromDIP(8));
         }
 
         _attachChipBar->Show();
         _attachChipBar->Layout();
-        _rightPanel->GetSizer()->Layout();
+
+        // The strip is a sibling immediately above the composer.  Re-layout
+        // the right panel so its newly visible height is taken from the chat
+        // display without changing the message row itself.
+        LayoutInputAreaOnly();
     }
 
     void SetStreamingState(bool streaming)
@@ -2138,7 +2538,125 @@ private:
     bool IsBusy() const
     {
         return m_chatState != ChatState::Idle ||
+               (m_bench && m_bench->IsRunning()) ||
+               (m_convController && m_convController->IsSaveRecoveryActive()) ||
                (m_agentController && m_agentController->IsActive());
+    }
+
+    static bool ThinkingModeAtSelection(int selection, ChatHistory::ThinkOverride& mode)
+    {
+        using Think = ChatHistory::ThinkOverride;
+        switch (selection) {
+            case 0: mode = Think::Auto;   return true;
+            case 1: mode = Think::Off;    return true;
+            case 2: mode = Think::On;     return true;
+            case 3: mode = Think::Low;    return true;
+            case 4: mode = Think::Medium; return true;
+            case 5: mode = Think::High;   return true;
+            default: return false;
+        }
+    }
+
+    static const char* ThinkingModeName(ChatHistory::ThinkOverride mode)
+    {
+        using Think = ChatHistory::ThinkOverride;
+        switch (mode) {
+            case Think::On:     return "on";
+            case Think::Off:    return "off";
+            case Think::Low:    return "low";
+            case Think::Medium: return "medium";
+            case Think::High:   return "high";
+            default:           return "auto";
+        }
+    }
+
+    bool ConversationRequiresReasoning()
+    {
+        if (!m_modelSwitcher) return false;
+        const InferenceTarget target =
+            m_modelSwitcher->ResolveTargetForConversation();
+        return !target.managed && !target.imageOutput &&
+            lb_reasoning::RequiresReasoning(target.modelId,
+                target.reasoningDialect == ReasoningDialect::OpenAIStyle);
+    }
+
+    // Fills a menu with the six thinking modes as radio items, the
+    // current mode checked, and binds a handler that applies the pick.
+    // Used both by the chip's own popup and as the "Thinking" submenu of
+    // the model picker (the submenu handler runs before the parent
+    // menu's, and does not Skip, so the model picker never sees it).
+    void BuildThinkingMenu(wxMenu& menu)
+    {
+        static const char* labels[] = { "Auto (model default)", "Off", "On",
+                                        "Low", "Medium", "High" };
+        std::vector<int> ids(6, wxID_NONE);
+        const ChatHistory::ThinkOverride current = m_chatHistory
+            ? m_chatHistory->GetThinkOverride()
+            : ChatHistory::ThinkOverride::Auto;
+        const bool requiresReasoning = ConversationRequiresReasoning();
+        for (int selection = 0; selection < 6; ++selection) {
+            auto* item = menu.AppendRadioItem(wxID_ANY,
+                wxString::FromUTF8(selection == 1 && requiresReasoning
+                    ? "Off (unavailable for this model)" : labels[selection]));
+            ids[selection] = item->GetId();
+            ChatHistory::ThinkOverride mode;
+            if (ThinkingModeAtSelection(selection, mode))
+                item->Check(mode == current);
+            if (selection == 1 && requiresReasoning) item->Enable(false);
+        }
+        menu.Bind(wxEVT_MENU, [this, ids](wxCommandEvent& event) {
+            if (!m_chatHistory || m_isClosing || IsBusy()) return;
+            for (int selection = 0; selection < 6; ++selection) {
+                ChatHistory::ThinkOverride mode;
+                if (event.GetId() == ids[selection] &&
+                    ThinkingModeAtSelection(selection, mode)) {
+                    SetConversationThinking(mode);
+                    return;
+                }
+            }
+        });
+    }
+
+    void RefreshThinkingSelector()
+    {
+        if (!_thinkingChip || !m_chatHistory) return;
+        wxString mode = wxString::FromUTF8(
+            ThinkingModeName(m_chatHistory->GetThinkOverride()));
+        mode = mode.Left(1).Upper() + mode.Mid(1);
+        // "\xC2\xB7" == U+00B7 middle dot, the pill's segment separator.
+        const wxString label = wxString::FromUTF8("\xC2\xB7 ") + mode;
+        if (_thinkingChip->GetLabel() != label) {
+            _thinkingChip->SetLabel(label);
+            _thinkingChip->Refresh();
+            // Width changed: reflow the pill and re-center it in the bar.
+            if (auto* parent = _thinkingChip->GetParent()) {
+                parent->Layout();
+                if (auto* grand = parent->GetParent()) grand->Layout();
+            }
+        }
+    }
+
+    void SetConversationThinking(ChatHistory::ThinkOverride mode)
+    {
+        if (!m_chatHistory) return;
+        if (mode == ChatHistory::ThinkOverride::Off &&
+            ConversationRequiresReasoning()) {
+            m_chatDisplay->DisplaySystemMessage(
+                "This model requires reasoning. Choose Low for the lowest "
+                "effort, or Auto to use the model's default. "
+                "The current thinking setting has not changed.");
+            return;
+        }
+        m_chatHistory->SetThinkOverride(mode);
+        RefreshThinkingSelector();
+        m_chatDisplay->DisplaySystemMessage(
+            std::string("Thinking set to ") + ThinkingModeName(mode) +
+            " for this conversation. Applies to the next message." +
+            (mode == ChatHistory::ThinkOverride::Auto
+                ? " Using the model's default." : ""));
+        // Reuse normal persistence; an empty chat remains unsaved until it
+        // has content, and then carries its selected mode with its snapshot.
+        if (m_convController) m_convController->AutoSaveConversation();
     }
 
     static bool IsPythonAsyncToolName(const std::string& toolName)
@@ -2192,6 +2710,7 @@ private:
             m_agentModeEnabled
               ? "\xF0\x9F\xA4\x96 Agent mode ON. The model can use read/ls/open/grep/pwd/powershell."
               : "\xF0\x9F\xA4\x96 Agent mode OFF.");
+        if (m_agentModeEnabled) SchedulePromptPrewarm("agent mode on");
     }
 
     void OnAttachImage(wxCommandEvent&)
@@ -2255,8 +2774,8 @@ private:
         // same Queue* helpers the drop path uses, so the click and drag
         // paths share the cwd-copy logic, the 100 MB cap, and the
         // system-message feedback.  IsCsvFile MUST be tested before
-        // IsTextFile.  .docm is intentionally not auto-routed here even
-        // though IsDocxFile() accepts it -- matches the drop-target gate.
+        // IsTextFile.  .docm is intentionally not auto-routed here --
+        // matches the drop-target gate.
         for (const auto& path : paths) {
             if (m_attachments->GetCount() >= AttachmentManager::kMaxAttachments) {
                 hitCap = true;
@@ -2345,10 +2864,8 @@ private:
 
         // Hidden control turns are deliberately invisible: they have no
         // assistant placeholder in the user-visible transcript, so streamed
-        // contract-builder/verifier/Skill-draft deltas must not append onto
-        // the previous assistant reply.
-        if ((m_goalController && m_goalController->AnyHiddenTurnInFlight()) ||
-            (m_skillDraftController && m_skillDraftController->AnyHiddenTurnInFlight())) return;
+        // Skill-draft deltas must not append onto the previous assistant reply.
+        if (m_skillDraftController && m_skillDraftController->AnyHiddenTurnInFlight()) return;
 
         m_chatHistory->AppendToLastAssistantMessage(delta);
 
@@ -2390,11 +2907,11 @@ private:
     // ── Generated images (image-output models) ───────────────────
     // Decode the base64 data URLs an image model returned, persist
     // them under the conversation's artifacts folder, attach the
-    // workflow-relative paths to the assistant message (sidecar,
+    // chat-folder-relative paths to the assistant message (sidecar,
     // survives save/load), and render thumbnails in the chat.
     //
     // Runs on the UI thread from OnAssistantComplete: the decode is
-    // a few ms even for multi-MB images, and both the workflow-path
+    // a few ms even for multi-MB images, and both the chat-folder-path
     // resolution and the history mutation are UI-thread-only anyway.
     void HandleGeneratedImages(const std::vector<std::string>& dataUrls)
     {
@@ -2408,7 +2925,7 @@ private:
             return;
         }
 
-        ChatHistory::EnsureWorkflowDir(convPath);
+        ChatHistory::EnsureChatFolder(convPath, m_chatHistory->GetChatFolderTitle());
         const std::string genDir = ChatHistory::GetGeneratedFilesDir(convPath);
         const std::string relDir = ChatHistory::GetGeneratedFilesRelDir(convPath);
         if (!wxDirExists(wxString::FromUTF8(genDir))) {
@@ -2563,8 +3080,8 @@ private:
         // object (wx/event.h keeps a raw m_clientObject; no wx destructor
         // frees it -- it exists for pointing at control-owned item data).
         // Take ownership as the very first action so EVERY exit path,
-        // including the stale-generation guard and the hidden skill/goal
-        // turn consumes below, frees the payload.  Image-generation turns
+        // including the stale-generation guard and the hidden skill
+        // turn consume below, frees the payload.  Image-generation turns
         // carry the full base64 image data in here, so the old leak was
         // multiple MB per generated image and one small payload per agent
         // iteration on text turns.
@@ -2586,12 +3103,20 @@ private:
         // Hidden control turns are not transcript replies.  Their streamed
         // deltas were discarded above; consume their completed text before
         // any normal chat UI finalization runs.
-        if (m_skillDraftController->ConsumeAssistantComplete(fullResponse)) return;
-        if (m_goalController->ConsumeAssistantComplete(fullResponse)) return;
+        // A hidden Skill draft must not reach the save path when the
+        // worker cut it short, even if its partial text looks valid.
+        const bool interruptedTurn =
+            payload && payload->Stats().stoppedForRepetition;
+        if (interruptedTurn) {
+            if (m_skillDraftController->ConsumeAssistantError(
+                    "Stopped this reply: the model kept repeating the same text. "
+                    "The interrupted Skill draft was not saved.")) return;
+        }
+        else if (m_skillDraftController->ConsumeAssistantComplete(fullResponse)) return;
 
         // Context meter: adopt the server's exact token usage for this
         // completed transcript turn as the occupancy anchor.  Placed
-        // AFTER the hidden-turn consumes above on purpose — goal/skill
+        // AFTER the hidden-turn consume above on purpose — skill
         // control turns are built from different (smaller) prompts and
         // would drag the anchor below the real transcript occupancy.
         // Agent-loop iterations do flow through here and re-anchor on
@@ -2604,8 +3129,37 @@ private:
                     payload->CompletionTokens() > 0
                         ? payload->CompletionTokens() : 0;
                 m_ctxAnchorExact = true;
-                RefreshContextMeter();
+                m_ctxAnchorRevision =
+                    m_chatHistory ? m_chatHistory->GetRevision() : 0;
+                // Self-calibrating elision budget: same request/usage
+                // pairing as the calibration log below.
+                if (m_chatHistory)
+                    m_chatHistory->RecordExactPromptTokens(payload->PromptTokens());
+                LogContextCalibration(payload->PromptTokens());
             }
+            // Speeds / timings for this reply: shown in the ctx meter
+            // tooltip and appended to the chat folder's turn_stats.tsv.
+            m_lastTurnStats = payload->Stats();
+            if (m_lastTurnStats.stoppedForRepetition) {
+                m_chatDisplay->DisplaySystemNotice(
+                    m_agentController->IsActive()
+                    ? "Stopped this reply: the model kept repeating the same text. "
+                      "The agent turn was ended and no tool call from this reply "
+                      "was run. Send your message again or rephrase it; if it "
+                      "keeps happening with this model, try /think off."
+                    : "Stopped this reply: the model kept repeating the same text. "
+                      "Send your message again or rephrase it; if it keeps "
+                      "happening with this model, try /think off.");
+            }
+            if (m_chatHistory)
+                m_lastRequestBreakdown = m_chatHistory->GetLastBuildBreakdown();
+            if (!m_lastTurnStats.empty()) {
+                if (m_chatTurnStats.size() >= 1000)
+                    m_chatTurnStats.erase(m_chatTurnStats.begin());
+                m_chatTurnStats.push_back(m_lastTurnStats);
+            }
+            LogTurnStats(m_lastTurnStats);
+            RefreshContextMeter();
         }
 
         // Phase 3 bugfix #3: extract native tool_calls before deciding
@@ -2619,6 +3173,15 @@ private:
             toolCallsJson = payload->ToolCallsJson();
             imageDataUrls = payload->TakeImageDataUrls();
         }
+
+        // Repetition-guard stop (repetition_guard.h): the reply was cut
+        // off by LlamaBoss, not finished by the model.  Treat it as an
+        // interrupted turn -- keep the partial text, but never act on it.
+        // ChatWorkerThread already drops native tool calls from such a
+        // reply; clearing here as well keeps the invariant local, and the
+        // agent routing below ends the loop instead of letting the
+        // controller parse an XML <tool_call> out of fullResponse.
+        if (interruptedTurn) toolCallsJson.clear();
 
         const auto hasVisibleText = [](const std::string& text) -> bool {
             return text.find_first_not_of(" \t\r\n") != std::string::npos;
@@ -2634,13 +3197,20 @@ private:
             !toolCallsJson.empty() &&
             !hasVisibleText(fullResponse) &&
             m_agentToolVisibleProseLen == 0;
-        const bool agentToolOnlyCall = xmlToolOnlyCall || nativeToolOnlyCall;
+        const bool agentEmptyCompletion =
+            agentStreamActive &&
+            toolCallsJson.empty() &&
+            imageDataUrls.empty() &&
+            !hasVisibleText(fullResponse) &&
+            m_agentToolVisibleProseLen == 0;
+        const bool suppressAgentAssistantRow =
+            xmlToolOnlyCall || nativeToolOnlyCall || agentEmptyCompletion;
 
         if (agentStreamActive) {
             FlushAgentHeldProseIfSafe();
         }
 
-        if (agentToolOnlyCall) {
+        if (suppressAgentAssistantRow) {
             m_chatDisplay->CancelPendingAssistantDisplay();
         } else {
             m_chatDisplay->DisplayAssistantComplete();
@@ -2652,6 +3222,19 @@ private:
         else if (auto* logger = m_appState->GetLogger();
                  logger && toolCallsJson.empty() && imageDataUrls.empty()) {
             logger->warning("Assistant complete event arrived empty; keeping streamed content");
+        }
+
+        // OpenAI Responses (Phase 2): keep the model's own output items
+        // (encrypted reasoning + function calls) on this assistant turn.
+        // Must land BEFORE the agent controller attaches tool_calls and
+        // appends the first tool result, so the next iteration's request
+        // can replay reasoning in front of the calls it produced.  The
+        // adapter only replays entries whose call ids survive the
+        // controller's batch/overflow filtering.
+        if (payload && !toolCallsJson.empty() &&
+            !payload->ResponsesOutputJson().empty()) {
+            m_chatHistory->SetLastAssistantResponsesOutput(
+                payload->ResponsesOutputJson());
         }
 
         // ── Generated images (image-output models) ───────────────
@@ -2670,7 +3253,14 @@ private:
         // normal "finalize and stop streaming" path — the next
         // iteration is already in flight and SetStreamingState(true)
         // was re-applied by OnAgentIterationBegin (Phase 5).
-        if (m_agentController->IsActive()) {
+        if (interruptedTurn && m_agentController->IsActive()) {
+            // Same unwind as OnAssistantError: reset the XML stream
+            // filter, end the loop (StreamError reason -- the notice
+            // above is the user-facing message), then finalize below.
+            ResetAgentToolStreamFilter();
+            m_agentController->HandleAssistantError("repetition loop");
+        }
+        else if (m_agentController->IsActive()) {
             // Phase 3c-ii: structured tool_calls were extracted above
             // before UI finalization so native tool-only turns can be
             // hidden cleanly instead of rendering blank assistant rows.
@@ -2713,7 +3303,6 @@ private:
         FlushPendingAssistantDelta();
 
         if (m_skillDraftController->ConsumeAssistantError(error)) return;
-        if (m_goalController->ConsumeAssistantError(error)) return;
 
         std::string modelName = ServerManager::ModelDisplayName(
             m_modelSwitcher->GetConversationModelForSave());
@@ -2775,7 +3364,6 @@ private:
     // HandleSlashCommand → DispatchInvocation, the same path the agent
     // uses.  Stateful conversation commands keep their own handlers:
     //   - /cd mutates the per-conversation tool cwd.
-    //   - /goal manages Goals Phase 1 mission state.
     //
     // /cd resolution: per-conversation tool CWD if set, else the
     // conversation workspace.  Env-var expansion (%USERPROFILE% etc.)
@@ -2784,33 +3372,34 @@ private:
     // in memory until the first real message pins it to disk.
 
     // Ensures the current conversation has a stable identity and a
-    // user-visible workflow folder before tools or attachments need a
+    // user-visible chat folder before tools or attachments need a
     // real path on disk.  Conversation JSON still saves under
     // %LOCALAPPDATA%\LlamaBoss\conversations, but files for this chat
-    // live under %USERPROFILE%\LlamaBoss\Workflows\chat_xxxxxxxx.
-    void EnsureConversationWorkflow()
+    // live under %USERPROFILE%\LlamaBoss\Chats\<date>_<title-slug>_<id>.
+    void EnsureConversationChatFolder()
     {
         if (!m_chatHistory->HasFilePath())
             m_chatHistory->SetFilePath(ChatHistory::GenerateFilePath());
 
         const std::string convFilePath = m_chatHistory->GetFilePath();
-        if (m_workflowRootEnsuredForFilePath != convFilePath) {
-            ChatHistory::EnsureWorkflowDir(convFilePath);
-            m_workflowRootEnsuredForFilePath = convFilePath;
+        if (m_chatFolderEnsuredForFilePath != convFilePath) {
+            ChatHistory::EnsureChatFolder(convFilePath,
+                                         m_chatHistory->GetChatFolderTitle());
+            m_chatFolderEnsuredForFilePath = convFilePath;
         }
     }
 
     // Resolves the effective working directory for a tool invocation:
     // per-conversation override first, falling back to this
-    // conversation's own workflow Workspace folder.  Never returns
+    // conversation's own chat Workspace folder.  Never returns
     // empty.  The Workspace folder is created on first use rather than
-    // up-front in EnsureWorkflowDir, so chats that never invoke tools
+    // up-front in EnsureChatFolder, so chats that never invoke tools
     // don't grow an empty Workspace/ subfolder.
     std::string ResolveCurrentCwd()
     {
         std::string cwd = m_chatHistory->GetToolCwd();
         if (cwd.empty()) {
-            EnsureConversationWorkflow();
+            EnsureConversationChatFolder();
 
             const std::string convFilePath = m_chatHistory->GetFilePath();
             cwd = ChatHistory::GetConversationWorkspaceDir(convFilePath);
@@ -2841,9 +3430,12 @@ private:
                                              : path.substr(a, b - a + 1);
         }
 
+        // Bare /cd reports the current directory (/pwd was removed with
+        // the other typed tool mirrors on 2026-09-28).
         if (path.empty()) {
             m_chatDisplay->DisplaySystemMessage(
-                "Usage: /cd <path>   (use /pwd to show the current directory)");
+                "Working directory: " + ResolveCurrentCwd() +
+                "\nUsage: /cd <path>");
             return;
         }
 
@@ -2871,19 +3463,28 @@ private:
             m_convController->AutoSaveConversation();
     }
 
+    // Minute sweep for idle Python sessions.  Silent: the death note
+    // recorded by ReapIdle surfaces as the restart notice on that
+    // conversation's next py call.  Also ages out zombie sessions a
+    // frame can no longer reach (conversation moved to another window).
+    void OnPySessionReapTimer(wxTimerEvent&)
+    {
+        if (m_pySessionManager)
+            m_pySessionManager->ReapIdle();
+    }
 
     // ─── Unified slash-command dispatch (Phase 4 / 4.1) ──────────
     //
-    // Every tool-shaped slash command — /read, /ls, /grep, /pwd,
-    // /open, /cmd (Phase 4) plus /write, /mkdir, /edit, /delete
-    // (Phase 4.1) — flows through HandleSlashCommand below.  The
+    // Typed tool commands (since 2026-09-28 only /reminder_create,
+    // /reminder_list and /reminder_cancel; see kToolSlashTable in
+    // lb_input_parsers.cpp) flow through HandleSlashCommand below.  The
     // method builds a ToolInvocation, calls DispatchInvocation, and
     // either renders the sync result or sets the chat-state so the
     // matching OnGrepComplete / OnCmdComplete picks up the async
     // continuation.
     //
-    // /cd and /goal are NOT tools — they mutate per-conversation state
-    // and keep dedicated handlers.  Everything else that used to live in
+    // /cd is NOT a tool — it mutates per-conversation state
+    // and keeps a dedicated handler.  Everything else that used to live in
     // HandleSlashRead/Ls/Grep/Open/Pwd is gone: dispatch,
     // validation, rendering, and history are now identical to the
     // agent path.
@@ -2995,7 +3596,8 @@ private:
 
         DispatchOutcome out = DispatchInvocation(
             inv, ctx, m_grepExecutor.get(), m_cmdExecutor.get(),
-            m_pythonRunner.get(), m_webFetchExecutor.get());
+            m_pythonRunner.get(), m_webFetchExecutor.get(),
+            m_pySessionManager.get());
 
         switch (out.status) {
         case DispatchStatus::Completed:
@@ -3011,6 +3613,46 @@ private:
             SetStreamingState(true);
             return;
         }
+    }
+
+    void GateOrDispatchSlashInvocation(const ToolInvocation& inv,
+                                       const ToolContext&    ctx)
+    {
+        // Location authorization is independent of general tool trust. Even
+        // a chat that previously selected Allow Always must explicitly grant
+        // each out-of-root folder before a native mutation can run there.
+        const bool alreadyApproved =
+            m_chatHistory && m_chatHistory->IsToolChatApproved(inv.name);
+
+        tool_approval::ApprovalDecision approval;
+        const bool needsWriteRoot =
+            tool_approval::RequiresWriteRootGrant(inv, ctx, approval);
+        const bool needsActionApproval =
+            !needsWriteRoot &&
+            !alreadyApproved &&
+            tool_approval::RequiresApproval(inv, ctx, approval);
+
+        if (needsWriteRoot || needsActionApproval) {
+            if (HasPendingApproval()) {
+                m_chatDisplay->DisplaySystemMessage(
+                    "Approval is already pending. Use the buttons above to respond.");
+                return;
+            }
+            m_pendingSlashApproval.invocation = inv;
+            m_pendingSlashApproval.context    = ctx;
+            m_pendingSlashApproval.writeRootGrant = needsWriteRoot
+                ? approval.writeRoot
+                : std::string();
+            m_pendingSlashApproval.active = true;
+
+            ToolBlock card = approval.block;
+            card.requiresApproval = true;
+            m_chatDisplay->DisplayToolBlock(card, false);
+            SetApprovalState(true);
+            return;
+        }
+
+        DispatchSlashInvocation(inv, ctx);
     }
 
     void HandleSlashCommand(const std::string& toolName,
@@ -3030,40 +3672,7 @@ private:
         inv.valid         = ValidateToolArgs(toolName, args, reason);
         inv.invalidReason = reason;
 
-        ToolContext ctx = BuildToolContext();
-
-        // Approval polish: skip the approval card if this chat is
-        // already trusted (plain approve / approve always) or this
-        // tool was remembered by an older build.  Read-only tools
-        // never enter the gate at all (RequiresApproval returns false).
-        const bool alreadyApproved =
-            m_chatHistory && m_chatHistory->IsToolChatApproved(toolName);
-
-        tool_approval::ApprovalDecision approval;
-        if (!alreadyApproved &&
-            tool_approval::RequiresApproval(inv, ctx, approval)) {
-            if (HasPendingApproval()) {
-                m_chatDisplay->DisplaySystemMessage(
-                    "Approval is already pending. Use the buttons above to respond.");
-                return;
-            }
-            m_pendingSlashApproval.invocation = inv;
-            m_pendingSlashApproval.context    = ctx;
-            m_pendingSlashApproval.active     = true;
-            // UX polish: keep the approval card calm by default. The full
-            // preview/source remains one click away under [show details].
-            // requiresApproval=true tells ChatDisplay to render the Allow
-            // Once / Allow Always / Deny buttons inline beneath
-            // [show details]; the typed-command fallback in
-            // TryHandlePendingApprovalInput remains as a keyboard safety net.
-            ToolBlock card = approval.block;
-            card.requiresApproval = true;
-            m_chatDisplay->DisplayToolBlock(card, false);
-            SetApprovalState(true);
-            return;
-        }
-
-        DispatchSlashInvocation(inv, ctx);
+        GateOrDispatchSlashInvocation(inv, BuildToolContext());
     }
 
 
@@ -3079,8 +3688,26 @@ private:
 
         ToolInvocation inv = m_pendingSlashApproval.invocation;
         ToolContext    ctx = m_pendingSlashApproval.context;
+        std::string    writeRootGrant =
+            m_pendingSlashApproval.writeRootGrant;
         m_pendingSlashApproval = PendingSlashApproval{};
         SetApprovalState(false);
+
+        if (!writeRootGrant.empty()) {
+            if (!m_chatHistory ||
+                !m_chatHistory->GrantWriteRootForChat(writeRootGrant)) {
+                ToolInvocationResult r = tool_approval::DeniedResult(
+                    inv,
+                    "Folder access could not be granted. Tool was not executed.");
+                m_toolResultController->RenderAndPersistSlashResult(r);
+                return;
+            }
+
+            // Rebuild so the new root is present, then re-run the ordinary
+            // action gate. A delete therefore still gets its delete card.
+            GateOrDispatchSlashInvocation(inv, BuildToolContext());
+            return;
+        }
 
         // Mark BEFORE dispatch so the per-chat approval state is
         // already in place if the model immediately requests another
@@ -3125,7 +3752,14 @@ private:
         // LoadConversationFromPath re-arm the ChatHistory flag on
         // reload.  Unsaved chats have an empty path and are ignored;
         // AutoSaveConversation syncs them once a path exists.
-        if (approve && rememberForChat && m_chatHistory) {
+        const bool resolvingWriteRoot =
+            (m_pendingSlashApproval.active &&
+             !m_pendingSlashApproval.writeRootGrant.empty()) ||
+            (m_agentController &&
+             m_agentController->IsAwaitingWriteRootGrant());
+
+        if (approve && rememberForChat && !resolvingWriteRoot &&
+            m_chatHistory) {
             wxGetApp().GetConversationRegistry()
                 .RememberSessionTrust(m_chatHistory->GetFilePath());
         }
@@ -3170,13 +3804,30 @@ private:
     ToolContext BuildToolContext()
     {
         ToolContext ctx;
+        ctx.setupConnection = [this](const std::string& provider, const std::string& query) {
+            if (!wxIsMainThread() || m_isClosing) return std::string("Connection setup is unavailable.");
+            std::string modelToUse;
+            const bool saved = LbShowAIConnectionSetup(this, m_appState->GetEndpointStore(),
+                m_appState->GetSecretsStore(), m_appState->GetTheme(), provider, query, &modelToUse);
+            if (!saved) return std::string("Connection setup cancelled. No changes were saved.");
+            // Plain Save from the setup dialog keeps the provider's model
+            // list without touching this chat's model.
+            if (modelToUse.empty()) return std::string("Connection saved. Model selection unchanged.");
+            if (m_agentController && m_agentController->IsActive()) {
+                m_pendingSetupModel = modelToUse;
+                return std::string("Connection saved. Applying your selected model when this setup turn ends.");
+            }
+            // Also covers a direct slash invocation of the setup tool.
+            m_modelSwitcher->SwitchToModel(modelToUse);
+            _userInputCtrl->SetFocus();
+            return std::string("Connection saved. Model selection requested.");
+        };
         ctx.cwd = ResolveCurrentCwd();
 
         unsigned long t = m_chatHistory->GetToolTimeoutMs();
         ctx.timeoutMs = (t == 0) ? kDefaultToolTimeoutMs : t;
 
-        ctx.ctxTokens = m_appState->GetCtxSize();
-        if (ctx.ctxTokens <= 0) ctx.ctxTokens = 8192;  // defensive
+        ctx.ctxTokens = m_modelSwitcher->ConversationContextTokens();
 
         ctx.eventHandler = this;
         ctx.aliveToken   = m_alive;
@@ -3202,6 +3853,7 @@ private:
         // helper scripts in place instead of being forced to create stray
         // one-off workspace scripts.
         ctx.skillsRoot = ProjectManager::GetSkillsDir();
+        ctx.additionalWriteRoots = m_chatHistory->GetChatWriteRoots();
         return ctx;
     }
 
@@ -3212,7 +3864,6 @@ private:
     {
         AgentPromptBuilderInput input;
         input.activeProjectContextBlock = m_projectContextBuilder->BuildActiveProjectContextBlock();
-        input.activeGoalContextBlock = m_goalController->BuildActiveGoalContextBlock();
         input.pendingSkillAuthoringContextBlock = m_skillDraftController->BuildPendingSkillAuthoringContextBlock();
         return ::BuildNormalSystemPrompt(input);
     }
@@ -3238,7 +3889,6 @@ private:
         input.isWorkspace = m_chatHistory->GetToolCwd().empty();
         input.cwd = ResolveCurrentCwd();
         input.activeProjectContextBlock = m_projectContextBuilder->BuildActiveProjectContextBlock();
-        input.activeGoalContextBlock = m_goalController->BuildActiveGoalContextBlock();
         input.pendingSkillAuthoringContextBlock = m_skillDraftController->BuildPendingSkillAuthoringContextBlock();
         input.toolSafetySummaryText = BuildToolSafetySummaryText(GetGlobalRouter());
 
@@ -3271,17 +3921,10 @@ private:
     //  Project status strip helpers
     // ═════════════════════════════════════════════════════════════
 
-    // Pulls the current project + goal state from ChatHistory and
-    // pushes it into the merged ProjectStatusStrip in one call. Project
-    // counts are exact, but cached briefly so goal-only refresh churn does
-    // not repeatedly walk Sources/Workflows on the UI thread. Goal fields
-    // are O(1) lookups on the in-memory GoalState.
-    //
-    // RefreshGoalStatusStrip() is kept as a thin alias so the ~17 call
-    // sites scattered through this file that touched only the goal
-    // strip can stay unchanged.  Internal callers may use either name;
-    // they do the same thing.  See TODO(rename) in
-    // project_status_strip.h for the eventual cleanup.
+    // Pulls the current project state from ChatHistory and pushes it
+    // into the ProjectStatusStrip in one call. Project counts are exact,
+    // but cached briefly so refresh churn does not repeatedly walk
+    // Sources/Workflows on the UI thread.
     void RefreshProjectStrip()
     {
         if (!m_projectStrip) return;
@@ -3300,26 +3943,7 @@ private:
             s.scriptCount   = counts.scriptCount;
         }
 
-        // ── Goal half ────────────────────────────────────────────
-        // Compact the objective on this side so the strip stays a
-        // pure renderer.  96 bytes matches what the old
-        // BuildGoalStatusStripText() used.
-        const GoalState& goal = m_chatHistory->GetGoalState();
-        if (goal.HasGoal()) {
-            s.hasGoal              = true;
-            s.goalStatusLabel      = GoalStatusLabel(goal.status);
-            s.goalObjectiveCompact = LbCompactGoalStripText(goal.objective, 96);
-        }
-
         m_projectStrip->Refresh(s);
-    }
-
-    // Thin alias preserved for source-compatibility with the old
-    // separate goal strip.  Do not add logic here -- everything lives
-    // in RefreshProjectStrip().
-    void RefreshGoalStatusStrip()
-    {
-        RefreshProjectStrip();
     }
 
     // Builds and shows the project / skill popup menu beside the strip.
@@ -3397,83 +4021,6 @@ private:
             pos = ScreenToClient(pos);
         }
         PopupMenu(&menu, pos);
-    }
-
-    // Goal popup ([ Goal v ]).  State-aware.  Items map onto the existing
-    // /goal subcommands so there's no parallel logic.  Two disabled header
-    // rows echo the objective + status so the menu is self-describing
-    // without opening Goal Details (which prints into the transcript).
-    //
-    // Action availability is matched to what the controller actually
-    // accepts, so the menu never offers a command that would be rejected:
-    //   * Verify Now  -> Active only (HandleSlashGoal "verify" requires an
-    //     active goal; it errors out otherwise).
-    //   * Resume Goal -> any non-active goal ("resume" only rejects "no
-    //     goal" / "already active"), so Paused, AwaitingUser, and
-    //     BudgetReached all get it; Resume() even resets the budget window.
-    // The actions separator is emitted only when the current state has a
-    // mid-run action, so states that fall through (Completed / Cancelled /
-    // Failed) no longer render the old back-to-back double separator.
-    void ShowGoalPopupMenu(wxWindow* anchor)
-    {
-        wxMenu menu;
-
-        if (!m_chatHistory->HasGoal()) {
-            menu.Append(ID_GOAL_SET, "Set a Goal...");
-            PopupMenuAtAnchor(menu, anchor);
-            return;
-        }
-
-        const GoalState& goal = m_chatHistory->GetGoalState();
-
-        // Disabled informational header: objective + status at a glance.
-        if (wxMenuItem* h = menu.Append(
-                wxID_ANY,
-                "Goal: " + wxString::FromUTF8(
-                    LbCompactGoalStripText(goal.objective, 48))))
-            h->Enable(false);
-        if (wxMenuItem* s = menu.Append(
-                wxID_ANY,
-                wxString("Status: ") + GoalStatusLabel(goal.status) +
-                "  \xC2\xB7  contract: " +
-                GoalContractStatusLabel(goal.contract.status)))
-            s->Enable(false);
-
-        menu.AppendSeparator();
-        menu.Append(ID_GOAL_STATUS, "Goal Details...");
-
-        bool actionSep = false;
-        auto ensureSep = [&] {
-            if (!actionSep) { menu.AppendSeparator(); actionSep = true; }
-        };
-
-        switch (goal.status) {
-        case GoalStatus::Active:
-            ensureSep();
-            menu.Append(ID_GOAL_PAUSE,  "Pause Goal");
-            menu.Append(ID_GOAL_VERIFY, "Verify Now");
-            break;
-        case GoalStatus::Paused:
-            ensureSep();
-            menu.Append(ID_GOAL_RESUME, "Resume Goal");
-            break;
-        case GoalStatus::AwaitingUser:
-            ensureSep();
-            menu.Append(ID_GOAL_RESUME, "Resume Goal");
-            break;
-        case GoalStatus::BudgetReached:
-            ensureSep();
-            menu.Append(ID_GOAL_RESUME, "Resume Goal (reset budget)");
-            break;
-        default:
-            // Completed / Cancelled / Failed / None: Details + Clear only.
-            break;
-        }
-
-        menu.AppendSeparator();
-        menu.Append(ID_GOAL_CLEAR, "Clear Goal");
-
-        PopupMenuAtAnchor(menu, anchor);
     }
 
 
@@ -3566,6 +4113,14 @@ private:
         wxMenuItem* moveItem = menu.AppendSubMenu(moveSub, moveLabel);
         if (busy) moveItem->Enable(false);
 
+        // ── Export (single conversation; read-only, so not busy-gated) ─
+        int exportItemId = 0;
+        if (paths.size() == 1) {
+            wxMenuItem* exportItem =
+                menu.Append(wxID_ANY, "Export conversation...");
+            exportItemId = exportItem->GetId();
+        }
+
         menu.AppendSeparator();
 
         // ── Archive / restore ─────────────────────────────────────
@@ -3630,6 +4185,15 @@ private:
                 capturedItemId);
         }
 
+        if (exportItemId) {
+            menu.Bind(
+                wxEVT_MENU,
+                [this, path = paths.front()](wxCommandEvent&) {
+                    m_convController->ExportConversation(path);
+                },
+                exportItemId);
+        }
+
         menu.Bind(
             wxEVT_MENU,
             [this, snapshot, archivedView](wxCommandEvent&) {
@@ -3641,6 +4205,12 @@ private:
         menu.Bind(
             wxEVT_MENU,
             [this, snapshot](wxCommandEvent&) {
+                if (m_pySessionManager) {
+                    for (const std::string& p : snapshot) {
+                        m_pySessionManager->CloseSessionFor(
+                            ChatHistory::GetConversationWorkspaceDir(p));
+                    }
+                }
                 m_convController->DeleteConversations(snapshot);
             },
             wxID_DELETE);
@@ -4185,36 +4755,6 @@ private:
 
     void OnProjectsOpenRootFolder(wxCommandEvent&) { m_projectController->OpenProjectsRootFolder(); }
 
-    // ── Goal menu handlers ──────────────────────────────────────────
-    // Each routes through the same paths as the /goal slash command so the
-    // menu and the command can never drift apart.
-    void OnGoalSet(wxCommandEvent&)
-    {
-        if (IsBusy()) return;
-
-        LbThemedTextEntryDialog dlg(
-            this,
-            m_appState->GetTheme(),
-            "Set a Goal",
-            "Goal objective:",
-            "Start");
-        if (LbShowModalWithScrim(*this, dlg) != wxID_OK) return;
-
-        // Identical to typing "/goal <objective>": HandleSlashGoal trims the
-        // input and a real objective starts the goal (including the contract
-        // build).  The themed dialog disables Start until the field is
-        // non-empty, so the old "empty objective shows status" fallback is
-        // unreachable from here — which is correct, since "Set a Goal..."
-        // only renders when no goal exists on the chat.
-        m_goalController->HandleSlashGoal(std::string(dlg.GetValue().ToUTF8().data()));
-    }
-
-    void OnGoalStatus(wxCommandEvent&) { m_goalController->DisplayGoalStatus(); }
-    void OnGoalPause (wxCommandEvent&) { m_goalController->HandleSlashGoal("pause"); }
-    void OnGoalResume(wxCommandEvent&) { m_goalController->HandleSlashGoal("resume"); }
-    void OnGoalVerify(wxCommandEvent&) { m_goalController->HandleSlashGoal("verify"); }
-    void OnGoalClear (wxCommandEvent&) { m_goalController->HandleSlashGoal("clear"); }
-
     void OnProjectClear(wxCommandEvent&) { m_projectController->ClearProjectFromChat(); }
 
     void OnToggleSidebar(wxCommandEvent&)
@@ -4226,8 +4766,172 @@ private:
         GetSizer()->Layout();
     }
 
+    // ── New Chat prompt-cache pre-warm (prompt_prewarm.h) ────────
+    // Delay before priming: long enough that New Chat followed by
+    // opening an old chat (or typing a quick /command) primes nothing,
+    // short compared with the ~8 s the prime itself takes.
+    static constexpr int kPrewarmDelayMs = 1000;
+
+    void SchedulePromptPrewarm(const char* reason)
+    {
+        m_prewarmReason = reason;
+        m_prewarmTimer.StartOnce(kPrewarmDelayMs);
+    }
+
+    // Queues a prime of the stable part of the agent prompt when this
+    // window shows an empty agent-mode chat on a local model and nothing
+    // is running.  Returns false (and logs why) otherwise.  Always on:
+    // the /prewarm on|off|now command was removed 2026-09-28.
+    bool TryPromptPrewarm(const std::string& reason)
+    {
+        auto skip = [&](const std::string& why) {
+            if (auto* logger = m_appState->GetLogger())
+                logger->debug("prewarm: not started (" + reason + "): " + why);
+            return false;
+        };
+        if (m_isClosing) return skip("window closing");
+        if (!m_agentModeEnabled) return skip("Agent mode is off");
+        if (IsBusy() || m_pendingSend.active) return skip("this window is busy");
+        if (!m_chatHistory || !m_chatHistory->IsEmpty())
+            return skip("only a new, empty chat is primed (this chat's own KV is saved/restored instead)");
+        if (!m_modelSwitcher->IsServerReady() || !m_modelSwitcher->IsConversationTargetActive())
+            return skip("the model isn't loaded yet");
+        const InferenceTarget target = m_modelSwitcher->ResolveTargetForConversation();
+        if (!target.managed)
+            return skip("remote models cache prompts on the provider side");
+        if (target.noTools || target.imageOutput)
+            return skip("this model runs without agent tools");
+        if (_activeProtocol == ToolProtocol::Unknown)
+            return skip("tool protocol not detected yet");
+
+        // Same request shaping as the agent branch of
+        // StartAssistantResponseForPreparedTurn, so /apply-template renders
+        // the prefix exactly as the first real request will.  Only the
+        // user message differs, and it comes after the cut.
+        const bool native = (_activeProtocol == ToolProtocol::Native);
+        const std::string tools = native ? GetCachedToolsArrayJson() : std::string();
+        const std::string systemPrompt = BuildAgentSystemPrompt();
+        const std::string model = m_modelSwitcher->GetConversationModelForSave();
+        int ctxTokens = m_appState->GetCtxSize();
+        if (ctxTokens <= 0) ctxTokens = 8192;
+
+        ChatHistory scratch;
+        scratch.SetActiveReasoningDialect(target.reasoningDialect);
+        scratch.SetActiveResponsesApi(target.responsesApi);
+        scratch.SetThinkOverride(m_chatHistory->GetThinkOverride());
+        scratch.AddUserMessage(".");
+        const std::string body = scratch.BuildChatRequestJson(
+            model, true, systemPrompt, ctxTokens, tools, native, true);
+
+        const std::string stable =
+            prompt_prewarm::StablePart(systemPrompt, kAgentWorkingContextHeading);
+        const std::string key = prompt_prewarm::MakeKey(
+            model, ToolProtocolName(_activeProtocol),
+            ThinkingModeName(m_chatHistory->GetThinkOverride()), stable, tools);
+
+        std::string why;
+        if (!m_modelService->PrewarmPromptPrefix(this, body,
+                kAgentWorkingContextHeading, key, why))
+            return skip(why);
+
+        if (auto* logger = m_appState->GetLogger())
+            logger->information("prewarm: queued (" + reason + ", " +
+                ToolProtocolName(_activeProtocol) + ", " +
+                std::to_string(stable.size()) + " stable system bytes) [key " + key + "]");
+        return true;
+    }
+
+    // /bench [runs] [cold] [long] | stop | help  -- see bench_stats.h.
+    // Sends a fixed prompt to this conversation's model N times on its own
+    // connection (chat history untouched), prints one line per run and a
+    // median summary, and saves a TSV under Shared\\Benchmarks.
+    void HandleBenchCommand(const std::string& args)
+    {
+        bench::Options opts;
+        bool stop = false, help = false;
+        std::string error;
+        if (!bench::ParseArgs(args, opts, stop, help, error)) {
+            m_chatDisplay->DisplaySystemMessage(error + "\n" + bench::Usage());
+            return;
+        }
+        if (help) { m_chatDisplay->DisplaySystemMessage(bench::Usage()); return; }
+        if (stop) {
+            if (m_bench && m_bench->IsRunning()) m_bench->Stop();
+            else m_chatDisplay->DisplaySystemMessage("No benchmark is running.");
+            return;
+        }
+        if (!m_modelSwitcher->IsServerReady()) {
+            m_chatDisplay->DisplaySystemMessage("Load a model first, then run /bench.");
+            return;
+        }
+
+        const InferenceTarget target = m_modelSwitcher->ResolveTargetForConversation();
+        if (target.imageOutput) {
+            m_chatDisplay->DisplaySystemMessage(
+                "/bench measures text generation; this is an image-output model.");
+            return;
+        }
+        // One shared llama-server slot: another window's stream would
+        // queue our runs behind it and wreck the timings.
+        if (target.managed && m_modelService->AnyOtherWindowBusyOnLocalServer(this)) {
+            m_chatDisplay->DisplaySystemMessage(
+                "Another window is using the model. Run /bench when it's idle "
+                "so the timings aren't skewed.");
+            return;
+        }
+
+        const std::string sep(1, static_cast<char>(wxFILE_SEP_PATH));
+        BenchController::Setup setup;
+        setup.target    = target;
+        setup.bodyModel = m_modelSwitcher->GetConversationModelForSave();
+        setup.label     = _modelLabel ? WxToUtf8(_modelLabel->GetLabel()) : std::string();
+        if (setup.label.empty() || setup.label == "loading...")
+            setup.label = WxToUtf8(wxFileName(wxString::FromUTF8(setup.bodyModel)).GetName());
+        setup.think     = m_chatHistory ? m_chatHistory->GetThinkOverride()
+                                        : ChatHistory::ThinkOverride::Auto;
+        setup.outDir    = ServerManager::GetSharedLanesRootDir() + sep + "Benchmarks";
+        setup.options   = opts;
+
+        if (!m_bench) {
+            BenchController::Callbacks cb;
+            cb.progress = [this](const std::string& line) {
+                if (!m_isClosing) m_chatDisplay->DisplaySystemMessage(line);
+            };
+            cb.finished = [this](const std::string& summary) {
+                if (m_isClosing) return;
+                m_chatDisplay->DisplaySystemMessage(summary);
+                SetStreamingState(false);
+            };
+            m_bench = std::make_unique<BenchController>(std::move(cb));
+        }
+
+        // The benchmark overwrites llama-server's single KV slot.  Claim it
+        // under a benchmark-only name so switching conversations never
+        // saves this prompt's KV as a chat's cache.
+        if (target.managed)
+            m_modelService->NoteSlotOwner(this, setup.outDir + sep + "bench.json");
+
+        std::string startError;
+        if (!m_bench->Start(setup, startError)) {
+            m_chatDisplay->DisplaySystemMessage(startError);
+            return;
+        }
+        SetStreamingState(true);   // Stop button cancels; input locked
+        const char* dot = " \xC2\xB7 ";
+        m_chatDisplay->DisplaySystemMessage(
+            "Benchmark" + std::string(dot) + setup.label + dot +
+            std::to_string(opts.runs) + (opts.runs == 1 ? " run" : " runs") + dot +
+            (opts.longPrompt ? "~4k" : "~540") + "-token prompt" + dot +
+            std::to_string(opts.genTokens) + "-token generation" + dot +
+            (target.managed ? (opts.allCold ? "every run cold" : "run 1 cold")
+                            : "remote (output length varies)") +
+            ". Press Stop to cancel.");
+    }
+
     void OnStopGeneration(wxCommandEvent&)
     {
+        if (m_isClosing) return;
+        if (m_bench && m_bench->IsRunning()) { m_bench->Stop(); return; }
         // Stop any running Easter egg animation
         if (m_activeAnimation) { StopAnimation(); return; }
 
@@ -4248,11 +4952,42 @@ private:
             return;
         }
 
-        // Hidden Skill/goal control turns have no transcript placeholder.
-        // Let their controllers stop them before normal assistant or agent
+        // ── Long-task guard ─────────────────────────────────────
+        // Stop kills the whole process tree.  Past a couple of minutes
+        // into a download / build that is almost always a mis-click, and
+        // the cost of confirming is one dialog; the cost of not confirming
+        // is the last 14 minutes of a 15-minute download.
+        if (m_activityStrip && m_activityStrip->IsActive() &&
+            m_activityStrip->ElapsedSec() > 120.0) {
+            const std::uint64_t confirmedActivity = m_activityRevision;
+            const long long elapsed =
+                static_cast<long long>(m_activityStrip->ElapsedSec());
+            const wxString msg = wxString::Format(
+                "A tool has been running for %lld:%02lld. Stop this tool "
+                "and cancel the current turn?\n\n"
+                "Output already captured is kept. Files already written "
+                "are not undone.\n\n"
+                "If this tool finishes while this dialog is open, this "
+                "confirmation will not stop the next step.",
+                elapsed / 60, elapsed % 60);
+            if (wxMessageBox(msg, "Stop Long-Running Task",
+                             wxYES_NO | wxNO_DEFAULT | wxICON_WARNING,
+                             this) != wxYES) {
+                return;
+            }
+            // wxMessageBox pumps events: A can finish and B can become
+            // active before Yes is clicked. Never apply A's confirmation
+            // to B, a new approval, or the next model stream.
+            if (m_isClosing || !m_activityStrip ||
+                !m_activityStrip->IsActive() ||
+                m_activityRevision != confirmedActivity)
+                return;
+        }
+
+        // Hidden Skill control turns have no transcript placeholder.
+        // Let the controller stop them before normal assistant or agent
         // teardown runs.
         if (m_skillDraftController->HandleStopGeneration()) return;
-        if (m_goalController->HandleStopGeneration()) return;
 
         // ── Agent loop cancellation ─────────────────────────────
         // Arm agent cancellation before stopping the in-flight operation.
@@ -4289,7 +5024,12 @@ private:
                 return;
             }
             if (m_chatState == ChatState::RunningPython) {
+                // RunningPython covers both Python backends; Cancel()
+                // on the idle one is a harmless flag set.  A cancelled
+                // /py exec kills its session (state lost, said
+                // explicitly in the result card).
                 m_pythonRunner->Cancel();
+                if (m_pySessionManager) m_pySessionManager->Cancel();
                 return;
             }
             if (m_chatState == ChatState::RunningWebFetch) {
@@ -4419,6 +5159,7 @@ private:
 
         if (dialogResult != wxID_OK) return;
 
+        const std::string connectionModelToUse = dlg.GetConnectionModelToUse();
         bool folderChanged             = dlg.WasModelsFolderChanged();
         bool modelChanged              = dlg.WasModelChanged();
         const bool themeChanged        = dlg.WasThemeChanged();
@@ -4439,7 +5180,8 @@ private:
         // visual-only announcement gate) sees a consistent "nothing
         // server-side changed" state; visual settings (theme, font,
         // agent default) still apply normally below.
-        if ((folderChanged || modelChanged || ctxSizeChanged ||
+        if (connectionModelToUse.empty() &&
+            (folderChanged || modelChanged || ctxSizeChanged ||
              kvCacheQ8Changed || mtpChanged) &&
             m_modelService->AnyOtherWindowBusyOnLocalServer(this)) {
             const int r = wxMessageBox(
@@ -4479,14 +5221,20 @@ private:
         // model from the now-active folder. Takes precedence over
         // modelChanged: any combo auto-select that happened during the
         // folder swap isn't a deliberate user pick.
-        if (folderChanged) {
+        if (!connectionModelToUse.empty()) {
+            // Guided setup deliberately selects a remote model. Preserve the
+            // conversation and use the picker path rather than the local reload.
+            ClearPendingSend();
+            m_modelSwitcher->SwitchToModel(connectionModelToUse);
+            _userInputCtrl->SetFocus();
+        }
+        else if (folderChanged) {
             // Deliberate server action supersedes any lazy-load intent.
             m_modelSwitcher->ClearPendingDeferredModel();
-            m_pendingSend = PendingSend{};
+            ClearPendingSend();
 
-            // Durable: history is cleared just below.
-            if (!m_chatHistory->IsEmpty())
-                m_convController->AutoSaveConversation(true, /*durable=*/true);
+            // Do not clear the conversation after a failed save.
+            if (!m_convController->SaveBeforeLeaving()) return;
 
             m_modelService->StopLocalServer();
             m_modelSwitcher->ClearConversationPreference();
@@ -4513,16 +5261,15 @@ private:
         else if (modelChanged) {
             // Deliberate server action supersedes any lazy-load intent.
             m_modelSwitcher->ClearPendingDeferredModel();
-            m_pendingSend = PendingSend{};
+            ClearPendingSend();
 
             std::string newModel = dlg.GetSelectedModel();
 
             // Launch-argument settings were persisted before branch
             // selection, so MakeServerConfig() sees the accepted values.
 
-            // Durable: history is cleared just below.
-            if (!m_chatHistory->IsEmpty())
-                m_convController->AutoSaveConversation(true, /*durable=*/true);
+            // Do not clear the conversation after a failed save.
+            if (!m_convController->SaveBeforeLeaving()) return;
 
             m_modelSwitcher->SetConversationPreferredLocalModel(newModel);
             _statusDot->SetConnected(false);
@@ -4551,7 +5298,7 @@ private:
         else if (ctxSizeChanged || kvCacheQ8Changed || mtpChanged) {
             // Deliberate server action supersedes any lazy-load intent.
             m_modelSwitcher->ClearPendingDeferredModel();
-            m_pendingSend = PendingSend{};
+            ClearPendingSend();
 
             // Restart server with the same model but new launch args.
             // Values were persisted before branch selection.  History is
@@ -4662,103 +5409,96 @@ private:
 
     void OnAbout(wxCommandEvent&)
     {
-        const wxString msg = LbBuildAboutMessage(
-            LLAMABOSS_VERSION,
-            ServerManager::ModelDisplayName(m_appState->GetModel()),
-            m_appState->GetApiUrl(),
-            ServerManager::GetModelsDir());
+        LbAboutDialog dlg(this,
+                          m_appState->GetTheme(),
+                          LLAMABOSS_VERSION,
+                          ServerManager::ModelDisplayName(m_appState->GetModel()),
+                          m_appState->GetApiUrl(),
+                          ServerManager::GetModelsDir(),
+                          [this]() { return UpdateInstallBlocker(); });
 
-        wxMessageDialog dlg(this, msg, "About LlamaBoss Beta",
-                            wxYES_NO | wxICON_INFORMATION);
-        dlg.SetYesNoLabels("Check for Updates", "Close");
-        if (dlg.ShowModal() == wxID_YES)
-            CheckForUpdates(/*silent=*/false);
+        if (LbShowModalWithScrim(*this, dlg) == LbAboutDialog::ID_INSTALL)
+            InstallUpdateAndQuit(dlg.GetInstallerPath());
     }
 
-    // ── Update check ──────────────────────────────────────────────
-    // silent=false : user-initiated. Always reports outcome.
-    // silent=true  : startup. One quiet status line only if an update
-    //                exists; errors and "up to date" stay silent.
-    void CheckForUpdates(bool silent)
+    // ── In-app update install ─────────────────────────────────────
+    // Non-empty = a reason the installer must not start right now.
+    // Checked when the user clicks Download and Install, and again right
+    // before launch (a chat may have started during the download).
+    wxString UpdateInstallBlocker()
     {
-        bool expected = false;
-        if (!m_updateCheckInFlight.compare_exchange_strong(expected, true)) {
-            if (!silent)
-                m_chatDisplay->DisplaySystemMessage(
-                    "Update check already running.");
-            return;
-        }
-        if (!silent)
+        if (IsBusy() ||
+            (m_modelService && m_modelService->AnyOtherWindowBusy(this)))
+            return "A chat is still running. Stop it or let it finish, "
+                   "then install the update.";
+        return wxString();
+    }
+
+    // Order matters -- every save/recovery decision happens BEFORE the
+    // installer exists, so nothing after launch is allowed to veto:
+    //   1. this window saves its conversation (with the normal Retry /
+    //      Save Elsewhere / Keep Chat Open recovery); Keep Chat Open or a
+    //      failed save aborts the update with nothing launched;
+    //   2. every OTHER window closes (each saves, and may veto the same
+    //      way); a veto aborts the update with nothing launched;
+    //   3. the installer starts (per-user Inno Setup, no UAC prompt);
+    //   4. this window closes with force=true.  Its conversation was
+    //      saved durably in step 1 and nothing can run in between (the
+    //      busy check passed), so the close cannot be vetoed out from
+    //      under a running installer.  The app exits and ModelService
+    //      stops llama-server; /CLOSEAPPLICATIONS covers anything slow to
+    //      let go of files, and [Run] relaunches LlamaBoss afterwards.
+    void InstallUpdateAndQuit(const std::wstring& installerPath)
+    {
+        const wxString blocker = UpdateInstallBlocker();
+        if (!blocker.empty()) {
             m_chatDisplay->DisplaySystemMessage(
-                "Checking llamaboss.com for updates...");
-
-        const std::string current = LLAMABOSS_VERSION;
-        wxEvtHandler* target = this;
-        std::weak_ptr<std::atomic<bool>> alive = m_alive;
-
-        // Keeper instead of std::thread(...).detach(): identical runtime
-        // behavior, but the thread is joined at process exit so it can
-        // never race static destruction (see LbBackgroundThreadKeeper).
-        LbBackgroundThreadKeeper::Instance().Launch(
-            [target, alive, current, silent]() {
-                UpdateChecker::UpdateInfo info =
-                    UpdateChecker::CheckBlocking(current);
-
-                auto* ev = new wxThreadEvent(wxEVT_UPDATE_CHECK_RESULT);
-                ev->SetPayload(info);
-                ev->SetInt(silent ? 1 : 0);
-                LbQueueEventIfAlive(target, alive, ev);
-            });
-    }
-
-    void OnUpdateCheckThreadResult(wxThreadEvent& event)
-    {
-        m_updateCheckInFlight.store(false);
-        if (m_isClosing) return;
-
-        const bool silent = event.GetInt() != 0;
-        OnUpdateCheckResult(
-            event.GetPayload<UpdateChecker::UpdateInfo>(),
-            silent);
-    }
-
-    void OnUpdateCheckResult(const UpdateChecker::UpdateInfo& info, bool silent)
-    {
-        if (!info.ok) {
-            if (!silent)
-                m_chatDisplay->DisplaySystemMessage(
-                    "Update check failed: " + info.error);
-            return;
-        }
-        if (!info.available) {
-            if (!silent)
-                m_chatDisplay->DisplaySystemMessage(
-                    "LlamaBoss is up to date (v" +
-                    std::string(LLAMABOSS_VERSION) + ").");
+                "Update not installed: " + blocker.ToStdString() +
+                " Open About to try again.");
             return;
         }
 
-        m_chatDisplay->DisplaySystemMessage(
-            "Update available: v" + info.latest + "  -  llamaboss.com");
+        if (!m_convController->SaveBeforeLeaving()) {
+            m_chatDisplay->DisplaySystemMessage(
+                "Update paused: this conversation could not be saved, so "
+                "LlamaBoss stayed open. Fix the save problem, then open "
+                "About to try again.");
+            return;
+        }
 
-        if (silent) return; // startup: one line, no modal
-
-        wxMessageDialog dlg(this,
-                            LbBuildUpdateAvailableMessage(LLAMABOSS_VERSION, info),
-                            "Update Available",
-                            wxYES_NO | wxICON_INFORMATION);
-        dlg.SetYesNoLabels("Open Download", "Later");
-        if (dlg.ShowModal() == wxID_YES) {
-            const std::string fallback = LbUpdateFallbackUrl();
-            std::string target = info.url.empty() ? fallback : info.url;
-            if (!LbIsTrustedUpdateUrl(target)) {
+        std::vector<wxWindow*> others;
+        for (wxWindow* w : wxTopLevelWindows) {
+            if (w == this || w->GetParent() != nullptr) continue;
+            if (!dynamic_cast<wxFrame*>(w) || w->IsBeingDeleted()) continue;
+            others.push_back(w);
+        }
+        for (wxWindow* w : others) {
+            if (!w->Close(/*force=*/false)) {
                 m_chatDisplay->DisplaySystemMessage(
-                    "Update manifest returned an untrusted download URL; "
-                    "opening llamaboss.com instead.");
-                target = fallback;
+                    "Update paused: another LlamaBoss window could not close. "
+                    "Close it manually, then open About to try again.");
+                return;
             }
-            wxLaunchDefaultBrowser(wxString::FromUTF8(target));
         }
+
+        // Recovery dialogs in the other windows pump events; re-check that
+        // nothing started while they were up.
+        const wxString lateBlocker = UpdateInstallBlocker();
+        if (!lateBlocker.empty()) {
+            m_chatDisplay->DisplaySystemMessage(
+                "Update not installed: " + lateBlocker.ToStdString() +
+                " Open About to try again.");
+            return;
+        }
+
+        std::string error;
+        if (!UpdateInstaller::LaunchInstaller(installerPath, error)) {
+            m_chatDisplay->DisplaySystemMessage("Update failed: " + error);
+            return;
+        }
+        // Saved in step 1; force so the close cannot be vetoed now that the
+        // installer is running (OnClose still re-saves, without a dialog).
+        Close(/*force=*/true);
     }
 
     // ── Phase 3a: multiple windows ───────────────────────────────
@@ -4794,10 +5534,8 @@ private:
         const bool hadSkillAuthoring =
             m_skillDraftController && m_skillDraftController->HasActiveDesignSession();
 
-        // Durable: history is cleared just below — the file becomes the
-        // only copy of this conversation.
-        if (!m_chatHistory->IsEmpty())
-            m_convController->AutoSaveConversation(false, /*durable=*/true);
+        // Preserve the current chat when saving fails or recovery is cancelled.
+        if (!m_convController->SaveBeforeLeaving()) return;
 
         // KV fast path: snapshot the outgoing conversation's slot state
         // before Clear().  Ownership-guarded no-op unless the slot holds
@@ -4812,7 +5550,7 @@ private:
         // claim the newly generated path (Phase 3b).
         wxGetApp().GetConversationRegistry().SetCurrent(this, "");
         CancelPendingSendForConversationSwitch();
-        RefreshGoalStatusStrip();
+        RefreshProjectStrip();
         m_chatDisplay->Clear();
         if (hadSkillAuthoring) {
             m_chatDisplay->DisplaySystemMessage(
@@ -4840,6 +5578,10 @@ private:
 
         if (auto* logger = m_appState->GetLogger())
             logger->information("New chat started");
+
+        // Runs after the save-away above was queued; the slot-action
+        // worker executes them in order.
+        SchedulePromptPrewarm("new chat");
     }
 
     // App-level target/readiness changes, including remote synthesized ready
@@ -4985,26 +5727,34 @@ private:
         // the queued prompt now — but only if the model that became ready is
         // the one it was queued under.  A model switch between queueing and
         // ready leaves the prompt orphaned; drop it rather than send it to
-        // the wrong model.  (The prompt builds against whatever protocol
-        // detection has resolved so far, same as any fast manual send during
-        // the ready→probe window noted above.)
+        // the wrong model.
+        //
+        // The queued prompt does NOT fire here.  Detection always reports
+        // through a queued event (even a cache hit), so at this point
+        // _activeProtocol is still Unknown; sending now built an XML-shaped
+        // request whose reply was later parsed as native once detection
+        // landed mid-stream, silently dropping the model's tool call.
+        // Wait for OnToolProtocolDetected instead.  If the probe failed to
+        // start, the XML fallback above already resolved the protocol, so
+        // send immediately.
         if (m_pendingSend.active) {
-            const std::string queued    = m_pendingSend.userInput;
             const std::string queuedFor = m_pendingSend.modelPath;
-            m_pendingSend = PendingSend{};
 
-            if (queuedFor.empty() || queuedFor != modelPath) {
+            if (queuedFor.empty() ||
+                !path_safety::SameModelPath(queuedFor, modelPath)) {
+                ClearPendingSend();
                 m_chatDisplay->DisplaySystemMessage(
-                    "Queued message was dropped because the loaded model "
-                    "changed.");
+                    "A different model finished loading than the one your "
+                    "message was queued for. Your message is still in the "
+                    "input box \xE2\x80\x94 press Send to use this model.");
             }
-            else if (IsBusy() || HasPendingApproval()) {
-                m_chatDisplay->DisplaySystemMessage(
-                    "Queued message was dropped because another operation "
-                    "started before the model finished loading.");
+            else if (_activeProtocol != ToolProtocol::Unknown) {
+                FlushPendingSend();
             }
             else {
-                DispatchUserTurn(queued);
+                m_pendingSend.awaitingProtocol = true;   // stays "Queued"
+                m_pendingSendProtocolTimer.StartOnce(
+                    kPendingSendProtocolTimeoutMs);
             }
         }
     }
@@ -5041,6 +5791,21 @@ private:
         _activeProtocol = r.protocol;
 
         UpdateProtocolChip(r.protocol);
+
+        // A prompt queued behind this model's load was waiting for the
+        // protocol (see OnServerReady).  Now the first request can be
+        // built with the right prompt shape and tools array.
+        if (m_pendingSend.active && m_pendingSend.awaitingProtocol) {
+            if (!m_pendingSend.modelPath.empty() &&
+                path_safety::SameModelPath(m_pendingSend.modelPath, r.modelPath)) {
+                FlushPendingSend();
+            }
+        }
+
+        // The prompt shape is known now.  An app launch or model switch
+        // usually lands on an empty chat -- the most common "new chat".
+        // (TryPromptPrewarm re-checks idle/empty when the timer fires.)
+        SchedulePromptPrewarm("model ready");
     }
 
     // Apply protocol to the chip widget.  Called from
@@ -5053,12 +5818,342 @@ private:
     // the tokenizer changes: New Chat, conversation load, model switch.
     void InvalidateContextAnchor()
     {
+        m_lastTurnStats             = TurnStats{};
+        m_chatTurnStats.clear();
+        m_lastRequestBreakdown      = RequestBreakdown{};
         m_ctxAnchorPromptTokens     = -1;
         m_ctxAnchorCompletionTokens = 0;
         m_ctxAnchorExact            = false;
+        m_ctxAnchorRevision         = 0;
         m_ctxHistoryEstimateTokens  = m_chatHistory
-            ? (long long)m_chatHistory->EstimateHistoryTokens()
+            ? FallbackContextEstimate(*m_chatHistory, CurrentContextWindow(),
+                                      &m_ctxFallbackWouldElide)
             : 0;
+        m_ctxEstimateHistory  = m_chatHistory.get();
+        m_ctxEstimateRevision = m_chatHistory ? m_chatHistory->GetRevision() : 0;
+    }
+
+    // Append one TSV row per turn that carried an exact usage report:
+    // the bytes we actually put on the wire versus the prompt_tokens
+    // the server counted.  bytes_per_token is the measured ratio for
+    // the running model; est_error_pct is how far the kBytesPerToken
+    // heuristic would have been off on this same request.  Lands in
+    // the conversation's chat folder as ctx_calibration.tsv.
+    //
+    // Deliberately best-effort and silent: an unsaved conversation has
+    // no chat folder, and a logging failure must never disturb a turn.
+    void LogContextCalibration(long long promptTokens)
+    {
+        if (!m_chatHistory || promptTokens <= 0) return;
+
+        const size_t bytes = m_chatHistory->GetLastBuildRequestBytes();
+        if (bytes == 0) return;
+
+        const std::string dir =
+            ChatHistory::GetChatFolder(m_chatHistory->GetFilePath());
+        if (dir.empty()) return;
+
+        const long long est =
+            (long long)ChatHistory::EstimateTokensFromBytes(bytes);
+        const double bpt   = (double)bytes / (double)promptTokens;
+        const double errPc =
+            ((double)(est - promptTokens) * 100.0) / (double)promptTokens;
+
+        try {
+            const std::filesystem::path p =
+                std::filesystem::path(dir) / "ctx_calibration.tsv";
+            const bool fresh = !std::filesystem::exists(p);
+
+            std::ofstream f(p, std::ios::app);
+            if (!f) return;
+
+            if (fresh) {
+                f << "time\tmodel\treq_bytes\tprompt_tokens\test_tokens"
+                     "\tbytes_per_token\test_error_pct\telided\n";
+            }
+
+            char nums[96];
+            snprintf(nums, sizeof(nums), "%.3f\t%+.1f", bpt, errPc);
+
+            f << wxDateTime::Now().FormatISOCombined(' ').ToStdString() << '\t'
+              << (!m_chatHistory->GetLastBuildModel().empty()
+                      ? m_chatHistory->GetLastBuildModel()
+                      : (m_appState ? m_appState->GetModel() : std::string())) << '\t'
+              << bytes         << '\t'
+              << promptTokens  << '\t'
+              << est           << '\t'
+              << nums          << '\t'
+              << m_chatHistory->GetLastBuildElidedCount()
+              << '\n';
+        } catch (...) {
+            // best-effort only
+        }
+    }
+
+    // Reload m_lastTurnStats / m_chatTurnStats from the current chat's
+    // turn_stats.tsv (same 1000-reply cap as the live list).  No file, no
+    // folder (new chat) or an unreadable file leaves them empty.
+    void RestoreTurnStatsFromLog()
+    {
+        if (!m_chatHistory || !m_chatHistory->HasFilePath()) return;
+        const std::string dir = ChatHistory::GetChatFolder(m_chatHistory->GetFilePath());
+        if (dir.empty()) return;
+        try {
+            const std::filesystem::path p =
+                std::filesystem::path(path_safety::Utf8ToWide(dir)) / L"turn_stats.tsv";
+            std::ifstream f(p, std::ios::binary);
+            if (!f) return;
+            std::ostringstream ss;
+            ss << f.rdbuf();
+            m_chatTurnStats = TurnStats::ParseTsv(ss.str(), 1000);
+            if (!m_chatTurnStats.empty()) m_lastTurnStats = m_chatTurnStats.back();
+        } catch (...) {
+            m_chatTurnStats.clear();
+            m_lastTurnStats = TurnStats{};
+        }
+    }
+
+    // Append one row per completed reply to <chat folder>\turn_stats.tsv:
+    // token counts, first-token / total time, generation and prompt speed,
+    // and llama-server's own timings when present.  Columns are defined in
+    // turn_stats.h.  Best-effort and silent, like LogContextCalibration.
+    void LogTurnStats(const TurnStats& stats)
+    {
+        if (!m_chatHistory || stats.empty()) return;
+        const std::string dir =
+            ChatHistory::GetChatFolder(m_chatHistory->GetFilePath());
+        if (dir.empty() || !wxDirExists(wxString::FromUTF8(dir))) return;
+
+        try {
+            const std::filesystem::path p =
+                std::filesystem::path(path_safety::Utf8ToWide(dir)) / L"turn_stats.tsv";
+            // Older logs have fewer columns. A repeated header starts the
+            // new schema without rewriting their historical rows; ParseTsv
+            // already supports header changes within an appended log.
+            std::string lastHeader;
+            if (std::filesystem::exists(p)) {
+                std::ifstream existing(p, std::ios::binary);
+                if (!existing) return;
+                std::string line;
+                while (std::getline(existing, line)) {
+                    if (!line.empty() && line.back() == '\r') line.pop_back();
+                    if (line.compare(0, 5, "time\t") == 0) lastHeader = line;
+                }
+                if (existing.bad()) return;
+            }
+            std::ofstream f(p, std::ios::app);
+            if (!f) return;
+            if (lastHeader != TurnStats::TsvHeader()) f << TurnStats::TsvHeader() << '\n';
+            f << stats.TsvRow(
+                     wxDateTime::Now().FormatISOCombined(' ').ToStdString(),
+                     stats.modelId)
+              << '\n';
+        } catch (...) {
+            // best-effort only
+        }
+    }
+
+    // Tooltip for the ctx meter: what the number means, plus the last
+    // reply's speed line once there is one.
+    wxString BuildContextMeterTooltip() const
+    {
+        std::string tip =
+            "Click for context details.\n\n"
+            "Context window occupancy for the next request.\n"
+            "Exact (from the server's reported token usage) after each "
+            "completed turn; \"~\" marks a size-based estimate.\n"
+            "Amber: past the elision threshold - older tool-result "
+            "bodies are being trimmed from what the model sees "
+            "(\"\xC2\xB7" "elided\" appears when the last request was "
+            "trimmed).\n"
+            "Red: the window is nearly full - responses may degrade; "
+            "consider starting a new chat.\n"
+            "Window size is the Context Length in Settings.";
+        if (!m_lastTurnStats.empty()) {
+            tip += "\n\nLast reply: " + m_lastTurnStats.OneLineSummary();
+            if (!m_lastTurnStats.hasServerTimings)
+                tip += "\n(Measured by LlamaBoss; includes network and provider time.)";
+        }
+        return wxString::FromUTF8(tip);
+    }
+
+    // Occupancy of the next request, exactly as the ctx meter shows it.
+    // Context window the meter prices against (same source as
+    // ComputeContextUsage).
+    int CurrentContextWindow() const
+    {
+        if (m_modelSwitcher) return m_modelSwitcher->ConversationContextTokens();
+        if (m_appState && m_appState->GetCtxSize() > 0) return m_appState->GetCtxSize();
+        return 8192;
+    }
+
+    // Meter fallback when no exact usage anchor exists (endpoint sends no
+    // usage, or the chat was just reopened).  2026-10-01: the raw
+    // history-at-3.0-bytes estimate read ~324.5k/262.1k (red) for a
+    // reopened GPT-6 Luna chat whose real requests ran ~150k tokens.
+    // Now: measured bytes-per-token for the conversation model (seeded
+    // from ctx_calibration.tsv on load), capped at the elision budget the
+    // next request will enforce; *wouldElide drives "·elided".
+    long long FallbackContextEstimate(const ChatHistory& h, int window,
+                                      bool* wouldElide) const
+    {
+        const std::string model = m_modelSwitcher
+            ? m_modelSwitcher->GetConversationModelForSave()
+            : (m_appState ? m_appState->GetModel() : std::string());
+        return (long long)h.EstimateNextRequestTokens(model, window, wouldElide);
+    }
+
+    struct ContextUsage {
+        int       window    = 8192;
+        long long used      = 0;     // base + draft
+        bool      exact     = false; // `used` as a whole is a server count
+        bool      baseExact = false; // the history part is a server count
+        long long draft     = 0;     // unsent composer text, estimated
+    };
+    ContextUsage ComputeContextUsage() const
+    {
+        ContextUsage u;
+        if (m_modelSwitcher)
+            u.window = m_modelSwitcher->ConversationContextTokens();
+        else if (m_appState && m_appState->GetCtxSize() > 0)
+            u.window = m_appState->GetCtxSize();
+
+        if (m_ctxAnchorPromptTokens >= 0) {
+            u.used      = m_ctxAnchorPromptTokens + m_ctxAnchorCompletionTokens;
+            u.baseExact = m_ctxAnchorExact;
+        } else {
+            // No server count (endpoint sends no usage, or none yet):
+            // re-price the history estimate whenever the history changed.
+            const ChatHistory* h = m_chatHistory.get();
+            if (!h) {
+                m_ctxHistoryEstimateTokens = 0;
+                m_ctxEstimateHistory = nullptr;
+            } else if (h != m_ctxEstimateHistory ||
+                       h->GetRevision() != m_ctxEstimateRevision) {
+                m_ctxHistoryEstimateTokens =
+                    FallbackContextEstimate(*h, u.window, &m_ctxFallbackWouldElide);
+                m_ctxEstimateHistory  = h;
+                m_ctxEstimateRevision = h->GetRevision();
+            }
+            u.used      = m_ctxHistoryEstimateTokens;
+            u.baseExact = false;
+        }
+        u.exact = u.baseExact;
+
+        // Pending composer text rides on top as an estimate.
+        // GetLastPosition() is O(1) — deliberately NOT GetValue(),
+        // which copies the whole buffer (see OnUserInputChanged).
+        if (_userInputCtrl) {
+            const long pendingChars = _userInputCtrl->GetLastPosition();
+            if (pendingChars > 0) {
+                u.draft = (long long)ChatHistory::EstimateTokensFromBytes(
+                    (size_t)pendingChars);
+                u.used += u.draft;
+                // Server count + estimated draft is an estimate as a
+                // whole; the meter shows "~" and the HUD says which part
+                // is exact.
+                u.exact = false;
+            }
+        }
+        return u;
+    }
+
+    // Everything the context details panel shows, gathered from the meter
+    // state, the last request breakdown and this chat's reply stats.
+    HudInputs BuildHudInputs() const
+    {
+        const ContextUsage u = ComputeContextUsage();
+        HudInputs in;
+        in.ctxUsed         = u.used;
+        in.ctxWindow       = u.window;
+        in.ctxExact        = u.exact;
+        in.ctxBaseExact    = u.baseExact;
+        in.draftTokens     = u.draft;
+        in.elisionFraction = ChatHistory::ElisionBudgetFraction();
+        in.request         = m_lastRequestBreakdown;
+        in.requestPromptTokens = m_lastTurnStats.promptTokens;
+        // The HUD reads model identity from the recorded turn, never from
+        // the current model pill or the app-global active target.
+        in.last            = m_lastTurnStats;
+        in.history         = m_chatTurnStats;
+        return in;
+    }
+
+    // "[ Open log ]" for the current chat, or empty when it has no folder yet.
+    std::function<void()> MakeOpenLogAction() const
+    {
+        const std::string chatDir = (m_chatHistory && m_chatHistory->HasFilePath())
+            ? ChatHistory::GetChatFolder(m_chatHistory->GetFilePath())
+            : std::string();
+        if (chatDir.empty() || !wxDirExists(wxString::FromUTF8(chatDir)))
+            return {};
+        return [chatDir]() {
+            const wxString log = wxString::FromUTF8(chatDir + "/turn_stats.tsv");
+            if (!wxFileExists(log) || !wxLaunchDefaultApplication(log))
+                wxLaunchDefaultApplication(wxString::FromUTF8(chatDir));
+        };
+    }
+
+    // Click on the ctx meter: pin the context details panel to the chat
+    // view's bottom-right corner, or close it if it is already open.
+    void ToggleContextHud()
+    {
+        if (!m_appState || m_isClosing) return;
+        if (m_contextHud) { CloseContextHud(); return; }
+
+        ContextHud::Actions actions;
+        actions.openLog = MakeOpenLogAction();
+        actions.close   = [this]() { CloseContextHud(); };
+
+        m_contextHud = new ContextHud(this, m_appState->GetTheme(),
+                                      context_stats::BuildContextHudModel(BuildHudInputs()),
+                                      std::move(actions));
+        m_contextHud->ShowInCorner(_chatDisplayCtrl ? static_cast<wxWindow*>(_chatDisplayCtrl)
+                                                    : static_cast<wxWindow*>(this));
+        m_appState->SetContextHudOpen(true);   // reopened on next launch
+#ifdef __WXMSW__
+        m_contextHudVisTimer.Start(250);
+#endif
+    }
+
+#ifdef __WXMSW__
+    void SyncContextHudVisibility()
+    {
+        if (!m_contextHud || m_isClosing) return;
+        const HWND fg = ::GetForegroundWindow();
+        const bool ours = fg == static_cast<HWND>(GetHWND()) ||
+                          fg == static_cast<HWND>(m_contextHud->GetHWND());
+        const bool want = ours && !IsIconized();
+        if (want != m_contextHud->IsShown()) {
+            m_contextHud->Show(want);
+            if (want) m_contextHud->Reposition();
+        }
+    }
+#endif
+
+    void CloseContextHud()
+    {
+        if (!m_contextHud) return;
+#ifdef __WXMSW__
+        m_contextHudVisTimer.Stop();
+#endif
+        ContextHud* hud = m_contextHud;
+        m_contextHud = nullptr;
+        // Only user actions (meter click, the panel's close button) reach
+        // here; window teardown destroys the panel as a child instead, so
+        // quitting with the panel open keeps it open next launch.
+        if (m_appState) m_appState->SetContextHudOpen(false);
+        hud->Hide();
+        hud->Destroy();
+    }
+
+    // Live update: called at the end of every RefreshContextMeter (replies,
+    // New Chat, loads, model switches, draft typing).
+    void UpdateContextHud()
+    {
+        if (!m_contextHud || m_isClosing) return;
+        m_contextHud->SetOpenLog(MakeOpenLogAction());
+        m_contextHud->SetModel(context_stats::BuildContextHudModel(BuildHudInputs()));
     }
 
     void RefreshContextMeter()
@@ -5073,34 +6168,24 @@ private:
             _ctxMeter->Show(wantShown);
             if (_toolbarPanel) _toolbarPanel->Layout();
         }
-        if (!wantShown) return;
-
-        int ctxTokens = m_appState->GetCtxSize();
-        if (ctxTokens <= 0) ctxTokens = 8192;
-
-        long long used;
-        bool exact;
-        if (m_ctxAnchorPromptTokens >= 0) {
-            used  = m_ctxAnchorPromptTokens + m_ctxAnchorCompletionTokens;
-            exact = m_ctxAnchorExact;
-        } else {
-            used  = m_ctxHistoryEstimateTokens;
-            exact = false;
+        if (!wantShown) {
+            // The meter is only the panel's toggle, not its data source:
+            // an open HUD must keep following chat switches and replies
+            // (it still has its own [ Close ]).  Returning before this
+            // froze it on the previous chat's numbers.
+            UpdateContextHud();
+            return;
         }
 
-        // Pending composer text rides on top as an estimate.
-        // GetLastPosition() is O(1) — deliberately NOT GetValue(),
-        // which copies the whole buffer (see OnUserInputChanged).
-        if (_userInputCtrl) {
-            const long pendingChars = _userInputCtrl->GetLastPosition();
-            if (pendingChars > 0) {
-                used += (long long)ChatHistory::EstimateTokensFromBytes(
-                    (size_t)pendingChars);
-            }
-        }
+        const ContextUsage u = ComputeContextUsage();
+        const int ctxTokens = u.window;
+        const long long used = u.used;
+        const bool exact = u.exact;
 
         const bool elided =
-            m_chatHistory && m_chatHistory->GetLastBuildElidedCount() > 0;
+            m_chatHistory && (m_chatHistory->GetLastBuildElidedCount() > 0 ||
+                              m_chatHistory->GetLastBuildArgsElidedCount() > 0 ||
+                              (!u.baseExact && m_ctxFallbackWouldElide));
 
         auto fmtK = [](long long t) -> std::string {
             if (t < 1000) return std::to_string(t < 0 ? 0 : t);
@@ -5128,6 +6213,11 @@ private:
         else if (frac >= ChatHistory::ElisionBudgetFraction())
             fg = wxColour(224, 175, 104);           // amber: elision active zone
 
+        // Clickable now: light up on hover like the other toolbar controls,
+        // but only in the calm state -- amber/red keep their warning colour.
+        if (m_ctxMeterHover && fg == t.textMuted)
+            fg = LbInteractiveAccent(t);
+
         const wxString label = wxString::FromUTF8(text);
         bool changed = false;
         if (label != m_ctxMeterLastLabel) {
@@ -5140,20 +6230,17 @@ private:
             changed = true;
         }
         _ctxMeter->SetBackgroundColour(t.bgToolbar);
-        if (changed) {
-            _ctxMeter->Refresh();
-            _ctxMeter->SetToolTip(
-                "Context window occupancy for the next request.\n"
-                "Exact (from the server's reported token usage) after each "
-                "completed turn; \"~\" marks a size-based estimate.\n"
-                "Amber: past the elision threshold - older tool-result "
-                "bodies are being trimmed from what the model sees "
-                "(\"\xC2\xB7" "elided\" appears when the last request was "
-                "trimmed).\n"
-                "Red: the window is nearly full - responses may degrade; "
-                "consider starting a new chat.\n"
-                "Window size is the Context Length in Settings.");
+        if (changed) _ctxMeter->Refresh();
+        // Refreshed on every call (cheap) so the "Last reply" line follows
+        // each completed turn even when the label text didn't change.
+        {
+            const wxString tip = BuildContextMeterTooltip();
+            if (tip != m_ctxMeterLastTooltip) {
+                _ctxMeter->SetToolTip(tip);
+                m_ctxMeterLastTooltip = tip;
+            }
         }
+        UpdateContextHud();
     }
 
     void UpdateProtocolChip(ToolProtocol protocol)
@@ -5228,10 +6315,10 @@ private:
         // A prompt queued behind this (failed) load can never fire — drop it
         // and say so, rather than leaving it stuck.
         if (m_pendingSend.active) {
-            m_pendingSend = PendingSend{};
+            ClearPendingSend();
             m_chatDisplay->DisplaySystemMessage(
                 "Your queued message was not sent because the model failed "
-                "to load.");
+                "to load. It is still in the input box.");
         }
     }
 
@@ -5421,6 +6508,13 @@ private:
 
     void OnCharHook(wxKeyEvent& evt)
     {
+        if (evt.ControlDown() && evt.ShiftDown() && !evt.AltDown() &&
+            (evt.GetKeyCode() == 'V' || evt.GetKeyCode() == 'v') &&
+            wxWindow::FindFocus() == _userInputCtrl &&
+            _userInputCtrl->IsEnabled() && _userInputCtrl->IsEditable()) {
+            _userInputCtrl->PasteAsText();
+            return;
+        }
         if (evt.ControlDown()) {
             switch (evt.GetKeyCode()) {
             case 'N':
@@ -5472,6 +6566,92 @@ private:
         }
 
         evt.Skip();
+    }
+
+    bool TryPasteLargeTextFromClipboard()
+    {
+        if (!_userInputCtrl || !m_attachments || !m_chatHistory ||
+            IsBusy() || m_isClosing || !wxTheClipboard->Open())
+            return false;
+
+        // Close the clipboard before any file I/O, callbacks, or dialogs.
+        wxTextDataObject clipboardText;
+        const bool hasText = wxTheClipboard->IsSupported(wxDF_UNICODETEXT) ||
+                             wxTheClipboard->IsSupported(wxDF_TEXT);
+        const bool gotText = hasText && wxTheClipboard->GetData(clipboardText);
+        wxTheClipboard->Close();
+        if (!gotText) return false;
+
+        const wxScopedCharBuffer utf8 = clipboardText.GetText().ToUTF8();
+        if (!utf8.data()) return false;
+        const size_t byteCount = utf8.length();
+        if (byteCount <= varstore::DemotionConfig{}.thresholdBytes)
+            return false; // native paste preserves normal selection/undo
+
+        auto reportFailure = [this](const wxString& reason) {
+            wxMessageBox(reason +
+                "\n\nYour draft and clipboard have not been changed. "
+                "Ctrl+Shift+V pastes directly into the message instead.",
+                "Paste Text Attachment", wxOK | wxICON_WARNING, this);
+            return true; // handled: do not fall through to native paste
+        };
+        if (byteCount > AttachmentManager::kMaxPastedTextBytes)
+            return reportFailure("This paste exceeds the 64 MiB attachment limit.");
+        if (m_attachments->GetCount() >= AttachmentManager::kMaxAttachments)
+            return reportFailure("Remove an attachment before adding another.");
+
+        // Always use this conversation's Workspace, not a /cd override or
+        // a project source directory. Use an absolute tool path so later
+        // working-directory changes do not make the attachment unreachable.
+        EnsureConversationChatFolder();
+        const wxString directory = wxString::FromUTF8(
+            ChatHistory::GetConversationWorkspaceDir(m_chatHistory->GetFilePath()));
+        if (!wxDirExists(directory) &&
+            !wxFileName::Mkdir(directory, wxS_DIR_DEFAULT, wxPATH_MKDIR_FULL))
+            return reportFailure("Could not create the folder for this attachment.");
+
+        const wxString stem = "Pasted-text-" +
+            wxDateTime::Now().Format("%Y%m%d-%H%M%S");
+        wxString filePath;
+        wxFile file;
+        for (int suffix = 0; suffix < 10000; ++suffix) {
+            const wxString name = stem +
+                (suffix == 0 ? wxString() : wxString::Format("-%d", suffix)) +
+                ".txt";
+            const wxString candidate = wxFileName(directory, name).GetFullPath();
+            if (wxFileExists(candidate) || wxDirExists(candidate)) continue;
+            // Exclusive creation: even a competing writer cannot be overwritten.
+            if (file.Create(candidate, false)) {
+                filePath = candidate;
+                break;
+            }
+            if (!wxFileExists(candidate) && !wxDirExists(candidate))
+                return reportFailure("Could not save the pasted text attachment.");
+        }
+        if (filePath.empty())
+            return reportFailure("Could not choose a filename for this attachment.");
+
+        auto discardUnattachedFile = [this, &filePath]() {
+            if (!wxRemoveFile(filePath))
+                m_chatHistory->NoteWorkspaceSideEffect();
+        };
+        const bool wroteAll = file.Write(utf8.data(), byteCount) == byteCount;
+        const bool closed = file.Close();
+        if (!wroteAll || !closed) {
+            discardUnattachedFile();
+            return reportFailure("Could not finish saving the pasted text attachment.");
+        }
+
+        // Length-aware construction preserves UTF-8 bytes, whitespace, and
+        // line endings; the existing draft (including selection) is untouched.
+        const std::string content(utf8.data(), byteCount);
+        if (!m_attachments->AttachPastedText(content, WxToUtf8(filePath))) {
+            discardUnattachedFile();
+            return reportFailure("Could not add the pasted text attachment.");
+        }
+        m_chatHistory->NoteWorkspaceSideEffect();
+        _userInputCtrl->SetFocus();
+        return true;
     }
 
     bool TryPasteImageFromClipboard()
@@ -5671,83 +6851,21 @@ private:
             return true;
         }
 
-        // -- /wait_budget -- agent wait-time budget per turn --------
-        // Not a tool: session-level AgentController setting (not
-        // persisted).  Bare "/wait_budget" reports the current value;
-        // "/wait_budget <seconds>" sets it (clamped 60..14400).
-        if (!hasAttachments && userInput.rfind("/wait_budget", 0) == 0 &&
-            (userInput.size() == 12 ||
-             userInput[12] == ' ' || userInput[12] == '\t' ||
-             userInput[12] == '\n' || userInput[12] == '\r')) {
-            std::string rest = (userInput.size() > 12)
-                ? userInput.substr(13) : std::string();
-
-            _userInputCtrl->Clear();
-            { wxCommandEvent e(wxEVT_TEXT, _userInputCtrl->GetId());
-              OnUserInputChanged(e); }
-
-            size_t a = rest.find_first_not_of(" \t\r\n");
-            size_t b = rest.find_last_not_of(" \t\r\n");
-            std::string token = (a == std::string::npos)
-                ? std::string() : rest.substr(a, b - a + 1);
-
-            const int current = m_agentController
-                ? m_agentController->GetWaitBudgetSeconds()
-                : AgentController::kDefaultWaitBudgetSeconds;
-
-            if (token.empty()) {
-                m_chatDisplay->DisplaySystemMessage(
-                    "Agent wait budget: " + std::to_string(current) +
-                    " seconds of wait time per turn. Use /wait_budget "
-                    "<seconds> (60-14400) to change it for this session.");
-                return true;
-            }
-
-            bool allDigits = !token.empty();
-            for (char c : token) {
-                if (c < '0' || c > '9') { allDigits = false; break; }
-            }
-            long parsed = 0;
-            if (allDigits) {
-                for (char c : token) {
-                    parsed = parsed * 10 + (c - '0');
-                    if (parsed > 1000000) { parsed = 1000000; break; }
-                }
-            }
-            if (!allDigits || parsed <= 0) {
-                m_chatDisplay->DisplaySystemMessage(
-                    "Usage: /wait_budget <seconds> where seconds is "
-                    "60-14400. Current: " + std::to_string(current) + ".");
-                return true;
-            }
-
-            const int requested = (int)parsed;
-            if (m_agentController)
-                m_agentController->SetWaitBudgetSeconds(requested);
-            const int applied = m_agentController
-                ? m_agentController->GetWaitBudgetSeconds() : requested;
-
-            std::string note = "Agent wait budget set to " +
-                std::to_string(applied) + " seconds per turn.";
-            if (applied != requested) {
-                note += " (Requested " + std::to_string(requested) +
-                        " was clamped to the supported 60-14400 range.)";
-            }
-            note += " Applies immediately for this session (not persisted).";
-            m_chatDisplay->DisplaySystemMessage(note);
-            return true;
-        }
-
         // -- /think -- per-conversation reasoning override ----------
         // Not a tool: mutates per-conversation ChatHistory state, like
         // /cd.  Bare "/think" reports the current mode; "/think
-        // on|off|auto" sets it.  Auto sends nothing on the wire (the
-        // historical request shape); on/off ask the backend to enable
-        // or suppress model reasoning.  Local llama-server targets get
-        // chat_template_kwargs.enable_thinking (honored by hybrid
-        // reasoning models such as Qwen3 under --jinja, ignored by
-        // templates that never reference it); remote OpenAI-compatible
-        // targets get an OpenRouter-style reasoning object.
+        // on|off|auto|low|medium|high" sets it.  Auto sends nothing on
+        // the wire (the historical request shape); everything else asks
+        // the backend to enable or suppress model reasoning.  Local
+        // llama-server targets get chat_template_kwargs.enable_thinking
+        // (honored by hybrid reasoning models such as Qwen3 under
+        // --jinja, ignored by templates that never reference it;
+        // boolean only, so any effort level enables).  Remote targets
+        // branch on the endpoint's resolved reasoning dialect — the
+        // OpenRouter-style reasoning object, or direct OpenAI's
+        // reasoning_effort string where off maps to "none" (which also
+        // unblocks function tools on reasoning models there).  See
+        // ChatHistory::ThinkOverride for the full mapping.
         if (!hasAttachments && userInput.rfind("/think", 0) == 0 &&
             (userInput.size() == 6 ||
              userInput[6] == ' ' || userInput[6] == '\t' ||
@@ -5767,109 +6885,51 @@ private:
             for (char& c : token)
                 if (c >= 'A' && c <= 'Z') c = (char)(c + 32);
 
-            auto modeName = [](ChatHistory::ThinkOverride m) -> const char* {
-                switch (m) {
-                    case ChatHistory::ThinkOverride::On:  return "on";
-                    case ChatHistory::ThinkOverride::Off: return "off";
-                    default:                              return "auto";
-                }
-            };
-
             if (token.empty()) {
                 m_chatDisplay->DisplaySystemMessage(
                     std::string("Thinking mode: ") +
-                    modeName(m_chatHistory->GetThinkOverride()) +
-                    ". Use /think on, /think off, or /think auto. "
+                    ThinkingModeName(m_chatHistory->GetThinkOverride()) +
+                    ". Use /think on | off | auto, or an effort level: "
+                    "/think low | medium | high. "
                     "auto = backend default (nothing added to the "
-                    "request); on/off ask the model to reason (or not) "
-                    "before answering -- honored by hybrid-reasoning "
-                    "models, ignored by models without a thinking mode.");
+                    "request); off requests no reasoning; "
+                    "on/low/medium/high request thinking. Support "
+                    "depends on the model and provider. Local models "
+                    "treat any level as on.");
                 return true;
             }
 
             ChatHistory::ThinkOverride mode;
-            if      (token == "on")   mode = ChatHistory::ThinkOverride::On;
-            else if (token == "off")  mode = ChatHistory::ThinkOverride::Off;
-            else if (token == "auto") mode = ChatHistory::ThinkOverride::Auto;
+            if      (token == "on")     mode = ChatHistory::ThinkOverride::On;
+            else if (token == "off")    mode = ChatHistory::ThinkOverride::Off;
+            else if (token == "auto")   mode = ChatHistory::ThinkOverride::Auto;
+            else if (token == "low")    mode = ChatHistory::ThinkOverride::Low;
+            else if (token == "medium") mode = ChatHistory::ThinkOverride::Medium;
+            else if (token == "high")   mode = ChatHistory::ThinkOverride::High;
             else {
                 m_chatDisplay->DisplaySystemMessage(
-                    "Usage: /think on | off | auto. Current: " +
-                    std::string(modeName(m_chatHistory->GetThinkOverride())) +
+                    "Usage: /think on | off | auto | low | medium | "
+                    "high. Current: " +
+                    std::string(ThinkingModeName(m_chatHistory->GetThinkOverride())) +
                     ".");
                 return true;
             }
 
-            m_chatHistory->SetThinkOverride(mode);
-            std::string note = std::string("Thinking mode set to ") +
-                               modeName(mode) +
-                               " for this conversation.";
-            if (mode != ChatHistory::ThinkOverride::Auto) {
-                note += " Takes effect on the next message. If a remote "
-                        "endpoint rejects the reasoning field, run "
-                        "/think auto to restore the default request.";
-            }
-            m_chatDisplay->DisplaySystemMessage(note);
+            SetConversationThinking(mode);
             return true;
         }
 
 
-        // ── /goal — per-conversation goal state ───────────────────
-        // Not a tool: forwards goal commands to GoalController.
-        if (!hasAttachments && userInput.rfind("/goal", 0) == 0 &&
-            (userInput.size() == 5 ||
-             userInput[5] == ' ' || userInput[5] == '\t' ||
-             userInput[5] == '\n' || userInput[5] == '\r')) {
-            std::string rest = (userInput.size() > 5)
-                ? userInput.substr(6) : std::string();
-
+        // ── /bench — model speed benchmark ───────────────────────
+        if (!hasAttachments && userInput.rfind("/bench", 0) == 0 &&
+            (userInput.size() == 6 ||
+             userInput[6] == ' ' || userInput[6] == '\t' ||
+             userInput[6] == '\n' || userInput[6] == '\r')) {
             _userInputCtrl->Clear();
-            { wxCommandEvent e(wxEVT_TEXT, _userInputCtrl->GetId());
-              OnUserInputChanged(e); }
-
-            m_goalController->HandleSlashGoal(rest);
+            { wxCommandEvent ev(wxEVT_TEXT, _userInputCtrl->GetId());
+              OnUserInputChanged(ev); }
+            HandleBenchCommand(userInput.size() > 6 ? userInput.substr(7) : std::string());
             return true;
-        }
-
-        // ── Natural-language Goal controls (Goals Phase 16) ─────
-        // Command-like, full-message phrases map onto the existing /goal
-        // control flow.  This keeps slash commands available for power users
-        // while the normal UX reads more naturally.
-        if (!hasAttachments) {
-            std::string naturalGoalCommand;
-            if (LbTryParseNaturalLanguageGoalControl(userInput, naturalGoalCommand)) {
-                _userInputCtrl->Clear();
-                { wxCommandEvent e(wxEVT_TEXT, _userInputCtrl->GetId());
-                  OnUserInputChanged(e); }
-
-                m_chatDisplay->DisplaySystemMessage(
-                    "Natural-language goal command recognized.");
-                m_goalController->HandleSlashGoal(naturalGoalCommand);
-                return true;
-            }
-        }
-
-        // ── Natural-language Goal start (Goals Phase 15) ────────
-        // Keep this explicit and conservative: only command-like phrases
-        // that literally say "goal" are treated as Goal creation. Ordinary
-        // conversational requests keep flowing through normal chat.
-        if (!hasAttachments) {
-            std::string naturalGoalObjective;
-            if (LbTryParseNaturalLanguageGoalStart(userInput, naturalGoalObjective)) {
-                _userInputCtrl->Clear();
-                { wxCommandEvent e(wxEVT_TEXT, _userInputCtrl->GetId());
-                  OnUserInputChanged(e); }
-
-                if (naturalGoalObjective.empty()) {
-                    m_chatDisplay->DisplaySystemMessage(
-                        "To start a natural-language goal, include the objective after the phrase. "
-                        "Example: Make this a goal: <objective>");
-                } else {
-                    m_chatDisplay->DisplaySystemMessage(
-                        "Natural-language goal request recognized.");
-                    m_goalController->HandleSlashGoal(naturalGoalObjective);
-                }
-                return true;
-            }
         }
 
         // ── Tool-shaped slash commands (Phase 4 / 4.1) ────────────
@@ -5976,9 +7036,7 @@ private:
     }
 
     // Prepares a real chat turn after special routing falls through.
-    // Returns false when the text was captured as an awaiting-goal reply
-    // and no assistant request should start yet.
-    bool PrepareAndRecordUserTurn(std::string userInput,
+    void PrepareAndRecordUserTurn(std::string userInput,
                                   bool hasAttachments)
     {
         if (userInput.empty() && hasAttachments) {
@@ -5998,6 +7056,17 @@ private:
             if (!m_chatHistory->HasFilePath())
                 m_chatHistory->SetFilePath(ChatHistory::GenerateFilePath());
 
+            // Images are saved before this message is recorded, so on a
+            // first turn the history has no title yet.  Name the chat
+            // folder from the message being sent instead of leaving it
+            // untitled.  No-op when the folder already exists.
+            {
+                std::string folderTitle = m_chatHistory->GetChatFolderTitle();
+                if (folderTitle == "Untitled conversation")
+                    folderTitle = ChatHistory::TitleFromUserText(userInput);
+                ChatHistory::EnsureChatFolder(m_chatHistory->GetFilePath(), folderTitle);
+            }
+
             std::string attachDir = ChatHistory::GetAttachmentDir(m_chatHistory->GetFilePath());
             std::string relDir = ChatHistory::GetAttachmentRelDir(m_chatHistory->GetFilePath());
             size_t msgIndex = m_chatHistory->GetMessageCount();
@@ -6006,10 +7075,10 @@ private:
 
         std::vector<std::string> imagePaths;
         if (m_attachments->HasImage()) {
-            std::string workflowDir = ChatHistory::GetWorkflowDir(m_chatHistory->GetFilePath());
+            std::string chatDir = ChatHistory::GetChatFolder(m_chatHistory->GetFilePath());
             for (const auto& info : attachInfo) {
                 if (info.kind == AttachmentInfo::Kind::Image && !info.storagePath.empty())
-                    imagePaths.push_back(workflowDir + "/" + info.storagePath);
+                    imagePaths.push_back(chatDir + "/" + info.storagePath);
             }
         }
 
@@ -6029,8 +7098,18 @@ private:
         _userInputCtrl->Clear();
         { wxCommandEvent e(wxEVT_TEXT, _userInputCtrl->GetId()); OnUserInputChanged(e); }
 
-        if (m_attachments->HasTextFile())
-            userInput = m_attachments->BakeTextFilesIntoMessage(userInput);
+        if (m_attachments->HasTextFile()) {
+            // Decide at Send, not Paste: the user may toggle Agent mode or
+            // choose a no-tools model while this attachment is pending.
+            const InferenceTarget attachmentTarget =
+                m_modelSwitcher->ResolveTargetForConversation();
+            const bool usePastedFileReferences = m_agentModeEnabled &&
+                !attachmentTarget.noTools && !attachmentTarget.imageOutput;
+            userInput = m_attachments->BakeTextFilesIntoMessage(
+                userInput, usePastedFileReferences);
+        }
+        if (m_attachments->HasTextFileRef())
+            userInput = m_attachments->BakeTextFileRefsIntoMessage(userInput);
         if (m_attachments->HasPdfFile())
             userInput = m_attachments->BakePdfFilesIntoMessage(
                 userInput, m_agentModeEnabled);
@@ -6050,22 +7129,10 @@ private:
         // Per-turn ambient context: prepended AFTER the bakes so the
         // header is the first line of the wire message.  Stored in
         // history (stable KV prefix; temporal grounding of past turns).
-        // Goal-answer capture below intentionally receives the clean
-        // userInput, not the wire copy.
         const std::string wireInput =
             BuildSessionContextHeader() + "\n\n" + userInput;
 
         m_chatHistory->AddUserMessage(wireInput, "", attachInfo);
-
-        // A plain user reply while a goal is waiting for input is recorded
-        // as the answer, not immediately routed into a fresh agent turn.
-        if (!hasAttachments &&
-            m_goalController->TryCaptureAwaitingUserReply(userInput)) {
-            m_attachments->Clear();
-            return false;
-        }
-
-        return true;
     }
 
     void StartAssistantResponseForPreparedTurn()
@@ -6073,36 +7140,71 @@ private:
         std::string model =
             m_modelSwitcher->GetConversationModelForSave();
 
-        // Image-generation model (per-model image_output flag on the
-        // active remote target)?  Two consequences for this turn:
-        //   * never attach the tool catalog — OpenRouter routes only
-        //     to providers supporting every requested feature, and no
-        //     provider of an image model supports tool use, so a
-        //     tools-bearing request 404s before generation starts;
-        //   * the request builder adds "modalities": ["image","text"]
-        //     so the provider actually returns image data.
-        // Agent mode is bypassed rather than silently degraded: an
-        // image model can't drive the tool loop, and pretending it
-        // can would just burn a paid API call on a guaranteed error.
-        const bool imageModel =
-            m_modelSwitcher->ResolveTargetForConversation().imageOutput;
+        // Resolve once so request policy and transport use the exact same
+        // per-conversation target.  Two per-model flags bypass Agent mode:
+        //   * image_output: providers reject tool-bearing image requests,
+        //     and the body also needs modalities ["image","text"];
+        //   * no_tools: a chat/reasoning-only model whose provider rejects
+        //     function tools (for example direct OpenAI Luna with reasoning).
+        //
+        // Bypassing the complete Agent path matters: an empty native tools
+        // catalog alone would still leave the XML tool prompt and agent loop
+        // available on other protocols.  These models instead receive the
+        // normal system prompt and an ordinary reasoning/chat request.
+        const InferenceTarget target =
+            m_modelSwitcher->ResolveTargetForConversation();
+        const bool imageModel   = target.imageOutput;
+        const bool noToolsModel = target.noTools;
+        const bool agentToolsAllowed = !imageModel && !noToolsModel;
+
+        // Tell the request builder which reasoning dialect the target
+        // speaks BEFORE any body is built this turn, so /think emits
+        // the right shape (direct OpenAI: reasoning_effort string;
+        // everything else: the historical reasoning object).  Agent
+        // iterations within the turn reuse the same pinned target, so
+        // one set here covers the whole loop; the sendRequest lambda
+        // refreshes it defensively as well.
+        m_chatHistory->SetActiveReasoningDialect(target.reasoningDialect);
+        // Same lifetime: lets the request builder attach the Responses
+        // reasoning-replay sidecar (Phase 2) only for Responses targets.
+        m_chatHistory->SetActiveResponsesApi(target.responsesApi);
+
+        // A conversation can restore Off or carry it across a model switch.
+        // Normalize before the first body (including agent/tool requests),
+        // update the chip, and tell the user what will actually be sent.
+        if (!target.managed && !imageModel &&
+            m_chatHistory->GetThinkOverride() == ChatHistory::ThinkOverride::Off &&
+            lb_reasoning::RequiresReasoning(target.modelId,
+                target.reasoningDialect == ReasoningDialect::OpenAIStyle)) {
+            m_chatHistory->SetThinkOverride(ChatHistory::ThinkOverride::Low);
+            RefreshThinkingSelector();
+            m_chatDisplay->DisplaySystemMessage(
+                "This model does not support Thinking Off. Changed this "
+                "conversation to Low, its lowest supported reasoning effort.");
+            if (m_convController) m_convController->AutoSaveConversation();
+        }
 
         // Build the final request body only once.
         // Important: agent mode must add its system prompt BEFORE image injection.
         // If we inject images first and then rebuild the body for agent mode,
         // the rebuilt body loses the multimodal content array.
         std::string body;
-        if (m_agentModeEnabled && !imageModel) {
-            int ctxTokens = m_appState->GetCtxSize();
-            if (ctxTokens <= 0) ctxTokens = 8192;
+        // Protocol snapshot for this first request; handed to the agent
+        // controller after Begin() so the reply is parsed the same way the
+        // request was built, even if detection resolves mid-stream.
+        ToolProtocol firstTurnProto = ToolProtocol::Unknown;
+        if (m_agentModeEnabled && agentToolsAllowed) {
+            const int ctxTokens = m_modelSwitcher->ConversationContextTokens();
+            m_chatHistory->SetElisionSpoolWorkspace(ResolveCurrentCwd());
 
             // Phase 3c-i: attach the tool catalog when the loaded
             // model supports native function calling.  The agent
             // controller does the same on subsequent iterations
             // (see AgentController::BuildRequestBody); this is the
             // first turn before the controller takes over the loop.
+            firstTurnProto = _activeProtocol;
             std::string tools;
-            const bool native = (_activeProtocol == ToolProtocol::Native);
+            const bool native = (firstTurnProto == ToolProtocol::Native);
             if (native) {
                 tools = GetCachedToolsArrayJson();
             }
@@ -6117,13 +7219,19 @@ private:
                 true);
         }
         else {
-            if (m_agentModeEnabled && imageModel) {
-                m_chatDisplay->DisplaySystemMessage(
-                    "image model: agent tools are disabled for this turn.");
+            if (m_agentModeEnabled) {
+                if (imageModel) {
+                    m_chatDisplay->DisplaySystemMessage(
+                        "image model: agent tools are disabled for this turn.");
+                }
+                else if (noToolsModel) {
+                    m_chatDisplay->DisplaySystemMessage(
+                        "chat/reasoning-only model: agent tools are disabled for this turn.");
+                }
             }
 
-            int ctxTokens = m_appState->GetCtxSize();
-            if (ctxTokens <= 0) ctxTokens = 8192;
+            const int ctxTokens = m_modelSwitcher->ConversationContextTokens();
+            m_chatHistory->SetElisionSpoolWorkspace(ResolveCurrentCwd());
             body = m_chatHistory->BuildChatRequestJson(
                 model,
                 true,
@@ -6143,7 +7251,7 @@ private:
         // injector's only remaining action on such a body is a full
         // Poco parse of the multi-MB request to find there is nothing
         // to do.  It stays as the fallback for what projection cannot
-        // cover — no workflow dir yet, or images without a persisted
+        // cover — no chat folder yet, or images without a persisted
         // storage_path.
         if (m_attachments->HasImage() &&
             !m_chatHistory->LastBuildProjectedImages())
@@ -6187,13 +7295,16 @@ private:
 
         // Arm the agent loop only after the first request body has been built.
         // AgentController::Begin() prepares the controller to treat the upcoming
-        // streamed assistant reply as iteration 1.  Image-model turns never
-        // arm it — the request carried no tools (see imageModel above), so
-        // treating the reply as an agent iteration would only hold prose in
-        // the stream filter and log a phantom loop.
-        if (m_agentModeEnabled && !imageModel) {
+        // streamed assistant reply as iteration 1.  Image/no-tools turns never
+        // arm it — the request carried no tools, so treating the reply as an
+        // agent iteration would only hold prose in the stream filter and log
+        // a phantom loop.
+        if (m_agentModeEnabled && agentToolsAllowed) {
             ResetAgentToolStreamFilter();
+            m_agentController->SetConversationContextTokens(
+                m_modelSwitcher->ConversationContextTokens());
             m_agentController->Begin();
+            m_agentController->SetRequestProtocol(firstTurnProto);
         }
 
         DiscardPendingAssistantDelta();
@@ -6234,13 +7345,11 @@ private:
                                       ? body.substr(0, 2000) + "...(truncated)"
                                       : body;
             logger->debug(
-                std::string("Outbound /v1/chat/completions preview (") + protoLabel
+                std::string("Outbound chat projection (target ") + target.chatPath + "; " + protoLabel
                 + "): " + preview);
         }
 
-        if (!m_chatClient->SendMessage(
-                m_modelSwitcher->ResolveTargetForConversation(),
-                body, m_generationId)) {
+        if (!m_chatClient->SendMessage(target, body, m_generationId)) {
 
             if (m_agentController->IsActive()) {
                 ResetAgentToolStreamFilter();
@@ -6269,7 +7378,7 @@ private:
         const bool hasAttachments = m_attachments->HasPending();
         if (userInput.empty() && !hasAttachments) return;
         if (TryHandleSpecialInputRouting(userInput, hasAttachments)) return;
-        if (!PrepareAndRecordUserTurn(userInput, hasAttachments)) return;
+        PrepareAndRecordUserTurn(userInput, hasAttachments);
         StartAssistantResponseForPreparedTurn();
     }
 
@@ -6279,7 +7388,7 @@ private:
 
         std::string userInput = WxToUtf8(_userInputCtrl->GetValue());
 
-        // Trim leading whitespace so slash-commands (/cmd, /yay) fire
+        // Trim leading whitespace so slash-commands (/cd, /yay) fire
         // regardless of stray leading spaces in the input box.  Do NOT
         // trim trailing whitespace — prompts may intentionally end with
         // newlines for paragraph spacing.
@@ -6292,6 +7401,17 @@ private:
         if (TryHandlePendingApprovalInput(userInput)) return;
 
         if (IsBusy()) return;
+
+        // The model is ready but the queued prompt is waiting for tool-
+        // protocol detection (see OnServerReady).  IsServerReady() is
+        // already true here, so without this guard an Enter press would
+        // bypass the queue and send with an unresolved protocol.
+        if (m_pendingSend.active && m_pendingSend.awaitingProtocol) {
+            m_chatDisplay->DisplaySystemNotice(
+                "Model is ready \xE2\x80\x94 finishing setup, your message "
+                "will send in a moment.");
+            return;
+        }
 
         const bool hasAttachments = m_attachments->HasPending();
 
@@ -6321,13 +7441,13 @@ private:
             // Nothing to send — don't queue an empty turn.
             if (userInput.empty() && !hasAttachments) return;
 
-            // A prompt is already queued behind a load we kicked off.
-            // Keep the freshest text and wait.  Checked first so repeated
-            // Sends can never launch a second server.
+            // A prompt is already queued behind a load in flight.  The
+            // composer holds the text, so there is nothing to update —
+            // just wait.  Checked first so repeated Sends (Enter key; the
+            // button is disabled while queued) can never launch a second
+            // server.
             if (m_pendingSend.active) {
-                m_pendingSend.userInput = userInput;
-                _userInputCtrl->ChangeValue("");
-                m_chatDisplay->DisplaySystemMessage(
+                m_chatDisplay->DisplaySystemNotice(
                     "Model is still loading \xE2\x80\x94 your message will send "
                     "when it's ready.");
                 return;
@@ -6367,9 +7487,8 @@ private:
                 wxFileExists(wxString::FromUTF8(deferred)))
             {
                 m_pendingSend.active    = true;
-                m_pendingSend.userInput = userInput;
                 m_pendingSend.modelPath = deferred;
-                _userInputCtrl->ChangeValue("");
+                SetPendingSendUi(true);   // text stays in the composer
 
                 // A fresh model invalidates the previous tool protocol; reset
                 // so the next request doesn't build with a stale capability.
@@ -6393,7 +7512,24 @@ private:
             }
 
             // Genuinely mid-load with nothing deferred (initial boot, or a
-            // switch already in flight) — original wait behavior.
+            // switch already in flight).  Queue behind that load the same
+            // way the deferred path does, so "Send while loading" behaves
+            // identically regardless of why the model is loading.  The
+            // selection key is the path RequestLocalModel was called with.
+            {
+                const std::string inFlight =
+                    m_modelService->GetActiveSelectionKey();
+                if (!inFlight.empty() &&
+                    m_modelService->ResolveTarget().managed) {
+                    m_pendingSend.active    = true;
+                    m_pendingSend.modelPath = inFlight;
+                    SetPendingSendUi(true);
+                    m_chatDisplay->DisplaySystemMessage(
+                        "Loading " + ServerManager::ModelDisplayName(inFlight) +
+                        "\xE2\x80\xA6 your message will send when it's ready.");
+                    return;
+                }
+            }
             m_chatDisplay->DisplaySystemMessage(
                 "Server is still loading the model. Please wait...");
             return;
@@ -6403,8 +7539,7 @@ private:
 
         if (TryHandleSpecialInputRouting(userInput, hasAttachments)) return;
 
-        if (!PrepareAndRecordUserTurn(std::move(userInput), hasAttachments))
-            return;
+        PrepareAndRecordUserTurn(std::move(userInput), hasAttachments);
 
         StartAssistantResponseForPreparedTurn();
 

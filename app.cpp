@@ -5,6 +5,8 @@
 #include "app_state.h"
 #include "model_service.h"
 #include "server_manager.h"   // EnsureDataDirs
+#include "chat_history.h"     // MigrateLegacyChatFolders
+#include "update_installer.h"   // CleanupStaleDownloads
 
 #ifdef __WXMSW__
 #include <wx/msw/wrapwin.h>
@@ -144,6 +146,10 @@ bool MyApp::OnInit()
 
     wxInitAllImageHandlers();
 
+    // Remove the installer left in %TEMP% by the previous in-app update
+    // (cheap no-op when the folder doesn't exist).  Primary instance only.
+    UpdateInstaller::CleanupStaleDownloads();
+
     // ── App-level singletons, in dependency order ────────────────
     // Data dirs first (cheap no-op when they exist), then AppState
     // (settings + logger), then ModelService (needs the logger).
@@ -165,6 +171,29 @@ bool MyApp::OnInit()
     }
 
     m_modelService = std::make_unique<ModelService>(*m_appState);
+
+    // ── One-time chat folder migration ───────────────────────────
+    // Moves LlamaBoss\Workflows\chat_<id> into
+    // LlamaBoss\Chats\<date>_<title-slug>_<id>.  Runs before any window
+    // exists, so nothing of ours holds files open inside those folders.
+    // No-op once the legacy root is gone.  A folder that cannot move
+    // (another program has a file open) stays put and keeps working —
+    // the resolver still finds it — and is retried on the next launch.
+    try {
+        const auto mig = ChatHistory::MigrateLegacyChatFolders();
+        if (mig.moved || mig.failed || mig.skipped) {
+            if (auto* logger = m_appState->GetLogger()) {
+                logger->information(
+                    "Chat folder migration: moved " + std::to_string(mig.moved) +
+                    ", skipped " + std::to_string(mig.skipped) +
+                    ", failed " + std::to_string(mig.failed));
+                for (const auto& f : mig.failedFolders)
+                    logger->warning("Chat folder not migrated (in use?): " + f);
+            }
+        }
+    } catch (...) {
+        // Migration is cosmetic; never block startup on it.
+    }
 
     try {
         wxFrame* frame = CreateMainFrame();

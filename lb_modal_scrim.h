@@ -14,4 +14,11 @@ class wxDialog;
 // Shows `dlg` modally with a dimming scrim drawn over `parent`'s client area
 // (Windows only; elsewhere this is a plain ShowModal()).  Returns the dialog's
 // ShowModal() result (e.g. wxID_OK / wxID_CANCEL).
-int LbShowModalWithScrim(wxWindow& parent, wxDialog& dlg);
+//
+// dismissOnScrimClick: when true, a full left click (down + up) on the dimmed
+// backdrop posts WM_CLOSE to the dialog, which arrives as wxEVT_CLOSE_WINDOW.
+// The dialog decides what that means (the image lightbox binds it to
+// EndModal).  Default false keeps every existing dialog's behavior: backdrop
+// clicks are swallowed.
+int LbShowModalWithScrim(wxWindow& parent, wxDialog& dlg,
+                         bool dismissOnScrimClick = false);

@@ -22,19 +22,42 @@ namespace {
 
 #ifdef __WXMSW__
 
+// Window properties used only when the caller opts into click-to-dismiss.
+// kDismissTargetProp holds the dialog HWND to close; kPressedProp records
+// that the left button went DOWN on the scrim, so a stray button-up (e.g.
+// the tail of the click that opened the dialog) can never dismiss it.
+const wchar_t* const kDismissTargetProp = L"LbScrimDismissTarget";
+const wchar_t* const kPressedProp       = L"LbScrimPressed";
+
 LRESULT CALLBACK ModalScrimWndProc(HWND hwnd,
                                    UINT msg,
                                    WPARAM wParam,
                                    LPARAM lParam)
 {
+    const HWND dismissTarget =
+        static_cast<HWND>(::GetPropW(hwnd, kDismissTargetProp));
+
     switch (msg) {
     case WM_MOUSEACTIVATE:
         // The scrim is decorative modal chrome, not an interactive window.
-        // Do not let an outside click activate it or leak into focus changes.
-        return MA_NOACTIVATEANDEAT;
+        // Never activate it.  Normally the triggering click is eaten too;
+        // a dismissable scrim lets the button-down through so it can pair
+        // it with the button-up below.
+        return dismissTarget ? MA_NOACTIVATE : MA_NOACTIVATEANDEAT;
 
     case WM_LBUTTONDOWN:
+        if (dismissTarget)
+            ::SetPropW(hwnd, kPressedProp, reinterpret_cast<HANDLE>(1));
+        return 0;
+
     case WM_LBUTTONUP:
+        if (dismissTarget && ::GetPropW(hwnd, kPressedProp)) {
+            ::RemovePropW(hwnd, kPressedProp);
+            if (::IsWindow(dismissTarget))
+                ::PostMessageW(dismissTarget, WM_CLOSE, 0, 0);
+        }
+        return 0;
+
     case WM_LBUTTONDBLCLK:
     case WM_RBUTTONDOWN:
     case WM_RBUTTONUP:
@@ -52,6 +75,13 @@ LRESULT CALLBACK ModalScrimWndProc(HWND hwnd,
         // This preserves the dimming effect without disturbing
         // wxDialog::ShowModal().
         return 0;
+
+    case WM_NCDESTROY:
+        // Windows requires added properties to be removed before the
+        // window goes away.
+        ::RemovePropW(hwnd, kDismissTargetProp);
+        ::RemovePropW(hwnd, kPressedProp);
+        return DefWindowProcW(hwnd, msg, wParam, lParam);
 
     default:
         return DefWindowProcW(hwnd, msg, wParam, lParam);
@@ -164,13 +194,15 @@ void HideModalScrim(wxFrame*& scrim)
 
 } // namespace
 
-int LbShowModalWithScrim(wxWindow& parent, wxDialog& dlg)
+int LbShowModalWithScrim(wxWindow& parent, wxDialog& dlg,
+                         bool dismissOnScrimClick)
 {
 #ifdef __WXMSW__
     ModalScrimGuard modalScrim(ShowModalScrim(parent));
     if (modalScrim.Get()) {
         std::shared_ptr<HWND> scrimState = modalScrim.scrim;
-        dlg.Bind(wxEVT_SHOW, [scrimState, &dlg](wxShowEvent& event) {
+        dlg.Bind(wxEVT_SHOW, [scrimState, &dlg, dismissOnScrimClick](
+                                 wxShowEvent& event) {
             event.Skip();
             if (!event.IsShown()) return;
 
@@ -179,6 +211,12 @@ int LbShowModalWithScrim(wxWindow& parent, wxDialog& dlg)
 
             HWND dialogHwnd = reinterpret_cast<HWND>(dlg.GetHandle());
             if (!dialogHwnd) return;
+
+            // Opt-in click-to-dismiss: tell the scrim which window to
+            // close.  Set only once the dialog is visible, so no click
+            // can target a dialog that is not on screen yet.
+            if (dismissOnScrimClick)
+                ::SetPropW(scrimHwnd, kDismissTargetProp, dialogHwnd);
 
             // Some wxMSW custom dialogs create/focus their child controls
             // before ShowModal() enters the native modal loop.  Make the
@@ -200,6 +238,7 @@ int LbShowModalWithScrim(wxWindow& parent, wxDialog& dlg)
     modalScrim.Reset();
     return dialogResult;
 #else
+    (void)dismissOnScrimClick;
     wxFrame* modalScrim = ShowModalScrim(parent);
     const int dialogResult = dlg.ShowModal();
     HideModalScrim(modalScrim);

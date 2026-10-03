@@ -10,9 +10,9 @@
 //   - Freeze/Thaw wraps each ProcessDelta to prevent flicker.
 
 #include "markdown_renderer.h"
+#include "chat_display_ctrl.h"
 #include <algorithm>
 #include <cctype>
-#include <cstring>
 #include <vector>
 
 // ═══════════════════════════════════════════════════════════════════
@@ -172,6 +172,8 @@ void MarkdownRenderer::ProcessDelta(const std::string& delta, const wxColour& ba
 {
     if (delta.empty()) return;
 
+    TranscriptUpdateGuard update(m_ctrl, !m_bulkMode && ShouldAutoScroll(), !m_bulkMode);
+
     // ── Append-only fast path ────────────────────────────────────
     // The overwhelmingly common delta carries no '\n' at all, which
     // means the permanent part of the document is untouched and the
@@ -203,18 +205,12 @@ void MarkdownRenderer::ProcessDelta(const std::string& delta, const wxColour& ba
     {
         m_lineBuffer += delta;
 
-        m_ctrl->Freeze();
         if (m_inCodeBlock) WriteStyled(delta, m_codeColor, false, false, true);
         else               WriteStyled(delta, baseColor);
         m_partialLineRenderedLen = m_lineBuffer.size();
-        m_ctrl->Thaw();
-
-        if (ShouldAutoScroll())
-            m_ctrl->ShowPosition(m_ctrl->GetLastPosition());
         return;
     }
 
-    m_ctrl->Freeze();
 
     // Erase the previous partial-line preview (if any) before modifying the buffer,
     // so it doesn't get baked in as permanent text.
@@ -248,17 +244,6 @@ void MarkdownRenderer::ProcessDelta(const std::string& delta, const wxColour& ba
         RenderPartialLine(m_lineBuffer, baseColor);
     }
 
-    m_ctrl->Thaw();
-
-    // Per-call scroll is for live streaming only. In bulk/replay mode the
-    // ShowPosition() — which forces a layout pass that scales with document
-    // size — is suppressed; ChatDisplay's replay batch scrolls once at the
-    // end. (See SetBulkMode in the header.)  Live streaming additionally
-    // consults the follow-mode predicate so a user reading upstream isn't
-    // yanked back down on every delta.
-    if (!m_bulkMode && ShouldAutoScroll()) {
-        m_ctrl->ShowPosition(m_ctrl->GetLastPosition());
-    }
 }
 
 void MarkdownRenderer::Flush(const wxColour& baseColor)
@@ -269,7 +254,8 @@ void MarkdownRenderer::Flush(const wxColour& baseColor)
     // needs finalizing for Copy link integrity.
     if (m_lineBuffer.empty() && !m_inCodeBlock) return;
 
-    m_ctrl->Freeze();
+    TranscriptUpdateGuard update(m_ctrl, !m_bulkMode && ShouldAutoScroll(), !m_bulkMode);
+
 
     // Remove the partial-line preview — we're about to render this text
     // permanently with full markdown formatting.
@@ -287,15 +273,6 @@ void MarkdownRenderer::Flush(const wxColour& baseColor)
     // than to a future block in a later message.
     FinalizeOpenCodeBlock(/*drawBottomBorder=*/true);
 
-    m_ctrl->Thaw();
-
-    // See ProcessDelta: in bulk/replay mode the single scroll-to-end is
-    // performed by ChatDisplay's replay batch, not per message.  Live
-    // completion honors follow mode too — finishing a long reply must
-    // not yank a user who scrolled up mid-stream.
-    if (!m_bulkMode && ShouldAutoScroll()) {
-        m_ctrl->ShowPosition(m_ctrl->GetLastPosition());
-    }
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -382,6 +359,17 @@ void MarkdownRenderer::RenderCompleteLine(const std::string& line, const wxColou
                 FenceInfo info = ParseFenceInfo(rawAfter);
                 m_codeBlockLang     = info.language;
                 m_codeBlockFilename = info.filename;
+            }
+
+            // Plain fences (``` with no language tag) must receive the
+            // same framed header and Copy affordance as typed fences.
+            // The renderer historically used an empty language as the
+            // signal to suppress all code-block chrome, which made these
+            // very common blocks look like amber text with no way to copy
+            // them.  Normalize only the presentation label here; the
+            // captured clipboard payload remains the exact original text.
+            if (m_codeBlockLang.empty()) {
+                m_codeBlockLang = "text";
             }
 
             // Render the code-block header: top border, language row, and
@@ -973,13 +961,6 @@ bool MarkdownRenderer::IsNumberedItem(const std::string& line,
     return false;
 }
 
-std::string MarkdownRenderer::TrimLeading(const std::string& s, char c) const
-{
-    size_t start = s.find_first_not_of(c);
-    if (start == std::string::npos) return "";
-    return s.substr(start);
-}
-
 // ── Filename detection helpers ──────────────────────────────────
 // Loose rule: looks like "name.ext" — alphanumerics, dots, dashes,
 // underscores, and exactly one trailing extension of 1–10 chars.
@@ -1006,47 +987,6 @@ bool MarkdownRenderer::IsLikelyFilename(const std::string& s) const
         return false;
     }
     return true;
-}
-
-std::string MarkdownRenderer::LanguageToExtension(const std::string& lang) const
-{
-    std::string l = lang;
-    for (auto& c : l) c = static_cast<char>(::tolower((unsigned char)c));
-    if (l == "cpp" || l == "c++" || l == "cxx" || l == "cc") return "cpp";
-    if (l == "c")                                               return "c";
-    if (l == "h")                                               return "h";
-    if (l == "hpp")                                             return "hpp";
-    if (l == "py" || l == "python")                             return "py";
-    if (l == "js" || l == "javascript")                         return "js";
-    if (l == "ts" || l == "typescript")                         return "ts";
-    if (l == "cs" || l == "csharp" || l == "c#")                return "cs";
-    if (l == "java")                                            return "java";
-    if (l == "kt" || l == "kotlin")                             return "kt";
-    if (l == "swift")                                           return "swift";
-    if (l == "go")                                              return "go";
-    if (l == "rs" || l == "rust")                               return "rs";
-    if (l == "rb" || l == "ruby")                               return "rb";
-    if (l == "php")                                             return "php";
-    if (l == "pl" || l == "perl")                               return "pl";
-    if (l == "sh" || l == "bash" || l == "shell" || l == "zsh") return "sh";
-    if (l == "ps" || l == "ps1" || l == "powershell")           return "ps1";
-    if (l == "bat" || l == "batch" || l == "cmd")               return "bat";
-    if (l == "sql")                                             return "sql";
-    if (l == "html")                                            return "html";
-    if (l == "xml")                                             return "xml";
-    if (l == "css")                                             return "css";
-    if (l == "json")                                            return "json";
-    if (l == "yaml" || l == "yml")                              return "yml";
-    if (l == "toml")                                            return "toml";
-    if (l == "md" || l == "markdown")                           return "md";
-    if (l == "lua")                                             return "lua";
-    if (l == "r")                                               return "r";
-    if (l == "dart")                                            return "dart";
-    if (l == "cmake")                                           return "cmake";
-    if (l == "makefile" || l == "make")                         return "mk";
-    if (l == "dockerfile")                                      return "dockerfile";
-    if (l == "tex" || l == "latex")                             return "tex";
-    return "txt";
 }
 
 // Pretty display name for a fence language tag. Used in the code-block
@@ -1207,80 +1147,4 @@ MarkdownRenderer::ParseFenceInfo(const std::string& rawAfterTicks) const
     }
 
     return out;
-}
-
-// Looks at the first few non-blank lines of code for a filename hint
-// embedded in a leading comment.  Handles the common comment syntaxes.
-// Returns "" when no confident match is found.
-std::string MarkdownRenderer::ExtractFilenameFromContent(
-    const std::string& content) const
-{
-    // Grab up to the first ~5 non-blank lines.
-    std::vector<std::string> lines;
-    {
-        std::string cur;
-        for (char c : content) {
-            if (c == '\n') { lines.push_back(cur); cur.clear(); }
-            else if (c != '\r') cur += c;
-            if (lines.size() >= 6) break;
-        }
-        if (!cur.empty() && lines.size() < 6) lines.push_back(cur);
-    }
-
-    for (const std::string& raw : lines) {
-        // Trim leading whitespace
-        size_t a = raw.find_first_not_of(" \t");
-        if (a == std::string::npos) continue;
-        std::string line = raw.substr(a);
-
-        // Skip shebangs — language concern, not filename
-        if (line.size() >= 2 && line[0] == '#' && line[1] == '!') continue;
-
-        // Strip each known comment opener/closer.  Order matters for
-        // the multi-char ones (<!-- before --, /* before *).
-        auto stripPrefix = [](std::string& t, const char* p) {
-            size_t n = std::strlen(p);
-            if (t.size() >= n && t.compare(0, n, p) == 0) { t.erase(0, n); return true; }
-            return false;
-        };
-        auto stripSuffix = [](std::string& t, const char* p) {
-            size_t n = std::strlen(p);
-            if (t.size() >= n && t.compare(t.size() - n, n, p) == 0) {
-                t.erase(t.size() - n); return true;
-            }
-            return false;
-        };
-
-        bool stripped =
-            stripPrefix(line, "<!--") ||
-            stripPrefix(line, "///")  ||
-            stripPrefix(line, "//")   ||
-            stripPrefix(line, "/*")   ||
-            stripPrefix(line, "--")   ||
-            stripPrefix(line, "#")    ||
-            stripPrefix(line, ";")    ||   // Lisp, ini
-            stripPrefix(line, "%");        // MATLAB/LaTeX
-
-        if (!stripped) continue;  // not a comment — bail, don't dig into code
-
-        stripSuffix(line, "-->");
-        stripSuffix(line, "*/");
-
-        // Trim whitespace on both sides
-        size_t s0 = line.find_first_not_of(" \t");
-        size_t s1 = line.find_last_not_of(" \t");
-        if (s0 == std::string::npos) continue;
-        line = line.substr(s0, s1 - s0 + 1);
-
-        // Sometimes the comment is a full phrase: "filename: hello.cpp".
-        // Take the last whitespace-separated token if it looks like a file.
-        size_t sp = line.find_last_of(" \t");
-        if (sp != std::string::npos) {
-            std::string tail = line.substr(sp + 1);
-            if (IsLikelyFilename(tail)) return tail;
-        }
-        if (IsLikelyFilename(line)) return line;
-    }
-
-    return "";
 }

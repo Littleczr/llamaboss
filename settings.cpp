@@ -440,7 +440,7 @@ void SettingsDialog::CreateControls()
 
     auto* connRow = new wxBoxSizer(wxHORIZONTAL);
     m_connectionsLabel = new wxStaticText(body, wxID_ANY,
-        "No connections configured");
+        "No AI providers configured");
     { wxFont cf = m_connectionsLabel->GetFont(); cf.SetPointSize(11);
       m_connectionsLabel->SetFont(cf); }
     // Keep the right-side Manage button visible even if this text grows
@@ -455,41 +455,10 @@ void SettingsDialog::CreateControls()
     bodySizer->Add(connRow, 0, wxEXPAND | wxBOTTOM, 6);
 
     auto* connHint = new wxStaticText(body, wxID_ANY,
-        "Skill scripts read these via os.environ (e.g. GMAIL_API_KEY).");
+        "Add OpenRouter, OpenAI, or another AI provider. Manage other service keys here too.");
     { wxFont ch = connHint->GetFont(); ch.SetPointSize(10); connHint->SetFont(ch); }
+    connHint->Wrap(520);
     bodySizer->Add(connHint, 0, wxBOTTOM, 14);
-
-    // ─────────────────────────────────────────────────────────────
-    //  SECTION 3b — REMOTE ENDPOINTS
-    // ─────────────────────────────────────────────────────────────
-    //  Remote OpenAI-compatible inference endpoints (OpenRouter, OpenAI,
-    //  etc.). Each endpoint's models appear in the model picker; the API
-    //  key is resolved from a Connections entry by provider/key name.
-    //  Stored as JSON at %LOCALAPPDATA%\LlamaBoss\endpoints.json.
-    bodySizer->Add(MakeSectionDivider(body), 0, wxEXPAND | wxBOTTOM, 14);
-    bodySizer->Add(MakeSectionHeader(body, "Remote Endpoints"), 0, wxBOTTOM, 8);
-
-    auto* epRow = new wxBoxSizer(wxHORIZONTAL);
-    m_endpointsLabel = new wxStaticText(body, wxID_ANY,
-        "No remote endpoints configured");
-    { wxFont ef = m_endpointsLabel->GetFont(); ef.SetPointSize(11);
-      m_endpointsLabel->SetFont(ef); }
-    // Same shrinkability guard as Connections.
-    m_endpointsLabel->SetMinSize(wxSize(120, -1));
-    epRow->Add(m_endpointsLabel, 1, wxALIGN_CENTER_VERTICAL);
-
-    m_manageEndpointsBtn = MakeAccentButton(body, wxID_ANY, "Manage", 26);
-    m_manageEndpointsBtn->Bind(wxEVT_BUTTON,
-                               &SettingsDialog::OnManageEndpoints, this);
-    epRow->Add(m_manageEndpointsBtn, 0, wxLEFT, 10);
-    bodySizer->Add(epRow, 0, wxEXPAND | wxBOTTOM, 6);
-
-    auto* epHint = new wxStaticText(body, wxID_ANY,
-        "Each endpoint's models show in the model picker. Set the API key "
-        "under Connections, using the endpoint's provider/key name.");
-    { wxFont eh = epHint->GetFont(); eh.SetPointSize(10); epHint->SetFont(eh); }
-    epHint->Wrap(520);   // 540 → 520: clearance for the body scrollbar when it shows
-    bodySizer->Add(epHint, 0, wxBOTTOM, 14);
 
     // ─────────────────────────────────────────────────────────────
     //  SECTION 4 — APPEARANCE
@@ -508,7 +477,7 @@ void SettingsDialog::CreateControls()
         themeChoices.Add(wxString::FromUTF8(c.displayName));
     }
     m_themeComboBox = new wxComboBox(body, wxID_ANY, "",
-        wxDefaultPosition, wxSize(-1, 28), themeChoices,
+        wxDefaultPosition, wxDefaultSize, themeChoices,
         wxCB_DROPDOWN | wxCB_READONLY);
 
     // Find the index matching the user's stored theme. If the stored
@@ -929,31 +898,9 @@ void SettingsDialog::OnResetFolder(wxCommandEvent&)
 
 // ─── Connections ────────────────────────────────────────────────
 
-void SettingsDialog::OnManageConnections(wxCommandEvent&)
+void SettingsDialog::OnManageConnections(wxCommandEvent& event)
 {
-    if (!m_secretsStore) {
-        wxMessageBox(
-            "Secrets store is not available. Restart LlamaBoss "
-            "and try again.",
-            "Connections", wxOK | wxICON_INFORMATION, this);
-        return;
-    }
-
-    ConnectionsDialog dlg(this, m_secretsStore, *m_theme);
-    dlg.ShowModal();
-
-    // Save immediately on dialog close.  Connections are user-edited
-    // state that should persist even if the user later hits Cancel on
-    // Settings — keys are not bundled with the rest of the dialog
-    // settings.
-    const bool saved = m_secretsStore->Save();
-    if (!saved) {
-        wxMessageBox(
-            "Connections were updated for this session, but LlamaBoss "
-            "could not save them to disk. They may be lost after restart.",
-            "Connections Not Saved", wxOK | wxICON_WARNING, this);
-    }
-
+    OnManageEndpoints(event);
     UpdateConnectionsLabel();
 }
 
@@ -961,15 +908,15 @@ void SettingsDialog::UpdateConnectionsLabel()
 {
     if (!m_connectionsLabel) return;
     size_t count = 0;
-    if (m_secretsStore) count = m_secretsStore->ListConnections().size();
+    if (m_endpointStore) count = m_endpointStore->Endpoints().size();
 
     if (count == 0) {
-        m_connectionsLabel->SetLabel("No connections configured");
+        m_connectionsLabel->SetLabel("No AI providers configured");
     } else if (count == 1) {
-        m_connectionsLabel->SetLabel("1 connection configured");
+        m_connectionsLabel->SetLabel("1 AI provider configured");
     } else {
         m_connectionsLabel->SetLabel(
-            wxString::Format("%zu connections configured", count));
+            wxString::Format("%zu AI providers configured", count));
     }
     if (m_connectionsLabel->GetParent())
         m_connectionsLabel->GetParent()->Layout();
@@ -987,18 +934,17 @@ void SettingsDialog::OnManageEndpoints(wxCommandEvent&)
         return;
     }
 
-    EndpointsDialog dlg(this, m_endpointStore, *m_theme);
-    dlg.ShowModal();
+    if (!LbEnsureConnectionStoresWritable(this, m_endpointStore, m_secretsStore))
+        return;
 
-    // Persist immediately on close, like Connections — endpoint config is
-    // user-edited state that should survive even if Settings is later
-    // cancelled.
-    const bool saved = m_endpointStore->Save();
-    if (!saved) {
-        wxMessageBox(
-            "Endpoints were updated for this session, but LlamaBoss could "
-            "not save them to disk. They may be lost after restart.",
-            "Endpoints Not Saved", wxOK | wxICON_WARNING, this);
+    EndpointsDialog dlg(this, m_endpointStore, m_secretsStore, *m_theme);
+    if (dlg.ShowModal() == wxID_OK && !dlg.GetModelToUse().empty()) {
+        m_connectionModelToUse = dlg.GetModelToUse();
+        // Capture the other Settings choices through their normal save path.
+        // The frame handles this remote selection before local-model branches.
+        wxCommandEvent event;
+        OnOK(event);
+        return;
     }
 
     UpdateEndpointsLabel();

@@ -5,17 +5,14 @@
 // deleting a project's folder, moving chats between projects (and to
 // Unassigned), adding Source files, and creating / opening Workflows.
 //
-// Mirrors the GoalController / SkillDraftController extraction: the
+// Mirrors the SkillDraftController extraction: the
 // behavior moves here, the *menus* stay in the frame.  Specifically:
 //
 //   - The strip popups (ShowProjectPopupMenu / ShowSkillPopupMenu) keep
 //     living in MyFrame because they build wxMenus out of the frame's
 //     ID_PROJECT_* command ids, which are Bound to the frame's thin
-//     OnProject* handlers — exactly the split already used for
-//     ShowGoalPopupMenu.  After this extraction those OnProject*
-//     handlers become one-line delegations into this controller, the
-//     same way OnGoalPause/Resume/etc. already delegate to
-//     GoalController.
+//     OnProject* handlers.  After this extraction those OnProject*
+//     handlers become one-line delegations into this controller.
 //
 //   - The sidebar context menus (ShowSidebarChatContextMenu /
 //     ShowSidebarProjectHeaderContextMenu) also stay in MyFrame: they
@@ -35,14 +32,13 @@
 //   - ProjectContextBuilder owns the cached project-context block and
 //     the strip counts; this controller drives it via Invalidate() and
 //     GetProjectStripCounts(), unchanged.
-//   - MyFrame keeps the unified ProjectStatusStrip (it renders the goal
-//     half too), so RefreshProjectStrip() stays in the frame and this
-//     controller pokes it through Callbacks::refreshProjectStrip —
-//     identical to how GoalController uses refreshGoalStatusStrip.
+//   - MyFrame keeps the ProjectStatusStrip, so RefreshProjectStrip()
+//     stays in the frame and this controller pokes it through
+//     Callbacks::refreshProjectStrip.
 //
 // Threading: every method must be called on the UI thread, same as the
 // MyFrame methods they replace.  There are no hidden turns and no
-// deferred work here, so unlike GoalController there is no callAfter
+// deferred work here, so there is no callAfter
 // seam — all dialogs are modal and synchronous, exactly as before.
 
 #pragma once
@@ -75,15 +71,14 @@ public:
         // while a response is streaming.
         std::function<bool()> isBusy;
 
-        // RefreshProjectStrip().  The strip is the unified
-        // project+goal renderer owned by the frame; this controller
-        // only asks it to repaint after a project mutation, the same
-        // way GoalController does via refreshGoalStatusStrip.
+        // RefreshProjectStrip().  The strip is owned by the frame;
+        // this controller only asks it to repaint after a project
+        // mutation.
         std::function<void()> refreshProjectStrip;
     };
 
     // chatHistory is passed as the owning unique_ptr (house style —
-    // matches GoalController / SkillDraftController) so the controller
+    // matches SkillDraftController) so the controller
     // always sees the live conversation even if the pointer is ever
     // swapped.  parentFrame is the MyFrame itself, used as the parent
     // for every modal dialog / message box and as the scrim host

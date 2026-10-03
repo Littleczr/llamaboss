@@ -69,36 +69,6 @@ std::string BuildSkillActionText()
     return "[ Skills \xE2\x96\xBE ]";
 }
 
-// ── Goal formatters ─────────────────────────────────────────────────
-
-// Builds "Goal: none" or "Goal: <status> · <objective>".  Mirrors the
-// old BuildGoalStatusStripText() that used to live in LlamaBoss.cpp.
-std::string BuildGoalStateText(const ProjectStatusStrip::State& s)
-{
-    if (!s.hasGoal) {
-        return "Goal: none";
-    }
-
-    std::string out = "Goal: ";
-    out += s.goalStatusLabel.empty() ? std::string("active") : s.goalStatusLabel;
-    if (!s.goalObjectiveCompact.empty()) {
-        out += kDot;
-        out += s.goalObjectiveCompact;
-    }
-    return out;
-}
-
-// Builds the goal-side affordance label.  Empty state surfaces the
-// slash-command name to keep it discoverable; populated state opens
-// the detail card.
-std::string BuildGoalActionText(const ProjectStatusStrip::State& /*s*/)
-{
-    // "\xE2\x96\xBE" == U+25BE down-triangle.  Like [ Project v ] / [ Skills v ],
-    // the goal affordance is a dropdown in every state; the menu adapts its
-    // contents to none / active / paused.
-    return std::string("[ Goal \xE2\x96\xBE ]");
-}
-
 } // namespace
 
 ProjectStatusStrip::ProjectStatusStrip(wxWindow* parent,
@@ -110,7 +80,11 @@ ProjectStatusStrip::ProjectStatusStrip(wxWindow* parent,
     m_bgColor     = theme.bgToolbar;
     m_textColor   = theme.textPrimary;
     m_mutedColor  = theme.textMuted;
-    m_actionColor = theme.chatAssistant;
+    // Hover colour: the shared toolbar accent (theme.h).  This used to be
+    // chatAssistant, which in every theme except "dark" is plain foreground
+    // text -- in Nord the hover went from #D8DEE9 to #ECEFF4 and was
+    // effectively invisible.
+    m_actionColor = LbInteractiveAccent(theme);
     m_borderColor = theme.borderSubtle;
 
     m_panel = new wxPanel(parent, wxID_ANY);
@@ -137,9 +111,7 @@ void ProjectStatusStrip::BuildContent()
     // Padding constants for the row.  Tight (4 px) between a state
     // label and its own action chip.  In the no-project state, the
     // [ Skills v ] shortcut sits just after [ Project v ].
-    // The project pair stays anchored to the left edge while the goal
-    // pair is pushed to the far right, leaving the center of the strip
-    // visually quiet.
+    // The project pair stays anchored to the left edge.
     const int kEdgePad        = 6;
     const int kVerticalPad    = 6;
     const int kStateActionGap = 4;
@@ -156,8 +128,8 @@ void ProjectStatusStrip::BuildContent()
     rowSizer->AddSpacer(kStateActionGap);
 
     // Project action.  Default stays muted so the strip is calm; hover
-    // switches to the mint-green accent, matching the New Chat plus
-    // button behavior.
+    // switches to the shared interactive accent, matching the New Chat
+    // plus button behavior.
     m_actionLabel = new wxStaticText(m_row, wxID_ANY, "");
     m_actionLabel->SetForegroundColour(m_mutedColor);
     m_actionLabel->SetFont(monoFont);
@@ -176,28 +148,7 @@ void ProjectStatusStrip::BuildContent()
     rowSizer->Add(m_skillActionLabel, 0,
                   wxALIGN_CENTER_VERTICAL | wxLEFT, kStateActionGap);
 
-    // Let the center of the strip absorb the unused width so the goal
-    // pair reads as a separate right-aligned status cluster instead of
-    // crowding the project state on the left.
     rowSizer->AddStretchSpacer(1);
-
-    // ── Goal pair ────────────────────────────────────────────────
-    m_goalStateLabel = new wxStaticText(m_row, wxID_ANY, "");
-    m_goalStateLabel->SetForegroundColour(m_textColor);
-    m_goalStateLabel->SetFont(monoFont);
-    rowSizer->Add(m_goalStateLabel, 0,
-                  wxALIGN_CENTER_VERTICAL | wxTOP | wxBOTTOM, kVerticalPad);
-
-    rowSizer->AddSpacer(kStateActionGap);
-
-    m_goalActionLabel = new wxStaticText(m_row, wxID_ANY, "");
-    m_goalActionLabel->SetForegroundColour(m_mutedColor);
-    m_goalActionLabel->SetFont(monoFont);
-    m_goalActionLabel->SetCursor(wxCURSOR_HAND);
-    m_goalActionLabel->SetMinSize(wxSize(78, -1));
-    rowSizer->Add(m_goalActionLabel, 0,
-                  wxALIGN_CENTER_VERTICAL | wxTOP | wxBOTTOM, kVerticalPad);
-
     rowSizer->AddSpacer(kEdgePad);  // symmetric right edge padding
 
     m_row->SetSizer(rowSizer);
@@ -214,12 +165,8 @@ void ProjectStatusStrip::BuildContent()
     // ── Mouse routing ────────────────────────────────────────────
     // Project action: [ Project v ] opens the project popup menu in both
     // states (the menu adapts its contents to whether a project is
-    // attached).  Right-click
-    // anywhere on the strip (outside the goal action) still opens the
-    // project menu -- a holdover from the pre-goal layout where the whole
-    // row was the project surface.  We keep the right-click-anywhere
-    // behavior because the project menu is the primary action surface;
-    // goal requires an explicit left-click on its chip.
+    // attached).  Right-click anywhere on the strip also opens the
+    // project menu, since it is the primary action surface.
     BindProjectActionEvents(m_actionLabel);
 
     m_actionLabel->Bind(wxEVT_ENTER_WINDOW, [this](wxMouseEvent& e) {
@@ -257,26 +204,7 @@ void ProjectStatusStrip::BuildContent()
         e.Skip();
     });
 
-    // Goal action: left-click only.  Hover behavior mirrors the project
-    // action so the strip feels consistent.
-    BindGoalActionEvents(m_goalActionLabel);
-
-    m_goalActionLabel->Bind(wxEVT_ENTER_WINDOW, [this](wxMouseEvent& e) {
-        if (m_goalActionLabel) {
-            m_goalActionLabel->SetForegroundColour(m_actionColor);
-            m_goalActionLabel->Refresh();
-        }
-        e.Skip();
-    });
-    m_goalActionLabel->Bind(wxEVT_LEAVE_WINDOW, [this](wxMouseEvent& e) {
-        if (m_goalActionLabel) {
-            m_goalActionLabel->SetForegroundColour(m_mutedColor);
-            m_goalActionLabel->Refresh();
-        }
-        e.Skip();
-    });
-
-    // Right-click anywhere on the strip (outside the goal action)
+    // Right-click anywhere on the strip
     // opens the project menu -- preserves prior behavior.
     auto rightClickToProjectMenu = [this](wxWindow* w) {
         w->Bind(wxEVT_RIGHT_UP, [this](wxMouseEvent&) {
@@ -286,16 +214,13 @@ void ProjectStatusStrip::BuildContent()
     rightClickToProjectMenu(m_panel);
     rightClickToProjectMenu(m_row);
     rightClickToProjectMenu(m_stateLabel);
-    rightClickToProjectMenu(m_goalStateLabel);
 }
 
 void ProjectStatusStrip::BindProjectActionEvents(wxWindow* w)
 {
     // Both states open the project popup, consistent with the Skills
     // affordance.  The no-project menu offers New Project / Load-Attach /
-    // Delete; the attached menu offers the full project actions.  (The
-    // onAttachRequested callback is no longer fired from here -- loading is
-    // now reached via the menu's "Load / Attach Project..." item.)
+    // Delete; the attached menu offers the full project actions.
     w->Bind(wxEVT_LEFT_UP, [this](wxMouseEvent&) {
         if (m_callbacks.onMenuRequested) m_callbacks.onMenuRequested(m_actionLabel);
     });
@@ -322,22 +247,9 @@ void ProjectStatusStrip::BindSkillActionEvents(wxWindow* w)
     });
 }
 
-void ProjectStatusStrip::BindGoalActionEvents(wxWindow* w)
-{
-    // Opens the state-aware goal popup, consistent with the project and
-    // skill affordances.  Right-click mirrors left-click.
-    w->Bind(wxEVT_LEFT_UP, [this](wxMouseEvent&) {
-        if (m_callbacks.onGoalMenuRequested) m_callbacks.onGoalMenuRequested(m_goalActionLabel);
-    });
-    w->Bind(wxEVT_RIGHT_UP, [this](wxMouseEvent&) {
-        if (m_callbacks.onGoalMenuRequested) m_callbacks.onGoalMenuRequested(m_goalActionLabel);
-    });
-}
-
 void ProjectStatusStrip::RelayoutCurrentState()
 {
-    if (!m_stateLabel || !m_actionLabel || !m_skillActionLabel ||
-        !m_goalStateLabel || !m_goalActionLabel) {
+    if (!m_stateLabel || !m_actionLabel || !m_skillActionLabel) {
         return;
     }
 
@@ -372,28 +284,10 @@ void ProjectStatusStrip::RelayoutCurrentState()
         m_skillActionLabel->InvalidateBestSize();
     }
 
-    // ── Goal labels ──────────────────────────────────────────────
-    m_goalStateLabel->SetLabel(wxString::FromUTF8(BuildGoalStateText(m_state).c_str()));
-
-    {
-        const std::string actionText = BuildGoalActionText(m_state);
-        m_goalActionLabel->SetLabel(wxString::FromUTF8(actionText.c_str()));
-        m_goalActionLabel->SetForegroundColour(m_mutedColor);
-
-        // Both states show "[ Goal v ]" now, so a single floor covers them;
-        // measured width still wins when larger.
-        const int floorWidth = 88;
-        const wxSize measured = m_goalActionLabel->GetTextExtent(m_goalActionLabel->GetLabel());
-        const int actionWidth = std::max(floorWidth, measured.GetWidth() + 12);
-        m_goalActionLabel->SetMinSize(wxSize(actionWidth, -1));
-        m_goalActionLabel->InvalidateBestSize();
-    }
-
     m_stateLabel->InvalidateBestSize();
     m_skillActionLabel->InvalidateBestSize();
-    m_goalStateLabel->InvalidateBestSize();
 
-    // State text changes width when project / goal info changes; force
+    // State text changes width when project info changes; force
     // the row and owning parent to relayout so everything stays aligned.
     if (m_row) m_row->Layout();
     if (m_panel) {
@@ -414,7 +308,7 @@ void ProjectStatusStrip::ApplyTheme(const ThemeData& theme)
     m_bgColor     = theme.bgToolbar;
     m_textColor   = theme.textPrimary;
     m_mutedColor  = theme.textMuted;
-    m_actionColor = theme.chatAssistant;
+    m_actionColor = LbInteractiveAccent(theme);
     m_borderColor = theme.borderSubtle;
 
     if (m_panel)           m_panel->SetBackgroundColour(m_bgColor);
@@ -422,8 +316,6 @@ void ProjectStatusStrip::ApplyTheme(const ThemeData& theme)
     if (m_stateLabel)       m_stateLabel->SetForegroundColour(m_textColor);
     if (m_actionLabel)      m_actionLabel->SetForegroundColour(m_mutedColor);
     if (m_skillActionLabel) m_skillActionLabel->SetForegroundColour(m_mutedColor);
-    if (m_goalStateLabel)   m_goalStateLabel->SetForegroundColour(m_textColor);
-    if (m_goalActionLabel) m_goalActionLabel->SetForegroundColour(m_mutedColor);
     if (m_separator)       m_separator->SetBackgroundColour(m_borderColor);
 
     if (m_panel) m_panel->Refresh();

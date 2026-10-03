@@ -10,11 +10,10 @@
 // "the file is attached above" — patterned on the write tool's artifact
 // cards — when no file existed at all. The harness gave the model no
 // ground truth about file-system effects, so it confabulated one.
-// The manifest closes that gap in BOTH directions:
-//   * files that WERE created are named (and can be attached as
-//     PresentedFile cards by the caller), and
-//   * when nothing was created or modified, the result says so
-//     explicitly, which leaves the model no room to claim otherwise.
+// Detected changes are named and created files can be attached as
+// PresentedFile cards. Complete scans with no detected changes stay
+// quiet; expected output files must still be verified before claiming
+// success. Incomplete scans retain an explicit cap notice.
 //
 // Scope is deliberately the conversation workspace folder only:
 // cheap, bounded, and where run-style tools are expected to place
@@ -285,10 +284,8 @@ inline Delta Diff(const Snapshot& before, const Snapshot& after)
 
 // Builds the model-and-user-facing manifest text.  `afterSizes` is the
 // post-run snapshot (for created-file sizes); `rootUtf8` is used to
-// shorten displayed paths.  ALWAYS returns a non-empty section so the
-// negative case ("no files were created or modified") is stated
-// explicitly — that explicit negative is the anti-hallucination
-// signal this header exists for.
+// shorten displayed paths. Complete scans with no detected changes
+// return an empty string. Capped scans always disclose their limitation.
 inline std::string FormatManifest(const Delta&    d,
                                   const Snapshot& afterSizes,
                                   const std::string& rootUtf8)
@@ -296,12 +293,12 @@ inline std::string FormatManifest(const Delta&    d,
     constexpr size_t kMaxCreatedListed  = 12;
     constexpr size_t kMaxModifiedListed = 8;
 
-    std::string out = "[workspace changes]\n";
+    const bool hasChanges = !d.created.empty() || !d.modified.empty();
+    if (!hasChanges && !d.capped) return {};
 
-    if (d.created.empty() && d.modified.empty()) {
-        out += "no files were created or modified in the workspace folder "
-               "by this command.\n";
-    } else {
+    std::string out = hasChanges ? "[workspace changes]\n" : "";
+
+    if (hasChanges) {
         size_t listed = 0;
         for (const std::string& p : d.created) {
             if (listed >= kMaxCreatedListed) break;
@@ -332,7 +329,7 @@ inline std::string FormatManifest(const Delta&    d,
     }
 
     if (d.capped) {
-        out += "(scan capped at " + std::to_string(kMaxScanEntries) +
+        out += "(workspace scan capped at " + std::to_string(kMaxScanEntries) +
                " entries; changes beyond the cap may be missing)\n";
     }
 

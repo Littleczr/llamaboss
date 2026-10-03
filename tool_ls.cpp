@@ -162,13 +162,16 @@ LsResult ListDirectory(const std::string& inputPath, const ToolContext& ctx)
     // Empty arg means "list ctx.cwd itself".  ResolveToolPath with
     // the cwd as both input and reference canonicalizes it.
     const std::string target = inputPath.empty() ? ctx.cwd : inputPath;
-    std::string resolved = tool_path_safety::ResolveProjectAwareToolPath(target, ctx.cwd, ctx.activeProjectRoot);
+    bool usedConversationLane = false;
+    std::string resolved = tool_path_safety::ResolveReadOnlyToolPath(
+        target, ctx.cwd, ctx.activeProjectRoot, &usedConversationLane);
     if (resolved.empty()) {
         r.chips.push_back("failed");
         r.errorBody = "Could not resolve path: " + target;
         r.chips.push_back(ElapsedChip(t0));
         return r;
     }
+    if (usedConversationLane) r.chips.push_back("conversation lane");
 
     // ── Existence / type check ───────────────────────────────────
     if (!IsDirectory(resolved)) {
@@ -297,7 +300,7 @@ LsResult ListDirectory(const std::string& inputPath, const ToolContext& ctx)
     // model could use the cwd as a reasoning cue, but in practice
     // that backfired: when the cwd path coincidentally contained
     // the project or topic name (e.g. C:\Users\Cesar\LlamaBoss\
-    // Workflows\chat_xxx and the user asks about "LlamaBoss source
+    // Chats\2026-09-26_..._1ed3d3c2 and the user asks about "LlamaBoss source
     // code"), small models grabbed the path as a confident lead and
     // climbed to the parent, never consulting notes.  Hint-first
     // reverses precedence: the actionable suggestion is what the

@@ -28,6 +28,7 @@
 #include <wx/event.h>
 
 #include <atomic>
+#include <cstddef>
 #include <memory>
 #include <string>
 #include <vector>
@@ -52,11 +53,24 @@ struct ToolInvocationResult {
     std::string              errorBody;
     std::string              bodyLang;
 
+    // Optional structural override for model-history demotion.  0 uses the
+    // global var-store threshold. Deliberately requested read_range slices
+    // set a context-aware budget capped at 48 KiB; presentation strings are
+    // never parsed to determine policy.
+    size_t                   historyInlineBudgetBytes = 0;
+
     // Optional clickable file chips associated with this result.
     // The first producer is /write: after a successful write, the
     // result carries the created file path so the UI can present a
     // "save/copy" chip without re-parsing human text.
     std::vector<PresentedFile> presentedFiles;
+
+    // Validated image files the model asked to SEE (view_image), as
+    // {absolute path, sniffed MIME type} pairs.  Not rendered as text: AgentController threads them
+    // onto the history message as a "tool_images" sidecar, and
+    // ChatHistory::BuildChatRequestJson projects them as image_url parts
+    // on the next request.  Empty for every other tool.
+    std::vector<std::pair<std::string, std::string>> viewImages;
 
     // Protocol fields — caller packs these back to the model as a
     // <tool_result>.  toolTag is the lowercase protocol name
@@ -129,10 +143,13 @@ bool ShouldDispatchToolOnWorker(const std::string& toolName);
 // environment); otherwise it's required — pass the MyFrame-owned
 // GrepExecutor.  Same convention applies to `cmdExec` for the
 // `powershell` tool. Same convention applies to `pythonRunner` for
-// controlled Python-backed helper tools such as python_health.
+// controlled Python-backed helper tools such as python_health, and
+// to `pySession` for the persistent-session `py` tool.
+class PythonSessionManager;   // forward: defined in python_session.h
 DispatchOutcome DispatchInvocation(const ToolInvocation& inv,
                                    const ToolContext&    ctx,
                                    GrepExecutor*         grepExec,
                                    CmdExecutor*          cmdExec,
                                    PythonRunner*         pythonRunner,
-                                   WebFetchExecutor*     webFetchExec = nullptr);
+                                   WebFetchExecutor*     webFetchExec = nullptr,
+                                   PythonSessionManager* pySession    = nullptr);

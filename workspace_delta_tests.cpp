@@ -168,6 +168,60 @@ int main()
               "hint: case-insensitive");
     }
 
+    // ── ps_command_hints: wildcard -Path + -Recurse -File (2026-09-30) ──
+    {
+        using ps_command_hints::GetChildItemWildcardRecurseHint;
+        // Exact commands a Qwen model ran against D: in the transcripts.
+        std::string h1 = GetChildItemWildcardRecurseHint(
+            "Get-ChildItem -Path 'D:\\*' -Recurse -File -Filter '*Child Support*' "
+            "-ErrorAction SilentlyContinue | Select-Object FullName, Length, "
+            "LastWriteTime | Format-Table -AutoSize | Out-String -Width 300");
+        CHECK(!h1.empty(), "wildcard hint: fires on transcript -Filter search");
+        CHECK(h1.find("-Path 'D:\\' -Recurse -File") != std::string::npos,
+              "wildcard hint: suggests the same path without the wildcard");
+        CHECK(!GetChildItemWildcardRecurseHint(
+                  "Get-ChildItem -Path 'D:\\*' -Recurse -File -ErrorAction "
+                  "SilentlyContinue | Where-Object Name -match 'child.?support'").empty(),
+              "wildcard hint: fires on transcript Where-Object search");
+        CHECK(!GetChildItemWildcardRecurseHint(
+                  "gci 'D:\\*' -Recurse -File -EA 0").empty(),
+              "wildcard hint: fires on positional path + gci alias");
+        CHECK(!GetChildItemWildcardRecurseHint(
+                  "GET-CHILDITEM -PATH \"C:\\Docs\\*\" -RECURSE -FILE").empty(),
+              "wildcard hint: case-insensitive, double quotes");
+
+        // Measured-good or unrelated forms must stay silent.
+        CHECK(GetChildItemWildcardRecurseHint(
+                  "Get-ChildItem -Path 'D:\\' -Recurse -File -Filter '*x*'").empty(),
+              "wildcard hint: silent on plain folder path");
+        CHECK(GetChildItemWildcardRecurseHint(
+                  "Get-ChildItem -Path 'D:\\*' -Recurse -Include *.txt").empty(),
+              "wildcard hint: silent without -File (measured OK)");
+        CHECK(GetChildItemWildcardRecurseHint(
+                  "Get-ChildItem -Path 'D:\\*' -Recurse -Filter *.txt").empty(),
+              "wildcard hint: -Filter is not mistaken for -File");
+        CHECK(GetChildItemWildcardRecurseHint(
+                  "Get-ChildItem -Path 'D:\\*' -File").empty(),
+              "wildcard hint: silent without -Recurse");
+        CHECK(GetChildItemWildcardRecurseHint(
+                  "Get-ChildItem -LiteralPath 'D:\\odd*name' -Recurse -File").empty(),
+              "wildcard hint: silent for -LiteralPath");
+        CHECK(GetChildItemWildcardRecurseHint(
+                  "Copy-Item -Path 'D:\\*' -Recurse -Destination E:\\").empty(),
+              "wildcard hint: silent on non-gci commands");
+        CHECK(GetChildItemWildcardRecurseHint(
+                  "gci -Recurse -File | Measure-Object").empty(),
+              "wildcard hint: silent with implicit path");
+    }
+
+    // The -Include hint must no longer suggest adding -Recurse to a \* path.
+    {
+        std::string hint = ps_command_hints::GetChildItemIncludeHint(
+            "gci -Path C:\\dir -Include *.h");
+        CHECK(hint.find("no trailing") != std::string::npos,
+              "include hint: recursive advice says no trailing \\*");
+    }
+
     std::cout << (g_failures == 0 ? "\nALL TESTS PASSED\n"
                                   : "\nFAILURES: " + std::to_string(g_failures) + "\n");
     return g_failures == 0 ? 0 : 1;

@@ -179,7 +179,6 @@ private:
     int  GetHeadingLevel(const std::string& line) const;
     bool IsBulletItem(const std::string& line) const;
     bool IsNumberedItem(const std::string& line, std::string& prefix) const;
-    std::string TrimLeading(const std::string& s, char c) const;
 
     // ── Filename detection helpers (used by the file-chip callback) ─
     struct FenceInfo {
@@ -187,9 +186,6 @@ private:
         std::string filename;   // Parsed from fence if present, else empty
     };
     FenceInfo    ParseFenceInfo(const std::string& rawAfterTicks) const;
-    std::string  LanguageToExtension(const std::string& lang) const;
     std::string  LanguageDisplayName(const std::string& lang) const;
-    std::string  ExtractFilenameFromContent(const std::string& content) const;
     bool         IsLikelyFilename(const std::string& s) const;
 };
-

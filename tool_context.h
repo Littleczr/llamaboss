@@ -20,20 +20,33 @@
 
 #include <wx/event.h>
 
+#include <functional>
 #include <atomic>
 #include <memory>
 #include <string>
+#include <vector>
 
 class ChatHistory;   // forward — tools that opt into history-aware
                      // resolution (open, future view/edit/delete)
                      // dereference through this; others ignore it.
 
 // Global fallback timeout — used when no per-conversation override is
-// set on ChatHistory.  Matches the Phase 1 CmdExecutor default so
-// existing /cmd behaviour is unchanged when no per-conv timeout is set.
-constexpr unsigned long kDefaultToolTimeoutMs = 60000;  // 60 s
+// set on ChatHistory.  Five minutes keeps finite foreground builds and
+// dependency installs inside the controlled executor instead of killing
+// them at the former 60-second ceiling.  Stop/cancel still tears the
+// process tree down immediately.
+constexpr unsigned long kDefaultToolTimeoutMs = 5UL * 60UL * 1000UL;
+
+// A PowerShell invocation may request a different bounded timeout.  The
+// override is deliberately constrained: short calls can fail fast, while a
+// long build can receive enough time without creating an unbounded process.
+constexpr unsigned long kMinPowerShellTimeoutSeconds = 15UL;
+constexpr unsigned long kMaxPowerShellTimeoutSeconds = 30UL * 60UL;
 
 struct ToolContext {
+    // UI-thread-only guided setup. Accepts provider/model query, never a secret.
+    std::function<std::string(const std::string&, const std::string&)> setupConnection;
+
     // Resolved working directory — absolute path, guaranteed non-empty
     // when built through MakeToolContext().  Caller resolves relative
     // argument paths against this.  Stored as UTF-8.
@@ -81,4 +94,11 @@ struct ToolContext {
     // files beneath this root through the normal approval flow instead of
     // hard-blocking Skill development outside the chat workspace.
     std::string skillsRoot;
+
+    // Additional user-approved write roots for this chat.  These grants are
+    // created by the folder-access approval card when a native mutation
+    // targets an absolute path outside cwd/project/Skills.  ChatHistory owns
+    // the session-scoped list; BuildToolContext snapshots it here so every
+    // native mutation tool applies the same boundary.
+    std::vector<std::string> additionalWriteRoots;
 };

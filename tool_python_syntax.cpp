@@ -78,8 +78,24 @@ std::string ReadAllFromPipe(HANDLE h)
     return out;
 }
 
-// True if py_compile's output names a genuine source-level error.
-// py_compile prints the error class name on the final line, so a
+// Syntax check run with `python -c`.  Compiles the file in memory with
+// compile() and writes NOTHING to disk.  (It replaced `-m py_compile`,
+// which always writes a .pyc into a __pycache__ folder next to the script
+// -- `-B` does not stop py_compile -- so every created script left a
+// __pycache__ behind in the chat's Scripts folder.)
+//
+// Reads bytes so PEP 263 coding cookies and a UTF-8 BOM are honoured
+// exactly as the interpreter would.  The excepthook prints only the
+// exception part (File/line/caret + "SyntaxError: ..."), the same shape
+// py_compile produced, so LooksLikeSyntaxError below is unchanged.
+// Single quotes only: the whole program is passed as one quoted argv item.
+const wchar_t* const kCompileCheckProgram =
+    L"import sys,traceback as t;"
+    L"sys.excepthook=lambda c,e,b:sys.stderr.write(''.join(t.format_exception_only(c,e)));"
+    L"compile(open(sys.argv[1],'rb').read(),sys.argv[1],'exec',dont_inherit=True)";
+
+// True if the checker's output names a genuine source-level error.
+// The checker prints the error class name on the final line, so a
 // substring match is sufficient and avoids treating "interpreter
 // failed to run" (which also exits non-zero) as a syntax failure.
 bool LooksLikeSyntaxError(const std::string& output)
@@ -105,10 +121,15 @@ SyntaxCheckResult CheckFile(const std::string& filePath)
         return result;
     }
 
+    // -I (isolated): no cwd / user-site on sys.path, PYTHON* env ignored,
+    // so a stray sys.py or traceback.py can't hijack the checker.
+    // -B: belt and braces; compile() itself never writes bytecode.
+    const std::wstring args =
+        L" -I -B -c " + QuoteWinArg(kCompileCheckProgram) + L" " + QuoteWinArg(wPath);
     std::vector<std::wstring> commands = {
-        L"py.exe -3 -B -m py_compile " + QuoteWinArg(wPath),
-        L"python.exe -B -m py_compile " + QuoteWinArg(wPath),
-        L"python3.exe -B -m py_compile " + QuoteWinArg(wPath)
+        L"py.exe -3" + args,
+        L"python.exe" + args,
+        L"python3.exe" + args
     };
 
     std::string startErrors;
@@ -210,7 +231,7 @@ SyntaxCheckResult CheckFile(const std::string& filePath)
 
         // Everything else -- timed out, or a non-zero exit that does NOT
         // name a syntax error (e.g. a py launcher with no usable 3.x
-        // runtime, or py_compile failing to start).  We couldn't get a
+        // runtime, or the checker failing to start).  We couldn't get a
         // real verdict, so we do NOT block; python_health /
         // python_run_script will surface a genuine runtime problem
         // later.  `message` is kept only for diagnostics and is not

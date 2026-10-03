@@ -8,6 +8,8 @@
 #include <wx/filename.h>
 #include <wx/dir.h>
 #include <wx/log.h>
+#include <wx/datetime.h>
+#include <wx/filefn.h>
 
 #include <Poco/JSON/Parser.h>
 #include <Poco/JSON/Object.h>
@@ -46,13 +48,39 @@ std::string StripOneMatchingQuotePair(std::string s)
 }
 
 // Read whole file UTF-8.  Returns empty string on any error.
-std::string ReadWholeFile(const wxString& path)
+// Returns false when the file exists but could not be read (locked,
+// permissions, I/O error) -- distinct from an empty file.
+bool ReadWholeFile(const wxString& path, std::string& out)
 {
+    out.clear();
     std::ifstream f(path.fn_str(), std::ios::in | std::ios::binary);
-    if (!f) return {};
+    if (!f) return false;
     std::ostringstream ss;
     ss << f.rdbuf();
-    return ss.str();
+    if (f.bad()) return false;
+    out = ss.str();
+    return true;
+}
+
+// Keeps a copy of a settings file that failed to load, next to it, so a
+// later "start fresh" can never destroy the only copy.  Returns the
+// backup path, or empty when no copy could be made.
+std::string BackupUnreadableFile(const wxString& path)
+{
+    const wxString stamp = wxDateTime::Now().Format("%Y%m%d-%H%M%S");
+    wxLogNull quiet;
+    // Retry can fail again within the same second; never overwrite an
+    // earlier backup, pick the next free name instead.
+    for (int n = 0; n < 100; ++n) {
+        wxString dest = path + ".unreadable-" + stamp;
+        if (n > 0) dest << "-" << n;
+        dest << ".bak";
+        if (wxFileExists(dest)) continue;
+        if (wxCopyFile(path, dest, /*overwrite=*/false))
+            return std::string(dest.ToUTF8().data());
+        return std::string();
+    }
+    return std::string();
 }
 
 // Atomic-ish write: write to <path>.tmp then rename over <path>.
@@ -227,6 +255,9 @@ bool SecretsStore::Load()
 {
     m_providers.clear();
     m_loaded = true;
+    m_loadFailed = false;
+    m_loadError.clear();
+    m_loadBackupPath.clear();
 
     wxString path = wxString::FromUTF8(GetSecretsFilePath().c_str());
     if (!wxFileExists(path)) {
@@ -234,23 +265,40 @@ bool SecretsStore::Load()
         return true;
     }
 
-    std::string body = ReadWholeFile(path);
+    // A present file that can't be read or parsed is NOT an empty store:
+    // saving the in-memory state over it would silently erase every key
+    // it holds.  Record the failure, keep a copy, and block Save() until
+    // a reload succeeds or the user explicitly starts fresh.
+    auto fail = [&](const std::string& why) {
+        m_providers.clear();
+        m_loadFailed = true;
+        m_loadError = why;
+        m_loadBackupPath = BackupUnreadableFile(path);
+        wxLogWarning("SecretsStore: %s; saving is disabled until this is resolved.",
+                     wxString::FromUTF8(why));
+        return false;
+    };
+
+    std::string body;
+    if (!ReadWholeFile(path, body))
+        return fail("secrets.json could not be read");
     if (body.empty()) return true;
 
     try {
         Poco::JSON::Parser parser;
         auto val = parser.parse(body);
         auto root = val.extract<Poco::JSON::Object::Ptr>();
-        if (!root) return false;
+        if (!root) return fail("secrets.json is not a JSON object");
 
+        if (!root->has("providers")) return true;  // no providers, fine
         auto providers = root->getObject("providers");
-        if (!providers) return true;  // empty providers, fine
+        if (!providers) return fail("secrets.json has a malformed \"providers\" section");
 
         std::vector<std::string> names;
         providers->getNames(names);
         for (const auto& name : names) {
             auto sub = providers->getObject(name);
-            if (!sub) continue;
+            if (!sub) return fail("secrets.json has a malformed entry for \"" + name + "\"");
 
             std::map<std::string, std::string> kvs;
             std::vector<std::string> keys;
@@ -267,15 +315,23 @@ bool SecretsStore::Load()
         return true;
     }
     catch (const std::exception& e) {
-        wxLogWarning("SecretsStore: failed to parse secrets.json (%s); "
-                     "starting empty.", e.what());
-        m_providers.clear();
-        return false;
+        return fail(std::string("secrets.json could not be parsed (") + e.what() + ")");
     }
+}
+
+void SecretsStore::ResetAfterFailedLoad()
+{
+    // Explicit user choice: keep the current in-memory keys and let the
+    // next Save() replace the unreadable file (a copy was kept if possible).
+    m_loadFailed = false;
+    m_loadError.clear();
 }
 
 bool SecretsStore::Save()
 {
+    // Never overwrite a file that failed to load (see Load()).
+    if (m_loadFailed) return false;
+
     Poco::JSON::Object::Ptr root = new Poco::JSON::Object(true);
     root->set("version", 1);
 
@@ -427,11 +483,6 @@ void SecretsStore::RemoveSecret(const std::string& provider,
     pit->second.erase(key);
     if (pit->second.empty())
         m_providers.erase(pit);
-}
-
-void SecretsStore::RemoveProvider(const std::string& provider)
-{
-    m_providers.erase(provider);
 }
 
 // ─── UI helpers ─────────────────────────────────────────────────

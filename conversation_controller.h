@@ -32,12 +32,16 @@ public:
         // keeps the strip in sync.
         std::function<void()>  onProjectStateChanged;
 
-        // Fired at the top of LoadConversationFromPath(), before the new
-        // conversation replaces the current one.  The frame uses this to
+        // Fired after save and load succeed, before the new conversation
+        // replaces the current one.  The frame uses this to
         // drop cross-chat transient state (queued sends behind deferred model
         // loads, pending Skill authoring sessions, etc.) so old-chat state
         // cannot leak into the newly-loaded chat.  Optional.
         std::function<void()>  cancelPendingSend;
+
+        // Flush UI-side streaming bytes before a synchronous save, including
+        // retries after a recovery dialog has pumped worker/timer events.
+        std::function<void()>  beforeDurableSave;
     };
 
     ConversationController(wxFrame& frame,
@@ -67,9 +71,17 @@ public:
     // queue is drained first, then the final write is synchronously flushed.
     // touchActivityTimestamp=false is reserved for metadata-only changes;
     // content saves should use the default true.
-    void AutoSaveConversation(bool refreshSidebar = true,
+    // Returns success (or queued, for background saves). Destructive callers
+    // must use SaveBeforeLeaving so a failed write cannot discard history.
+    bool AutoSaveConversation(bool refreshSidebar = true,
                               bool durable = false,
                               bool touchActivityTimestamp = true);
+
+    // True only after a durable save/recovery export, or when nothing needs
+    // saving. False keeps the current history alive. Forced OS shutdown may
+    // disallow both a modal recovery dialog and vetoing the close.
+    bool SaveBeforeLeaving(bool allowRecoveryDialog = true);
+    bool IsSaveRecoveryActive() const { return m_saveRecoveryActive; }
 
     // ── Sidebar conversation management ─────────────────────────
     // Rename is single-chat; pin/archive support multi-selection.
@@ -80,6 +92,12 @@ public:
                                 bool pinned);
     void SetConversationsArchived(const std::vector<std::string>& paths,
                                   bool archived);
+
+    // ── Export ───────────────────────────────────────────────────
+    // Save one conversation as a readable Markdown transcript (.md, or the
+    // same text as .txt).  Read-only: works for the active chat, chats
+    // open in other windows, and archived chats; never modifies the JSON.
+    void ExportConversation(const std::string& path);
 
     // ── Batch delete ─────────────────────────────────────────────
     // Paths open in another window are skipped (Phase 3b guard).
@@ -111,4 +129,5 @@ private:
 
     Callbacks                       m_cb;
     std::unique_ptr<AsyncSaveState> m_asyncSave;
+    bool m_saveRecoveryActive = false;
 };

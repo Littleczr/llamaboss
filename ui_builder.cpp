@@ -3,6 +3,7 @@
 #include "widgets.h"
 #include "chat_input_ctrl.h"
 #include "theme.h"
+#include "settings_icon.h"
 
 namespace UIBuilder {
 
@@ -14,6 +15,13 @@ TopBarWidgets BuildTopBar(wxWindow* parent, wxBoxSizer* mainSizer,
     w.toolbarPanel = new wxPanel(parent, wxID_ANY);
     w.toolbarPanel->SetBackgroundColour(theme.bgToolbar);
     auto* sizer = new wxBoxSizer(wxHORIZONTAL);
+    // Equal expanding side columns center the model/thinking pair on the
+    // window, independently of the different widths of the side controls.
+    // At narrow widths the sizer respects each side's minimum to avoid overlap.
+    auto* leftSizer = new wxBoxSizer(wxHORIZONTAL);
+    auto* centerSizer = new wxBoxSizer(wxHORIZONTAL);
+    auto* rightSizer = new wxBoxSizer(wxHORIZONTAL);
+    rightSizer->AddStretchSpacer(1);
 
     // ── Left: Sidebar toggle + App title ──
     wxString hamburger = wxString::FromUTF8("\xE2\x98\xB0"); // ☰
@@ -26,7 +34,7 @@ TopBarWidgets BuildTopBar(wxWindow* parent, wxBoxSizer* mainSizer,
     hamburgerFont.SetPointSize(18);
     w.sidebarToggle->SetFont(hamburgerFont);
     w.sidebarToggle->SetCursor(wxCURSOR_HAND);
-    sizer->Add(w.sidebarToggle, 0, wxALIGN_CENTER_VERTICAL | wxLEFT, 4);
+    leftSizer->Add(w.sidebarToggle, 0, wxALIGN_CENTER_VERTICAL | wxLEFT, 4);
 
     w.titleLabel = new wxStaticText(w.toolbarPanel, wxID_ANY, "LlamaBoss");
     w.titleLabel->SetForegroundColour(theme.textPrimary);
@@ -34,9 +42,8 @@ TopBarWidgets BuildTopBar(wxWindow* parent, wxBoxSizer* mainSizer,
     titleFont.SetPointSize(15);
     titleFont.SetWeight(wxFONTWEIGHT_BOLD);
     w.titleLabel->SetFont(titleFont);
-    sizer->Add(w.titleLabel, 0, wxALIGN_CENTER_VERTICAL | wxLEFT, 4);
+    leftSizer->Add(w.titleLabel, 0, wxALIGN_CENTER_VERTICAL | wxLEFT, 4);
 
-    sizer->AddStretchSpacer(1);
 
     // ── Center: Model pill [ ● model-name · quant ] (clickable) ──
     // Bracket, status dot, model label, optional protocol chip, and
@@ -54,7 +61,7 @@ TopBarWidgets BuildTopBar(wxWindow* parent, wxBoxSizer* mainSizer,
                         wxFONTWEIGHT_NORMAL, false, "Consolas");
 
     // Opening bracket of the [ ... ] affordance, matching the bracket
-    // language used elsewhere in the chrome ([ + attach ], [ /goal ]).
+    // language used elsewhere in the chrome ([ + attach ]).
     // Muted at rest; LlamaBoss.cpp recolors it to the interactive accent
     // on hover and binds it to the same click handler as the dot/label.
     w.modelPillLeftBracket = new wxStaticText(w.modelPill, wxID_ANY, "[");
@@ -109,8 +116,30 @@ TopBarWidgets BuildTopBar(wxWindow* parent, wxBoxSizer* mainSizer,
     w.protocolChip->Hide();
     pillSizer->Add(w.protocolChip, 0, wxALIGN_CENTER_VERTICAL | wxLEFT, 8);
 
+    // ── Thinking chip ──
+    // Per-conversation thinking override, rendered as a muted segment of
+    // the model pill: "[ * model-name  . Auto ]".  Clicking it opens the
+    // thinking popup menu (MyFrame binds it); clicking the rest of the
+    // pill still opens the model picker.  The same six modes are also
+    // reachable from the model picker's "Thinking" submenu.
+    // "\xC2\xB7" == U+00B7 middle dot.  Created with a real label so
+    // MSW gives it a sane best size (same quirk as the protocol chip).
+    w.thinkingChip = new wxStaticText(w.modelPill, wxID_ANY,
+        wxString::FromUTF8("\xC2\xB7 Auto"));
+    w.thinkingChip->SetForegroundColour(theme.textMuted);
+    w.thinkingChip->SetCursor(wxCURSOR_HAND);
+    w.thinkingChip->SetFont(pillMonoFont);
+    w.thinkingChip->SetName("Thinking mode for this conversation");
+    w.thinkingChip->SetToolTip(
+        "Thinking for this conversation; applies to the next message.\n"
+        "Auto uses the model's default. Off requests no thinking.\n"
+        "On enables thinking; Low, Medium and High request an effort level.\n"
+        "Support depends on the model and provider. Local models treat effort levels as On.\n"
+        "Click to change. Unavailable while a turn is running.");
+    pillSizer->Add(w.thinkingChip, 0, wxALIGN_CENTER_VERTICAL | wxLEFT, 8);
+
     // Closing bracket. Sits after the (often hidden) protocol chip so the
-    // readout reads "[ * model-name . quant ]" normally and
+    // readout reads "[ * model-name . Auto ]" normally and
     // "[ * model-name . quant  native ]" once protocol detection lands.
     w.modelPillRightBracket = new wxStaticText(w.modelPill, wxID_ANY, "]");
     w.modelPillRightBracket->SetForegroundColour(theme.textMuted);
@@ -119,9 +148,7 @@ TopBarWidgets BuildTopBar(wxWindow* parent, wxBoxSizer* mainSizer,
     pillSizer->Add(w.modelPillRightBracket, 0, wxALIGN_CENTER_VERTICAL | wxLEFT, 6);
 
     w.modelPill->SetSizer(pillSizer);
-    sizer->Add(w.modelPill, 0, wxALIGN_CENTER_VERTICAL);
-
-    sizer->AddStretchSpacer(1);
+    centerSizer->Add(w.modelPill, 0, wxALIGN_CENTER_VERTICAL);
 
     // ── Context meter (right side) ──
     // "ctx 18.2k/32k" occupancy readout for the model's context window.
@@ -150,7 +177,7 @@ TopBarWidgets BuildTopBar(wxWindow* parent, wxBoxSizer* mainSizer,
     w.ctxMeter->SetMinSize(wxSize(190, -1));
     w.ctxMeter->SetLabel("");
     w.ctxMeter->Hide();
-    sizer->Add(w.ctxMeter, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 10);
+    rightSizer->Add(w.ctxMeter, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 10);
 
     // ── Right: New Chat button ──
     w.newChatButton = new wxButton(w.toolbarPanel, wxID_ANY, "+",
@@ -162,29 +189,18 @@ TopBarWidgets BuildTopBar(wxWindow* parent, wxBoxSizer* mainSizer,
     newChatFont.SetPointSize(22);
     w.newChatButton->SetFont(newChatFont);
     w.newChatButton->SetCursor(wxCURSOR_HAND);
-    sizer->Add(w.newChatButton, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
+    rightSizer->Add(w.newChatButton, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
 
-    // ── Right: Settings gear ──
-    // U+2699 GEAR followed by U+FE0E VARIATION SELECTOR-15, which asks
-    // for TEXT presentation.  The trailing selector used to be U+FE0F
-    // (VS16), the emoji-presentation request -- Windows honoured it,
-    // pulled the glyph from Segoe UI Emoji, and drew a full-colour gear
-    // that carried its own palette and therefore ignored the
-    // SetForegroundColour(theme.textMuted) two lines down.  That made it
-    // the only glyph in the toolbar that did not track the active theme.
-    // Do not drop the selector entirely: U+2699 defaults to emoji
-    // presentation on Windows, so the request has to be explicit.
-    wxString gear = wxString::FromUTF8("\xE2\x9A\x99\xEF\xB8\x8E");
-    w.settingsButton = new wxButton(w.toolbarPanel, wxID_ANY, gear,
-        wxDefaultPosition, wxSize(52, 44), wxBORDER_NONE);
-    w.settingsButton->SetBackgroundColour(theme.bgToolbar);
-    w.settingsButton->SetForegroundColour(theme.textMuted);
+    // ── Right: Settings vector icon ──
+    // Keep a text label for accessibility while displaying only the SVG.
+    w.settingsButton = new wxButton(w.toolbarPanel, wxID_ANY, "Settings",
+        wxDefaultPosition, w.toolbarPanel->FromDIP(wxSize(52, 44)),
+        wxBORDER_NONE | wxBU_NOTEXT);
+    w.settingsButton->SetName("Settings");
     w.settingsButton->SetToolTip("Settings");
-    wxFont gearFont = w.settingsButton->GetFont();
-    gearFont.SetPointSize(18);
-    w.settingsButton->SetFont(gearFont);
+    LbSettingsIcon::Apply(w.settingsButton, theme);
     w.settingsButton->SetCursor(wxCURSOR_HAND);
-    sizer->Add(w.settingsButton, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 2);
+    rightSizer->Add(w.settingsButton, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 2);
 
     // ── Right: About info ──
     wxString infoChar = wxString::FromUTF8("\xE2\x93\x98"); // ⓘ
@@ -197,8 +213,11 @@ TopBarWidgets BuildTopBar(wxWindow* parent, wxBoxSizer* mainSizer,
     aboutFont.SetPointSize(18);
     w.aboutButton->SetFont(aboutFont);
     w.aboutButton->SetCursor(wxCURSOR_HAND);
-    sizer->Add(w.aboutButton, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 8);
+    rightSizer->Add(w.aboutButton, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 8);
 
+    sizer->Add(leftSizer, 1, wxEXPAND);
+    sizer->Add(centerSizer, 0, wxALIGN_CENTER_VERTICAL);
+    sizer->Add(rightSizer, 1, wxEXPAND);
     w.toolbarPanel->SetSizer(sizer);
     mainSizer->Add(w.toolbarPanel, 0, wxEXPAND);
 

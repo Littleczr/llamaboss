@@ -4,6 +4,7 @@
 
 #include "tool_notes.h"
 #include "path_safety.h"
+#include "lb_string_utils.h"     // LbUtf8SafeTruncate
 #include "tool_staged_write.h"   // CreateStagedTempFile, atomic save
 
 #include <wx/filename.h>
@@ -149,7 +150,11 @@ std::string OneLineSummary(const std::string& s, size_t maxLen = 180)
     }
 
     if (collapsed.size() > maxLen) {
-        collapsed.resize(maxLen);
+        // UTF-8-safe cut: this summary is persisted into global NOTES.md,
+        // so a split character would break every later notes_read (the
+        // tool result carries invalid UTF-8 and llama-server rejects the
+        // request) until the file is repaired by hand.
+        collapsed = LbUtf8SafeTruncate(collapsed, maxLen);
         collapsed += "...";
     }
     return collapsed;

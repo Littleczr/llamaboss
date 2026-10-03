@@ -5,6 +5,7 @@
 // Supports multiple simultaneous attachments.
 
 #include "attachment_manager.h"
+#include "var_store.h"
 #include "path_safety.h"
 
 #include <fstream>
@@ -240,6 +241,110 @@ bool AttachmentManager::AttachTextFile(const std::string& filePath)
     return true;
 }
 
+bool AttachmentManager::AttachPastedText(const std::string& content,
+                                        const std::string& filePath)
+{
+    if (m_pending.size() >= kMaxAttachments || content.empty() ||
+        content.size() > kMaxPastedTextBytes)
+        return false;
+
+    wxFileName fname(wxString::FromUTF8(filePath));
+    if (!fname.IsAbsolute() || !fname.FileExists()) return false;
+    const wxULongLong size = fname.GetSize();
+    if (size == wxInvalidSize || size.GetValue() != content.size()) return false;
+
+    PendingAttachment item;
+    item.type = PendingAttachment::Type::TextFile;
+    item.data = content;
+    item.name = std::string(fname.GetFullName().ToUTF8().data());
+    item.originalSize = content.size();
+    item.pastedTextPath = filePath;
+    m_pending.push_back(std::move(item));
+
+    if (m_logger)
+        m_logger->information("Pasted text attached: " + m_pending.back().name +
+            " (" + std::to_string(content.size()) + " bytes)");
+    NotifyChanged();
+    return true;
+}
+
+bool AttachmentManager::AttachTextFileRef(const std::string& filePath,
+                                          const std::string& toolRelativePath)
+{
+    if (m_pending.size() >= kMaxAttachments) return false;
+
+    wxFileName fname(wxString::FromUTF8(filePath));
+    if (!fname.FileExists()) return false;
+
+    wxULongLong fileSize = fname.GetSize();
+    // Hard ceiling mirrors the read tool's 64 MiB refusal: beyond
+    // this even a shape-report pass over the content is unreasonable.
+    constexpr unsigned long long kMaxRefBytes = 64ULL * 1024ULL * 1024ULL;
+    if (fileSize == wxInvalidSize || fileSize.GetValue() > kMaxRefBytes)
+        return false;
+
+    std::ifstream ifs(path_safety::Utf8ToWide(filePath), std::ios::binary);
+    if (!ifs.is_open()) return false;
+    std::ostringstream oss;
+    oss << ifs.rdbuf();
+    std::string content = oss.str();
+
+    // Same encoding normalization as the inline path — the CARD must
+    // be valid UTF-8 on the wire even when the file is UTF-16.  The
+    // on-disk copy is left as-is; the card carries a note steering
+    // the model toward python for exact reads in that case.
+    bool utf16 = false;
+    if (content.size() >= 2) {
+        const unsigned char b0 = static_cast<unsigned char>(content[0]);
+        const unsigned char b1 = static_cast<unsigned char>(content[1]);
+        const bool utf16le = (b0 == 0xFF && b1 == 0xFE);
+        const bool utf16be = (b0 == 0xFE && b1 == 0xFF);
+        if (utf16le || utf16be) {
+            utf16 = true;
+            wxMBConvUTF16LE convLE;
+            wxMBConvUTF16BE convBE;
+            wxString decoded(content.data() + 2,
+                             utf16le ? static_cast<wxMBConv&>(convLE)
+                                     : static_cast<wxMBConv&>(convBE),
+                             content.size() - 2);
+            if (!decoded.empty()) {
+                const wxScopedCharBuffer utf8 = decoded.ToUTF8();
+                if (utf8.data())
+                    content.assign(utf8.data(), utf8.length());
+            }
+        }
+        else if (content.size() >= 3 && b0 == 0xEF && b1 == 0xBB &&
+                 static_cast<unsigned char>(content[2]) == 0xBF) {
+            content.erase(0, 3);  // strip UTF-8 BOM from the preview copy
+        }
+    }
+
+    const std::string relArg = toolRelativePath.empty()
+        ? std::string(fname.GetFullName().ToUTF8().data())
+        : toolRelativePath;
+    const std::string name = std::string(fname.GetFullName().ToUTF8().data());
+
+    PendingAttachment item;
+    item.type         = PendingAttachment::Type::TextFileRef;
+    // For large text refs, data is the finished varstore handle card —
+    // built once here so the send path never re-reads the file.
+    item.data         = varstore::BuildHandleCard(relArg, content, name,
+                                                  varstore::DemotionConfig{},
+                                                  /*reusedSameFile=*/false,
+                                                  /*utf16Original=*/utf16);
+    item.name         = name;
+    item.originalSize = static_cast<size_t>(fileSize.GetValue());
+    m_pending.push_back(std::move(item));
+
+    if (m_logger)
+        m_logger->information("Large text attached as variable: " +
+            m_pending.back().name + " -> " + relArg +
+            " [" + std::to_string(m_pending.size()) + " pending]");
+
+    NotifyChanged();
+    return true;
+}
+
 bool AttachmentManager::AttachPdfFile(const std::string& filePath,
                                       const std::string& toolRelativePath)
 {
@@ -451,6 +556,13 @@ bool AttachmentManager::HasTextFile() const
     return false;
 }
 
+bool AttachmentManager::HasTextFileRef() const
+{
+    for (const auto& item : m_pending)
+        if (item.type == PendingAttachment::Type::TextFileRef) return true;
+    return false;
+}
+
 bool AttachmentManager::HasPdfFile() const
 {
     for (const auto& item : m_pending)
@@ -484,40 +596,6 @@ bool AttachmentManager::HasZipFile() const
     for (const auto& item : m_pending)
         if (item.type == PendingAttachment::Type::ZipFile) return true;
     return false;
-}
-
-std::string AttachmentManager::GetDisplayLabel() const
-{
-    if (m_pending.empty()) return "";
-
-    if (m_pending.size() == 1) {
-        const auto& item = m_pending[0];
-        if (item.type == PendingAttachment::Type::Image)
-            return "  [img]  " + item.name;
-        if (item.type == PendingAttachment::Type::SpreadsheetFile)
-            return "  [xlsx] " + item.name;
-        if (item.type == PendingAttachment::Type::PdfFile)
-            return "  [pdf]  " + item.name;
-        if (item.type == PendingAttachment::Type::DocxFile)
-            return "  [docx] " + item.name;
-        if (item.type == PendingAttachment::Type::CsvFile)
-            return "  [csv]  " + item.name;
-        if (item.type == PendingAttachment::Type::ZipFile)
-            return "  [zip]  " + item.name;
-        return "  [file] " + item.name;
-    }
-
-    // Multiple items — show count plus a short file preview.
-    std::string label = "  [files] "
-        + std::to_string(m_pending.size()) + " files: ";
-    const size_t shown = std::min<size_t>(m_pending.size(), 3);
-    for (size_t i = 0; i < shown; ++i) {
-        if (i > 0) label += ", ";
-        label += m_pending[i].name;
-    }
-    if (m_pending.size() > shown)
-        label += " +" + std::to_string(m_pending.size() - shown) + " more";
-    return label;
 }
 
 std::vector<std::string> AttachmentManager::GetFileNames() const
@@ -563,7 +641,8 @@ std::vector<AttachmentInfo> AttachmentManager::GetAttachmentInfo() const
 //  Serialization
 // ═══════════════════════════════════════════════════════════════════
 
-std::string AttachmentManager::BakeTextFilesIntoMessage(const std::string& userText) const
+std::string AttachmentManager::BakeTextFilesIntoMessage(const std::string& userText,
+                                                       bool usePastedFileReferences) const
 {
     // Prepend each text file as a code-fenced block before the user's text.
     // Images are not baked — they go through InjectImagesIntoRequest.
@@ -571,9 +650,35 @@ std::string AttachmentManager::BakeTextFilesIntoMessage(const std::string& userT
 
     for (const auto& item : m_pending) {
         if (item.type != PendingAttachment::Type::TextFile) continue;
+        if (usePastedFileReferences && !item.pastedTextPath.empty() &&
+            wxFileExists(wxString::FromUTF8(item.pastedTextPath))) {
+            baked += "[Attached large text file: " + item.name + "]\n"
+                  + varstore::BuildHandleCard(item.pastedTextPath, item.data,
+                        item.name, varstore::DemotionConfig{}, false, false)
+                  + "\n\n";
+            continue;
+        }
         const std::string fence = FenceForContent(item.data);
         baked += "[File: " + item.name + "]\n"
               + fence + "\n" + item.data + "\n" + fence + "\n\n";
+    }
+
+    if (baked.empty()) return userText;
+    return baked + userText;
+}
+
+std::string AttachmentManager::BakeTextFileRefsIntoMessage(const std::string& userText) const
+{
+    // Large text files feel like PDF attachments in the composer: a
+    // chip, not a wall of text.  The model receives the handle card
+    // (path + shape + preview) built at attach time — the content
+    // itself never enters the request.
+    std::string baked;
+
+    for (const auto& item : m_pending) {
+        if (item.type != PendingAttachment::Type::TextFileRef) continue;
+        baked += "[Attached large text file: " + item.name + "]\n"
+              + item.data + "\n\n";
     }
 
     if (baked.empty()) return userText;
@@ -620,12 +725,11 @@ std::string AttachmentManager::BakePdfFilesIntoMessage(const std::string& userTe
         } else {
             if (likelyFormFill) {
                 baked += "PDF form filling is not available in this non-agent request. Tell "
-                         "the user to enable Agent mode or run /pdf_inspect_form first, then "
-                         "/pdf_fill_form with the exact fields.\n";
+                         "the user to turn on Agent mode so you can fill the form.\n";
             } else {
                 baked += "PDF text is not embedded in this non-agent request. If the user "
-                         "needs the contents, tell them to enable Agent mode or run: "
-                         "/pdf_extract_text " + item.data + "\n";
+                         "needs the contents, tell them to turn on Agent mode so you can "
+                         "read it.\n";
             }
         }
 
@@ -659,8 +763,8 @@ std::string AttachmentManager::BakeSpreadsheetFilesIntoMessage(const std::string
                      "report/artifact; xlsx_report requires approval.\n";
         } else {
             baked += "Workbook data is not embedded in this non-agent request. If the user "
-                     "needs the contents, tell them to enable Agent mode or run: "
-                     "/xlsx_inspect " + item.data + "\n";
+                     "needs the contents, tell them to turn on Agent mode so you can "
+                     "inspect it.\n";
         }
 
         baked += "\n";
@@ -736,8 +840,8 @@ std::string AttachmentManager::BakeCsvFilesIntoMessage(const std::string& userTe
                      "a Markdown report/artifact.\n";
         } else {
             baked += "CSV data is not embedded in this non-agent request. If the user "
-                     "needs the contents, tell them to enable Agent mode or run: "
-                     "/csv_inspect " + item.data + "\n";
+                     "needs the contents, tell them to turn on Agent mode so you can "
+                     "inspect it.\n";
         }
 
         baked += "\n";
@@ -769,6 +873,11 @@ std::string AttachmentManager::BakeZipFilesIntoMessage(const std::string& userTe
             baked += "When the user's request depends on what this archive contains, "
                      "call the zip_inspect tool with exactly this args value before "
                      "answering: " + item.data + "\n";
+            baked += "If the archive holds images (png/jpg/jpeg/gif/bmp/webp) the user wants "
+                     "looked at, described, or analyzed: after zip_inspect, extract it with "
+                     "zip_extract, then call view_image on the extracted folder or files so "
+                     "the pictures reach your vision input. Never describe images from their "
+                     "filenames alone.\n";
         } else {
             baked += "Archive contents are not embedded in this non-agent request. If the user "
                      "needs them, tell them to enable Agent mode or run: "
@@ -1001,22 +1110,10 @@ bool AttachmentManager::IsImageFile(const std::string& path)
            ext == "gif" || ext == "bmp" || ext == "webp";
 }
 
-bool AttachmentManager::IsPdfFile(const std::string& path)
-{
-    wxString ext = wxFileName(wxString::FromUTF8(path)).GetExt().Lower();
-    return ext == "pdf";
-}
-
 bool AttachmentManager::IsSpreadsheetFile(const std::string& path)
 {
     wxString ext = wxFileName(wxString::FromUTF8(path)).GetExt().Lower();
     return ext == "xlsx";
-}
-
-bool AttachmentManager::IsDocxFile(const std::string& path)
-{
-    wxString ext = wxFileName(wxString::FromUTF8(path)).GetExt().Lower();
-    return ext == "docx" || ext == "docm";
 }
 
 bool AttachmentManager::IsCsvFile(const std::string& path)

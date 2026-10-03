@@ -1,0 +1,83 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <Filter Include="Source Files">
+      <UniqueIdentifier>{4FC737F1-C7A5-4376-A066-2A32D752A2FF}</UniqueIdentifier>
+      <Extensions>cpp;c;cc;cxx;c++;cppm;ixx;def;odl;idl;hpj;bat;asm;asmx</Extensions>
+    </Filter>
+    <Filter Include="Header Files">
+      <UniqueIdentifier>{93995380-89BD-4b04-88EB-625FBE52EBFB}</UniqueIdentifier>
+      <Extensions>h;hh;hpp;hxx;h++;hm;inl;inc;ipp;xsd</Extensions>
+    </Filter>
+    <Filter Include="Resource Files">
+      <UniqueIdentifier>{67DA6AB6-F800-4c08-8B7A-83BB121AAD01}</UniqueIdentifier>
+      <Extensions>rc;ico;cur;bmp;dlg;rc2;rct;bin;rgs;gif;jpg;jpeg;jpe;resx;tiff;tif;png;wav;mfcribbon-ms</Extensions>
+    </Filter>
+    <Filter Include="Production Sources">
+      <UniqueIdentifier>{C849E91B-A2CF-4D47-B8BE-61F01C47FA97}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Production Headers">
+      <UniqueIdentifier>{5CA06A88-1D83-42C3-A2C8-A463264F3B29}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="json_case_loader.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="LlamaBossTests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="read_grep_tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="var_store_tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\path_safety.cpp">
+      <Filter>Production Sources</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\tool_path.cpp">
+      <Filter>Production Sources</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\tool_read.cpp">
+      <Filter>Production Sources</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\var_store.cpp">
+      <Filter>Production Sources</Filter>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="json_case_loader.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="test_framework.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\path_safety.h">
+      <Filter>Production Headers</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\tool_context.h">
+      <Filter>Production Headers</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\tool_grep_args.h">
+      <Filter>Production Headers</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\tool_path.h">
+      <Filter>Production Headers</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\tool_path_safety.h">
+      <Filter>Production Headers</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\tool_read.h">
+      <Filter>Production Headers</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\var_store.h">
+      <Filter>Production Headers</Filter>
+    </ClInclude>
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="README_TESTS.md" />
+    <None Include="Cases\*.json" />
+    <None Include="Cases\README.md" />
+  </ItemGroup>
+</Project>

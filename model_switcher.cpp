@@ -213,6 +213,7 @@ ModelSwitcher::ModelSwitcher(ModelService& service,
 
 bool ModelSwitcher::IsConversationTargetActive() const
 {
+    if (m_conversationNeedsExplicitSelection) return false;
     if (m_conversationSelectionKey.empty()) return true;
     return SameSelectionKey(m_conversationSelectionKey,
                             m_service.GetActiveSelectionKey());
@@ -231,8 +232,29 @@ bool ModelSwitcher::SessionUsesLocalServer() const
     return !IsRemoteModelKey(key);
 }
 
+int ModelSwitcher::ConversationContextTokens() const
+{
+    return ContextTokensForLane(!SessionUsesLocalServer(),
+                                m_appState.GetCtxSize());
+}
+
+std::string ModelSwitcher::ExplicitSelectionMessage() const
+{
+    return "This conversation was saved with \"" + m_conversationModelForSave +
+           "\", which can't be matched to a single AI connection. Choose a "
+           "model from the model menu before sending. No request was sent.";
+}
+
 InferenceTarget ModelSwitcher::ResolveTargetForConversation()
 {
+    if (m_conversationNeedsExplicitSelection) {
+        InferenceTarget unavailable;
+        unavailable.managed = false;
+        unavailable.modelId = m_conversationModelForSave;
+        unavailable.resolutionError = ExplicitSelectionMessage();
+        return unavailable;
+    }
+
     // Local conversations (and frames with no preference yet) ride
     // the app-global target exactly as before.
     if (!IsRemoteModelKey(m_conversationSelectionKey))
@@ -241,30 +263,34 @@ InferenceTarget ModelSwitcher::ResolveTargetForConversation()
     // Remote conversations resolve their own endpoint per send,
     // without installing it as the app-global target.  SecretsStore
     // is UI-thread-only; every caller (main send, agent sendRequest,
-    // goal sends, skill draft) dispatches from the main thread, and
+    // skill draft) dispatches from the main thread, and
     // the resolved target is copied into the worker as usual.
     std::string endpointId;
     std::string wireModel;
+    std::string reason = "Invalid remote model selection.";
     if (ParseRemoteModelKey(m_conversationSelectionKey,
                             endpointId, wireModel)) {
         EndpointStore* endpoints = m_appState.GetEndpointStore();
         SecretsStore*  secrets   = m_appState.GetSecretsStore();
         InferenceTarget target;
-        std::string reason;
+        reason = "Connection storage is unavailable.";
         if (endpoints && secrets &&
             endpoints->ResolveTarget(endpointId, wireModel, *secrets,
                                      target, reason)) {
             return target;
         }
-        if (auto* logger = m_appState.GetLogger())
-            logger->information(
-                "ResolveTargetForConversation: remote key '" +
-                m_conversationSelectionKey + "' failed to resolve (" +
-                reason + "); falling back to the app-global target");
     }
-    // Fallback preserves the pre-pinning behavior (global target)
-    // when the endpoint was deleted or the key is malformed.
-    return m_service.ResolveTarget();
+    // Never substitute another window's provider for an unavailable endpoint.
+    // Keep the failure on the value so UI-only inspection remains non-modal
+    // and every send path (including skills) fails at the transport.
+    InferenceTarget unavailable;
+    unavailable.managed = false;
+    unavailable.modelId = wireModel;
+    unavailable.resolutionError = "Selected AI connection is unavailable. " + reason +
+        " Restore that connection or explicitly select another provider/model. No request was sent.";
+    if (auto* logger = m_appState.GetLogger())
+        logger->warning("ResolveTargetForConversation: " + unavailable.resolutionError);
+    return unavailable;
 }
 
 void ModelSwitcher::MarkServerNotReady()
@@ -281,9 +307,23 @@ std::string ModelSwitcher::GetConversationModelForSave() const
         : m_conversationModelForSave;
 }
 
+std::string ModelSwitcher::GetConversationSelectionKeyForSave() const
+{
+    if (m_conversationNeedsExplicitSelection) return std::string();
+    const std::string key = m_conversationSelectionKey.empty()
+        ? m_service.GetActiveSelectionKey()
+        : m_conversationSelectionKey;
+    // Only persist a key that agrees with the model id being saved, so a
+    // stale key can never point a conversation at the wrong connection.
+    std::string endpointId, wireModel;
+    if (!ParseRemoteModelKey(key, endpointId, wireModel)) return std::string();
+    return wireModel == GetConversationModelForSave() ? key : std::string();
+}
+
 void ModelSwitcher::SetConversationPreferredLocalModel(
     const std::string& modelPath)
 {
+    m_conversationNeedsExplicitSelection = false;
     m_conversationSelectionKey = modelPath;
     m_conversationModelForSave = modelPath;
 
@@ -300,6 +340,7 @@ void ModelSwitcher::SetConversationPreferredRemoteModel(
     const std::string& selectionKey,
     const std::string& wireModel)
 {
+    m_conversationNeedsExplicitSelection = false;
     m_conversationSelectionKey = selectionKey;
     m_conversationModelForSave = wireModel;
     m_pendingDeferredModel.clear();
@@ -307,7 +348,8 @@ void ModelSwitcher::SetConversationPreferredRemoteModel(
 
 
 bool ModelSwitcher::SetConversationPreferredSavedModel(
-    const std::string& savedModel)
+    const std::string& savedModel,
+    const std::string& savedSelection)
 {
     if (savedModel.empty()) return false;
 
@@ -316,44 +358,29 @@ bool ModelSwitcher::SetConversationPreferredSavedModel(
         return true;
     }
 
-    // A conversation currently using the active remote model can retain the
-    // endpoint identity exactly, even though older conversation files persist
-    // only the wire model id.
-    const InferenceTarget activeTarget = m_service.ResolveTarget();
-    const std::string activeKey = m_service.GetActiveSelectionKey();
-    if (!activeTarget.managed && activeTarget.modelId == savedModel &&
-        IsRemoteModelKey(activeKey)) {
-        SetConversationPreferredRemoteModel(activeKey, savedModel);
-        return true;
-    }
-
-    EndpointStore* endpoints = m_appState.GetEndpointStore();
-    if (!endpoints) return false;
-
-    // Prefer the last explicit remote selection when it names this wire model.
-    // This disambiguates common ids that appear under multiple providers.
-    std::string lastEndpoint;
-    std::string lastWireModel;
-    const std::string lastSelection = m_appState.GetLastSelection();
-    if (ParseRemoteModelKey(lastSelection, lastEndpoint, lastWireModel) &&
-        lastWireModel == savedModel) {
-        if (const EndpointStore::Endpoint* ep =
-                endpoints->FindEndpoint(lastEndpoint)) {
-            const bool stillConfigured = std::any_of(
-                ep->models.begin(), ep->models.end(),
-                [&savedModel](const EndpointStore::Model& model) {
-                    return model.id == savedModel;
-                });
-            if (stillConfigured) {
-                SetConversationPreferredRemoteModel(lastSelection, savedModel);
-                return true;
-            }
+    // Exact selection saved with the conversation: honour it as-is.  If that
+    // connection has since been removed, ResolveTargetForConversation and
+    // ActivateRemoteModel report it as unavailable on send -- the chat is
+    // never re-routed to another provider that happens to offer the same id.
+    {
+        std::string endpointId, wireModel;
+        if (ParseRemoteModelKey(savedSelection, endpointId, wireModel) &&
+            wireModel == savedModel) {
+            SetConversationPreferredRemoteModel(savedSelection, savedModel);
+            return true;
         }
     }
 
-    // Otherwise accept only a unique endpoint/model match.  Guessing when two
-    // endpoints expose the same wire id could silently send private chat data
-    // to the wrong provider.
+    // Files from older builds carry only the wire model id.  The active
+    // target or the last selection are NOT evidence of which connection the
+    // chat used (switching to another connection's same-named model and
+    // reopening the chat would silently adopt it), so accept only a unique
+    // endpoint/model match.
+    EndpointStore* endpoints = m_appState.GetEndpointStore();
+    if (!endpoints) return false;
+
+    // Guessing when two endpoints expose the same wire id could silently
+    // send private chat data to the wrong provider.
     std::string matchedKey;
     size_t matches = 0;
     for (const auto& ep : endpoints->Endpoints()) {
@@ -372,8 +399,24 @@ bool ModelSwitcher::SetConversationPreferredSavedModel(
     return false;
 }
 
+bool ModelSwitcher::HandleUnresolvedSavedModel(const std::string& savedModel)
+{
+    const InferenceTarget active = m_service.ResolveTarget();
+    if (active.managed) {
+        // Local target: nothing leaves the machine; keep the old behaviour.
+        AdoptActiveTargetForConversation();
+        return false;
+    }
+    m_conversationSelectionKey.clear();
+    m_conversationModelForSave = savedModel;   // saving keeps the original id
+    m_pendingDeferredModel.clear();
+    m_conversationNeedsExplicitSelection = true;
+    return true;
+}
+
 void ModelSwitcher::AdoptActiveTargetForConversation()
 {
+    m_conversationNeedsExplicitSelection = false;
     m_conversationSelectionKey = m_service.GetActiveSelectionKey();
     m_conversationModelForSave = m_service.ResolveTarget().modelId;
     if (m_conversationModelForSave.empty())
@@ -383,6 +426,7 @@ void ModelSwitcher::AdoptActiveTargetForConversation()
 
 void ModelSwitcher::ClearConversationPreference()
 {
+    m_conversationNeedsExplicitSelection = false;
     m_conversationSelectionKey.clear();
     m_conversationModelForSave.clear();
     m_pendingDeferredModel.clear();
@@ -390,12 +434,19 @@ void ModelSwitcher::ClearConversationPreference()
 
 bool ModelSwitcher::NeedsRemoteActivationForConversation() const
 {
+    // An unresolved saved model routes the send path here so it can stop
+    // with an explanation instead of falling into the local lazy-load path.
+    if (m_conversationNeedsExplicitSelection) return true;
     return IsRemoteModelKey(m_conversationSelectionKey) &&
            !IsConversationTargetActive();
 }
 
 bool ModelSwitcher::ActivateConversationPreferredRemoteTarget()
 {
+    if (m_conversationNeedsExplicitSelection) {
+        m_chatDisplay->DisplaySystemMessage(ExplicitSelectionMessage());
+        return false;
+    }
     if (!NeedsRemoteActivationForConversation())
         return IsServerReady();
 
@@ -447,19 +498,11 @@ void ModelSwitcher::OnServiceStateChanged()
 // ═════════════════════════════════════════════════════════════════
 
 // ── KV slot ownership forwarding ─────────────────────────────────
-// Invalidation stays a thin pass-through (always safe).  The stamp
-// routes through ModelService (Phase 3c) so a goal auto-continuation
-// dispatched while another window is mid-generation invalidates
-// instead of claiming — same adjudication as the main send path.
+// Invalidation is a thin pass-through (always safe).
 
 void ModelSwitcher::InvalidateKvSlotOwner()
 {
     m_serverManager.InvalidateSlotOwner();
-}
-
-void ModelSwitcher::NoteKvSlotOwner(const std::string& conversationPath)
-{
-    m_service.NoteSlotOwner(m_parentFrame, conversationPath);
 }
 
 void ModelSwitcher::StartInitialServer()
@@ -633,7 +676,7 @@ void ModelSwitcher::OnServerError(const std::string& error)
 void ModelSwitcher::OnModelPillClick(wxWindow* popupParent)
 {
     if (m_cb.isBusy && m_cb.isBusy()) {
-        m_chatDisplay->DisplaySystemMessage(
+        m_chatDisplay->DisplaySystemNotice(
             "Can't switch models while a response is streaming. Stop the response first.");
         return;
     }
@@ -652,7 +695,7 @@ void ModelSwitcher::OnModelPillClick(wxWindow* popupParent)
 void ModelSwitcher::OnModelPillRightClick(wxWindow* parent)
 {
     if (m_cb.isBusy && m_cb.isBusy()) {
-        m_chatDisplay->DisplaySystemMessage(
+        m_chatDisplay->DisplaySystemNotice(
             "Can't open model settings while a response is streaming. Stop the response first.");
         return;
     }
@@ -751,6 +794,7 @@ void ModelSwitcher::ShowModelPickerMenu(wxWindow* anchor,
         bool addedSeparator = false;
         for (const auto& ep : endpoints->Endpoints()) {
             for (const auto& model : ep.models) {
+                if (!model.showInPicker) continue;
                 if (!addedSeparator) {
                     menu.AppendSeparator();
                     addedSeparator = true;
@@ -762,6 +806,15 @@ void ModelSwitcher::ShowModelPickerMenu(wxWindow* anchor,
                 if (currentModel == model.id) item->Check(true);
             }
         }
+    }
+
+    // ── Thinking submenu ────────────────────────────────────────
+    // Same six modes as the pill's ". Auto" chip; MyFrame builds it so
+    // the two entry points share one handler.  Its items are handled by
+    // the submenu itself and never reach the model handler below.
+    if (m_cb.appendThinkingSubmenu) {
+        menu.AppendSeparator();
+        m_cb.appendThinkingSubmenu(menu);
     }
 
     menu.Bind(wxEVT_MENU,
@@ -800,7 +853,7 @@ void ModelSwitcher::SwitchToModel(const std::string& newModel)
     // below (targetIsLive / IsProcessRunning / StartServer).
     if (IsRemoteModelKey(newModel)) {
         if (m_cb.isBusy && m_cb.isBusy()) {
-            m_chatDisplay->DisplaySystemMessage(
+            m_chatDisplay->DisplaySystemNotice(
                 "Can't switch models while a response is streaming. "
                 "Stop the response first.");
             return;
@@ -863,7 +916,7 @@ void ModelSwitcher::SwitchToModel(const std::string& newModel)
     }
 
     if (m_cb.isBusy && m_cb.isBusy()) {
-        m_chatDisplay->DisplaySystemMessage(
+        m_chatDisplay->DisplaySystemNotice(
             "Can't switch models while a response is streaming. Stop the response first.");
         return;
     }

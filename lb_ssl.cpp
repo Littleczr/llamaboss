@@ -41,6 +41,10 @@
 #include <Poco/SharedPtr.h>
 #include <Poco/Base64Encoder.h>
 #include <Poco/Net/SSLManager.h>
+// SSLManager::initializeClient takes SharedPtr<PrivateKeyPassphraseHandler>;
+// include the complete interface so Poco::SharedPtr's inline release sees
+// its virtual destructor instead of instantiating delete on an incomplete type.
+#include <Poco/Net/PrivateKeyPassphraseHandler.h>
 #include <Poco/Net/Context.h>
 #include <Poco/Net/InvalidCertificateHandler.h>
 #include <Poco/Net/RejectCertificateHandler.h>

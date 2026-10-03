@@ -26,6 +26,7 @@
 #include <map>
 #include <set>
 #include <string>
+#include <vector>
 
 class ConversationRegistry
 {
@@ -71,6 +72,33 @@ public:
         return !key.empty() && m_sessionTrust.count(key) > 0;
     }
 
+    // Chat-scoped folder capabilities follow a saved conversation while the
+    // app remains open, just like one-approval mode. The map is never
+    // serialized, so restarting LlamaBoss clears every external write grant.
+    void RememberSessionWriteRoot(const std::string& conversationPath,
+                                  const std::string& writeRoot)
+    {
+        const std::string key = Normalize(conversationPath);
+        if (key.empty() || writeRoot.empty()) return;
+
+        auto& roots = m_sessionWriteRoots[key];
+        const std::string normalizedRoot = Normalize(writeRoot);
+        for (const std::string& existing : roots) {
+            if (Normalize(existing) == normalizedRoot) return;
+        }
+        roots.push_back(writeRoot);
+    }
+
+    std::vector<std::string> SessionWriteRoots(
+        const std::string& conversationPath) const
+    {
+        const std::string key = Normalize(conversationPath);
+        auto it = m_sessionWriteRoots.find(key);
+        return (it == m_sessionWriteRoots.end())
+            ? std::vector<std::string>{}
+            : it->second;
+    }
+
     // The frame (other than |exclude|) that currently has |path|
     // open, or nullptr.  Empty paths never match.
     wxFrame* OwnerOf(const std::string& path, const wxFrame* exclude) const
@@ -107,4 +135,5 @@ private:
     // Normalized paths of conversations granted one-approval mode
     // during this app session.  App lifetime; never saved to disk.
     std::set<std::string> m_sessionTrust;
+    std::map<std::string, std::vector<std::string>> m_sessionWriteRoots;
 };

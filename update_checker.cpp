@@ -230,6 +230,10 @@ UpdateInfo CheckBlocking(const std::string& currentVersion)
         info.latest = JsonStringOrEmpty(obj, "version");
         info.url    = JsonStringOrEmpty(obj, "url");
         info.notes  = JsonStringOrEmpty(obj, "notes");
+        info.installerUrl = JsonStringOrEmpty(obj, "installer_url");
+        info.sha256       = JsonStringOrEmpty(obj, "sha256");
+        for (char& c : info.sha256)
+            if (c >= 'A' && c <= 'F') c = static_cast<char>(c - 'A' + 'a');
 
         if (info.latest.empty()) {
             info.ok = false;

@@ -25,7 +25,7 @@ struct SlashCommandParseResult {
 
 // Parses user-typed tool-shaped slash commands only.  It does not
 // execute anything and intentionally does not handle app-state commands
-// such as /cd or /goal.
+// such as /cd.
 SlashCommandParseResult TryParseToolSlashCommand(const std::string& userInput);
 
 } // namespace lb_input_parsers

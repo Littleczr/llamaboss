@@ -52,46 +52,14 @@ struct SlashEntry {
     const char*      toolName;
 };
 
-// Table order matters for commands where one verb is a prefix of
-// another, e.g. /read_head before /read.
+// Typed tool commands kept for the user.  The model still has every
+// tool; these are the only ones a person can run by typing, because
+// reminders have no other screen for listing or cancelling them.
+// (The other 32 typed tool mirrors were removed 2026-09-28.)
 static const SlashEntry kToolSlashTable[] = {
-    { "/read_head", tool_names::kReadHead   },
-    { "/read",      tool_names::kRead       },
-    { "/ls",        tool_names::kLs         },
-    { "/grep",      tool_names::kGrep       },
-    { "/pwd",       tool_names::kPwd        },
-    { "/open",      tool_names::kOpen       },
-    { "/cmd",       tool_names::kPowerShell },
-    { "/python_health",          tool_names::kPythonHealth },
-    { "/csv_inspect",            tool_names::kCsvInspect   },
-    { "/csv_report",             tool_names::kCsvReport    },
-    { "/csv_to_xlsx",            tool_names::kCsvToXlsx    },
-    { "/xlsx_inspect",           tool_names::kXlsxInspect  },
-    { "/xlsx_report",            tool_names::kXlsxReport   },
-    { "/xlsx_create_workbook",   tool_names::kXlsxCreateWorkbook },
-    { "/pdf_extract_text",       tool_names::kPdfExtractText },
-    { "/pdf_inspect_form",       tool_names::kPdfInspectForm },
-    { "/pdf_fill_form",          tool_names::kPdfFillForm    },
-    { "/python_create_script",   tool_names::kPythonCreateScript },
-    { "/python_run_script",      tool_names::kPythonRunScript    },
-    { "/python_install_package", tool_names::kPythonInstallPackage },
-    { "/web_fetch_url",          tool_names::kWebFetchUrl },
-    { "/notes_read",             tool_names::kNotesRead },
-    { "/notes_append",           tool_names::kNotesAppend },
     { "/reminder_create",        tool_names::kReminderCreate },
     { "/reminder_list",          tool_names::kReminderList },
     { "/reminder_cancel",        tool_names::kReminderCancel },
-    { "/project_notes_read",     tool_names::kProjectNotesRead },
-    { "/project_notes_append",   tool_names::kProjectNotesAppend },
-
-    // Mutating tools.  These stay in the slash parser so MyFrame only
-    // has to ask whether an input is a recognized tool command.  The
-    // actual sandbox and approval checks remain in the normal tool path.
-    { "/overwrite_file", tool_names::kOverwriteFile },
-    { "/write",          tool_names::kWrite      },
-    { "/mkdir",          tool_names::kMkdir      },
-    { "/edit",           tool_names::kEdit       },
-    { "/delete",         tool_names::kDelete     },
 };
 
 } // namespace

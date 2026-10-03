@@ -8,7 +8,8 @@
 // single shared implementation prevents.
 //
 // ─── Behavior ─────────────────────────────────────────────────────
-// CheckFile runs `py_compile` on the file at `filePath` using whichever
+// CheckFile compiles the file at `filePath` in memory (compile(), via
+// `python -I -B -c`, writing no __pycache__) using whichever
 // launcher is found first (py.exe -3, then python.exe, then
 // python3.exe).  It never throws and always returns a populated result.
 //
@@ -16,7 +17,7 @@
 // compiler output names a recognized source-level error
 // (SyntaxError / IndentationError / TabError).  Anything else -- no
 // interpreter on PATH, a py launcher with no usable 3.x runtime, a
-// check that times out, or py_compile failing to start -- leaves
+// check that times out, or the checker failing to start -- leaves
 // ok == true so the caller does NOT block the write/creation; a real
 // runtime problem is surfaced later by python_health / python_run_script.
 //
@@ -38,7 +39,7 @@ struct SyntaxCheckResult {
     // TabError.  true in every other case, including "couldn't verify".
     bool ok = true;
 
-    // true if py_compile actually produced a verdict (clean or error);
+    // true if the checker actually produced a verdict (clean or error);
     // false if no usable interpreter ran, or the check timed out.
     // Carried for diagnostics / future use; callers may ignore it.
     bool checked = false;
@@ -48,7 +49,7 @@ struct SyntaxCheckResult {
     std::string message;
 };
 
-// Runs py_compile on `filePath`.  Never throws.  See header notes for
+// Syntax-checks `filePath` without writing bytecode.  Never throws.  See header notes for
 // the exact verdict rules.
 SyntaxCheckResult CheckFile(const std::string& filePath);
 

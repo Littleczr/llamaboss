@@ -213,8 +213,7 @@ public:
     void SaveSlotStateForConversation(const std::string& conversationPath);
     void RestoreSlotStateForConversation(const std::string& conversationPath);
 
-    // Out-of-conversation generations (goal contract builder, goal
-    // verifier, Skill draft builder) run against the same single
+    // Out-of-conversation generations (e.g. the Skill draft builder) run against the same single
     // slot with throwaway histories.  They replace the slot's KV
     // with content that belongs to NO conversation — call this at
     // their dispatch so a later switch-away doesn't serialize that
@@ -223,6 +222,23 @@ public:
     // reprocess) but wasted a multi-GB write and a pointless
     // restore.  Cheap no-op when nothing is tracked.
     void InvalidateSlotOwner();
+
+    // ── Prompt-cache pre-warm (prompt_prewarm.h) ─────────────────
+    // Queue a "prewarm" slot action: render |chatRequestBody| with
+    // /apply-template, cut it before "\n\n" + |marker|, and have
+    // llama-server process that prefix so the next new chat's first
+    // request only extends it.  Runs on the serialized slot-action
+    // worker (after any queued save-away).  Clears slot ownership: the
+    // slot will hold no conversation's KV.  |key| identifies the prefix;
+    // re-priming is skipped while the same key is queued/running, or
+    // after it SUCCEEDED until something else uses the slot (an exact
+    // re-send is not free on recurrent models).  A failed or superseded
+    // prime does not block a retry.  Returns false with |why| when
+    // skipped.
+    bool PrewarmPromptPrefix(const std::string& chatRequestBody,
+                             const std::string& marker,
+                             const std::string& key,
+                             std::string& why);
 
     // Display name: "/path/to/model.gguf" -> "model"
     static std::string ModelDisplayName(const std::string& ggufPath);
@@ -266,7 +282,7 @@ public:
 
     // ── Workspace ────────────────────────────────────────────────
     // The user-visible directory where the agent creates files by
-    // default. Lives under %USERPROFILE%\LlamaBoss\Workspace so it
+    // default. Lives under %USERPROFILE%\LlamaBoss\Shared\Workspace so it
     // stays out of OneDrive-redirected Documents by default while still
     // being easy to find in File Explorer.
     //
@@ -277,38 +293,44 @@ public:
     // GetWorkspaceDir() is the single source of truth consumed by
     // MyFrame::ResolveCurrentCwd() and BuildAgentSystemPrompt() as
     // the fallback when no per-conversation /cd override is set.
-    static std::string GetDefaultWorkspaceDir();    // %USERPROFILE%\LlamaBoss\Workspace
+    static std::string GetDefaultWorkspaceDir();    // %USERPROFILE%\LlamaBoss\Shared\Workspace
     static std::string GetWorkspaceDir();
     static std::string GetWorkspaceDirOverride();
-    static void        SetWorkspaceDirOverride(const std::string& path);
     static void        EnsureWorkspaceDir();
+    // Startup tidy-up: LlamaBoss\<lane> -> LlamaBoss\Shared\<lane> for
+    // installs that predate the Shared folder.  Called by EnsureWorkspaceDir.
+    static void        MigrateRootLanesToShared();
 
-    // ── Conversation lane layout (single source of truth) ────────
+    // ── Conversation lane layout ─────────────────────────────────
     // Recognizers for the per-conversation folder layout created by
-    // ChatHistory::EnsureWorkflowDir():
-    //   %USERPROFILE%\LlamaBoss\Workflows\chat_xxxxxxxx\Workspace
+    // ChatHistory::EnsureChatFolder():
+    //   %USERPROFILE%\LlamaBoss\Chats\<date>_<slug>_<id>\Workspace
     //
-    // Before these existed, python_runner.cpp and agent_controller.cpp
-    // each carried a private copy of the same cwd-shape recognizer and
-    // root-fallback chain.  agent_controller's copy guards the
-    // one-shot python_run_script approval bypass against cross-lane
-    // shadowing, so a silent divergence between the copies would
-    // weaken exactly the safety property it exists to protect.  Both
-    // files now delegate here.  If ChatHistory::EnsureWorkflowDir's
-    // layout ever changes, this is the one place to update.
+    // The shape check itself is chat_folders::ChatFolderFromWorkspaceCwd
+    // (chat_folders.h).  Every recognizer in the codebase — here,
+    // python_runner, agent_controller, cmd_executor, tool_router,
+    // tool_web_fetch, tool_path_safety — goes through that one function.
+    // agent_controller's use guards the one-shot python_run_script
+    // approval bypass against cross-lane shadowing, so a private copy that
+    // drifted would weaken exactly the safety property it exists to
+    // protect.  If the layout ever changes, chat_folders.h is the one
+    // place to update.
 
-    // %USERPROFILE%\LlamaBoss — the durable root that conversation
-    // lanes fall back to when the cwd is not a chat workspace.
-    // Equivalent to ParentDirOf(GetDefaultWorkspaceDir()).
+    // %USERPROFILE%\LlamaBoss — holds Chats, Projects, Skills, System.
     static std::string GetLlamaBossRootDir();
 
-    // Returns ...\Workflows\chat_xxxxxxxx when `cwd` matches the
-    // conversation-workspace shape above; empty otherwise.
-    static std::string ConversationWorkflowRootFromCwd(const std::string& cwd);
+    // %USERPROFILE%\LlamaBoss\Shared — the lanes (Workspace, Scripts,
+    // Documents, ToolOutputs, ...) used when the cwd is not a chat
+    // workspace.  Parent of GetDefaultWorkspaceDir().
+    static std::string GetSharedLanesRootDir();
+
+    // Returns the chat folder (...\Chats\<date>_<slug>_<id>) when `cwd`
+    // matches the conversation-workspace shape above; empty otherwise.
+    static std::string ChatFolderFromCwd(const std::string& cwd);
 
     // Lane folder ("Scripts", "Documents", "Spreadsheets", ...) for
-    // the conversation owning `cwd`, falling back to the global
-    // LlamaBoss root lane when `cwd` is not a chat workspace.
+    // the conversation owning `cwd`, falling back to the matching
+    // LlamaBoss\Shared lane when `cwd` is not a chat workspace.
     static std::string ConversationLaneDirForCwd(const std::string& cwd,
                                                  const std::string& lane);
 
@@ -369,7 +391,19 @@ private:
     // worker is draining it.  Logs the dispatch on the caller thread
     // (worker does not touch m_logger — it can outlive this object).
     void EnqueueSlotAction(const std::string& action,
-                           const std::string& filename);
+                           const std::string& filename,
+                           const std::string& requestBody = std::string(),
+                           const std::string& marker = std::string());
+
+    // Remove queued prewarm actions; with |abortInFlight| also cut short
+    // one that is running (its socket is closed).
+    void DropQueuedPrewarm(bool abortInFlight);
+    // Something other than a prewarm is taking the slot: bump the
+    // queue's slot epoch (an in-progress prewarm that hasn't submitted
+    // its prefix yet will not) and forget the primed key.  Primed /
+    // pending prewarm state lives in SlotActionQueue, where the worker
+    // records what actually happened.
+    void SupersedePrewarm();
     int           m_port = 8384;
     std::shared_ptr<std::atomic<bool>> m_healthCancelFlag;
 

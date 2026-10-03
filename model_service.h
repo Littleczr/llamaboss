@@ -195,6 +195,16 @@ public:
     void RestoreSlotStateForConversation(const wxEvtHandler* self,
                                          const std::string& conversationPath);
 
+    // New Chat prompt-cache pre-warm (see ServerManager::PrewarmPromptPrefix).
+    // Skipped when another window is generating on the shared slot: the
+    // prime would queue behind that stream and then replace its KV.
+    // Returns false with |why| when nothing was queued.
+    bool PrewarmPromptPrefix(const wxEvtHandler* self,
+                             const std::string& chatRequestBody,
+                             const std::string& marker,
+                             const std::string& key,
+                             std::string& why);
+
     // Number of currently attached windows.  MyFrame::OnClose detaches
     // itself first and then consults this: 0 means "I was the last
     // window", which is the trigger for stopping llama-server while a

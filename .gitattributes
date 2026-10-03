@@ -24,6 +24,10 @@
 *.css text eol=lf
 *.js text eol=lf
 *.json text eol=lf
+
+# Embedded Python resources must keep LF line endings.
+*.py text eol=lf
+*.rc2 text eol=crlf
 *.yml text eol=lf
 *.yaml text eol=lf
 .gitignore text eol=lf

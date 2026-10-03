@@ -1,25 +1,15 @@
 // project_status_strip.h
-// Single-line status strip showing both the active project and the
-// active goal for the current chat.  Replaces the native Windows menu
-// bar plus the old separate goal strip with one content-forward,
-// monospace, terminal-style row that always shows both pieces of
-// state at a glance.
+// Single-line status strip showing the active project for the current
+// chat plus the Skills shortcut.  Replaces the native Windows menu bar
+// with one content-forward, monospace, terminal-style row.
 //
 // Layout (packed left, stretch space on the right):
-//   ─ Project: <name> · N sources · M workflows  [ Change... ]  [ + New Skill ]   Goal: <status> · <objective>  [ details ] ─
-//   ─ [ + Load Project... ]  [ + New Skill ]   Goal: none  [ /goal ] ─
+//   ─ Project: <name> · N sources · M workflows  [ Project v ]  [ Skills v ] ─
+//   ─ [ Project v ]  [ Skills v ] ─
 //
-// The strip never reads ChatHistory / ProjectManager / GoalState
-// itself.  The frame computes the current State and pushes it via
-// Refresh().  Both right-side affordances route back to the frame
-// through the Callbacks.
-//
-// TODO(rename): now that this widget carries both Project AND Goal
-// state on a single row, "ProjectStatusStrip" is a slight misnomer.
-// Consider renaming to ContextStrip or ChatStatusStrip in a follow-up
-// pass once we're done iterating on the merged layout.  The rename
-// touches every #include and member reference, so it's deferred to
-// its own commit rather than bundled with this UI polish.
+// The strip never reads ChatHistory / ProjectManager itself.  The frame
+// computes the current State and pushes it via Refresh().  Affordances
+// route back to the frame through the Callbacks.
 
 #pragma once
 
@@ -40,16 +30,6 @@ public:
         int         sourceCount   = 0;
         int         workflowCount = 0;
         int         scriptCount   = 0;
-
-        // ── Goal ────────────────────────────────────────────────────
-        // The strip stitches "Goal: " + status + " · " + objective.  The
-        // frame passes the status label (e.g. "active", "awaiting user")
-        // and a pre-compacted objective string -- byte-budget compaction
-        // is display knowledge that lives on the frame side, alongside
-        // the GoalState that owns the raw text.
-        bool        hasGoal              = false;
-        std::string goalStatusLabel;
-        std::string goalObjectiveCompact;
     };
 
     // ── Callbacks the frame provides ────────────────────────────────
@@ -60,32 +40,11 @@ public:
         // the menu should be parented to (for screen-coord conversion).
         std::function<void(wxWindow* anchor)> onMenuRequested;
 
-        // Fired when the user left-clicks [ + Load Project... ] while no
-        // project is attached.  The frame routes this directly into its
-        // existing OnProjectAttach() flow so the chip behaves like the menu action,
-        // without forcing the extra popup-menu hop.
-        std::function<void()> onAttachRequested;
-
         // Fired when the user clicks the no-project [ + New Skill ]
         // shortcut.  This is intentionally separate from onMenuRequested
         // so the frame can show the same popup actions with Skill actions
         // prioritized at the top.
         std::function<void(wxWindow* anchor)> onSkillMenuRequested;
-
-        // Fired when the user clicks the goal right-side affordance
-        // ([ /goal ] when there is no goal, [ details ] otherwise).
-        // The frame routes both to its existing DisplayGoalStatus()
-        // flow so the slash-command path and the click path stay
-        // unified.
-        std::function<void()> onGoalActionClicked;
-
-        // Fired when the user clicks the goal affordance ([ Goal v ]).
-        // The frame builds and shows a state-aware goal popup menu
-        // (Set a Goal / Goal Details / Pause / Resume / Verify / Clear);
-        // |anchor| is the window the menu parents to for screen-coord
-        // conversion.  Supersedes the single-action onGoalActionClicked
-        // path above (which is left in place but no longer fired).
-        std::function<void(wxWindow* anchor)> onGoalMenuRequested;
     };
 
     ProjectStatusStrip(wxWindow* parent,
@@ -107,7 +66,6 @@ private:
     void RelayoutCurrentState();
     void BindProjectActionEvents(wxWindow* w);
     void BindSkillActionEvents(wxWindow* w);
-    void BindGoalActionEvents(wxWindow* w);
 
     Callbacks m_callbacks;
 
@@ -117,8 +75,6 @@ private:
     wxStaticText* m_stateLabel       = nullptr;  // project state text
     wxStaticText* m_actionLabel      = nullptr;  // project action ([ Change... ] / [ + Load Project... ])
     wxStaticText* m_skillActionLabel = nullptr;  // shortcut ([ + New Skill ])
-    wxStaticText* m_goalStateLabel   = nullptr;  // goal state text
-    wxStaticText* m_goalActionLabel = nullptr;  // goal action ([ details ] / [ /goal ])
     wxPanel*      m_separator       = nullptr;  // 1px bottom border
 
     // Current rendered state

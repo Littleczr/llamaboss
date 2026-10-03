@@ -58,6 +58,10 @@ const std::string kNameClose  = "</name>";
 const std::string kArgsOpen   = "<args>";
 const std::string kArgsClose  = "</args>";
 
+// Inline reasoning markers (see FindFirstOpenMarkerOutsideReasoning).
+const std::string kThinkOpen  = "<think>";
+const std::string kThinkClose = "</think>";
+
 // Hard cap for a single <tool_call>...</tool_call> block.
 // This prevents a malformed or runaway model response from causing
 // the streaming detector to retain unbounded text while waiting for
@@ -239,10 +243,12 @@ std::string MissingCloseReason(size_t openerLen)
            " valid closer." + kFormatReminder;
 }
 
-bool FindFirstOpenMarker(const std::string& text,
-                         size_t             start,
-                         size_t&            posOut,
-                         size_t&            lenOut)
+// Raw opener search: no notion of reasoning spans.  Callers that
+// decide dispatch must use FindFirstOpenMarkerOutsideReasoning.
+bool FindFirstOpenMarkerRaw(const std::string& text,
+                            size_t             start,
+                            size_t&            posOut,
+                            size_t&            lenOut)
 {
     size_t bestPos = std::string::npos;
     size_t bestLen = 0;
@@ -270,6 +276,292 @@ bool FindFirstOpenMarker(const std::string& text,
     posOut = bestPos;
     lenOut = bestLen;
     return true;
+}
+
+// ─── Qwen function-tag drift ─────────────────────────────────────
+// Qwen models trained on the Qwen3-Coder tool format
+//
+//   <tool_call>
+//   <function=powershell>
+//   <parameter=command>Get-ChildItem …</parameter>
+//   </function>
+//   </tool_call>
+//
+// blend it with ours.  Observed 2026-09-30 (Qwen 27B), repeated
+// verbatim through every malformed-call coaching attempt:
+//
+//   <function>powershell</name>   <args>…</args>
+//   <function=powershell</name>   <args>…</args>
+//   <function>powershell</function>             (no args)
+//   <function>powershell>        <args>…</args>  (2026-09-30, later run)
+//
+// The intent is unambiguous when the tag is the FIRST thing in the
+// block, carries an identifier-only name, and is followed only by a
+// balanced <args> envelope (or one native <parameter=…> body) and an
+// optional </function>.  Name/args still go through the normal
+// IsKnownToolName / ValidateToolArgs gates.  Anything looser falls
+// through to a malformed-call error that names the mistake.
+
+const std::string kFunctionTag      = "<function";
+const std::string kFunctionClose    = "</function>";
+const std::string kParameterOpen    = "<parameter=";
+const std::string kParameterClose   = "</parameter>";
+
+size_t SkipWs(const std::string& s, size_t i, size_t to)
+{
+    while (i < to && std::isspace(static_cast<unsigned char>(s[i]))) ++i;
+    return i;
+}
+
+bool At(const std::string& s, size_t i, size_t to, const std::string& tok)
+{
+    return i <= to && to - i >= tok.size() &&
+           s.compare(i, tok.size(), tok) == 0;
+}
+
+// Matches <function>NAME</name>, <function=NAME</name>,
+// <function>NAME</function>, <function=NAME</function>,
+// <function=NAME> or <function>NAME> at the first non-whitespace byte of s[from, to).
+// On success sets nameOut (lower-cased) and afterOut (just past the
+// tag's closer).
+bool MatchFunctionNameTag(const std::string& s,
+                          size_t             from,
+                          size_t             to,
+                          std::string&       nameOut,
+                          size_t&            afterOut)
+{
+    size_t i = SkipWs(s, from, to);
+    if (!At(s, i, to, kFunctionTag)) return false;
+    i += kFunctionTag.size();
+    if (i >= to) return false;
+
+    const bool eqForm = (s[i] == '=');
+    if (!eqForm && s[i] != '>') return false;
+    i = SkipWs(s, i + 1, to);
+
+    const size_t n0 = i;
+    while (i < to &&
+           (std::isalnum(static_cast<unsigned char>(s[i])) || s[i] == '_')) {
+        ++i;
+    }
+    if (i == n0) return false;
+    const std::string name = s.substr(n0, i - n0);
+    i = SkipWs(s, i, to);
+
+    if (At(s, i, to, kNameClose))          i += kNameClose.size();
+    else if (At(s, i, to, kFunctionClose)) i += kFunctionClose.size();
+    else if (i < to && s[i] == '>') ++i;   // <function=NAME> or <function>NAME>
+    else return false;
+
+    nameOut  = Lower(name);
+    afterOut = i;
+    return true;
+}
+
+// Recovers a <name>-less block written with a function tag.  Returns
+// true iff the shape was recognized (out is then populated, valid or
+// not); false leaves the caller to report a malformed call.
+bool TryParseFunctionTagBody(const std::string& inner, ToolInvocation& out)
+{
+    std::string name;
+    size_t i = 0;
+    if (!MatchFunctionNameTag(inner, 0, inner.size(), name, i)) return false;
+
+    const size_t end = inner.size();
+    i = SkipWs(inner, i, end);
+
+    std::string args;
+    if (At(inner, i, end, kArgsOpen)) {
+        const size_t a = i + kArgsOpen.size();
+        const size_t b = inner.find(kArgsClose, a);
+        if (b == std::string::npos) return false;   // partial envelope: fail closed
+        args = Trim(inner.substr(a, b - a));
+        i = b + kArgsClose.size();
+    } else if (At(inner, i, end, kParameterOpen)) {
+        // Qwen3-Coder native body: exactly ONE parameter.  Tools that
+        // need several fields have their own args layout, which a
+        // multi-parameter body cannot be mapped onto safely.
+        const size_t gt = inner.find('>', i + kParameterOpen.size());
+        if (gt == std::string::npos) return false;
+        const size_t pb = inner.find(kParameterClose, gt + 1);
+        if (pb == std::string::npos) return false;
+        args = Trim(inner.substr(gt + 1, pb - gt - 1));
+        i = pb + kParameterClose.size();
+        if (inner.find("<parameter", i) != std::string::npos) return false;
+    }
+
+    // Tail: whitespace and at most one </function>.
+    i = SkipWs(inner, i, end);
+    if (At(inner, i, end, kFunctionClose)) i += kFunctionClose.size();
+    if (SkipWs(inner, i, end) != end) return false;
+
+    out.name = name;
+    out.args = args;
+
+    std::string reason;
+    if (!IsKnownToolName(out.name)) {
+        out.valid         = false;
+        out.invalidReason = "unknown tool: " + out.name;
+        return true;
+    }
+    if (!ValidateToolArgs(out.name, out.args, reason)) {
+        out.valid         = false;
+        out.invalidReason = reason;
+        return true;
+    }
+    out.valid = true;
+    return true;
+}
+
+// Malformed-call reason that points at the model's actual mistake.
+// A bare "missing <name>" reads, to a model that wrote <function>, like
+// a restatement of what it already sent, so it repeats the same block.
+std::string MissingNameReason(const std::string& inner)
+{
+    static const std::string kFormat =
+        "<tool_call><name>TOOL_NAME</name><args>ARGS</args></tool_call>";
+
+    const size_t fn = inner.find(kFunctionTag);
+    if (fn == std::string::npos) {
+        return "missing <name>...</name> tag. Format must be: " + kFormat;
+    }
+
+    size_t stop = inner.find('\n', fn);
+    if (stop == std::string::npos) stop = inner.size();
+    std::string snippet = inner.substr(fn, std::min<size_t>(stop - fn, 60));
+
+    return "missing <name>...</name> tag: you wrote \"" + snippet +
+           "\", but the tool name goes in <name>...</name>, not <function>, "
+           "and arguments go in <args>...</args>, not <parameter>. "
+           "Format must be: " + kFormat;
+}
+
+// ─── Reasoning is never a tool call ──────────────────────────────
+// ChatClient re-wraps delta.reasoning_content as inline <think>…</think>,
+// so fullResponse carries the model's reasoning.  Models quote the
+// protocol while thinking ("I need to use the exact format:
+// <tool_call><name>powershell</name><args>...</args></tool_call>"),
+// and a raw search dispatched that quote as a real call (observed
+// 2026-09-30, Qwen 27B: PowerShell executed the literal "...").
+//
+// Reasoning reaches this parser in three shapes:
+//
+//   1. Wrapped:  <think>…</think>          (reasoning_content, or inline)
+//   2. Orphan:   …reasoning…</think>        (template prefilled <think>)
+//   3. Leaked:   <think>…`</think><tool_call>`. more reasoning…</think>
+//      llama-server's reasoning splitter ends reasoning_content at the
+//      first "<tool_call>" the model writes, even a mention inside its
+//      thinking.  The rest of the thought arrives as CONTENT, terminated
+//      by the model's own stray </think>.  Observed 2026-09-30 (Qwen
+//      27B): both a "..." execution and a burned malformed strike.
+//
+// Shapes 2 and 3 are both "an unmatched </think> closes reasoning that
+// started somewhere before it".  The complication is legitimate calls
+// whose ARGS contain "</think>" (writing LlamaBoss's own sources, say),
+// which must still dispatch.  Rule for an opener that precedes an
+// unmatched </think>:
+//   * the </think> falls AFTER the block's closer (and no <think> sits
+//     between them): the whole block was a quote inside leaked
+//     reasoning — skip past the </think>;
+//   * the </think> falls INSIDE the block: it is reasoning only if the
+//     block had not started a real call first, i.e. no complete
+//     <name>…</name> precedes the </think> (the Gemma colon-native
+//     opener carries its name inline, so it always counts as started).
+// Any misjudgment fails closed (a call is not run), never open.
+
+// True if [from, to) of `text` already contains a real call start.
+bool SegmentStartedRealCall(const std::string& text,
+                            size_t             from,
+                            size_t             to,
+                            size_t             openerLen)
+{
+    if (openerLen == kOpenGemmaNative.size()) return true;
+
+    // A recognized function tag (Qwen drift) is a started call too.
+    std::string fnName;
+    size_t fnAfter = 0;
+    if (MatchFunctionNameTag(text, from, to, fnName, fnAfter)) return true;
+
+    const size_t nameA = text.find(kNameOpen, from);
+    if (nameA == std::string::npos || nameA >= to) return false;
+    const size_t nameB = text.find(kNameClose, nameA + kNameOpen.size());
+    return nameB != std::string::npos &&
+           nameB + kNameClose.size() <= to;
+}
+
+// First tool-call opener at or after `start` that is NOT reasoning.
+// An unterminated <think> hides everything after it (fail closed: an
+// unfinished thought never dispatches).
+bool FindFirstOpenMarkerOutsideReasoning(const std::string& text,
+                                         size_t             start,
+                                         size_t&            posOut,
+                                         size_t&            lenOut)
+{
+    size_t cur = start;
+
+    while (cur <= text.size()) {
+        size_t markerPos = std::string::npos;
+        size_t markerLen = 0;
+        const bool haveMarker =
+            FindFirstOpenMarkerRaw(text, cur, markerPos, markerLen);
+        const size_t thinkOpen  = text.find(kThinkOpen, cur);
+        const size_t thinkClose = text.find(kThinkClose, cur);
+
+        // Earliest of: wrapped <think>, orphan </think>, tool opener.
+        const size_t mPos = haveMarker ? markerPos : std::string::npos;
+        const size_t first = std::min({thinkOpen, thinkClose, mPos});
+        if (first == std::string::npos) return false;
+
+        // Shape 1: wrapped block — skip it whole.
+        if (first == thinkOpen) {
+            const size_t close =
+                text.find(kThinkClose, thinkOpen + kThinkOpen.size());
+            if (close == std::string::npos) return false;
+            cur = close + kThinkClose.size();
+            continue;
+        }
+
+        // Shape 2: orphan closer with no opener before it — the text up
+        // to here was reasoning.
+        if (first == thinkClose) {
+            cur = thinkClose + kThinkClose.size();
+            continue;
+        }
+
+        // A tool-call opener.  Is an unmatched </think> still ahead?
+        const size_t contentStart = markerPos + markerLen;
+        const size_t stray = text.find(kThinkClose, contentStart);
+        if (stray != std::string::npos) {
+            size_t closePos = std::string::npos;
+            std::string closer;
+            const bool closed =
+                FindCloseMarker(text, contentStart, markerLen, closePos, closer);
+
+            if (!closed || stray < closePos) {
+                // </think> inside the block (or the block never closes).
+                if (!SegmentStartedRealCall(text, contentStart, stray,
+                                            markerLen)) {
+                    cur = stray + kThinkClose.size();
+                    continue;
+                }
+            } else {
+                // </think> after a complete block: a quoted example in
+                // leaked reasoning, unless a new <think> opens first
+                // (then that </think> belongs to its own wrapped block).
+                const size_t blockEnd = closePos + closer.size();
+                const size_t nextOpen = text.find(kThinkOpen, blockEnd);
+                if (nextOpen == std::string::npos || nextOpen > stray) {
+                    cur = stray + kThinkClose.size();
+                    continue;
+                }
+            }
+        }
+
+        posOut = markerPos;
+        lenOut = markerLen;
+        return true;
+    }
+    return false;
 }
 
 // ─── Inner block parser ──────────────────────────────────────────
@@ -300,8 +592,12 @@ bool ParseInnerBlock(const std::string& inner,
                    : inner.find(kArgsClose, argsA + kArgsOpen.size());
 
     if (nameA == std::string::npos || nameB == std::string::npos) {
+        // Qwen function-tag drift: recover the unambiguous shapes.
+        if (nameA == std::string::npos && TryParseFunctionTagBody(inner, out)) {
+            return true;
+        }
         out.valid         = false;
-        out.invalidReason = "missing <name>...</name> tag. Format must be: <tool_call><name>TOOL_NAME</name><args>ARGS</args></tool_call>";
+        out.invalidReason = MissingNameReason(inner);
         return false;
     }
 
@@ -441,14 +737,34 @@ bool ParseInnerBlockGemmaNative(const std::string& inner,
     return true;
 }
 
+// Defense in depth for quoted protocol examples that no structural
+// rule can catch: a well-formed call whose whole argument is the
+// template placeholder ("..." / "ARGS") was copied from a format
+// example, never meant (observed 2026-09-30: PowerShell ran "...").
+// Reject it with coaching instead of executing it.
+void RejectPlaceholderArgs(ToolInvocation& inv)
+{
+    if (!inv.valid) return;
+    const std::string a = Trim(inv.args);
+    if (a == "..." || a == "\xE2\x80\xA6" /* U+2026 ellipsis */ ||
+        a == "ARGS" || a == "<args>") {
+        inv.valid         = false;
+        inv.invalidReason =
+            "the <args> value \"" + a + "\" is a placeholder copied from "
+            "the format example, so nothing was run. Send the real "
+            "arguments: <tool_call><name>TOOL_NAME</name><args>ARGS"
+            "</args></tool_call>";
+    }
+}
+
 // Dispatch to the right inner parser based on which opener was
 // matched.  openerLen is the length stashed by the batch parser /
 // streaming detector at the time FindFirstOpenMarker matched; we
 // use it to recover the variant without re-scanning the buffer.
-bool ParseInnerByVariant(size_t             openerLen,
-                         const std::string& inner,
-                         const std::string& rawBlock,
-                         ToolInvocation&    out)
+bool ParseInnerByVariantImpl(size_t             openerLen,
+                             const std::string& inner,
+                             const std::string& rawBlock,
+                             ToolInvocation&    out)
 {
     if (openerLen == kOpenGemmaNative.size()) {
         // Hybrid drift observed in Gemma: colon opener, but XML <name>/<args>
@@ -537,6 +853,16 @@ bool ParseInnerByVariant(size_t             openerLen,
         return ParseInnerBlockGemmaNative(inner, rawBlock, out);
     }
     return ParseInnerBlock(inner, rawBlock, out);
+}
+
+bool ParseInnerByVariant(size_t             openerLen,
+                         const std::string& inner,
+                         const std::string& rawBlock,
+                         ToolInvocation&    out)
+{
+    const bool parsed = ParseInnerByVariantImpl(openerLen, inner, rawBlock, out);
+    RejectPlaceholderArgs(out);
+    return parsed;
 }
 
 // Gemma 4 e4b occasionally emits a nearly-complete brace-style call at the
@@ -992,7 +1318,7 @@ bool ContainsToolCallOpenMarker(const std::string& text)
 {
     size_t pos = std::string::npos;
     size_t len = 0;
-    return FindFirstOpenMarker(text, 0, pos, len);
+    return FindFirstOpenMarkerRaw(text, 0, pos, len);
 }
 
 std::string MakeToolCallDiagnosticPreview(const std::string& raw)
@@ -1008,12 +1334,13 @@ ParsedAssistantResponse ParseAssistantResponse(const std::string& text)
 {
     ParsedAssistantResponse out;
 
-    // Locate the first tool-call opener. Subsequent blocks are
-    // ignored for execution purposes per protocol; they remain in
-    // the prose so the user can see what happened.
+    // Locate the first tool-call opener OUTSIDE reasoning. Subsequent
+    // blocks are ignored for execution purposes per protocol; they
+    // remain in the prose so the user can see what happened. Openers
+    // quoted inside <think>…</think> stay in the prose untouched.
     size_t openPos = std::string::npos;
     size_t openLen = 0;
-    if (!FindFirstOpenMarker(text, 0, openPos, openLen)) {
+    if (!FindFirstOpenMarkerOutsideReasoning(text, 0, openPos, openLen)) {
         out.prose = text;
         return out;
     }
@@ -1046,6 +1373,7 @@ ParsedAssistantResponse ParseAssistantResponse(const std::string& text)
                 text, openPos, openLen, recovered) ||
             TryRecoverTerminalXmlBodyWithStrayCloser(
                 text, openPos, openLen, recovered)) {
+            RejectPlaceholderArgs(recovered);
             out.invocation    = recovered;
             out.hasInvocation = true;
             out.prose         = text.substr(0, openPos);
@@ -1130,6 +1458,7 @@ void ToolCallStreamDetector::Reset()
     m_invocation    = ToolInvocation{};
     m_complete      = false;
     m_insideBlock   = false;
+    m_inThink       = false;
     m_blockStart    = 0;
     m_openMarkerLen = 0;
 }
@@ -1145,10 +1474,50 @@ bool ToolCallStreamDetector::Feed(const std::string& delta)
     // publish everything up to (buffer.size - maxOpenLen + 1) as
     // prose — the trailing window is held back in case a marker is
     // splitting across deltas.
-    if (!m_insideBlock) {
+    //
+    // Reasoning (<think>…</think>) is tracked as state because the
+    // buffer is only a sliding window: once reasoning text has been
+    // published as prose, the <think> that opened it is gone from
+    // m_buffer.  Reasoning flows through as prose unchanged (ChatDisplay
+    // renders it as the thinking block), and openers inside it are not
+    // tool calls.
+  for (;;) {   // re-entered when a "block" turns out to be leaked reasoning
+    while (!m_insideBlock) {
+        if (m_inThink) {
+            const size_t thinkClose = m_buffer.find(kThinkClose);
+            if (thinkClose == std::string::npos) {
+                // Hold back enough to catch a </think> split across deltas.
+                const size_t kHold = kThinkClose.size() - 1;
+                if (m_buffer.size() > kHold) {
+                    size_t safeLen = m_buffer.size() - kHold;
+                    m_prosePrefix += m_buffer.substr(0, safeLen);
+                    m_buffer       = m_buffer.substr(safeLen);
+                }
+                return false;
+            }
+            const size_t end = thinkClose + kThinkClose.size();
+            m_prosePrefix += m_buffer.substr(0, end);
+            m_buffer       = m_buffer.substr(end);
+            m_inThink      = false;
+            continue;   // rescan the remainder as visible content
+        }
+
         size_t openPos = std::string::npos;
         size_t openLen = 0;
-        if (FindFirstOpenMarker(m_buffer, 0, openPos, openLen)) {
+        const bool haveMarker =
+            FindFirstOpenMarkerRaw(m_buffer, 0, openPos, openLen);
+
+        const size_t thinkOpen = m_buffer.find(kThinkOpen);
+        if (thinkOpen != std::string::npos &&
+            (!haveMarker || thinkOpen < openPos)) {
+            const size_t end = thinkOpen + kThinkOpen.size();
+            m_prosePrefix += m_buffer.substr(0, end);
+            m_buffer       = m_buffer.substr(end);
+            m_inThink      = true;
+            continue;
+        }
+
+        if (haveMarker) {
             // kOpenGemma ("<|tool_call>call") is a strict prefix of
             // kOpenGemmaNative ("<|tool_call>call:").  If a stream delta
             // ends exactly after "call", wait for one more byte before
@@ -1166,10 +1535,11 @@ bool ToolCallStreamDetector::Feed(const std::string& delta)
             m_openMarkerLen = openLen;
             // fall through to Phase 2 (maybe closer already in buffer)
         } else {
-            // Hold back the last bytes in case an opener split lands
-            // here; publish everything else as prose so the UI can
-            // render smoothly.
-            const size_t kHoldBack = MaxOpenMarkerBytes() - 1;
+            // Hold back the last bytes in case a split opener lands
+            // here (tool-call opener OR <think>); publish everything
+            // else as prose so the UI can render smoothly.
+            const size_t kHoldBack =
+                std::max(MaxOpenMarkerBytes(), kThinkOpen.size()) - 1;
             if (m_buffer.size() > kHoldBack) {
                 size_t safeLen = m_buffer.size() - kHoldBack;
                 m_prosePrefix += m_buffer.substr(0, safeLen);
@@ -1188,7 +1558,32 @@ bool ToolCallStreamDetector::Feed(const std::string& delta)
     size_t contentStart = m_openMarkerLen;
     size_t closePos = std::string::npos;
     std::string closer;
-    if (!FindCloseMarker(m_buffer, contentStart, m_openMarkerLen, closePos, closer)) {
+    const bool closed =
+        FindCloseMarker(m_buffer, contentStart, m_openMarkerLen, closePos, closer);
+
+    // Leaked reasoning (shape 3 in FindFirstOpenMarkerOutsideReasoning):
+    // a stray </think> inside the "block" before any real call started
+    // means the opener was a mention in the model's thinking.  Give the
+    // text back to the display as prose and resume scanning after it.
+    // (A complete quoted example FOLLOWED by a stray </think> cannot be
+    // told apart until after the detector has fired; that case is
+    // display-only, because dispatch is decided by the batch parser.)
+    {
+        const size_t stray = m_buffer.find(kThinkClose, contentStart);
+        if (stray != std::string::npos &&
+            (!closed || stray < closePos) &&
+            !SegmentStartedRealCall(m_buffer, contentStart, stray,
+                                    m_openMarkerLen)) {
+            const size_t end = stray + kThinkClose.size();
+            m_prosePrefix  += m_buffer.substr(0, end);
+            m_buffer        = m_buffer.substr(end);
+            m_insideBlock   = false;
+            m_openMarkerLen = 0;
+            continue;
+        }
+    }
+
+    if (!closed) {
         // No close yet — keep buffering, but never without a hard cap.
         // Once the cap is exceeded, surface an invalid invocation so
         // the agent loop can feed an error back to the model instead
@@ -1225,4 +1620,5 @@ bool ToolCallStreamDetector::Feed(const std::string& delta)
     ParseInnerByVariant(m_openMarkerLen, inner, rawBlock, m_invocation);
     m_complete = true;
     return true;
+  }
 }

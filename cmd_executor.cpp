@@ -19,10 +19,14 @@
 //     quoting a non-issue for anything the user types.
 //
 #include "cmd_executor.h"
+#include "copy_line_fold.h"   // fold MSBuild/vcpkg copy-progress runs
+#include "progress_output_fold.h" // collapse \r progress bars, PS 5.1 NativeCommandError wrappers
 
 #include "ps_command_hints.h"
 #include "workspace_delta.h"
 #include "command_policy.h"   // LintPowerShellHazards (advisory)
+#include "chat_folders.h"     // chat folder recognizer
+#include "server_manager.h"    // ConversationLaneDirForCwd
 
 // wx
 #include <wx/log.h>
@@ -46,10 +50,13 @@
 // Win32
 #define NOMINMAX
 #include <windows.h>
+#include <shlobj.h>       // SHGetKnownFolderPath (PowerShell 7 location)
+#include <knownfolders.h>
 
 // ─── Event definitions ───────────────────────────────────────────
 wxDEFINE_EVENT(wxEVT_CMD_COMPLETE, wxCommandEvent);
 wxDEFINE_EVENT(wxEVT_CMD_ERROR,    wxCommandEvent);
+wxDEFINE_EVENT(wxEVT_CMD_OUTPUT,   wxCommandEvent);
 
 namespace {
 
@@ -129,8 +136,24 @@ std::string EscapePsSingleQuoted(const std::string& s) {
 std::wstring BuildPowerShellPayload(const std::string& userCommand) {
     const std::string prefix =
         "$ProgressPreference = 'SilentlyContinue';"
+        // PowerShell 7 can emit ANSI colour escapes in error/format output;
+        // the tool result is plain text.  No-op on Windows PowerShell 5.1.
+        "if ($PSVersionTable.PSVersion.Major -ge 7) { $PSStyle.OutputRendering = 'PlainText' };"
         "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8;"
         "$OutputEncoding = [System.Text.Encoding]::UTF8;"
+        // MSBuild /m normally retains reusable workers after a successful
+        // foreground build. This fresh tool process cannot reuse them on its
+        // next call, and the job cleanup would report them as detached work.
+        // Disable reuse only in this PowerShell process and its descendants;
+        // do not change LlamaBoss's environment or the user's Windows settings.
+        "$env:MSBUILDDISABLENODEREUSE = '1';"
+        // Windows PowerShell 5.1 does not load the ZIP types by default:
+        // [IO.Compression.ZipFile] fails with "Unable to find type" until
+        // Add-Type runs (2026-10-01: one failed call in r16c3, and the
+        // model prepended Add-Type by hand 7 times across two sessions).
+        // GAC load, milliseconds; silent and before 'Stop' is set, so a
+        // missing assembly can never fail the user's command.
+        "try { Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem -ErrorAction SilentlyContinue } catch { };"
         // Default every text-file cmdlet to UTF-8.  Windows PowerShell
         // 5.1 otherwise READS as ANSI and WRITES UTF-16LE (Out-File) /
         // ANSI (Set-Content, Add-Content), which double-encodes any
@@ -149,8 +172,24 @@ std::wstring BuildPowerShellPayload(const std::string& userCommand) {
         "$PSDefaultParameterValues['Import-Csv:Encoding']='UTF8';"
         "$PSDefaultParameterValues['Export-Csv:Encoding']='UTF8';"
         "$ErrorActionPreference = 'Stop';"
+        // 2026-10-01: Windows PowerShell 5.1 wraps each line a NATIVE
+        // program writes to a redirected stderr (2> file, 2>&1) in an
+        // ErrorRecord.  Under 'Stop' the first such line is fatal: the
+        // script dies mid-call and the job cleanup kills the still-running
+        // child.  The trap printed only that stderr line, which read like
+        // the program's own failure (an ssh session announcing itself was
+        // misdiagnosed as a key-unlock problem).  Say what really happened.
+        // Wording (2026-10-01): the script may have set 'Stop' itself, and
+        // the steps before the fatal line DID run -- in r16c2 a packaging
+        // script had already appended a stale note to PROJECT_STATE.md
+        // when git's LF/CRLF warning stopped it.
         "trap { "
-            "[Console]::Error.WriteLine($_.ToString()); "
+            "if ($_.FullyQualifiedErrorId -like 'NativeCommandError*') { "
+                "[Console]::Error.WriteLine('[native stderr] ' + $_.ToString()); "
+                "[Console]::Error.WriteLine('[LlamaBoss] The script stopped because a native program wrote the line above to a redirected stderr (2> or 2>&1). It is not necessarily an error from that program. Windows PowerShell 5.1 turns redirected native stderr into error records, and $ErrorActionPreference was ''Stop'' at that point (the tool default, or set by the script), so the first stderr line ended the script; the program may have been stopped mid-run. Everything before that line already ran: files it wrote or appended are in place, so check them before rerunning (an append would repeat). Set $ErrorActionPreference = ''Continue'' before such a call and judge it by $LASTEXITCODE.'); "
+            "} else { "
+                "[Console]::Error.WriteLine($_.ToString()); "
+            "} "
             "exit 1 "
         "}\r\n";
 
@@ -182,10 +221,10 @@ std::wstring ResolveUserProfileDir() {
     return buf;
 }
 
-// Resolve the intended system PowerShell executable once per launch.
+// Resolve the Windows PowerShell 5.1 executable (always present).
 // Passing it as lpApplicationName avoids CreateProcessW's bare-name search
 // order (which can include the parent current directory / PATH shims).
-std::wstring ResolveSystemPowerShellExe()
+std::wstring ResolveWindowsPowerShellExe()
 {
     std::wstring sysDir(MAX_PATH, L'\0');
     UINT n = GetSystemDirectoryW(sysDir.data(), static_cast<UINT>(sysDir.size()));
@@ -197,6 +236,52 @@ std::wstring ResolveSystemPowerShellExe()
     }
     sysDir.resize(n);
     return sysDir + L"\\WindowsPowerShell\\v1.0\\powershell.exe";
+}
+
+// PowerShell 7 (pwsh.exe) when installed, else Windows PowerShell 5.1.
+//
+// Only the machine-wide install location is probed:
+// %ProgramFiles%\PowerShell\7\pwsh.exe (MSI / winget).  Like the 5.1 path, it comes from
+// a known folder rather than PATH, so a pwsh.exe dropped into the working
+// directory or a user-writable PATH entry is never picked up.  The
+// Microsoft Store build (WindowsApps alias) is deliberately not used.
+// Set LLAMABOSS_WINDOWS_POWERSHELL=1 to force 5.1.  Resolved once per
+// process; installing PowerShell 7 takes effect on the next app start.
+struct PowerShellChoice {
+    std::wstring exe;
+    bool         isPwsh = false;
+};
+
+const PowerShellChoice& ResolvePowerShell()
+{
+    static const PowerShellChoice choice = [] {
+        PowerShellChoice c;
+        wchar_t force[8] = {};
+        const DWORD forced = GetEnvironmentVariableW(
+            L"LLAMABOSS_WINDOWS_POWERSHELL", force, 8);
+        if (!(forced > 0 && forced < 8 && force[0] == L'1')) {
+            PWSTR programFiles = nullptr;
+            if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_ProgramFiles, 0,
+                                               nullptr, &programFiles))) {
+                std::wstring pwsh = std::wstring(programFiles) +
+                                    L"\\PowerShell\\7\\pwsh.exe";
+                CoTaskMemFree(programFiles);
+                const DWORD attrs = GetFileAttributesW(pwsh.c_str());
+                if (attrs != INVALID_FILE_ATTRIBUTES &&
+                    !(attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+                    c.exe = pwsh;
+                    c.isPwsh = true;
+                    return c;
+                }
+            }
+            else if (programFiles) {
+                CoTaskMemFree(programFiles);
+            }
+        }
+        c.exe = ResolveWindowsPowerShellExe();
+        return c;
+    }();
+    return choice;
 }
 
 std::string WideToUtf8(const std::wstring& in) {
@@ -222,13 +307,6 @@ std::string TrimTrailingSeparatorsLocal(std::string s)
 {
     while (!s.empty() && (s.back() == '/' || s.back() == '\\')) s.pop_back();
     return s;
-}
-
-std::string ParentDirLocal(const std::string& path)
-{
-    std::string clean = TrimTrailingSeparatorsLocal(path);
-    size_t pos = clean.find_last_of("/\\");
-    return (pos == std::string::npos) ? std::string() : clean.substr(0, pos);
 }
 
 std::string BaseNameLocal(const std::string& path)
@@ -279,33 +357,17 @@ bool IsPathUnderRootLocal(const std::string& path, const std::string& root)
     return p.size() > r.size() && p.compare(0, r.size(), r) == 0;
 }
 
-std::string WorkflowRootFromCwdLocal(const std::string& cwd)
+std::string ChatFolderFromCwdLocal(const std::string& cwd)
 {
-    std::string clean = TrimTrailingSeparatorsLocal(cwd);
-    if (clean.empty()) return std::string();
-    if (LowerForOutputLocal(BaseNameLocal(clean)) != "workspace") return std::string();
-
-    std::string chatRoot = ParentDirLocal(clean);
-    std::string workflows = ParentDirLocal(chatRoot);
-    if (chatRoot.empty() || workflows.empty()) return std::string();
-    if (!StartsWithLocal(BaseNameLocal(chatRoot), "chat_")) return std::string();
-    if (LowerForOutputLocal(BaseNameLocal(workflows)) != "workflows") return std::string();
-    return chatRoot;
-}
-
-std::string UserProfileUtf8Local()
-{
-    return WideToUtf8(ResolveUserProfileDir());
+    // Shared recognizer (chat_folders.h): ...\Chats\<chat folder>\Workspace.
+    return chat_folders::ChatFolderFromWorkspaceCwd(cwd);
 }
 
 std::string ToolOutputsDirForCwdLocal(const std::string& cwd)
 {
-    std::string root = WorkflowRootFromCwdLocal(cwd);
-    if (root.empty()) {
-        std::string profile = UserProfileUtf8Local();
-        root = profile.empty() ? std::string(".") : JoinPathLocal(profile, "LlamaBoss");
-    }
-    return JoinPathLocal(root, "ToolOutputs");
+    // Chat folder ToolOutputs lane, else LlamaBoss\Shared\ToolOutputs.
+    std::string dir = ServerManager::ConversationLaneDirForCwd(cwd, "ToolOutputs");
+    return dir.empty() ? JoinPathLocal(".", "ToolOutputs") : dir;
 }
 
 std::string SafeOutputStemLocal(const std::string& text, const std::string& fallback)
@@ -546,9 +608,9 @@ bool ResolveExplicitArtifactPathLocal(const std::string& raw,
     pathOut = WxToUtf8Local(fn.GetFullPath());
     if (!IsRegularFileLocal(pathOut)) return false;
 
-    const std::string workflowRoot = WorkflowRootFromCwdLocal(cwd);
+    const std::string chatFolder = ChatFolderFromCwdLocal(cwd);
     return IsPathUnderRootLocal(pathOut, cwd) ||
-           IsPathUnderRootLocal(pathOut, workflowRoot) ||
+           IsPathUnderRootLocal(pathOut, chatFolder) ||
            IsPathUnderRootLocal(pathOut, activeProjectRoot);
 }
 
@@ -681,6 +743,84 @@ double NowSec() {
 // to the user and burns context budget downstream (harness phase).
 // Handles multiple blocks in a single buffer and trims a single trailing
 // newline per block so the surrounding text doesn't gain blank lines.
+//
+// 2026-10-01: ERROR records are kept.  A block can carry
+//   <S S="Error">message_x000D__x000A_</S>
+// strings, which is how PowerShell reports failures that happen before
+// the payload's trap is installed — most importantly PARSE errors, where
+// nothing runs at all.  Deleting the whole block turned those into a
+// bare "exit 1" with no text.  Error strings are decoded and left in
+// place of the block; progress and other records are still dropped.
+
+// Decode CLIXML string content: XML entities plus _xHHHH_ escapes
+// (CLIXML encodes CR/LF and other control characters that way).
+std::string DecodeClixmlString(const std::string& in) {
+    std::string out;
+    out.reserve(in.size());
+    for (size_t i = 0; i < in.size(); ++i) {
+        const char c = in[i];
+        if (c == '&') {
+            static const struct { const char* ent; char ch; } kEnts[] = {
+                { "&lt;", '<' }, { "&gt;", '>' }, { "&amp;", '&' },
+                { "&quot;", '"' }, { "&apos;", '\'' } };
+            bool matched = false;
+            for (const auto& e : kEnts) {
+                const size_t n = std::char_traits<char>::length(e.ent);
+                if (in.compare(i, n, e.ent) == 0) {
+                    out += e.ch; i += n - 1; matched = true; break;
+                }
+            }
+            if (!matched) out += c;
+            continue;
+        }
+        if (c == '_' && i + 6 < in.size() && in[i + 1] == 'x' && in[i + 6] == '_') {
+            unsigned v = 0;
+            bool hex = true;
+            for (size_t k = i + 2; k < i + 6; ++k) {
+                const char h = in[k];
+                v <<= 4;
+                if (h >= '0' && h <= '9')      v |= unsigned(h - '0');
+                else if (h >= 'a' && h <= 'f') v |= unsigned(h - 'a' + 10);
+                else if (h >= 'A' && h <= 'F') v |= unsigned(h - 'A' + 10);
+                else { hex = false; break; }
+            }
+            if (hex) {
+                // Encode as UTF-8 (BMP only, which is all _xHHHH_ carries).
+                if (v < 0x80) {
+                    out += char(v);
+                } else if (v < 0x800) {
+                    out += char(0xC0 | (v >> 6));
+                    out += char(0x80 | (v & 0x3F));
+                } else {
+                    out += char(0xE0 | (v >> 12));
+                    out += char(0x80 | ((v >> 6) & 0x3F));
+                    out += char(0x80 | (v & 0x3F));
+                }
+                i += 6;
+                continue;
+            }
+        }
+        out += c;
+    }
+    return out;
+}
+
+// Collect the decoded text of every <S S="Error"> string in [begin, end).
+std::string ExtractClixmlErrors(const std::string& s, size_t begin, size_t end) {
+    const std::string open  = "<S S=\"Error\">";
+    const std::string shut  = "</S>";
+    std::string errors;
+    size_t p = begin;
+    while ((p = s.find(open, p)) != std::string::npos && p < end) {
+        const size_t textStart = p + open.size();
+        const size_t textEnd   = s.find(shut, textStart);
+        if (textEnd == std::string::npos || textEnd > end) break;
+        errors += DecodeClixmlString(s.substr(textStart, textEnd - textStart));
+        p = textEnd + shut.size();
+    }
+    return errors;
+}
+
 void StripClixmlInPlace(std::string& s) {
     const std::string marker = "#< CLIXML";
     const std::string close  = "</Objs>";
@@ -689,10 +829,15 @@ void StripClixmlInPlace(std::string& s) {
         size_t end = s.find(close, pos);
         if (end == std::string::npos) break;  // malformed — leave alone
         end += close.size();
+
+        std::string errors = ExtractClixmlErrors(s, pos, end);
+        if (!errors.empty() && errors.back() != '\n') errors += "\r\n";
+
         // Consume one trailing \r and/or \n so we don't leave blank gaps.
         if (end < s.size() && s[end] == '\r') ++end;
         if (end < s.size() && s[end] == '\n') ++end;
-        s.erase(pos, end - pos);
+        s.replace(pos, end - pos, errors);
+        pos += errors.size();
         // `pos` now points at whatever followed the block — keep scanning.
     }
 }
@@ -795,15 +940,76 @@ void CancelThreadSynchronousIoLocal(HANDLE threadHandle)
 // pipe is still drained so the child cannot block on a full pipe buffer.
 // Each stream has exactly one writer thread, and the worker reads `dest`
 // only after join(), so no per-stream mutex is needed.
+// Shared "latest line" slot fed by both pipe readers and drained by the
+// worker's wait loop.  Both readers write, so this one needs a mutex.
+struct LiveTail {
+    std::mutex  mutex;
+    std::string partial;    // bytes since the last terminator
+    std::string lastLine;   // most recent complete non-empty line
+    bool        dirty = false;
+
+    void Feed(const char* data, size_t len)
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        for (size_t i = 0; i < len; ++i) {
+            const char c = data[i];
+            if (c == '\n' || c == '\r') {
+                if (!partial.empty()) {
+                    // Trim trailing whitespace; skip pure-whitespace lines.
+                    size_t end = partial.find_last_not_of(" \t");
+                    if (end != std::string::npos) {
+                        lastLine.assign(partial, 0, end + 1);
+                        dirty = true;
+                    }
+                    partial.clear();
+                }
+            } else {
+                partial.push_back(c);
+                // A pathological writer with no terminators (progress
+                // rendered with backspaces, or a binary dump) must not grow
+                // this without bound.  Keep the tail; it is display-only.
+                if (partial.size() > 512) {
+                    // Erase to a codepoint boundary: the line is later
+                    // handed to wxString::FromUTF8, which returns EMPTY
+                    // for a leading partial sequence — the whole live
+                    // line would vanish, not just one character.
+                    size_t cut = partial.size() - 512;
+                    while (cut < partial.size() &&
+                           (static_cast<unsigned char>(partial[cut]) & 0xC0) == 0x80)
+                        ++cut;
+                    partial.erase(0, cut);
+                }
+            }
+        }
+    }
+
+    // Returns true and fills |out| if a new line arrived since last take.
+    bool Take(std::string& out)
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (!dirty) return false;
+        dirty = false;
+        out = lastLine;
+        return true;
+    }
+};
+
 void ReaderLoop(HANDLE readEnd, std::string& dest,
-                std::atomic<bool>& truncatedFlag)
+                std::atomic<bool>& truncatedFlag,
+                std::atomic<bool>& stopFlag,
+                std::atomic<bool>& doneFlag,
+                LiveTail* liveTail)
 {
     constexpr DWORD kChunk = 4096;
     char buf[kChunk];
     for (;;) {
+        if (stopFlag.load()) break;
+
         DWORD got = 0;
         BOOL ok = ReadFile(readEnd, buf, kChunk, &got, nullptr);
         if (!ok || got == 0) break;  // pipe closed/cancelled/error -> done
+
+        if (liveTail) liveTail->Feed(buf, got);
 
         if (dest.size() < CmdExecutor::kMaxOutputBytes) {
             size_t room = CmdExecutor::kMaxOutputBytes - dest.size();
@@ -816,6 +1022,192 @@ void ReaderLoop(HANDLE readEnd, std::string& dest,
             // keep reading to drain — discard the bytes
         }
     }
+    doneFlag.store(true);
+}
+
+enum class JobDescendantState {
+    None,
+    Present,
+    Unknown
+};
+
+// Presentation classification only, never permission to survive job cleanup.
+// Require the full MSVC tool-directory layout as well as the executable name;
+// a same-named executable in the workspace is not a compiler helper.
+bool IsMsvcCleanupHelperLocal(const std::wstring& imagePath)
+{
+    std::string path = LowerForOutputLocal(WideToUtf8(imagePath));
+    std::replace(path.begin(), path.end(), '/', '\\');
+    if (path.size() < 3 || path[1] != ':' || path[2] != '\\') return false;
+    const std::string marker = "\\vc\\tools\\msvc\\";
+    const size_t start = path.find(marker);
+    if (start == std::string::npos) return false;
+    const size_t versionStart = start + marker.size();
+    const size_t versionEnd = path.find('\\', versionStart);
+    if (versionEnd == std::string::npos || versionEnd == versionStart) return false;
+    const std::string version = path.substr(versionStart, versionEnd - versionStart);
+    if (version.find_first_not_of("0123456789.") != std::string::npos ||
+        version.find_first_of("0123456789") == std::string::npos) return false;
+    const std::string suffix = path.substr(versionEnd);
+    for (const char* host : { "hostx86", "hostx64", "hostarm64" }) {
+        for (const char* target : { "x86", "x64", "arm", "arm64", "arm64ec" }) {
+            const std::string dir = std::string("\\bin\\") + host + "\\" + target + "\\";
+            if (suffix == dir + "vctip.exe" || suffix == dir + "mspdbsrv.exe")
+                return true;
+        }
+    }
+    return false;
+}
+
+// Query the process IDs that are still active in the Job Object and ignore
+// the already-signalled top-level PowerShell process.  The accounting-only
+// ActiveProcesses value can briefly lag process-handle signalling, which made
+// a normal foreground command look like it had escaped into the background.
+JobDescendantState QueryJobDescendantsLocal(
+    HANDLE job, DWORD rootProcessId, std::string* details = nullptr,
+    bool* buildHelpersOnly = nullptr)
+{
+    if (details) details->clear();
+    if (buildHelpersOnly) *buildHelpersOnly = false;
+    size_t capacity = 8;
+    for (int attempt = 0; attempt < 6; ++attempt) {
+        const size_t bytes =
+            sizeof(JOBOBJECT_BASIC_PROCESS_ID_LIST) +
+            (capacity - 1) * sizeof(ULONG_PTR);
+        std::vector<unsigned char> storage(bytes, 0);
+        auto* ids = reinterpret_cast<JOBOBJECT_BASIC_PROCESS_ID_LIST*>(
+            storage.data());
+
+        if (QueryInformationJobObject(
+                job, JobObjectBasicProcessIdList,
+                ids, static_cast<DWORD>(storage.size()), nullptr)) {
+            bool anyLive = false;
+            bool anyUnknown = false;
+            bool allLiveAreBuildHelpers = true;
+            size_t reportedCount = 0;
+            auto report = [&](DWORD pid, const std::string& description) {
+                if (!details) return;
+                if (reportedCount < 8) {
+                    if (!details->empty()) *details += "; ";
+                    *details += "PID " + std::to_string(pid) + " " + description;
+                }
+                ++reportedCount;
+            };
+            for (DWORD i = 0; i < ids->NumberOfProcessIdsInList; ++i) {
+                const DWORD pid = static_cast<DWORD>(ids->ProcessIdList[i]);
+                if (pid == rootProcessId) continue;
+
+                HandleGuard child(OpenProcess(
+                    SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
+                    FALSE, pid));
+                if (!child.h) {
+                    const DWORD error = GetLastError();
+                    anyUnknown = true;
+                    report(pid, "(state unavailable; OpenProcess error " +
+                        std::to_string(error) + ")");
+                    continue;
+                }
+
+                // A PID may disappear or be reused between the job snapshot
+                // and OpenProcess. Never identify an unrelated process as a
+                // survivor, or an already-signalled child as live work.
+                BOOL inJob = FALSE;
+                if (!IsProcessInJob(child.h, job, &inJob)) {
+                    const DWORD error = GetLastError();
+                    anyUnknown = true;
+                    report(pid, "(job membership unavailable; error " +
+                        std::to_string(error) + ")");
+                    continue;
+                }
+                if (!inJob) continue;
+                const DWORD state = WaitForSingleObject(child.h, 0);
+                if (state == WAIT_OBJECT_0) continue;
+                if (state != WAIT_TIMEOUT) {
+                    const DWORD error = GetLastError();
+                    anyUnknown = true;
+                    report(pid, "(process state unavailable; error " +
+                        std::to_string(error) + ")");
+                    continue;
+                }
+                anyLive = true;
+                if (details || buildHelpersOnly) {
+                    std::wstring path(32768, L'\0');
+                    DWORD length = static_cast<DWORD>(path.size());
+                    if (QueryFullProcessImageNameW(child.h, 0, &path[0], &length)) {
+                        path.resize(length);
+                        if (!IsMsvcCleanupHelperLocal(path))
+                            allLiveAreBuildHelpers = false;
+                        const size_t slash = path.find_last_of(L"\\/");
+                        report(pid, WideToUtf8(slash == std::wstring::npos
+                            ? path : path.substr(slash + 1)) + " (running)");
+                    } else {
+                        allLiveAreBuildHelpers = false;
+                        report(pid, "(running; executable name unavailable)");
+                    }
+                }
+            }
+            if (details && reportedCount > 8)
+                *details += "; " + std::to_string(reportedCount - 8) + " more";
+            if (buildHelpersOnly)
+                *buildHelpersOnly = anyLive && !anyUnknown && allLiveAreBuildHelpers;
+            return anyLive ? JobDescendantState::Present :
+                (anyUnknown ? JobDescendantState::Unknown : JobDescendantState::None);
+        }
+
+        if (GetLastError() != ERROR_MORE_DATA)
+            return JobDescendantState::Unknown;
+
+        const size_t reported =
+            static_cast<size_t>(ids->NumberOfAssignedProcesses);
+        capacity = std::max(capacity * 2, reported + 1);
+    }
+    return JobDescendantState::Unknown;
+}
+
+// Short-lived foreground tools can finish their visible work just before a
+// helper process or Windows Job Object bookkeeping settles.  Give those
+// descendants a small, bounded opportunity to exit naturally.  A genuinely
+// detached child remains in the job, is reported to the caller, and is killed
+// when JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE takes effect immediately afterward.
+bool WaitForJobDescendantsLocal(
+    HANDLE job, DWORD rootProcessId, std::string& details,
+    bool& buildHelpersOnly)
+{
+    buildHelpersOnly = false;
+    constexpr DWORD kNaturalExitGraceMs = 1500;
+    constexpr DWORD kPollMs = 25;
+    const ULONGLONG deadline = GetTickCount64() + kNaturalExitGraceMs;
+
+    JobDescendantState state = JobDescendantState::Unknown;
+    for (;;) {
+        state = QueryJobDescendantsLocal(job, rootProcessId);
+        if (state == JobDescendantState::None)
+            return false;
+
+        if (GetTickCount64() >= deadline)
+            break;
+
+        Sleep(kPollMs);
+    }
+
+    // Capture names only once, immediately before job cleanup. Recheck the
+    // state too, so a child that exited at the grace boundary is not reported.
+    state = QueryJobDescendantsLocal(job, rootProcessId, &details, &buildHelpersOnly);
+    if (state == JobDescendantState::None)
+        return false;
+    if (state == JobDescendantState::Present)
+        return true;
+
+    // The PID-list query should normally succeed.  Preserve the old safe
+    // behavior if Windows refuses it: after the grace period, an active job
+    // still gets closed and surfaced rather than being allowed to escape.
+    JOBOBJECT_BASIC_ACCOUNTING_INFORMATION accounting = {};
+    if (details.empty())
+        details = "Process list unavailable; using job accounting (live state unconfirmed).";
+    return QueryInformationJobObject(
+               job, JobObjectBasicAccountingInformation,
+               &accounting, sizeof(accounting), nullptr) &&
+           accounting.ActiveProcesses > 0;
 }
 
 // ─── Worker thread ───────────────────────────────────────────────
@@ -881,7 +1273,7 @@ private:
             return;
         }
         std::string b64 = Base64EncodeUtf16LE(payload);
-        std::wstring psExe = ResolveSystemPowerShellExe();
+        std::wstring psExe = ResolvePowerShell().exe;
         std::wstring wCmdLine =
             L"\"" + psExe + L"\" -NoProfile -NonInteractive "
             L"-OutputFormat Text -EncodedCommand " +
@@ -1027,23 +1419,47 @@ private:
         // 5. Spin up reader threads.
         std::atomic<bool> stdoutTruncated(false);
         std::atomic<bool> stderrTruncated(false);
+        std::atomic<bool> stopReaders(false);
+        std::atomic<bool> stdoutReaderDone(false);
+        std::atomic<bool> stderrReaderDone(false);
+        LiveTail liveTail;
         std::thread outThread(ReaderLoop,
             outR.h, std::ref(result.stdoutText),
-            std::ref(stdoutTruncated));
+            std::ref(stdoutTruncated), std::ref(stopReaders),
+            std::ref(stdoutReaderDone), &liveTail);
         std::thread errThread(ReaderLoop,
             errR.h, std::ref(result.stderrText),
-            std::ref(stderrTruncated));
+            std::ref(stderrTruncated), std::ref(stopReaders),
+            std::ref(stderrReaderDone), &liveTail);
 
         // 6. Wait loop: poll process with timeout, observe cancel
-        //    flag, enforce the overall deadline.
+        //    flag, enforce the overall deadline.  The same 200 ms tick
+        //    doubles as the throttle for live-output events: at most one
+        //    wxEVT_CMD_OUTPUT per kLiveTailIntervalMs, and only when a
+        //    new line actually arrived.
         constexpr DWORD kTickMs = 200;
         double deadline = NowSec() + (m_timeoutMs / 1000.0);
+        double nextLivePost = 0.0;
+
+        auto postLiveTail = [&]() {
+            std::string line;
+            if (!liveTail.Take(line)) return;
+            auto* ev = new wxCommandEvent(wxEVT_CMD_OUTPUT);
+            ev->SetString(wxString::FromUTF8(line));
+            LbQueueEventIfAlive(m_evtHandler, m_aliveToken, ev);
+        };
 
         bool killIt = false;
         for (;;) {
             DWORD wr = WaitForSingleObject(proc.h, kTickMs);
             if (wr == WAIT_OBJECT_0) break;           // child exited
             if (wr == WAIT_FAILED) { killIt = true; break; }
+
+            const double now = NowSec();
+            if (now >= nextLivePost) {
+                postLiveTail();
+                nextLivePost = now + CmdExecutor::kLiveTailIntervalMs / 1000.0;
+            }
 
             if (m_cancelFlag && m_cancelFlag->load()) {
                 result.cancelled = true;
@@ -1057,22 +1473,58 @@ private:
             }
         }
 
-        if (killIt) {
-            // Closing the job handle triggers KILL_ON_JOB_CLOSE on
-            // the entire process tree.
-            CloseHandle(job.release());
-            // Give the OS a beat to deliver the kill so readers unblock.
-            DWORD killed = WaitForSingleObject(proc.h, 2000);
-            if (killed == WAIT_TIMEOUT) {
-                // Rare escape hatch: if a stubborn process or leaked writer
-                // keeps a pipe open after the job kill, cancel the synchronous
-                // ReadFile calls so this detached worker cannot wedge forever.
-                if (outThread.joinable()) CancelThreadSynchronousIoLocal(outThread.native_handle());
-                if (errThread.joinable()) CancelThreadSynchronousIoLocal(errThread.native_handle());
-            }
+        std::string descendantDetails;
+        bool buildHelpersOnly = false;
+        if (!killIt) {
+            // The top-level PowerShell process can exit while either a
+            // short-lived foreground helper is still winding down or a real
+            // detached child remains alive.  Wait briefly for the former,
+            // ignoring PowerShell's already-signalled PID, then classify only
+            // a persistent descendant as unsupported background work.
+            result.descendantsTerminated =
+                WaitForJobDescendantsLocal(job.h, pi.dwProcessId,
+                    descendantDetails, buildHelpersOnly);
         }
 
-        // Drain readers.
+        // Always close the job before joining the pipe readers. On timeout or
+        // cancellation this kills the whole process tree as before. On a
+        // normal PowerShell exit it also closes unsupported lingering
+        // descendants, guaranteeing that their inherited pipe writers cannot
+        // keep this worker pending indefinitely.
+        CloseHandle(job.release());
+
+        if (killIt) {
+            // Give Windows a moment to deliver the job termination. Reader
+            // completion is checked independently below because the direct
+            // process can exit while another leaked writer still owns a pipe.
+            WaitForSingleObject(proc.h, 2000);
+        }
+
+        // Give buffered stdout/stderr a bounded drain window. The old code
+        // joined unconditionally; one inherited writer handle could therefore
+        // bypass the command timeout forever. If either reader is still
+        // blocked after the grace period, ask its synchronous ReadFile to
+        // return and make the loop observe stopReaders before another read.
+        constexpr DWORD kReaderDrainGraceMs = 2000;
+        const ULONGLONG drainDeadline =
+            GetTickCount64() + kReaderDrainGraceMs;
+        while ((!stdoutReaderDone.load() || !stderrReaderDone.load()) &&
+               GetTickCount64() < drainDeadline) {
+            Sleep(10);
+        }
+
+        const bool forcedReaderStop =
+            !stdoutReaderDone.load() || !stderrReaderDone.load();
+        if (forcedReaderStop) {
+            stopReaders.store(true);
+            if (outThread.joinable() && !stdoutReaderDone.load())
+                CancelThreadSynchronousIoLocal(outThread.native_handle());
+            if (errThread.joinable() && !stderrReaderDone.load())
+                CancelThreadSynchronousIoLocal(errThread.native_handle());
+        }
+
+        // Drain readers. They have either seen EOF after the job closed or
+        // had their outstanding synchronous read cancelled above.
         if (outThread.joinable()) outThread.join();
         if (errThread.joinable()) errThread.join();
 
@@ -1095,26 +1547,119 @@ private:
         StripClixmlInPlace(result.stdoutText);
         StripClixmlInPlace(result.stderrText);
 
+        // Fold runs of "<src> -> <dst> done" lines (MSBuild/vcpkg
+        // app-local DLL copies: ~4 KB per build run, 23% of the r16c1
+        // transcript) into one summary line each.  Shape-matched, never
+        // folds errors/warnings/the .vcxproj -> .exe line; see
+        // copy_line_fold.h.  Before the breadcrumbs and large-output
+        // handling, so neither sees the noise.
+        lb_copyfold::FoldCopyProgressLines(result.stdoutText);
+        lb_copyfold::FoldCopyProgressLines(result.stderrText);
+
+        // Progress bars (curl/git/pip/tqdm) redraw with bare '\r' on
+        // stderr; PS 5.1 wraps redirected native stderr in multi-line
+        // NativeCommandError records.  Collapse both, and when stderr is
+        // nothing but progress, move a one-line summary to stdout so a
+        // successful download is not rendered (or scored) as a failure.
+        // 2026-10-02 v0.1.19 release: ~130 red "####  37.8%" lines on an
+        // exit-0 curl call.  See progress_output_fold.h.
+        lb_progressfold::TidyCapturedStreams(result.stdoutText, result.stderrText);
+
+        // Lingering MSVC helpers (mspdbsrv, vctip) are identified by
+        // process name and outlive FAILED builds exactly as they outlive
+        // successful ones.  2026-10-01: the exit-0/empty-stderr
+        // requirement sent every failed MSBuild run down the
+        // "[background process stopped]" warning path (six times in one
+        // r16c1 session), adding a misleading second problem to read next
+        // to the real compiler or test failure.  The exit code no longer
+        // decides the classification, only the wording.
+        result.buildHelpersCleaned = result.descendantsTerminated &&
+            buildHelpersOnly && !result.timedOut &&
+            !result.cancelled && !killIt && !forcedReaderStop;
+
+        if (result.buildHelpersCleaned && result.exitCode == 0 &&
+            result.stderrText.empty()) {
+            if (!result.stdoutText.empty() && result.stdoutText.back() != '\n')
+                result.stdoutText += "\r\n";
+            result.stdoutText +=
+                "[build helper cleanup] Command exited with code 0. "
+                "LlamaBoss stopped remaining MSVC compiler helpers after "
+                "the build command ended. This is informational cleanup, "
+                "not a tool failure. Continue the requested work when the "
+                "expected build outputs have been verified.\r\n"
+                "[remaining-process check] " + descendantDetails + "\r\n";
+        } else if (result.buildHelpersCleaned) {
+            // Failed (or stderr-producing) build: one neutral line in
+            // stdout, so stderr carries only the command's own errors.
+            if (!result.stdoutText.empty() && result.stdoutText.back() != '\n')
+                result.stdoutText += "\r\n";
+            result.stdoutText +=
+                "[build helper cleanup] LlamaBoss stopped leftover MSVC "
+                "compiler helpers (" + descendantDetails + ") after the "
+                "command ended. Unrelated to the exit code " +
+                std::to_string(result.exitCode) + "; diagnose the "
+                "command's own output.\r\n";
+        } else if (result.descendantsTerminated) {
+            if (!result.stderrText.empty() && result.stderrText.back() != '\n')
+                result.stderrText += "\r\n";
+            result.stderrText +=
+                "[background process stopped] PowerShell exited, but the "
+                "job still reported child processes after the 1.5s cleanup "
+                "grace period. LlamaBoss closed the job to stop remaining "
+                "children. This warning alone does not mean the command "
+                "failed; check its exit code, output and expected files.\r\n"
+                "[remaining-process check] " + descendantDetails + "\r\n";
+        }
+
+        if (forcedReaderStop) {
+            if (!result.stderrText.empty() && result.stderrText.back() != '\n')
+                result.stderrText += "\r\n";
+            result.stderrText +=
+                "[output capture warning] A process kept an output pipe open; "
+                "LlamaBoss stopped waiting for that pipe after 2s.\r\n";
+        }
+
         // If we killed and nothing was written to stderr, leave a
         // breadcrumb the display layer can style.  On timeout, make the
-        // breadcrumb CORRECTIVE for the model, not just diagnostic —
-        // observed failure mode is a script/command that silently scans
-        // far more than asked (build trees, IDE caches) and emits
-        // nothing before the deadline, giving the model nothing to fix.
+        // breadcrumb CORRECTIVE for the model, not just diagnostic.  Two
+        // observed failure modes:
+        //   * a script that silently scans far more than asked (build
+        //     trees, IDE caches) and emits nothing before the deadline;
+        //   * a process blocked on input nobody can see: an interactive
+        //     prompt, or a GUI dialog (2026-10-01: a wx debug assert box
+        //     in LlamaBossTests.exe turned a test run into a silent 1800 s
+        //     timeout, and the old text only suggested excluding folders).
+        // The timeout breadcrumb is now appended even when stderr already
+        // has text: a process that printed warnings and then hung got no
+        // explanation at all before.
         if (result.cancelled && result.stderrText.empty()) {
             result.stderrText = "[cancelled by user]\r\n";
-        } else if (result.timedOut && result.stderrText.empty()) {
-            result.stderrText =
+        } else if (result.timedOut) {
+            const bool noOutput = IsBlankTextLocal(result.stdoutText) &&
+                                  IsBlankTextLocal(result.stderrText);
+            if (!result.stderrText.empty() && result.stderrText.back() != '\n')
+                result.stderrText += "\r\n";
+            result.stderrText +=
                 "[timed out after " +
                 std::to_string(m_timeoutMs / 1000) + "s" +
-                (IsBlankTextLocal(result.stdoutText)
-                     ? " with no output. If this command scans or compresses "
-                       "directories, exclude build/IDE folders such as .vs, "
-                       ".git, x64, Debug, Release, node_modules, __pycache__, "
-                       "and emit progress as it works so partial output "
-                       "survives a timeout"
-                     : "") +
-                "]\r\n";
+                (noOutput ? " with no output" : "") +
+                "; LlamaBoss killed the process tree. Likely causes: "
+                "(1) it was waiting for input this tool cannot see or "
+                "answer: an interactive prompt (Read-Host, a y/n or "
+                "credential prompt) or a GUI window such as a debug "
+                "assert, crash or error dialog (common for Debug-built "
+                "test executables). Run it non-interactively (-y, --batch, "
+                "-NonInteractive, -Confirm:$false, redirected stdin), use "
+                "a Release build or disable assert/crash dialogs, and do "
+                "not rerun the same command unchanged. (2) it did far more "
+                "work than intended" +
+                (noOutput
+                     ? ": if it scans or compresses directories, exclude "
+                       "build/IDE folders such as .vs, .git, x64, Debug, "
+                       "Release, node_modules, __pycache__, and emit progress "
+                       "as it works so partial output survives a timeout"
+                     : "; the last output above shows where it stopped") +
+                ".]\r\n";
         }
 
         // Workspace delta: compute BEFORE large-output externalization
@@ -1158,6 +1703,20 @@ private:
                 result.stdoutText += "\r\n";
             }
         }
+
+        // Wildcard -Path + -Recurse -File (2026-09-30): surfaced on any
+        // successful run, not only blank ones -- the form can return a
+        // partial result, and a plain folder path is always the fix.
+        if (result.exitCode == 0 && !result.timedOut && !result.cancelled) {
+            std::string hint =
+                ps_command_hints::GetChildItemWildcardRecurseHint(result.command);
+            if (!hint.empty()) {
+                if (!result.stdoutText.empty() && result.stdoutText.back() != '\n')
+                    result.stdoutText += "\r\n";
+                result.stdoutText += hint;
+                result.stdoutText += "\r\n";
+            }
+        }
     }
 
     // Post the completion event back to the UI thread iff the frame
@@ -1180,6 +1739,28 @@ private:
 };
 
 } // namespace
+
+// ── Shell version (for the agent prompt) ─────────────────────────
+bool LbToolUsesPowerShell7()
+{
+    return ResolvePowerShell().isPwsh;
+}
+
+std::string LbPowerShellPromptNote()
+{
+    if (LbToolUsesPowerShell7()) {
+        return "The powershell tool runs PowerShell 7 (pwsh.exe, modern .NET), "
+               "not Windows PowerShell 5.1: newer .NET APIs such as "
+               "[IO.Path]::GetRelativePath are available, && and || chain "
+               "commands, Get-WmiObject does not exist (use Get-CimInstance), "
+               "use -AsByteStream instead of -Encoding Byte, and UTF8 file "
+               "writes have no BOM.";
+    }
+    return "The powershell tool runs Windows PowerShell 5.1 (.NET Framework): "
+           "newer .NET APIs such as [IO.Path]::GetRelativePath are "
+           "unavailable, and && / || chaining and the ?: ternary do not exist.";
+}
+
 
 // ─── CmdExecutor ─────────────────────────────────────────────────
 

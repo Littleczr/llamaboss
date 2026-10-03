@@ -89,10 +89,12 @@ class AppState;
 class GrepExecutor;
 class CmdExecutor;
 class PythonRunner;
+class PythonSessionManager;
 class WebFetchExecutor;
 class WaitExecutor;
 struct CmdResult;
 struct PythonRunResult;
+struct PySessionResult;
 struct WebFetchResult;
 struct WaitResult;
 
@@ -100,8 +102,13 @@ class AgentController {
 public:
     // Hard limits.  Exposed publicly so tests and the malformed-
     // counter UI messages can reference the same constants.
-    static constexpr int kMaxIterations       = 12;
+    static constexpr int kMaxIterations       = 40;
     static constexpr int kMaxMalformedPerTurn = 3;
+    // A provider can occasionally complete an agent continuation with no
+    // prose, no native tool call, and no error. Retry that transport-level
+    // blank once; a second consecutive blank ends explicitly instead of
+    // leaving an empty assistant row or spinning forever.
+    static constexpr int kMaxEmptyAssistantRetries = 1;
 
     // wait tool bounds.  Per-call range enforced at validation and
     // again at dispatch; the per-turn budget caps cumulative wait
@@ -113,8 +120,6 @@ public:
     static constexpr int kMinWaitSecondsPerCall     = 15;
     static constexpr int kMaxWaitSecondsPerCall     = 600;
     static constexpr int kDefaultWaitBudgetSeconds  = 1800;   // 30 min/turn
-    static constexpr int kMinConfigurableWaitBudget = 60;
-    static constexpr int kMaxConfigurableWaitBudget = 14400;  // 4 h
 
     // Phase 7: repeated-tool guard.  If the same normalized
     // tool signature would appear this many times inside the
@@ -205,6 +210,7 @@ public:
                     GrepExecutor*   grepExec,
                     CmdExecutor*    cmdExec,
                     PythonRunner*   pythonRunner,
+                    PythonSessionManager* pySession,
                     WebFetchExecutor* webFetchExec,
                     ToolWorkerExecutor* toolWorker,
                     WaitExecutor*   waitExec);
@@ -221,6 +227,22 @@ public:
     // OnAgentLoopBegin() so the frame can hook loop-scoped UI.
     void Begin();
 
+    // Tool-protocol snapshot for the request currently in flight.
+    // HandleAssistantComplete judges a response by the protocol its
+    // REQUEST was built with, never by the live protocol: detection can
+    // resolve mid-stream (e.g. a prompt queued behind a model load fires
+    // from OnServerReady before OnToolProtocolDetected lands), and
+    // reading the live value then parsed an XML-prompted reply as
+    // native, silently dropping its <tool_call>.  BuildRequestBody sets
+    // this for loop iterations; MyFrame sets it for the first turn,
+    // which it builds itself.  Call AFTER Begin().
+    void SetRequestProtocol(ToolProtocol p) { m_requestProtocol = p; }
+
+    // Context budget (tokens) for the conversation's lane: Settings
+    // value for local models, kRemoteContextTokens for remote ones.
+    // Call before Begin(); used by every request this turn builds.
+    void SetConversationContextTokens(int tokens) { m_conversationContextTokens = tokens; }
+
     // Phase 10: user-configurable tool-step cap.  Clamped to
     // [kMinConfigurableToolSteps, kMaxConfigurableToolSteps]; takes
     // effect on the NEXT cap comparison, so raising it mid-loop
@@ -228,12 +250,6 @@ public:
     // the next fed result.  Persisted by AppState; wired by MyFrame.
     void SetMaxToolSteps(int steps);
     int  GetMaxToolSteps() const { return m_maxToolSteps; }
-
-    // Session-level per-turn wait-time budget (seconds).  Clamped to
-    // [kMinConfigurableWaitBudget, kMaxConfigurableWaitBudget]; wired
-    // by MyFrame's /wait_budget command.  Not persisted (v1).
-    void SetWaitBudgetSeconds(int seconds);
-    int  GetWaitBudgetSeconds() const { return m_waitBudgetSeconds; }
 
     // True iff a loop is in progress.  MyFrame uses this to
     // decide whether to route events through us.
@@ -248,6 +264,9 @@ public:
     // MyFrame keeps the input enabled in this state so /approve or
     // /deny can resolve the pending tool invocation.
     bool IsAwaitingApproval() const { return m_awaitingApproval; }
+    bool IsAwaitingWriteRootGrant() const {
+        return m_awaitingApproval && !m_pendingWriteRootGrant.empty();
+    }
 
     // Phase 6: resolve a pending approval.  Approve executes the
     // stored invocation; Deny records a denied tool result and lets
@@ -276,9 +295,10 @@ public:
     // ─── Event handlers (called from MyFrame on event dispatch) ──
     // Each returns true iff the controller "consumed" the event:
     //   - HandleAssistantComplete returns true if the reply had a
-    //     tool call and another iteration is queued; false means
-    //     the loop has ended and MyFrame should do its normal
-    //     completion (finalize history, auto-save, etc.).
+    //     tool call or a first-strike empty-completion recovery and
+    //     another iteration is queued; false means the loop has ended
+    //     and MyFrame should do its normal completion (finalize history,
+    //     auto-save, etc.).
     //   - HandleGrepComplete returns true if the result was fed
     //     back to the model and the next iteration is in flight.
     //   - HandleAssistantError always returns false (errors always
@@ -302,6 +322,7 @@ public:
     // are legitimate again rather than doom-loop evidence.
     bool HandleWaitComplete(const WaitResult& waitResult);
     bool HandlePythonComplete(const PythonRunResult& pythonResult);
+    bool HandlePySessionComplete(const PySessionResult& sessionResult);
     bool HandleWebFetchComplete(const WebFetchResult& webResult);
     bool HandleToolWorkerComplete(const ToolWorkerResult& workerResult);
     bool HandleCmdError(const std::string& errorText);
@@ -462,7 +483,8 @@ private:
     // Lightweight non-history UI card shown as soon as an async tool starts.
     // This prevents the blank-turn feeling between approval/"yes run it"
     // and the eventual completed tool card.
-    void EmitPendingToolBlock(const ToolInvocation& inv);
+    void EmitPendingToolBlock(const ToolInvocation& inv,
+                              const ToolContext&    ctx);
 
     // Terminate the loop, fire OnAgentLoopEnd, reset state.
     // `userFacingMessage` is forwarded to the sink — empty for
@@ -486,6 +508,7 @@ private:
     GrepExecutor*   m_grepExec;
     CmdExecutor*    m_cmdExec;
     PythonRunner*   m_pythonRunner;
+    PythonSessionManager* m_pySession;
     WebFetchExecutor* m_webFetchExec;
     ToolWorkerExecutor* m_toolWorker;
     WaitExecutor*   m_waitExec;
@@ -502,6 +525,14 @@ private:
     bool          m_cancelled            = false;
     int           m_iterationsUsed       = 0;
     int           m_consecutiveMalformed = 0;
+    int           m_consecutiveEmptyAssistant = 0;
+    ToolProtocol  m_requestProtocol      = ToolProtocol::Unknown;
+
+    // One-request-only system nudge used after an empty assistant
+    // completion. It is appended while BuildRequestBody serializes the next
+    // request and then cleared, so recovery guidance never pollutes saved
+    // conversation history or replays after restart.
+    std::string   m_nextRequestSystemNudge;
 
     // Phase 7/7d: rolling window of recently DISPATCHED tool signatures,
     // used by the exact-repeat and cycle guards.  Phase 7d added the
@@ -529,6 +560,19 @@ private:
     };
     std::vector<ToolSignatureRecord> m_recentToolSignatures;
 
+    // Context budget for this turn's lane, pushed by MyFrame right before
+    // Begin() (ModelSwitcher::ConversationContextTokens).  0 = not set,
+    // fall back to the Settings value.
+    int m_conversationContextTokens = 0;
+
+    // Standalone write-and-stop (2026-10-01): lowercased disk paths that
+    // write / overwrite_file succeeded on during THIS turn.  The turn
+    // stops only when the same artifact is written a second time — the
+    // small-model re-write loop the heuristic exists for — so a capable
+    // model's single state-file overwrite no longer ends a multi-step
+    // plan.  Cleared in Begin().
+    std::vector<std::string> m_standaloneWritePathsThisTurn;
+
     // Phase 10: user-configurable tool-step cap.  Defaults to the
     // historical constant; AppState persists the user's value and
     // MyFrame pushes it here at startup and on /agent_steps.
@@ -536,7 +580,7 @@ private:
 
     // wait tool per-turn accounting.  m_waitSecondsUsed accumulates
     // GRANTED wait time (reset by Begin); m_waitBudgetSeconds is the
-    // session-level cap (/wait_budget).
+    // fixed per-turn cap (the /wait_budget command was removed 2026-09-28).
     int           m_waitSecondsUsed   = 0;
     int           m_waitBudgetSeconds = kDefaultWaitBudgetSeconds;
 
@@ -578,6 +622,7 @@ private:
     // previewed, even if later UI state changes.
     ToolInvocation m_pendingApprovalInvocation;
     ToolContext    m_pendingApprovalContext;
+    std::string    m_pendingWriteRootGrant;
     bool           m_awaitingApproval = false;
 
     // Python workflow polish: approving python_create_script grants

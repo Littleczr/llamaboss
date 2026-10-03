@@ -71,13 +71,19 @@ std::string BuildSkillDraftBuilderSystemPrompt(const SkillPromptBuilderInput& in
       << "Do not choose Python merely because Python could solve the task. "
       << "Do not choose Python for ordinary file lists, source manifests, basic ZIP backups, basic text reports, or other straightforward Windows file operations. "
 
-      // PowerShell guardrails -- the empty-output bug from
-      // Get-ChildItem -Recurse -Include without a wildcard in -Path
-      // is the specific failure that motivated this rewrite.
+      // PowerShell guardrails -- the empty-output footgun: -Include
+      // without -Recurse needs a trailing \* on -Path.  Corrected
+      // 2026-09-30 after measuring on Windows PowerShell 5.1 (62,392
+      // files on D:):  'D:\' -Recurse -Include  -> 191,
+      //                'D:\*' -Recurse -Include -> 191,
+      //                'D:\*' -Recurse -File    -> 0  (silent!),
+      //                'D:\' -Recurse -File     -> 62,392.
+      // The old guardrail called the trailing \* REQUIRED with -Recurse,
+      // which steered models into the -File combination that returns 0.
       << "\n\nPOWERSHELL GUARDRAILS (when PowerShell is the chosen path). "
-      << "For Get-ChildItem with a recursive multi-extension filter, the correct pattern is `Get-ChildItem -Path '<dir>\\*' -Recurse -Include '*.ext1','*.ext2'`. "
-      << "The trailing `\\*` on -Path is REQUIRED for -Include to return any results when -Recurse is set. "
-      << "Do NOT write `Get-ChildItem -Path '<dir>' -Recurse -Include '*.ext1','*.ext2'` (no wildcard on -Path) -- it silently returns nothing and writes an empty file. "
+      << "For Get-ChildItem with a recursive multi-extension filter, the correct pattern is `Get-ChildItem -Path '<dir>' -Recurse -Include '*.ext1','*.ext2'` -- a plain folder path with NO trailing `\\*`. "
+      << "Do NOT put a wildcard on -Path when using -Recurse: in Windows PowerShell 5.1, `-Path '<dir>\\*' -Recurse -File` can silently return nothing (measured: 0 of 62,392 files on a drive; exit 0, no error). "
+      << "The trailing `\\*` is only for -Include WITHOUT -Recurse (top level only): `Get-ChildItem -Path '<dir>\\*' -Include '*.ext1','*.ext2'`; without it, that non-recursive form silently returns nothing. "
       << "Do NOT use -Filter with multiple patterns; -Filter accepts exactly one pattern. "
       << "When the Skill writes a file via Out-File, add a follow-up verification step that confirms the file exists and is non-empty before reporting success. ";
 

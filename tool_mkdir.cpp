@@ -4,6 +4,7 @@
 #include "tool_path.h"
 #include "tool_path_safety.h"   // IsUnderAllowedWriteRoot, Basename, ParentDir
 #include "path_safety.h"
+#include "tool_mutation_guard.h"
 
 #include <algorithm>
 #include <chrono>
@@ -66,11 +67,25 @@ MkdirResult MakeDirectory(const std::string& pathIn,
     }
 
     // ── Containment ──────────────────────────────────────────────
-    if (!tool_path_safety::IsUnderAllowedWriteRoot(resolved, ctx.cwd, ctx.activeProjectRoot, ctx.skillsRoot)) {
+    if (!tool_path_safety::IsUnderAllowedWriteRoot(
+            resolved, ctx.cwd, ctx.activeProjectRoot, ctx.skillsRoot,
+            ctx.additionalWriteRoots)) {
         r.chips.push_back("blocked");
         r.errorBody = "Refuses to create directories outside the allowed write roots."
                       "\n  resolved: " + resolved +
-                      tool_path_safety::AllowedWriteRootsDiagnostic(ctx.cwd, ctx.activeProjectRoot, ctx.skillsRoot);
+                      tool_path_safety::AllowedWriteRootsDiagnostic(
+                          ctx.cwd, ctx.activeProjectRoot, ctx.skillsRoot,
+                          ctx.additionalWriteRoots);
+        r.chips.push_back(ElapsedChip(t0));
+        return r;
+    }
+
+    // Coordinate native mutations across chat windows and pin the real
+    // directory chain before touching the target. Reparse points fail closed.
+    tool_mutation_guard::Guard mutation;
+    if (!mutation.Begin(resolved, /*allowMissingParents=*/true)) {
+        r.chips.push_back("blocked");
+        r.errorBody = mutation.Error();
         r.chips.push_back(ElapsedChip(t0));
         return r;
     }
@@ -142,6 +157,13 @@ MkdirResult MakeDirectory(const std::string& pathIn,
 
     size_t createdCount = 0;
     for (const std::string& dir : toCreate) {
+        if (!tool_path_safety::IsUnderAllowedWriteRoot(
+                dir, ctx.cwd, ctx.activeProjectRoot, ctx.skillsRoot, ctx.additionalWriteRoots)) {
+            r.chips.push_back("blocked");
+            r.errorBody = "A missing parent directory is outside the granted write roots: " + dir;
+            r.chips.push_back(ElapsedChip(t0));
+            return r;
+        }
         std::wstring wDir = path_safety::Utf8ToWide(dir);
         if (wDir.empty()) {
             r.chips.push_back("failed");
@@ -153,7 +175,14 @@ MkdirResult MakeDirectory(const std::string& pathIn,
         if (!::CreateDirectoryW(wDir.c_str(), nullptr)) {
             DWORD err = ::GetLastError();
             if (err == ERROR_ALREADY_EXISTS && IsDirectory(dir)) {
-                // Benign race: another caller created this segment first.
+                // Pin and inspect even an already-existing segment before
+                // proceeding: another process could have inserted a junction.
+                if (!mutation.PinCreatedDirectory(dir)) {
+                    r.chips.push_back("blocked");
+                    r.errorBody = mutation.Error();
+                    r.chips.push_back(ElapsedChip(t0));
+                    return r;
+                }
                 continue;
             }
             r.chips.push_back("failed");
@@ -167,6 +196,12 @@ MkdirResult MakeDirectory(const std::string& pathIn,
             return r;
         }
         ++createdCount;
+        if (!mutation.PinCreatedDirectory(dir)) {
+            r.chips.push_back("blocked");
+            r.errorBody = mutation.Error();
+            r.chips.push_back(ElapsedChip(t0));
+            return r;
+        }
     }
 
     r.chips.push_back(createdCount == 0 ? "exists" : "created");

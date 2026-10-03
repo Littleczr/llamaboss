@@ -51,6 +51,7 @@
 class GrepExecutor;
 class CmdExecutor;
 class PythonRunner;
+class PythonSessionManager;
 class WebFetchExecutor;
 
 // ─── Dispatch dependencies ──────────────────────────────────────
@@ -62,6 +63,7 @@ struct DispatchDeps {
     GrepExecutor* grepExec     = nullptr;
     CmdExecutor*  cmdExec      = nullptr;
     PythonRunner* pythonRunner = nullptr;
+    PythonSessionManager* pySession = nullptr;
     WebFetchExecutor* webFetchExec = nullptr;
 };
 
@@ -104,6 +106,17 @@ struct ToolSpec {
     // read-only, which tools mutate files, and which tools require
     // approval.
     ToolSafetyProfile safety;
+
+    // Native multi-call batching eligibility.  True means several
+    // independently-formed invocations of this tool may be queued and
+    // executed before the model sees any intermediate result.  This is
+    // deliberately fail-closed: new tools default to false and must be
+    // reviewed explicitly before participating in a native batch.
+    //
+    // This does NOT bypass validation, approval, or dispatch policy and
+    // does not mean calls run concurrently.  AgentController still runs
+    // the accepted batch in order and returns one result per call id.
+    bool batchSafe = false;
 
     // Presentation metadata — the single source of truth for how this
     // tool renders in the UI.  Before these fields existed, the icon

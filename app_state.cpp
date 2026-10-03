@@ -27,6 +27,7 @@ const char* AppState::CONFIG_CTX_SIZE_KEY = "ContextLength";
 const char* AppState::CONFIG_FONT_SIZE_KEY = "ChatFontSize";
 const char* AppState::CONFIG_AGENT_DEFAULT_ON_KEY = "AgentDefaultOn";
 const char* AppState::CONFIG_CONTEXT_METER_KEY = "ContextMeterOn";
+const char* AppState::CONFIG_CONTEXT_HUD_OPEN_KEY = "ContextHudOpen";
 const char* AppState::CONFIG_KV_CACHE_Q8_KEY = "KvCacheQ8";
 const char* AppState::CONFIG_MTP_ENABLED_KEY = "MtpEnabled";
 const char* AppState::CONFIG_AGENT_MAX_TOOL_STEPS_KEY = "AgentMaxToolSteps";
@@ -71,7 +72,10 @@ SecretsStore* AppState::GetSecretsStore()
 {
     if (!m_secretsStore) {
         m_secretsStore = std::make_unique<SecretsStore>();
-        m_secretsStore->Load();
+        if (!m_secretsStore->Load() && m_secretsStore->LoadFailed() && m_logger)
+            m_logger->warning("secrets.json failed to load (" +
+                m_secretsStore->LoadError() + "); saving API keys is blocked "
+                "until it is fixed or reset from Connections.");
     }
     return m_secretsStore.get();
 }
@@ -83,7 +87,10 @@ EndpointStore* AppState::GetEndpointStore()
 {
     if (!m_endpointStore) {
         m_endpointStore = std::make_unique<EndpointStore>();
-        m_endpointStore->Load();
+        if (!m_endpointStore->Load() && m_endpointStore->LoadFailed() && m_logger)
+            m_logger->warning("endpoints.json failed to load (" +
+                m_endpointStore->LoadError() + "); saving connections is "
+                "blocked until it is fixed or reset from Connections.");
     }
     return m_endpointStore.get();
 }
@@ -257,6 +264,14 @@ void AppState::SetContextMeterOn(bool on)
     }
 }
 
+void AppState::SetContextHudOpen(bool open)
+{
+    if (m_contextHudOpen != open) {
+        m_contextHudOpen = open;
+        SaveSettings();
+    }
+}
+
 void AppState::SetKvCacheQ8(bool on)
 {
     if (m_kvCacheQ8 != on) {
@@ -329,6 +344,7 @@ void AppState::SaveSettings()
         cfg.Write(CONFIG_FONT_SIZE_KEY, (long)m_fontSize);
         cfg.Write(CONFIG_AGENT_DEFAULT_ON_KEY, m_agentDefaultOn);
         cfg.Write(CONFIG_CONTEXT_METER_KEY, m_contextMeterOn);
+        cfg.Write(CONFIG_CONTEXT_HUD_OPEN_KEY, m_contextHudOpen);
         cfg.Write(CONFIG_KV_CACHE_Q8_KEY, m_kvCacheQ8);
         cfg.Write(CONFIG_MTP_ENABLED_KEY, m_mtpEnabled);
         cfg.Write(CONFIG_AGENT_MAX_TOOL_STEPS_KEY, (long)m_agentMaxToolSteps);
@@ -424,11 +440,6 @@ void AppState::LogShutdownMessage() const
     if (m_logger) {
         m_logger->information("Application shutting down");
     }
-}
-
-bool AppState::HasValidConfiguration() const
-{
-    return !m_currentModel.empty() && !m_currentApiUrl.empty();
 }
 
 void AppState::SaveWindowState(wxFrame* frame)
@@ -694,6 +705,11 @@ void AppState::LoadSettings()
         m_contextMeterOn = savedContextMeter;
     }
 
+    bool savedContextHudOpen = false;
+    if (cfg.Read(CONFIG_CONTEXT_HUD_OPEN_KEY, &savedContextHudOpen)) {
+        m_contextHudOpen = savedContextHudOpen;
+    }
+
     // 8-bit KV cache: bool, absent on fresh installs (falls through to
     // the m_kvCacheQ8 = true initializer from the header — on by
     // default; q8_0 K/V costs nothing measurable and doubles usable
@@ -712,9 +728,13 @@ void AppState::LoadSettings()
         m_mtpEnabled = savedMtpEnabled;
     }
 
+    // Every beta install wrote the old default (12) on its first save
+    // whether or not the user ever chose it, so a saved 12 is treated as
+    // "never chosen" and moves to the new default.  Any other saved value
+    // was set on purpose with /agent_steps and is kept.
     long savedMaxSteps = 0;
     if (cfg.Read(CONFIG_AGENT_MAX_TOOL_STEPS_KEY, &savedMaxSteps) &&
-        savedMaxSteps > 0) {
+        savedMaxSteps > 0 && savedMaxSteps != 12) {
         if (savedMaxSteps < 4)  savedMaxSteps = 4;
         if (savedMaxSteps > 60) savedMaxSteps = 60;
         m_agentMaxToolSteps = (int)savedMaxSteps;

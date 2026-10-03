@@ -5,6 +5,8 @@
 #include "conversation_sidebar.h"
 #include "chat_history.h"
 #include "theme.h"
+#include "lb_hover_tile.h"
+#include "lb_scroll_rail.h"
 #include "path_safety.h"
 
 #include <wx/dir.h>
@@ -338,20 +340,12 @@ std::uint32_t SidebarStableHash(const std::string& value)
 }
 
 wxColour SidebarProjectAccent(const ThemeData& theme,
-                              const std::string& projectId,
-                              bool hasGoal)
+                              const std::string& projectId)
 {
     // Unassigned conversations intentionally stay neutral.  Their icon tile
     // still responds to selection/hover, but it does not imply a project.
-    if (projectId.empty() && !hasGoal) {
+    if (projectId.empty()) {
         return MixSidebarColour(theme.textMuted, theme.bgDialogSurface, 28);
-    }
-
-    // Project-less goals get a consistent purple accent.  A chat carrying a
-    // real project uses the project color because the project is its primary
-    // container and remains its drag/drop destination.
-    if (projectId.empty() && hasGoal) {
-        return wxColour(167, 112, 239);
     }
 
     static const std::array<wxColour, 8> kProjectPalette = {
@@ -373,13 +367,10 @@ wxColour SidebarProjectAccent(const ThemeData& theme,
 }
 
 std::string SidebarProjectTagText(const std::string& projectId,
-                                  const std::string& projectName,
-                                  bool hasGoal)
+                                  const std::string& projectName)
 {
     if (!projectId.empty())
         return projectName.empty() ? std::string("Project") : projectName;
-    if (hasGoal)
-        return "Goal";
     return {};
 }
 
@@ -397,7 +388,7 @@ public:
     {
         SetBackgroundStyle(wxBG_STYLE_PAINT);
 
-        // Mono-faced pill: the project/goal tag is a status token, so it wears
+        // Mono-faced pill: the project tag is a status token, so it wears
         // the same teletype face as the rest of the LlamaBoss chrome rather
         // than the stock proportional font.
         SetFont(SidebarMonoFont(8, wxFONTWEIGHT_MEDIUM));
@@ -621,27 +612,71 @@ ConversationSidebar::ConversationSidebar(wxWindow* parent,
         "Search conversations. Use Up/Down to choose a result and Enter to open.");
     contentSizer->Add(m_searchBox, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 8);
 
-    // Scrollable conversation list
-    m_listWindow = new wxScrolledWindow(m_content, wxID_ANY,
+    // Archive strip: one footer control for both directions.
+    //   normal view:   ▌ Archived chats                          N  →
+    //   archive view:  ▌ ←  Back to chats                ARCHIVED · N
+    // Hidden when nothing is archived.  The whole strip is clickable and
+    // uses the shared hover lift; the accent edge marks it as navigation.
+    m_archiveHeader = new wxPanel(m_content, wxID_ANY,
+        wxDefaultPosition, wxSize(-1, 40));
+    m_archiveHeader->SetCursor(wxCURSOR_HAND);
+    m_archiveHeader->SetToolTip(
+        "Return to your conversations (Esc)");
+    {
+        auto* headerSizer = new wxBoxSizer(wxHORIZONTAL);
+
+        m_archiveHeaderAccent = new wxPanel(m_archiveHeader, wxID_ANY,
+            wxDefaultPosition, wxSize(3, -1));
+        m_archiveHeaderAccent->SetCursor(wxCURSOR_HAND);
+        headerSizer->Add(m_archiveHeaderAccent, 0, wxEXPAND);
+
+        m_archiveBackLabel = new wxStaticText(m_archiveHeader, wxID_ANY,
+            wxString::FromUTF8("\xE2\x86\x90  Back to chats"));   // ←
+        m_archiveBackLabel->SetFont(SidebarMonoFont(10, wxFONTWEIGHT_BOLD));
+        m_archiveBackLabel->SetCursor(wxCURSOR_HAND);
+        m_archiveBackLabel->SetToolTip(m_archiveHeader->GetToolTipText());
+        headerSizer->Add(m_archiveBackLabel, 0,
+                         wxALIGN_CENTER_VERTICAL | wxLEFT, 12);
+
+        headerSizer->AddStretchSpacer(1);
+
+        m_archiveTitleLabel = new wxStaticText(m_archiveHeader, wxID_ANY,
+            "ARCHIVED");
+        m_archiveTitleLabel->SetFont(SidebarMonoFont(8, wxFONTWEIGHT_BOLD));
+        m_archiveTitleLabel->SetCursor(wxCURSOR_HAND);
+        m_archiveTitleLabel->SetToolTip(m_archiveHeader->GetToolTipText());
+        headerSizer->Add(m_archiveTitleLabel, 0,
+                         wxALIGN_CENTER_VERTICAL | wxLEFT | wxRIGHT, 12);
+
+        m_archiveHeader->SetSizer(headerSizer);
+    }
+    m_archiveHeader->Hide();
+    ApplyArchiveHeaderAppearance(false);
+
+    // Scrollable conversation list.  The native vertical scrollbar is
+    // clipped out of view and replaced by a slim themed rail
+    // (lb_scroll_rail.h); scrolling itself is still the native list.
+    m_listClip = new wxPanel(m_content, wxID_ANY);
+    m_listClip->SetBackgroundColour(theme.bgSidebar);
+    m_listWindow = new wxScrolledWindow(m_listClip, wxID_ANY,
         wxDefaultPosition, wxDefaultSize, wxVSCROLL);
     m_listWindow->SetBackgroundColour(theme.bgSidebar);
     m_listWindow->SetScrollRate(0, 8);
     m_listSizer = new wxBoxSizer(wxVERTICAL);
     m_listWindow->SetSizer(m_listSizer);
 
-    contentSizer->Add(m_listWindow, 1, wxEXPAND);
+    m_scrollRail = new LbScrollRail(m_content, m_listClip, m_listWindow,
+        [this]() -> const ThemeData& { return *m_theme; });
 
-    // Archive browser toggle.  Normal mode shows the archived count;
-    // archive mode provides a clear path back to the active history.
-    m_archiveButton = new wxButton(
-        m_content, wxID_ANY, "Archived",
-        wxDefaultPosition, wxSize(-1, 34), wxBORDER_NONE);
-    m_archiveButton->SetBackgroundColour(theme.bgDialogSurface);
-    m_archiveButton->SetForegroundColour(theme.textMuted);
-    m_archiveButton->SetFont(SidebarMonoFont(9));
-    contentSizer->Add(
-        m_archiveButton, 0,
-        wxEXPAND | wxLEFT | wxRIGHT | wxTOP | wxBOTTOM, 8);
+    auto* listRow = new wxBoxSizer(wxHORIZONTAL);
+    listRow->Add(m_listClip, 1, wxEXPAND);
+    listRow->Add(m_scrollRail, 0, wxEXPAND);
+    contentSizer->Add(listRow, 1, wxEXPAND);
+
+    // Archive strip in the footer slot: you enter and leave the archive
+    // from the same spot.
+    contentSizer->Add(m_archiveHeader, 0,
+                      wxEXPAND | wxLEFT | wxRIGHT | wxTOP | wxBOTTOM, 8);
     UpdateArchiveButton();
 
     m_content->SetSizer(contentSizer);
@@ -705,15 +740,43 @@ ConversationSidebar::ConversationSidebar(wxWindow* parent,
             m_callbacks.onNewWindowClicked();
     });
 
-    m_archiveButton->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) {
-        if (!m_showArchived && m_archivedCount == 0)
-            return;
+    // Secondary sidebar buttons get the same hover lift as the toolbar
+    // icons.  (+ New Chat is the primary action and keeps its solid fill.)
+    LbHoverTile::Bind(
+        m_newWindowButton,
+        [this]() -> const ThemeData& { return *m_theme; },
+        [](const ThemeData& t) { return t.bgDialogSurface; });
 
-        m_showArchived = !m_showArchived;
-        ClearSelection();
-        ClearSearch();
-        Refresh(m_activeFilePath);
-    });
+    // Archive strip: click anywhere on it to enter / leave the archive.  Hover is
+    // evaluated like the conversation cards: leave is deferred and checked
+    // against the strip's screen rect so moving between the child labels
+    // does not flicker the highlight.
+    {
+        wxWindow* headerTargets[] = {
+            m_archiveHeader, m_archiveHeaderAccent,
+            m_archiveBackLabel, m_archiveTitleLabel };
+        for (wxWindow* target : headerTargets) {
+            target->Bind(wxEVT_LEFT_UP, [this](wxMouseEvent&) {
+                m_panel->CallAfter([this]() {
+                    SetArchiveMode(!m_showArchived);
+                });
+            });
+            target->Bind(wxEVT_ENTER_WINDOW, [this](wxMouseEvent& e) {
+                ApplyArchiveHeaderAppearance(true);
+                e.Skip();
+            });
+            target->Bind(wxEVT_LEAVE_WINDOW, [this](wxMouseEvent& e) {
+                m_archiveHeader->CallAfter([this]() {
+                    if (!m_archiveHeader) return;
+                    if (m_archiveHeader->GetScreenRect().Contains(
+                            wxGetMousePosition()))
+                        return;
+                    ApplyArchiveHeaderAppearance(false);
+                });
+                e.Skip();
+            });
+        }
+    }
 
     // ── Search box events ────────────────────────────────────────
     m_searchBox->Bind(wxEVT_TEXT, [this](wxCommandEvent&) {
@@ -793,10 +856,7 @@ ConversationSidebar::ConversationSidebar(wxWindow* parent,
             }
             if (key == WXK_ESCAPE) {
                 if (m_showArchived) {
-                    m_showArchived = false;
-                    ClearSelection();
-                    ClearSearch();
-                    Refresh(m_activeFilePath);
+                    SetArchiveMode(false);
                 }
                 else if (!m_selected.empty()) {
                     ClearSelection();
@@ -911,7 +971,7 @@ void ConversationSidebar::Refresh(const std::string& activeFilePath)
         entries.end());
     UpdateArchiveButton();
 
-    // ── Primary grouping: project / Goals / Unassigned ───────────
+    // ── Primary grouping: project / Unassigned ───────────
     // Phase 3 deliberately keeps project headers as the primary containers.
     // They own collapse state, context menus, and drag/drop destinations.
     // Time sections are nested beneath them, which adds the mockup's useful
@@ -926,17 +986,14 @@ void ConversationSidebar::Refresh(const std::string& activeFilePath)
 
     for (const auto& e : entries) {
         std::string id;
-        if (!e.projectId.empty())          id = e.projectId;
-        else if (!e.goalObjective.empty()) id = kGoalsId;
-        else                               id = kUnassignedId;
+        if (!e.projectId.empty()) id = e.projectId;
+        else                      id = kUnassignedId;
 
         auto& g = groupsById[id];
         if (g.id.empty()) {
             g.id = id;
             if (id == kUnassignedId)
                 g.displayName = "Unassigned";
-            else if (id == kGoalsId)
-                g.displayName = "Goals";
             else
                 g.displayName = e.projectName.empty()
                     ? std::string("(unnamed project)")
@@ -948,7 +1005,7 @@ void ConversationSidebar::Refresh(const std::string& activeFilePath)
     std::vector<Group*> orderedGroups;
     orderedGroups.reserve(groupsById.size());
     for (auto& [id, g] : groupsById) {
-        if (id != kUnassignedId && id != kGoalsId)
+        if (id != kUnassignedId)
             orderedGroups.push_back(&g);
     }
     std::sort(orderedGroups.begin(), orderedGroups.end(),
@@ -956,8 +1013,6 @@ void ConversationSidebar::Refresh(const std::string& activeFilePath)
             return SidebarSearchKeyFromUtf8(a->displayName)
                  < SidebarSearchKeyFromUtf8(b->displayName);
         });
-    if (auto it = groupsById.find(kGoalsId); it != groupsById.end())
-        orderedGroups.push_back(&it->second);
     if (auto it = groupsById.find(kUnassignedId); it != groupsById.end())
         orderedGroups.push_back(&it->second);
 
@@ -1354,7 +1409,16 @@ void ConversationSidebar::ScrollPathIntoView(const std::string& path)
     const int viewportTop = viewY * pixelsPerUnitY;
     const int viewportBottom =
         viewportTop + m_listWindow->GetClientSize().GetHeight();
-    const int rowTop = rowIt->second.panel->GetPosition().y;
+
+    // A child's GetPosition() inside a wxScrolledWindow is *physical*
+    // (already shifted by the current scroll offset), but viewportTop /
+    // viewportBottom above are logical.  Comparing the two directly only
+    // works at viewY == 0 — which is why a short history behaved and a
+    // long one scrolled to the top on every click.  Convert to logical
+    // before comparing.
+    const wxPoint rowLogical = m_listWindow->CalcUnscrolledPosition(
+        rowIt->second.panel->GetPosition());
+    const int rowTop = rowLogical.y;
     const int rowBottom = rowTop + rowIt->second.panel->GetSize().GetHeight();
 
     int targetViewY = viewY;
@@ -1391,8 +1455,8 @@ void ConversationSidebar::ApplyTheme(const ThemeData& theme)
     m_searchBox->SetForegroundColour(
         m_searchHintActive ? theme.textMuted : theme.textPrimary);
     m_listWindow->SetBackgroundColour(theme.bgSidebar);
-    m_archiveButton->SetBackgroundColour(theme.bgDialogSurface);
-    m_archiveButton->SetForegroundColour(theme.textMuted);
+    if (m_scrollRail) m_scrollRail->ApplyTheme();
+    ApplyArchiveHeaderAppearance(false);
     m_border->SetBackgroundColour(theme.borderSubtle);
 
     // Cached rows do not get rebuilt on theme changes, so recolor every
@@ -1469,9 +1533,10 @@ void ConversationSidebar::ApplyRowAppearance(RowWidgets& row, bool hovered)
 
     wxColour cardBg = GetRowBackground(row.filePath);
     if (hovered && !active && !selected) {
-        cardBg = MixSidebarColour(
-            SidebarCardBackground(*m_theme),
-            m_theme->sidebarHover, 62);
+        // Exactly the toolbar icons' hover colour (lb_hover_tile.h), so a
+        // hovered chat matches a hovered ⓘ / ⚙.  The old mix toward
+        // sidebarHover was nearly invisible in Nord (2-3 RGB levels).
+        cardBg = LbHoverTile::Highlight(*m_theme);
     }
 
     row.panel->SetBackgroundColour(cardBg);
@@ -1482,8 +1547,8 @@ void ConversationSidebar::ApplyRowAppearance(RowWidgets& row, bool hovered)
     }
 
     const wxColour projectAccent = SidebarProjectAccent(
-        *m_theme, row.projectId, row.hasGoal);
-    const bool neutral = row.projectId.empty() && !row.hasGoal;
+        *m_theme, row.projectId);
+    const bool neutral = row.projectId.empty();
 
     // Assigned projects receive stable, distinct icon colors.  Unassigned
     // rows stay neutral so color always carries meaning rather than becoming
@@ -1627,35 +1692,88 @@ void ConversationSidebar::FilterRows()
 
 void ConversationSidebar::UpdateArchiveButton()
 {
-    if (!m_archiveButton)
+    if (!m_archiveHeader || !m_archiveBackLabel || !m_archiveTitleLabel)
         return;
 
+    // One strip, two directions.  Hidden when nothing is archived: a
+    // permanent "Archived 0" footer looked like an empty toolbar.
+    const wxString tip = m_showArchived
+        ? "Return to your conversations (Esc)"
+        : "Browse archived conversations";
     if (m_showArchived) {
-        m_archiveButton->Show(true);
-        m_archiveButton->SetLabel(
-            wxString::Format("< Back to conversations   (%zu archived)",
-                             m_archivedCount));
-        m_archiveButton->Enable(true);
-        m_archiveButton->SetToolTip(
-            "Return to the normal conversation history. Press Esc to go back.");
-    }
-    else if (m_archivedCount > 0) {
-        m_archiveButton->Show(true);
-        m_archiveButton->SetLabel(
-            wxString::Format("Archived   %zu", m_archivedCount));
-        m_archiveButton->Enable(true);
-        m_archiveButton->SetToolTip(
-            "Browse archived conversations.");
+        m_archiveBackLabel->SetLabel(
+            wxString::FromUTF8("\xE2\x86\x90  Back to chats"));      // ←
+        m_archiveTitleLabel->SetLabel(
+            wxString::Format(wxString::FromUTF8("ARCHIVED \xC2\xB7 %zu"),
+                             m_archivedCount));                     // ·
     }
     else {
-        // A permanently disabled "Archived 0" footer looked like an empty
-        // toolbar and consumed useful height.  Hide it until it has work to do.
-        m_archiveButton->Enable(false);
-        m_archiveButton->Show(false);
+        m_archiveBackLabel->SetLabel("Archived chats");
+        m_archiveTitleLabel->SetLabel(
+            wxString::Format(wxString::FromUTF8("%zu  \xE2\x86\x92"),
+                             m_archivedCount));                     // →
+    }
+    m_archiveHeader->SetToolTip(tip);
+    m_archiveBackLabel->SetToolTip(tip);
+    m_archiveTitleLabel->SetToolTip(tip);
+
+    const bool show = m_showArchived || m_archivedCount > 0;
+    if (m_archiveHeader->IsShown() != show) {
+        m_archiveHeader->Show(show);
+        ApplyArchiveHeaderAppearance(false);
+    }
+    m_archiveHeader->Layout();
+
+    // Keep an idle placeholder in sync with the current view.
+    if (m_searchHintActive && m_searchBox)
+        m_searchBox->ChangeValue(m_showArchived
+            ? "Search archived..."
+            : "Search conversations...");
+
+    if (wxSizer* sizer = m_archiveHeader->GetContainingSizer())
+        sizer->Layout();
+}
+
+void ConversationSidebar::SetArchiveMode(bool showArchived)
+{
+    if (showArchived && m_archivedCount == 0)
+        showArchived = false;
+    if (showArchived == m_showArchived)
+        return;
+
+    m_showArchived = showArchived;
+    ClearSelection();
+    ClearSearch();
+    ShowSearchHint();
+    Refresh(m_activeFilePath);
+}
+
+void ConversationSidebar::ApplyArchiveHeaderAppearance(bool hovered)
+{
+    if (!m_archiveHeader || !m_theme)
+        return;
+
+    // Same card surface as the conversation rows, washed slightly with the
+    // accent so the strip reads as "you are in a different view".  Hover
+    // uses the shared lift so it matches the toolbar icons.
+    const wxColour rest = MixSidebarColour(
+        SidebarCardBackground(*m_theme), m_theme->accentButton, 14);
+    const wxColour bg = hovered ? LbHoverTile::Surface(*m_theme, rest) : rest;
+
+    m_archiveHeader->SetBackgroundColour(bg);
+    if (m_archiveHeaderAccent)
+        m_archiveHeaderAccent->SetBackgroundColour(m_theme->accentButton);
+    if (m_archiveBackLabel) {
+        m_archiveBackLabel->SetBackgroundColour(bg);
+        m_archiveBackLabel->SetForegroundColour(
+            hovered ? LbInteractiveAccent(*m_theme) : m_theme->textPrimary);
+    }
+    if (m_archiveTitleLabel) {
+        m_archiveTitleLabel->SetBackgroundColour(bg);
+        m_archiveTitleLabel->SetForegroundColour(m_theme->textMuted);
     }
 
-    if (wxSizer* sizer = m_archiveButton->GetContainingSizer())
-        sizer->Layout();
+    m_archiveHeader->Refresh();
 }
 
 void ConversationSidebar::ShowSearchHint()
@@ -1666,7 +1784,8 @@ void ConversationSidebar::ShowSearchHint()
     }
 
     m_searchHintActive = true;
-    m_searchBox->ChangeValue("Search conversations...");
+    m_searchBox->ChangeValue(m_showArchived ? "Search archived..."
+                                            : "Search conversations...");
     if (m_theme)
         m_searchBox->SetForegroundColour(m_theme->textMuted);
 }
@@ -1829,7 +1948,6 @@ ConversationSidebar::ScanConversations()
             entry.title         = cachedIt->second.title;
             entry.projectId     = cachedIt->second.projectId;
             entry.projectName   = cachedIt->second.projectName;
-            entry.goalObjective = cachedIt->second.goalObjective;
             entry.pinned        = cachedIt->second.pinned;
             entry.archived      = cachedIt->second.archived;
             if (cachedIt->second.activityTimeMs > 0) {
@@ -1858,7 +1976,7 @@ ConversationSidebar::ScanConversations()
                 std::ifstream file(path_safety::Utf8ToWide(entry.filePath), std::ios::in);
                 if (file.is_open()) {
                     bool sawTitle = false, sawProjectId = false, sawProjectName = false;
-                    bool sawObjective = false, sawUpdatedAt = false;
+                    bool sawUpdatedAt = false;
                     auto extractStringField = [](const std::string& line,
                                                  const std::string& key,
                                                  std::string& out) -> bool {
@@ -1999,14 +2117,6 @@ ConversationSidebar::ScanConversations()
                             sawProjectId = true;
                         if (!sawProjectName && extractStringField(line, "project_name", entry.projectName))
                             sawProjectName = true;
-                        // "objective" lives one level down inside the "goal"
-                        // object, which SaveToFile writes before "messages".
-                        // extractStringField keys off the first token on the
-                        // line, so the indented "objective": line still
-                        // matches, and the key is unique (the contract block
-                        // has no "objective"), so there's no ambiguity.
-                        if (!sawObjective && extractStringField(line, "objective", entry.goalObjective))
-                            sawObjective = true;
                         if (!sawUpdatedAt) {
                             std::string updatedAt;
                             if (extractStringField(line, "updated_at", updatedAt)) {
@@ -2030,13 +2140,10 @@ ConversationSidebar::ScanConversations()
 
                         // Definitive terminator: "messages" is always the last
                         // top-level key SaveToFile writes, after every field the
-                        // sidebar reads (title/project/pinned/archived/updated_at
-                        // and the goal object holding objective).  Stopping here
-                        // is order-independent — it does not depend on a goal's
-                        // "objective" existing, so it also avoids scanning the
-                        // whole (large) message body for goal-less chats — and it
-                        // cannot skip a pinned/archived flag no matter how the
-                        // metadata keys in chat_history.cpp are later reordered.
+                        // sidebar reads (title/project/pinned/archived/updated_at).
+                        // Stopping here is order-independent and cannot skip a
+                        // pinned/archived flag no matter how the metadata keys in
+                        // chat_history.cpp are later reordered.
                         {
                             size_t firstToken =
                                 line.find_first_not_of(" \t");
@@ -2044,16 +2151,6 @@ ConversationSidebar::ScanConversations()
                                 line.compare(firstToken, 10, "\"messages\"") == 0) {
                                 break;
                             }
-                        }
-
-                        // Fast path for the common goal-bearing chat: once every
-                        // required field is in hand we can stop early rather than
-                        // waiting for the messages line.  Goal-less chats fall
-                        // through to the messages terminator above.
-                        if (sawTitle && sawProjectId && sawProjectName &&
-                            sawObjective && sawUpdatedAt &&
-                            !IsLegacySessionContextTitle(entry.title)) {
-                            break;
                         }
                     }
                 }
@@ -2074,7 +2171,7 @@ ConversationSidebar::ScanConversations()
             // (the exact bug this fix closes).
             m_metaCache[entry.filePath] = {
                 entry.title, entry.projectId, entry.projectName,
-                entry.goalObjective, entry.pinned, entry.archived,
+                entry.pinned, entry.archived,
                 (entry.hasActivityTime && entry.modTime.IsValid())
                     ? entry.modTime.GetValue().GetValue()
                     : 0,
@@ -2328,12 +2425,11 @@ ConversationSidebar::CreateProjectHeader(const std::string& groupId,
 
     // ── Right-click → header context menu ──────────────────────
     // Frame builds the popup (Attach this chat / open folders /
-    // delete project).  Sentinel sections (Unassigned, Goals) pass an
-    // empty groupId up so the frame shows nothing — neither is a real
-    // project, so there are no project actions to offer.
+    // delete project).  The Unassigned sentinel passes an empty groupId
+    // up so the frame shows nothing — it is not a real project, so there
+    // are no project actions to offer.
     const std::string contextId =
-        (groupId == kUnassignedId || groupId == kGoalsId)
-            ? std::string() : groupId;
+        (groupId == kUnassignedId) ? std::string() : groupId;
     auto rightClickMenu =
         [this, contextId, panel = header.panel](wxMouseEvent&) {
             if (m_callbacks.onProjectHeaderContextMenuRequested) {
@@ -2352,15 +2448,7 @@ ConversationSidebar::CreateProjectHeader(const std::string& groupId,
     // a project via DnD.  The OS routes drops over child static-text
     // widgets up to the parent panel since the children have no drop
     // target of their own.
-    //
-    // The Goals section is deliberately NOT a drop target: membership
-    // there is derived from whether a chat has a goal, which can't be
-    // set by dragging.  Without a target the OS shows the no-drop cursor
-    // over it, which is the correct affordance.  (OnChatsDroppedOnHeader
-    // also guards kGoalsId defensively in case the wiring ever changes.)
-    if (groupId != kGoalsId) {
-        header.panel->SetDropTarget(new HeaderDropTarget(this, groupId));
-    }
+    header.panel->SetDropTarget(new HeaderDropTarget(this, groupId));
 
     return header;
 }
@@ -2397,18 +2485,6 @@ void ConversationSidebar::UpdateProjectHeader(HeaderWidgets& header,
 
     if (header.panel) {
         header.panel->Layout();
-    }
-}
-
-void ConversationSidebar::RemoveProjectHeader(const std::string& groupId)
-{
-    auto it = m_projectHeaders.find(groupId);
-    if (it == m_projectHeaders.end()) return;
-
-    if (it->second.panel) {
-        m_listSizer->Detach(it->second.panel);
-        it->second.panel->Destroy();
-        it->second.panel = nullptr;
     }
 }
 
@@ -2472,17 +2548,6 @@ void ConversationSidebar::UpdateDateHeader(DateHeaderWidgets& header,
         header.label->SetLabel(wxString::FromUTF8(displayLabel.c_str()));
     if (header.panel)
         header.panel->Layout();
-}
-
-void ConversationSidebar::RemoveDateHeader(const std::string& key)
-{
-    auto it = m_dateHeaders.find(key);
-    if (it == m_dateHeaders.end()) return;
-    if (it->second.panel) {
-        m_listSizer->Detach(it->second.panel);
-        it->second.panel->Destroy();
-        it->second.panel = nullptr;
-    }
 }
 
 void ConversationSidebar::OnProjectHeaderClicked(const std::string& groupId)
@@ -2573,13 +2638,6 @@ void ConversationSidebar::OnChatsDroppedOnHeader(
     if (!m_callbacks.onChatsDroppedOnProject) return;
     if (paths.empty()) return;
 
-    // The Goals section isn't a real bucket you can drop into — its
-    // membership comes from each chat's goal state, not from project
-    // assignment.  The header has no drop target installed, so this
-    // shouldn't fire for it, but guard anyway so a stray drop can never
-    // be misread as "clear project."
-    if (groupId == kGoalsId) return;
-
     // Translate the Unassigned sentinel back to the empty-string
     // convention MoveChatsToProject already uses.  The frame doesn't
     // know about kUnassignedId — keep that abstraction local.
@@ -2602,15 +2660,12 @@ ConversationSidebar::CreateRow(const ConversationEntry& entry)
     row.hasActivityTime = entry.hasActivityTime;
     row.projectId = entry.projectId;
     row.projectName = entry.projectName;
-    row.hasGoal = !entry.goalObjective.empty();
     row.pinned = entry.pinned;
     row.archived = entry.archived;
     row.dateBucketId = DateBucketIdFor(entry.modTime, entry.pinned,
                                        entry.hasActivityTime);
     if (!entry.projectId.empty())
         row.groupId = entry.projectId;
-    else if (row.hasGoal)
-        row.groupId = kGoalsId;
     else
         row.groupId = kUnassignedId;
 
@@ -2690,9 +2745,9 @@ ConversationSidebar::CreateRow(const ConversationEntry& entry)
     metadataSizer->AddStretchSpacer(1);
 
     const std::string projectTagText = SidebarProjectTagText(
-        row.projectId, row.projectName, row.hasGoal);
+        row.projectId, row.projectName);
     const wxColour projectAccent = SidebarProjectAccent(
-        *m_theme, row.projectId, row.hasGoal);
+        *m_theme, row.projectId);
     row.projectTag = new SidebarProjectTag(
         row.panel, projectTagText,
         MixSidebarColour(SidebarCardBackground(*m_theme),
@@ -2917,46 +2972,28 @@ void ConversationSidebar::UpdateRow(RowWidgets& row,
             row.timeLabel->SetLabel(wxString::FromUTF8(newTime.c_str()));
     }
 
-    const bool newHasGoal = !entry.goalObjective.empty();
     const bool projectMetadataChanged =
         row.projectId != entry.projectId ||
-        row.projectName != entry.projectName ||
-        row.hasGoal != newHasGoal;
+        row.projectName != entry.projectName;
 
     row.projectId = entry.projectId;
     row.projectName = entry.projectName;
-    row.hasGoal = newHasGoal;
     row.pinned = entry.pinned;
     row.archived = entry.archived;
     row.dateBucketId = DateBucketIdFor(entry.modTime, entry.pinned,
                                        entry.hasActivityTime);
     if (!entry.projectId.empty())
         row.groupId = entry.projectId;
-    else if (newHasGoal)
-        row.groupId = kGoalsId;
     else
         row.groupId = kUnassignedId;
 
     if (projectMetadataChanged && row.projectTag) {
         static_cast<SidebarProjectTag*>(row.projectTag)->SetTagText(
-            SidebarProjectTagText(row.projectId, row.projectName, row.hasGoal));
+            SidebarProjectTagText(row.projectId, row.projectName));
         row.panel->Layout();
     }
 
     ApplyRowAppearance(row, false);
-}
-
-void ConversationSidebar::RemoveRow(const std::string& filePath)
-{
-    auto found = m_rows.find(filePath);
-    if (found == m_rows.end())
-        return;
-
-    if (found->second.panel) {
-        m_listSizer->Detach(found->second.panel);
-        found->second.panel->Destroy();
-        found->second.panel = nullptr;
-    }
 }
 
 // ═══════════════════════════════════════════════════════════════════

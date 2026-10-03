@@ -9,6 +9,10 @@
       <UniqueIdentifier>{93995380-89BD-4b04-88EB-625FBE52EBFB}</UniqueIdentifier>
       <Extensions>h;hh;hpp;hxx;h++;hm;inl;inc;ipp;xsd</Extensions>
     </Filter>
+    <Filter Include="Python Scripts">
+      <UniqueIdentifier>{3E6B2C1A-5D7F-4B8E-9A21-6C4F0D8E7B35}</UniqueIdentifier>
+      <Extensions>py</Extensions>
+    </Filter>
     <Filter Include="Resource Files">
       <UniqueIdentifier>{67DA6AB6-F800-4c08-8B7A-83BB121AAD01}</UniqueIdentifier>
       <Extensions>rc;ico;cur;bmp;dlg;rc2;rct;bin;rgs;gif;jpg;jpeg;jpe;resx;tiff;tif;png;wav;mfcribbon-ms</Extensions>
@@ -87,6 +91,9 @@
     <ClCompile Include="python_runner.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="python_session.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="python_arg_policy.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -106,6 +113,9 @@
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="tool_read.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="var_store.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="tool_ls.cpp">
@@ -159,9 +169,6 @@
     <ClCompile Include="agent_controller.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="wait_executor.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
     <ClCompile Include="path_safety.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -174,16 +181,13 @@
     <ClCompile Include="project_status_strip.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="activity_strip.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="skill_authoring_support.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="skill_prompt_builder.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="goal_prompt_builder.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="goal_controller.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="skill_draft_controller.cpp">
@@ -193,9 +197,6 @@
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="agent_prompt_builder.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="goal_verifier_support.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="python_package_recovery.cpp">
@@ -211,6 +212,12 @@
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="lb_update_ui.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="update_installer.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="lb_about_dialog.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="lb_project_ui_actions.cpp">
@@ -296,6 +303,9 @@
     <ClInclude Include="widgets.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="attachment_chip.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="ui_event_post.h">
       <Filter>Header Files</Filter>
     </ClInclude>
@@ -323,6 +333,9 @@
     <ClInclude Include="python_runner.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="python_session.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="python_arg_policy.h">
       <Filter>Header Files</Filter>
     </ClInclude>
@@ -345,6 +358,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="tool_read.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="var_store.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="tool_ls.h">
@@ -401,9 +417,6 @@
     <ClInclude Include="agent_controller.h">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="wait_executor.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
     <ClInclude Include="tool_block.h">
       <Filter>Header Files</Filter>
     </ClInclude>
@@ -422,7 +435,7 @@
     <ClInclude Include="project_status_strip.h">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="goal_state.h">
+    <ClInclude Include="activity_strip.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="lb_string_utils.h">
@@ -434,12 +447,6 @@
     <ClInclude Include="skill_prompt_builder.h">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="goal_prompt_builder.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="goal_controller.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
     <ClInclude Include="skill_draft_controller.h">
       <Filter>Header Files</Filter>
     </ClInclude>
@@ -447,9 +454,6 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="agent_prompt_builder.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="goal_verifier_support.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="python_package_recovery.h">
@@ -462,6 +466,15 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="lb_update_ui.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="lb_background_threads.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="update_installer.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="lb_about_dialog.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="lb_project_ui_actions.h">
@@ -482,7 +495,19 @@
     <ClInclude Include="lb_themed_dialogs.h">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="reminder_store.h">
+    <ClInclude Include="tool_call_elision.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="elision_budget.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="copy_line_fold.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="progress_output_fold.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="python_resources.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>
@@ -495,5 +520,67 @@
     <Image Include="app_icon.ico">
       <Filter>Resource Files</Filter>
     </Image>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="settings_icon.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="lb_hover_tile.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="lb_scroll_rail.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <None Include="assets\icons\LlamaBoss_Cogwheel.svg">
+      <Filter>Resource Files</Filter>
+    </None>
+    <None Include="python_helpers.rc2">
+      <Filter>Resource Files</Filter>
+    </None>
+    <None Include="assets\python\python_health.py">
+      <Filter>Python Scripts</Filter>
+    </None>
+    <None Include="assets\python\csv_inspect.py">
+      <Filter>Python Scripts</Filter>
+    </None>
+    <None Include="assets\python\csv_report.py">
+      <Filter>Python Scripts</Filter>
+    </None>
+    <None Include="assets\python\csv_to_xlsx.py">
+      <Filter>Python Scripts</Filter>
+    </None>
+    <None Include="assets\python\xlsx_create_workbook.py">
+      <Filter>Python Scripts</Filter>
+    </None>
+    <None Include="assets\python\xlsx_inspect.py">
+      <Filter>Python Scripts</Filter>
+    </None>
+    <None Include="assets\python\xlsx_report.py">
+      <Filter>Python Scripts</Filter>
+    </None>
+    <None Include="assets\python\pdf_extract_text.py">
+      <Filter>Python Scripts</Filter>
+    </None>
+    <None Include="assets\python\pdf_inspect_form.py">
+      <Filter>Python Scripts</Filter>
+    </None>
+    <None Include="assets\python\pdf_fill_form.py">
+      <Filter>Python Scripts</Filter>
+    </None>
+    <None Include="assets\python\docx_extract_text.py">
+      <Filter>Python Scripts</Filter>
+    </None>
+    <None Include="assets\python\docx_inspect.py">
+      <Filter>Python Scripts</Filter>
+    </None>
+    <None Include="assets\python\zip_inspect.py">
+      <Filter>Python Scripts</Filter>
+    </None>
+    <None Include="assets\python\zip_extract.py">
+      <Filter>Python Scripts</Filter>
+    </None>
+    <None Include="assets\python\lb_kernel.py">
+      <Filter>Python Scripts</Filter>
+    </None>
   </ItemGroup>
 </Project>

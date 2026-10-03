@@ -38,11 +38,15 @@ struct AttachmentInfo {
 // ═══════════════════════════════════════════════════════════════════
 
 struct PendingAttachment {
-    enum class Type { Image, TextFile, PdfFile, SpreadsheetFile, DocxFile, CsvFile, ZipFile };
+    enum class Type { Image, TextFile, TextFileRef, PdfFile, SpreadsheetFile, DocxFile, CsvFile, ZipFile };
     Type        type;
     std::string data;           // base64 for images, raw text for text files
     std::string name;           // display filename
     size_t      originalSize = 0;
+    // Set only for auto-attached clipboard text. Keep raw data for ordinary
+    // chat; agent-mode sends can use the saved file instead. Absolute so /cd
+    // changes between paste and Send cannot redirect retrieval.
+    std::string pastedTextPath;
 };
 
 // ═══════════════════════════════════════════════════════════════════
@@ -51,7 +55,7 @@ class AttachmentManager
 {
 public:
     // Callback fired whenever the pending list changes (add, remove, clear).
-    // The frame responds by reading GetDisplayLabel() / GetCount() and
+    // The frame responds by reading GetCount() / the pending items and
     // updating its indicator UI accordingly.
     using OnChangedCallback = std::function<void()>;
 
@@ -68,6 +72,20 @@ public:
     bool AttachImageFromBase64(const std::string& base64,
                                const std::string& displayName);
     bool AttachTextFile(const std::string& filePath);
+    // Caller has already saved these exact UTF-8 bytes to filePath.
+    bool AttachPastedText(const std::string& content,
+                          const std::string& filePath);
+    // RLM Phase B: large text files route like CSV/PDF (workspace
+    // import + handle card), NOT an inline bake.  `filePath` is the
+    // absolute path of the workspace copy prepared by
+    // DropImportController; `toolRelativePath` is the safe relative
+    // form quoted in the card.  The file is read ONCE here to build
+    // the varstore handle card (shape report + head/tail preview);
+    // the card — not the content — is what BakeTextFileRefsIntoMessage
+    // later injects.  UTF-16 sources are detected and noted on the
+    // card (the on-disk copy is not rewritten).
+    bool AttachTextFileRef(const std::string& filePath,
+                           const std::string& toolRelativePath);
     bool AttachPdfFile(const std::string& filePath,
                        const std::string& toolRelativePath = std::string());
     bool AttachSpreadsheetFile(const std::string& filePath,
@@ -96,6 +114,7 @@ public:
     bool   HasPending()  const { return !m_pending.empty(); }
     bool   HasImage()    const;    // true if any pending item is an image
     bool   HasTextFile() const;    // true if any pending item is a text file
+    bool   HasTextFileRef() const; // true if any pending item is a large-text handle
     bool   HasPdfFile()  const;    // true if any pending item is a PDF file
     bool   HasSpreadsheetFile() const; // true if any pending item is a spreadsheet
     bool   HasDocxFile()        const; // true if any pending item is a Word document
@@ -104,12 +123,6 @@ public:
     size_t GetCount()    const { return m_pending.size(); }
 
     const PendingAttachment& GetAt(size_t index) const { return m_pending.at(index); }
-
-    // Display label for the attachment indicator bar.
-    //   1 item:   "  [img]  photo.png" / "  [file] main.cpp"
-    //   N items:  "  [files] 3 files: photo.png, main.cpp, utils.h"
-    //   0 items:  ""
-    std::string GetDisplayLabel() const;
 
     // All pending filenames (for building chat display prefixes).
     std::vector<std::string> GetFileNames() const;
@@ -121,7 +134,17 @@ public:
 
     // Bakes ALL pending text files into the message as code-fenced blocks.
     // Images are skipped (they go through InjectImagesIntoRequest instead).
-    std::string BakeTextFilesIntoMessage(const std::string& userText) const;
+    // Auto-attached pastes use file references only when tools are available
+    // for this Send. Other text attachments keep their existing behavior.
+    std::string BakeTextFilesIntoMessage(const std::string& userText,
+                                         bool usePastedFileReferences = false) const;
+
+    // Bakes large-text handle cards into the message without dumping
+    // the file contents.  The card (built at attach time by varstore)
+    // tells the model the file's workspace path, shape, and preview,
+    // and coaches grep/python navigation — the Phase B mirror of the
+    // tool-result demotion path.
+    std::string BakeTextFileRefsIntoMessage(const std::string& userText) const;
 
     // Bakes PDF attachment routing hints into the message without dumping
     // extracted PDF text into the visible chat. In agent mode this gives the
@@ -178,9 +201,7 @@ public:
 
     static bool IsImageFile(const std::string& path);
     static bool IsTextFile(const std::string& path);
-    static bool IsPdfFile(const std::string& path);
     static bool IsSpreadsheetFile(const std::string& path);
-    static bool IsDocxFile(const std::string& path);
     // NOTE: callers must test IsCsvFile BEFORE IsTextFile when
     // classifying a dropped/picked file — CSV gets workspace routing,
     // and IsTextFile no longer claims the extension.
@@ -189,6 +210,7 @@ public:
     static std::string GuessMimeType(const std::string& filename);
 
     static constexpr size_t kMaxTextFileBytes = 100 * 1024;        // 100 KB
+    static constexpr size_t kMaxPastedTextBytes = 64 * 1024 * 1024; // 64 MiB
     static constexpr size_t kMaxImageBytes    = 50 * 1024 * 1024;  // 50 MB
     static constexpr size_t kMaxAttachments   = 10;                // Max pending files
 

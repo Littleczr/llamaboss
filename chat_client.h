@@ -18,6 +18,8 @@
 
 // Inference target descriptor (transport URL/path/tls/auth/protocol).
 #include "inference_target.h"
+// Per-turn token counts, timings and speeds.
+#include "turn_stats.h"
 
 // Custom events for thread communication
 wxDECLARE_EVENT(wxEVT_ASSISTANT_DELTA, wxCommandEvent);
@@ -50,19 +52,30 @@ public:
     explicit AssistantCompletePayload(std::string toolCallsJson,
                                       long promptTokens     = -1,
                                       long completionTokens = -1,
-                                      std::vector<std::string> imageDataUrls = {})
+                                      std::vector<std::string> imageDataUrls = {},
+                                      std::string responsesOutputJson = {})
         : m_toolCallsJson(std::move(toolCallsJson))
         , m_promptTokens(promptTokens)
         , m_completionTokens(completionTokens)
-        , m_imageDataUrls(std::move(imageDataUrls)) {}
+        , m_imageDataUrls(std::move(imageDataUrls))
+        , m_responsesOutputJson(std::move(responsesOutputJson)) {}
 
     const std::string& ToolCallsJson() const { return m_toolCallsJson; }
+
+    // OpenAI Responses (Phase 2): the verbatim `output` array of the
+    // completed response when it contained at least one function_call.
+    // Carries the model's encrypted reasoning items, which the next
+    // request in the tool loop must replay (store:false).  Persisted by
+    // ChatHistory::SetLastAssistantResponsesOutput; empty on every other
+    // lane and on tool-free Responses turns.
+    const std::string& ResponsesOutputJson() const
+    { return m_responsesOutputJson; }
 
     // Generated images from an image-output model (OpenRouter
     // chat-completions image generation).  Each entry is a base64
     // data URL exactly as it arrived on the stream's `images` field
     // ("data:image/png;base64,....").  Decoding and disk persistence
-    // happen on the UI thread — the workflow folder is keyed on the
+    // happen on the UI thread — the chat folder is keyed on the
     // conversation's file path, which only the frame knows (and may
     // have to create via autosave first).  Empty for text turns.
     const std::vector<std::string>& ImageDataUrls() const
@@ -87,11 +100,18 @@ public:
     long PromptTokens()     const { return m_promptTokens; }
     long CompletionTokens() const { return m_completionTokens; }
 
+    // Timings, detailed usage and derived speeds for this turn (see
+    // turn_stats.h).  Always set by the worker on a completed turn.
+    const TurnStats& Stats() const { return m_stats; }
+    void SetStats(const TurnStats& stats) { m_stats = stats; }
+
 private:
+    TurnStats m_stats;
     std::string m_toolCallsJson;
     long m_promptTokens     = -1;
     long m_completionTokens = -1;
     std::vector<std::string> m_imageDataUrls;
+    std::string m_responsesOutputJson;
 };
 
 // Forward declarations
