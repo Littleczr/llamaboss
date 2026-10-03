@@ -135,8 +135,8 @@ cd llamaboss
 Open `LlamaBoss.slnx`, restore dependencies through vcpkg, and build **Release |
 x64**. `LlamaBoss.vcxproj` is the application; `Tests/LlamaBossTests` is the native
 regression runner. Build the app project alone if you only need the application.
-The test runner's baseline JSON case files were not included in this source
-snapshot; see its README before running it.
+The native regression project ships its maintained JSON case files in
+`Tests/LlamaBossTests/Cases`; see its README for the complete run instructions.
 
 The embedded Python resources must remain UTF-8 without a BOM and use LF line
 endings. `.gitattributes` preserves that on Windows checkouts.

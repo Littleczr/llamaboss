@@ -1,0 +1,56 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {
+      "name": "R0_S3_Prompt_Requires_Persistent_Python_For_Arithmetic",
+      "action": "source_contract",
+      "input": {
+        "path": "agent_prompt_builder.cpp"
+      },
+      "expect": {
+        "contains": [
+          "Example (run Python in the PERSISTENT session",
+          "<name>py</name>",
+          "<args>total = 285000 + 120000 + 48000 + 60000\\n",
+          "py runs Python code in a PERSISTENT per-conversation session",
+          "Compute them with a py call that ends with the final expression, and report the printed result. This applies especially when finalizing figures gathered with grep and read_range.",
+          "Compute them with a py call that ends with the final expression, and report the printed result -- especially when finalizing figures gathered with grep and read_range."
+        ],
+        "not_contains": [
+          "<n>py</n>"
+        ],
+        "occurrences": [
+          {
+            "text": "<name>py</name>",
+            "count": 1
+          },
+          {
+            "text": "Arithmetic rule:",
+            "count": 2
+          }
+        ]
+      }
+    },
+    {
+      "name": "R0_S3_Python_Kernel_Keeps_State_And_Prints_Final_Expression",
+      "action": "source_contract",
+      "input": {
+        "path": "python_session.cpp"
+      },
+      "expect": {
+        "contains": [
+          "ns = {\"__name__\": \"__main__\", \"__builtins__\": __builtins__}",
+          "resp = run_exec(rid, req.get(\"code\", \"\"), ns,",
+          "ns[\"_\"] = val",
+          "print(repr(val))"
+        ],
+        "occurrences": [
+          {
+            "text": "ns = {\"__name__\": \"__main__\", \"__builtins__\": __builtins__}",
+            "count": 1
+          }
+        ]
+      }
+    }
+  ]
+}

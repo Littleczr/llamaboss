@@ -17,10 +17,10 @@ You can instead pass an absolute path to your maintained Cases directory.
 Use `--help` to inspect runner options. The runner writes `RESULTS.md` and
 `results.json` into its configured result directory.
 
-**The 2026-10-03 source snapshot did not include the baseline JSON case files.**
-Restore the maintained cases before running the command above. An empty Cases
-directory is an error, not a passing regression run. Do not substitute invented
-cases or report a successful full suite from a reduced case set.
+The repository includes the maintained baseline JSON cases under
+`Tests/LlamaBossTests/Cases`. The runner discovers every `.json` file there;
+keep that full set when reporting the complete regression suite. An empty Cases
+directory is a runner error, not a passing regression run.
 
 ## Portable harnesses
 

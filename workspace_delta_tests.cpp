@@ -48,16 +48,14 @@ int main()
           std::to_string(before.files.size()) + " files)");
     CHECK(!before.capped, "snapshot: not capped on small tree");
 
-    // ── No-change diff: the explicit negative ──
+    // ── No-change diff: a complete clean scan has no manifest ──
     {
         workspace_delta::Snapshot after = workspace_delta::TakeSnapshot(root);
         workspace_delta::Delta d = workspace_delta::Diff(before, after);
         CHECK(d.created.empty() && d.modified.empty(),
               "diff: clean run shows no changes");
         std::string m = workspace_delta::FormatManifest(d, after, root);
-        CHECK(m.find("[workspace changes]") != std::string::npos &&
-              m.find("no files were created or modified") != std::string::npos,
-              "manifest: explicit negative on no-op run");
+        CHECK(m.empty(), "manifest: empty when no changes");
     }
 
     // ── Created + modified ──

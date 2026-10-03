@@ -1,0 +1,82 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {
+      "name": "SingleRangeReturnsExactLines",
+      "action": "read_ranges",
+      "setup": {
+        "file": "numbered.txt",
+        "numbered_lines": 100
+      },
+      "input": {
+        "path": "numbered.txt",
+        "ctx_tokens": 131072,
+        "ranges": [
+          { "start": 25, "end": 30 }
+        ]
+      },
+      "expect": {
+        "success": true,
+        "body_mode": "numbered_lines"
+      }
+    },
+    {
+      "name": "MultiRangePreservesOrderAndLabels",
+      "action": "read_ranges",
+      "setup": {
+        "file": "numbered.txt",
+        "numbered_lines": 6000
+      },
+      "input": {
+        "path": "numbered.txt",
+        "ctx_tokens": 131072,
+        "ranges": [
+          { "start": 1, "end": 3 },
+          { "start": 4998, "end": 5002 },
+          { "start": 5998, "end": 6000 }
+        ]
+      },
+      "expect": {
+        "success": true,
+        "body_mode": "numbered_ranges",
+        "history_inline_budget_bytes": 49152
+      }
+    },
+    {
+      "name": "MultiRangeRejectsMoreThan1000CombinedLines",
+      "action": "read_ranges",
+      "setup": {
+        "file": "numbered.txt",
+        "numbered_lines": 1100
+      },
+      "input": {
+        "path": "numbered.txt",
+        "ctx_tokens": 131072,
+        "ranges": [
+          { "start": 1, "end": 500 },
+          { "start": 501, "end": 1000 },
+          { "start": 1001, "end": 1001 }
+        ]
+      },
+      "expect": {
+        "success": false,
+        "body_mode": "empty",
+        "error_contains": "exceeds 1000 lines"
+      }
+    },
+    {
+      "name": "GrepParsesPatternContainingSpacesAndColon",
+      "action": "parse_grep",
+      "input": {
+        "args": "\"Record key: PA-17\" raw2.txt",
+        "max_context_lines": 50
+      },
+      "expect": {
+        "pattern": "Record key: PA-17",
+        "path": "raw2.txt",
+        "context_lines": 0,
+        "error": ""
+      }
+    }
+  ]
+}
