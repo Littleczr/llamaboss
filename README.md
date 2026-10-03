@@ -1,289 +1,146 @@
 # LlamaBoss
 
-**LlamaBoss** is a private local desktop AI assistant for Windows. It is built
-for local LLMs, real files, projects, reusable skills, and approval-gated
-tools.
+**LlamaBoss** is a native Windows desktop AI assistant for local models, real
+files, projects, reusable skills, and tools with approval controls. It is built
+with C++ and wxWidgets and can also use remote OpenAI-compatible connections.
 
-> Current milestone: **LlamaBoss Beta v0.1.11**
+| Version | Status |
+| --- | --- |
+| Source in this repository | **0.1.20** development snapshot |
+| Published Windows installer | **0.1.19**, available from [llamaboss.com](https://llamaboss.com/) |
 
-LlamaBoss is designed for people who want an AI assistant that can help with
-documents, spreadsheets, PDFs, scripts, project files, and repeatable workflows
-while keeping control on the local machine.
+Source updates and installer releases are separate. The website is the current
+download destination; older GitHub releases do not represent the latest installer.
 
-## What LlamaBoss does
+- [Download and setup](https://llamaboss.com/)
+- [Product documentation](https://llamaboss.com/docs/)
+- [Native regression suite](Tests/LlamaBossTests/README_TESTS.md)
 
-- Runs as a native Windows desktop app built with C++ and wxWidgets
-- Uses an app-owned local llama.cpp-style model service (bundled runtimes in
-  release builds)
-- Supports multiple independent chat windows that can share one local-model
-  service
-- Chats with local GGUF models and configurable model folders
-- Supports OpenAI-compatible remote endpoints and Connections when you choose
-  to use them
-- Imports and works with local files, including PDF, DOCX, spreadsheet, CSV,
-  ZIP, and general document workflows
-- Creates per-chat workflow folders for generated artifacts
-- Supports long-lived Projects with their own files, notes, sources,
-  templates, outputs, and workflows
-- Supports reusable global Skills for cross-project procedures
-- Includes Agent Mode with readable approval controls for tool actions
-- Includes Goals with multi-step progress and verification
-- Uses approval cards before risky actions such as script creation, script
-  execution, deletion, package installation, and other controlled write
-  operations
-- Provides helper tools for common office-style work: CSV, XLSX, PDF, DOCX,
-  Python scripts, notes, and file operations
+## What you can do
 
-## Download and docs
+- Chat with local GGUF models through an app-owned llama.cpp service, with
+  streaming responses, image attachments, conversation search, and multiple
+  independent windows sharing the service.
+- Configure remote connections, including direct OpenAI Responses support.
+  Remote requests send the selected conversation data to the configured service.
+- Download local models from direct HTTPS links in Settings and choose context,
+  reasoning, and KV-cache settings for supported models.
+- Give Agent Mode file, search, document, Python, and PowerShell tasks, with
+  readable approval cards for actions that require review.
+- Inspect and create CSV/XLSX files, extract PDF/DOCX text, inspect and fill PDF
+  forms, and generate artifacts with embedded Python helpers.
+- Keep long-lived Projects with instructions, sources, templates, outputs,
+  workflows, and notes, and import/export reusable Skills.
+- Schedule persistent reminders and use bounded waits to monitor ongoing work.
+- Benchmark text-model generation with `/bench`, with results under
+  `Shared/Benchmarks`.
 
-- Website / installer: [https://llamaboss.com/](https://llamaboss.com/)
-- Product documentation: [https://llamaboss.com/docs/](https://llamaboss.com/docs/)
+Goals and `/goal` have been retired. Use ordinary chat or Agent Mode for
+multi-step work; the [documentation](https://llamaboss.com/docs/) includes
+migration guidance. The old collection of typed file/tool commands is also
+retired: ask the assistant to use its tools instead.
 
-## Beta status
+## Projects and Skills
 
+Projects live under `%USERPROFILE%\LlamaBoss\Projects`. Each project can contain
+`PROJECT.md`, `project.json`, `Sources`, `Templates`, `Notes`, `Outputs`, and
+`Workflows`. Attach a project to a chat to use its instructions and files.
 
-LlamaBoss is currently beta software. The core direction is stable, but feature
-names, workflows, file handling, installer behavior, and UI details may change
-before a stable release.
+Global notes live in `%USERPROFILE%\LlamaBoss\NOTES.md`; project notes live in
+`Notes/NOTES.md`. Saving a note with a project active stores the full note in
+the project and a compact pointer in global notes.
 
-Use caution with important files. LlamaBoss is intentionally built around
-approvals and local-first control, but beta builds should still be tested on
-copies of important documents.
+Skills live under `%USERPROFILE%\LlamaBoss\Skills`. A Skill has a `SKILL.md`
+contract and can include scripts and reference files. Import a `SKILL.md` to
+copy its containing folder, or import/export a Skill ZIP. Name collisions get
+a suffix rather than replacing an existing Skill. The Skill builder decides
+whether a helper script is useful.
 
-## Current feature areas
+## Chat files and local storage
 
-### Local chat
-
-- Native desktop chat UI
-- Multiple independent windows sharing one local-model service
-- Streaming responses
-- Conversation history and search
-- Markdown-style rendering
-- File and vision/image attachment support
-- Context controls and KV-cache options
-- Persistent in-app reminders with dismiss and snooze controls
-- A bounded agent wait tool for checking long-running downloads, builds, and
-  remote jobs without embedding sleep loops in commands
-- Per-chat workspace folders
-- Conversation deletion with associated workflow-folder cleanup
-
-### Projects
-
-Projects are long-lived folders under the user's LlamaBoss directory. A project
-can include:
-
-```text
-Projects/<Project Name>/
-  PROJECT.md
-  project.json
-  Sources/
-  Templates/
-  Notes/
-  Outputs/
-  Workflows/
-```
-
-Project support includes:
-
-- Create, attach, switch, and delete projects
-- Move existing chats into projects
-- Load project instructions from `PROJECT.md`
-- Use project source files as durable reference material
-- Keep generated chat artifacts separate from long-lived project files
-- Save project-specific notes to `Notes/NOTES.md`
-
-### Skills
-
-Skills are reusable global workflows stored under the LlamaBoss Skills folder.
-Each Skill uses an Agent Skills-style folder with a `SKILL.md` contract. The
-builder automatically decides whether the Skill genuinely benefits from a
-Python helper under that Skill's `scripts/` subfolder; users no longer have to
-choose between separate "with script" and "without script" creation modes.
-
-Skills are intended for repeatable procedures that should be available across
-projects, such as:
-
-- File conversion workflows
-- Report generation workflows
-- Recurring document cleanup steps
-- Office automation patterns
-- Reusable prompts and tool procedures
-
-### Goals
-
-Goals let you track multi-step work with progress and verification instead of
-treating every request as a one-off chat turn.
-
-### Remote endpoints and Connections
-
-When you explicitly configure them, LlamaBoss can use OpenAI-compatible remote
-endpoints and Connections. Local-model conversations can remain on your
-computer; remote endpoints transmit the selected data needed for those
-requests.
-
-### Notes
-
-LlamaBoss has both global notes and project notes.
-
-- Global notes live in the user's LlamaBoss root as `NOTES.md`
-- Project notes live inside the active project as `Notes/NOTES.md`
-- When a project is active and the user asks to save something to notes,
-  LlamaBoss saves the full note in the project notes and adds a compact
-  pointer in global notes
-
-### Tools and approvals
-
-LlamaBoss includes a structured tool system with approval-aware execution.
-Agent Mode can auto-run safer read-style actions while still requiring
-approval for higher-impact operations.
-
-Tool areas include:
-
-- File read, list, open, grep, write, edit, mkdir, and delete
-- Controlled PowerShell commands
-- Python health checks
-- Python script creation and execution
-- CSV inspection and report generation
-- XLSX inspection and report generation
-- PDF text extraction, PDF form inspection, and PDF form filling
-- DOCX text extraction and inspection
-- Global and project notes
-- Persistent reminder creation, listing, cancellation, snooze, and dismissal
-- Bounded waits for agent monitoring of long-running external work
-
-Riskier actions are gated by approval cards so the user can review what is
-about to happen before allowing it.
-
-### Python helpers
-
-Python is used for document and office automation tasks that are better handled
-by scripts than by C++ directly.
-
-Current Python-oriented capabilities include:
-
-- Create reviewable Python scripts
-- Run approved scripts from controlled LlamaBoss locations
-- Generate artifacts from scripts
-- Inspect and report on CSV/XLSX files
-- Extract text from PDFs and DOCX files
-- Fill PDF forms when fields are available
-- Install allowlisted helper packages after approval
-
-## Default local folders
-
-LlamaBoss uses a local user folder similar to:
+Current chat folders use this layout:
 
 ```text
 %USERPROFILE%\LlamaBoss\
-  Workspace\
-  Documents\
-  Spreadsheets\
-  PDFs\
-  Scripts\
-  Downloads\
-  Workflows\
+  Chats\<date_title_id>\
+    Workspace\          # attached files and generated artifacts
+      Vars\             # stored tool variables
+    Scripts\
+    Documents\
+    Spreadsheets\
+    PDFs\
+    Downloads\
   Projects\
   Skills\
+  Shared\
+  System\
   NOTES.md
 ```
 
-Per-chat artifacts are stored in conversation-specific workflow folders such
-as:
+Older per-chat `Workflows\chat_<id>` folders are handled by migration logic.
+Project `Workflows` folders remain part of the project structure. `/cd` changes
+a chat's tool working directory; it does not move the conversation's Workspace.
 
-```text
-%USERPROFILE%\LlamaBoss\Workflows\chat_<id>\Workspace\
-```
+## Chat commands
 
-## Requirements
+| Command | Purpose |
+| --- | --- |
+| `/cd` or `/cd <path>` | Show or change this chat's tool working directory. |
+| `/think` or `/think auto\|on\|off\|low\|medium\|high` | Show or set this chat's reasoning override; support depends on the model/provider. |
+| `/agent_steps` or `/agent_steps <n>` | Show or set the agent step cap, clamped to 4–60; the app saves the setting. |
+| `/bench [runs] [cold] [long]` | Benchmark a loaded text model; defaults to five runs. Use `/bench help` or `/bench stop` for help or cancellation. |
+| `/reminder_create`, `/reminder_list`, `/reminder_cancel` | Use the supported reminder tools directly; see the documentation for arguments. |
 
-- Windows 10/11 x64
-- A compatible local GGUF model
-- llama.cpp runtime support, either bundled by a release build or configured
-  locally
-- Python 3 for Python helper features
-- Optional Python packages for specific helpers, such as `openpyxl`, `pymupdf`,
-  and `python-docx`
+## Tools, approvals, and privacy
 
-## Building from source
+Agent Mode can run safer read operations automatically. Write, delete, script,
+command, and package actions follow the configured approval policy. Review the
+paths and commands on each approval card. Package installation requires approval.
 
-### Prerequisites
+Native file writes are restricted to the permitted working directory, project,
+and Skill locations. **Python and PowerShell run with your Windows account's
+permissions**; those native file-tool boundaries are not an operating-system
+sandbox for scripts. Approved scripts can access files and the network.
 
-- Visual Studio 2022 or newer with the Desktop development with C++ workload
-- C++17 support
-- vcpkg manifest mode
+Python is optional for basic chat. Document helpers and script tools need a
+usable Python installation and, for some tasks, packages such as `openpyxl`,
+`pymupdf`, or `python-docx`. Built-in helper source is embedded from
+`assets/python`. The persistent Python session can reuse state between calls;
+state is lost when its worker restarts.
 
-### Dependencies
+Local model inference does not require a remote AI endpoint. Remote connections,
+downloads, and network-enabled scripts use the network as requested. Direct
+connection secrets are stored in plaintext locally and protected by Windows
+folder permissions. Environment-variable references are available for API keys;
+do not commit keys or local connection files to this repository.
 
-Dependencies are managed through `vcpkg.json` and may include:
+LlamaBoss is beta software. Test automation on copies of important files first.
 
-- wxWidgets for the native UI
-- Poco for JSON, networking, and utility support
+## Build from source
 
-### Build steps
+The app targets Windows 10/11 x64. You need:
+
+- Visual Studio with Desktop development with C++, the **v145** platform toolset,
+  a Windows SDK, and support for the `.slnx` solution format.
+- C++17 and vcpkg manifest integration. The manifests specify wxWidgets and Poco.
+- A compatible local model and llama.cpp runtime for local inference. Models
+  and runtime binaries are not included in this source repository.
+- Python 3 if you want document helpers or Python tools.
 
 ```powershell
 git clone https://github.com/Littleczr/llamaboss.git
 cd llamaboss
 ```
 
-Open `LlamaBoss.slnx` or `LlamaBoss.vcxproj` in Visual Studio, restore
-dependencies through vcpkg, then build the Release x64 configuration.
+Open `LlamaBoss.slnx`, restore dependencies through vcpkg, and build **Release |
+x64**. `LlamaBoss.vcxproj` is the application; `Tests/LlamaBossTests` is the native
+regression runner. Build the app project alone if you only need the application.
+The native regression project ships its maintained JSON case files in
+`Tests/LlamaBossTests/Cases`; see its README for the complete run instructions.
 
-## Suggested first tests
+The embedded Python resources must remain UTF-8 without a BOM and use LF line
+endings. `.gitattributes` preserves that on Windows checkouts.
 
-After building or installing a beta build, try:
+## License and author
 
-```text
-Ask a normal chat question
-Create a project
-Attach the project to a chat
-Save a note while the project is active
-Import a PDF and extract text
-Create a small Python script
-Approve and run the script
-Create a Skill
-Run the Skill from a new chat
-Create and dismiss a short test reminder
-Delete a test chat and confirm the chat workflow folder is cleaned up
-```
-
-## Roadmap
-
-Near-term focus:
-
-- Polish the Projects and Skills workflow experience
-- Expand reminder scheduling and background-task coordination
-- Improve model download and runtime setup UX
-- Tighten approval and artifact handling edge cases
-- Improve installer reliability
-- Add stronger project/workflow onboarding
-- Continue improving local document automation
-
-Longer-term ideas:
-
-- SQLite-backed local memory, history, artifacts, and audit trail
-- Better Skills packaging and sharing
-- Theme sharing through llamaboss.com
-- Expanded local model catalog
-- Optional website summarization and web-follow-up tools
-- More advanced typed tool calling and workflow execution
-
-## Privacy and safety direction
-
-LlamaBoss is designed around local-first operation, user-visible files, and
-approval-based actions. Local-model conversations can remain on the computer.
-Remote endpoints and other explicit network features transmit selected data
-as required for those features. In the current version, direct Connection
-secrets are stored in a user-restricted local secrets file; environment-variable
-references are recommended when possible. The goal is useful local automation
-without hiding what the assistant is doing.
-
-## License
-
-MIT
-
-## Author
-
-Created by Cesar Avelar.
-
-Website: llamaboss.com
+[MIT](LICENSE). Created by Cesar Avelar.

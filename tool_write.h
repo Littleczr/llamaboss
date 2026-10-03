@@ -68,7 +68,7 @@
 //
 // ─── Python syntax pre-check ──────────────────────────────────────
 // When the target is a .py/.pyw file, the staged content is run
-// through `py_compile` before the rename.  The gate is deliberately
+// through an in-memory compile() syntax check before the rename.  The gate is deliberately
 // narrow: only a recognized SyntaxError / IndentationError / TabError
 // blocks the write (the staging file is deleted and the model gets the
 // compiler message back to retry).  Anything else -- no interpreter on

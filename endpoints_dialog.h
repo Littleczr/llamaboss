@@ -1,16 +1,3 @@
-// endpoints_dialog.h
-//
-// Modal sub-dialog opened from Settings -> Remote Endpoints -> [ Manage ].
-// Lists every configured remote inference endpoint from EndpointStore,
-// lets the user add a new endpoint, edit an existing one (URL, auth,
-// which SecretsStore key it uses, protocol, and its model list), or
-// delete one.
-//
-// All mutations write through to the in-memory EndpointStore; the caller
-// (SettingsDialog) is responsible for calling Save() when the user
-// accepts. The API key itself lives in SecretsStore and is managed in
-// the Connections dialog — this dialog only references it by name.
-//
 #pragma once
 
 #include <wx/wx.h>
@@ -20,6 +7,7 @@
 #include <vector>
 
 class EndpointStore;
+class SecretsStore;
 struct ThemeData;
 
 class EndpointsDialog : public wxDialog
@@ -27,9 +15,13 @@ class EndpointsDialog : public wxDialog
 public:
     EndpointsDialog(wxWindow* parent,
                     EndpointStore* store,
+                    SecretsStore* secretsStore,
                     const ThemeData& theme);
 
+    const std::string& GetModelToUse() const { return m_modelToUse; }
+
 private:
+    std::string m_modelToUse;
     void OnAdd(wxCommandEvent& evt);
     void OnEdit(wxCommandEvent& evt);
     void OnDelete(wxCommandEvent& evt);
@@ -42,6 +34,7 @@ private:
     void ApplyTheme();
 
     EndpointStore*   m_store = nullptr;
+    SecretsStore*    m_secretsStore = nullptr;
     const ThemeData* m_theme = nullptr;
 
     wxListCtrl* m_list     = nullptr;
@@ -56,3 +49,17 @@ private:
 
     wxDECLARE_EVENT_TABLE();
 };
+
+// Call before opening any editor that can save connections or keys.  When
+// either settings file failed to load, explains that saving is blocked to
+// protect it and offers Retry (reload from disk), Start Fresh (explicitly
+// allow replacing it; a copy was kept when possible) or Cancel.  Returns
+// false on Cancel -- the caller must not open the editor.
+bool LbEnsureConnectionStoresWritable(wxWindow* parent, EndpointStore* endpoints,
+                                      SecretsStore* secrets);
+
+// Shared guided setup. Keys are entered in the dialog; never pass them through chat.
+// Connect checks credentials; Save and use model persists and returns the selection.
+// Cancel leaves stores unchanged.
+bool LbShowAIConnectionSetup(wxWindow* parent, EndpointStore* store, SecretsStore* secrets,
+    const ThemeData& theme, const std::string& provider = "openrouter", const std::string& modelSearch = "", std::string* modelToUse = nullptr);

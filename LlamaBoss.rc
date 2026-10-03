@@ -2,3 +2,6 @@
 
 // Application icon (embedded as a named resource for wxIcon)
 APP_ICON ICON "app_icon.ico"
+
+// Built-in Python helpers and the py session kernel (RCDATA)
+#include "python_helpers.rc2"

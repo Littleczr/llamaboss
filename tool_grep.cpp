@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -40,6 +41,45 @@ size_t ComputeGrepByteCap(int ctxTokens)
 }
 
 // ─── UTF-8 helpers (local copies, same as other tools) ──────────
+
+// Shrink a byte-length clamp back to a UTF-8 character boundary.
+// Match lines are truncated at kMaxLineLength BYTES, which splits a
+// multi-byte character most of the time on CJK text and occasionally on
+// accented Latin text.  The truncated sequence then rides into
+// ChatHistory and out through Poco's JSON stringifier, which is called
+// with default options and emits non-ASCII verbatim; llama-server's
+// parser rejects malformed UTF-8 in a string, failing the whole request.
+// Never grows the clamp, and leaves already-malformed input untouched.
+size_t ClampToUtf8Boundary(const char* data, size_t len)
+{
+    if (len == 0) return 0;
+
+    size_t j = len;
+    while (j > 0 && ((unsigned char)data[j - 1] & 0xC0) == 0x80) --j;
+    if (j == 0) return len;                    // no lead byte in range
+
+    const size_t leadIdx  = j - 1;
+    const unsigned char c = (unsigned char)data[leadIdx];
+
+    size_t seqLen;
+    if      ((c & 0x80) == 0x00) seqLen = 1;
+    else if ((c & 0xE0) == 0xC0) seqLen = 2;
+    else if ((c & 0xF0) == 0xE0) seqLen = 3;
+    else if ((c & 0xF8) == 0xF0) seqLen = 4;
+    else return len;                           // invalid lead byte
+
+    return (leadIdx + seqLen <= len) ? len : leadIdx;
+}
+
+// Truncate a match line to kMaxLineLength without splitting a character.
+std::string ClampMatchLine(const std::string& text)
+{
+    if (text.size() <= GrepExecutor::kMaxLineLength) return text;
+    const size_t keep = ClampToUtf8Boundary(
+        text.data(), GrepExecutor::kMaxLineLength - 3);
+    return text.substr(0, keep) + "...";
+}
+
 std::wstring Utf8ToWide(const std::string& s)
 {
     if (s.empty()) return L"";
@@ -120,6 +160,7 @@ struct SearchState {
     const std::shared_ptr<std::atomic<bool>>& cancelFlag;
     unsigned long                             timeoutMs;
     std::chrono::steady_clock::time_point     t0;
+    size_t                                    contextLines;
 
     struct Match {
         std::string path;     // relative to search root, or basename for file-mode
@@ -128,17 +169,42 @@ struct SearchState {
     };
 
     std::vector<Match> matches;
+
+    struct ContextOutputLine {
+        std::string path;
+        size_t      lineNo;
+        std::string line;
+        bool        isMatch;
+        bool        separatorBefore;
+    };
+    std::vector<ContextOutputLine> contextOutput;
     size_t filesScanned = 0;
     bool   hitMatchCap = false;
     bool   hitFileCap  = false;
     bool   cancelled   = false;
     bool   timedOut    = false;
+
+    // ── Skip accounting: honest negatives ───────────────────────
+    // A file we never opened must never be folded into a "(no matches)"
+    // body.  That turns an unsearched file into a confident absence, and
+    // the caller cannot tell the difference.  Observed in production: a
+    // model grepped three DLLs for a build string, got 0 matches each
+    // time because the binary sniff skipped them silently, and concluded
+    // "the version string isn't greppable in the binary" — it is, the
+    // files were simply never read.
+    //
+    // filesScanned stays as-is because kMaxFilesScanned accounting and
+    // the walk's cap checks depend on counting every candidate.
+    // filesSearched counts only files actually read as text, and is what
+    // the chip now reports.
+    size_t filesSearched     = 0;
+    size_t skippedBinary     = 0;
+    size_t skippedTooLarge   = 0;
+    size_t skippedUnreadable = 0;   // open failed: permissions, transient IO
+    size_t prunedDirs        = 0;   // ShouldSkipDir: dot-dirs, node_modules, bin, obj, ...
 };
 
-// Returns true to continue; false if we should stop (cancel, timeout,
-// or a hard cap fired).  Called before every file open and every ~256
-// lines inside a file.
-bool CheckLimits(SearchState& s)
+bool CheckCancellationOrTimeout(SearchState& s)
 {
     if (s.cancelFlag->load()) { s.cancelled = true; return false; }
 
@@ -150,6 +216,79 @@ bool CheckLimits(SearchState& s)
             return false;
         }
     }
+    return true;
+}
+
+// Returns true to continue; false if we should stop (cancel, timeout,
+// or a hard cap fired).  Called before every file open and every ~256
+// lines inside a file.
+// grep is a LITERAL substring search (by design: predictable, fast, and
+// documented as such in the tool description and prompt).  Models
+// trained on rg/grep still write regex, and a regex pattern searched
+// literally comes back "(no matches)" -- a confident false negative.
+// One Luna turn lost about a fifth of its tool budget this way
+// (`a|b|c`, `Name\(`), retrying names that a plain search found at
+// once.  When a zero-match pattern carries regex syntax, say so and
+// name the literal terms to search instead.  Matching is unchanged.
+std::string RegexAttemptHint(const std::string& pattern)
+{
+    bool looksRegex = false;
+    if (pattern.find('|') != std::string::npos) looksRegex = true;
+    if (pattern.find(".*") != std::string::npos ||
+        pattern.find(".+") != std::string::npos) looksRegex = true;
+    if (!pattern.empty() && (pattern.front() == '^' || pattern.back() == '$'))
+        looksRegex = true;
+    for (size_t i = 0; i + 1 < pattern.size(); ++i) {
+        if (pattern[i] != '\\') continue;
+        const char n = pattern[i + 1];
+        if (n == '(' || n == ')' || n == '.' || n == '[' || n == ']' ||
+            n == 's' || n == 'b' || n == 'w' || n == 'd' || n == '|' ||
+            n == '*' || n == '+' || n == '?') { looksRegex = true; break; }
+    }
+    if (!looksRegex) return {};
+
+    std::string hint =
+        "[grep matches literal text only; regex syntax is not interpreted, so "
+        "'|' is not alternation and an escape like '\\(' searches for a "
+        "backslash. This \"(no matches)\" applies only to that exact text.";
+
+    // Name the alternatives, with regex escapes removed, so the next call
+    // is obvious.  Only when '|' actually separates non-empty terms.
+    std::vector<std::string> terms;
+    std::string cur;
+    for (size_t i = 0; i < pattern.size(); ++i) {
+        const char c = pattern[i];
+        if (c == '\\' && i + 1 < pattern.size()) { cur += pattern[++i]; continue; }
+        if (c == '|') { terms.push_back(cur); cur.clear(); continue; }
+        cur += c;
+    }
+    terms.push_back(cur);
+    // An empty term means '||' or a leading/trailing '|': most likely a
+    // literal C++/shell operator search, so don't propose a split.
+    for (const std::string& t : terms)
+        if (t.empty()) { hint += "]\n"; return hint; }
+
+    std::vector<std::string> named;
+    for (std::string t : terms) {
+        if (!t.empty() && t.front() == '^') t.erase(0, 1);
+        if (!t.empty() && t.back() == '$') t.pop_back();
+        if (!t.empty()) named.push_back(t);
+    }
+    if (named.size() >= 2 && named.size() <= 8) {
+        hint += " Search the terms separately:";
+        for (size_t i = 0; i < named.size(); ++i)
+            hint += (i ? ", '" : " '") + named[i] + "'";
+        hint += ".";
+    } else if (named.size() == 1 && named[0] != pattern) {
+        hint += " Literal form: '" + named[0] + "'.";
+    }
+    hint += "]\n";
+    return hint;
+}
+
+bool CheckLimits(SearchState& s)
+{
+    if (!CheckCancellationOrTimeout(s)) return false;
 
     if (s.matches.size() >= GrepExecutor::kMaxMatches) {
         s.hitMatchCap = true;
@@ -174,18 +313,25 @@ bool SearchFile(const std::string& absPath,
     // reliably from getline output on Windows line endings).  MSVC
     // accepts std::wstring paths as an extension.
     std::ifstream f(Utf8ToWide(absPath), std::ios::binary);
-    if (!f) return true;   // permissions, transient IO — skip, keep walking
+    if (!f) {
+        ++s.skippedUnreadable;   // permissions, transient IO — skip, keep walking
+        return true;
+    }
 
     // Size check — bail on huge files (binaries, minified bundles)
     f.seekg(0, std::ios::end);
     std::streamoff fsize = f.tellg();
     f.seekg(0, std::ios::beg);
     if (fsize <= 0) {
+        // Empty file: opened successfully and genuinely contains no
+        // match, so this IS a true negative — counts as searched.
         ++s.filesScanned;
+        ++s.filesSearched;
         return true;
     }
     if ((uint64_t)fsize > GrepExecutor::kMaxFileBytes) {
         ++s.filesScanned;
+        ++s.skippedTooLarge;
         return true;
     }
 
@@ -197,12 +343,109 @@ bool SearchFile(const std::string& absPath,
     std::streamsize gotten = f.gcount();
     if (IsLikelyBinary(sniff, (size_t)gotten)) {
         ++s.filesScanned;
+        ++s.skippedBinary;
         return true;
     }
     f.clear();
     f.seekg(0, std::ios::beg);
 
     ++s.filesScanned;
+    ++s.filesSearched;
+
+    // Context mode is deliberately separate from the context=0 path below,
+    // preserving the original match-only output byte-for-byte.  Stream the
+    // file with a bounded deque of preceding lines and an after-match
+    // countdown; overlapping neighborhoods merge without duplicate lines.
+    if (s.contextLines > 0) {
+        struct RecentLine {
+            size_t      lineNo;
+            std::string line;
+        };
+
+        std::deque<RecentLine> recent;
+        size_t lineNo = 0;
+        size_t lastOutputLine = 0;
+        size_t afterRemaining = 0;
+        bool producedForFile = false;
+        bool stoppingAtMatchCap = false;
+
+        auto clampLine = [](const std::string& text) {
+            return ClampMatchLine(text);   // UTF-8-boundary safe
+        };
+
+        auto appendOutput = [&](size_t number,
+                                const std::string& text,
+                                bool isMatch,
+                                bool separatorBefore) {
+            SearchState::ContextOutputLine item;
+            item.path = relPath;
+            item.lineNo = number;
+            item.line = clampLine(text);
+            item.isMatch = isMatch;
+            item.separatorBefore = separatorBefore;
+            s.contextOutput.push_back(std::move(item));
+            lastOutputLine = number;
+            producedForFile = true;
+        };
+
+        std::string line;
+        while (std::getline(f, line)) {
+            ++lineNo;
+            if ((lineNo & 0xFF) == 0 &&
+                !CheckCancellationOrTimeout(s)) {
+                return false;
+            }
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+
+            const bool isMatch = !stoppingAtMatchCap &&
+                line.find(s.pattern) != std::string::npos;
+
+            if (isMatch) {
+                const size_t contextStart = lineNo > s.contextLines
+                    ? lineNo - s.contextLines : 1;
+                bool separatorPending =
+                    (!producedForFile && !s.contextOutput.empty()) ||
+                    (producedForFile && contextStart > lastOutputLine + 1);
+
+                for (const RecentLine& prev : recent) {
+                    if (prev.lineNo < contextStart ||
+                        prev.lineNo <= lastOutputLine) {
+                        continue;
+                    }
+                    appendOutput(prev.lineNo, prev.line, false,
+                                 separatorPending);
+                    separatorPending = false;
+                }
+
+                appendOutput(lineNo, line, true, separatorPending);
+
+                SearchState::Match m;
+                m.path = relPath;
+                m.lineNo = lineNo;
+                m.line = clampLine(line);
+                s.matches.push_back(std::move(m));
+                afterRemaining = s.contextLines;
+
+                if (s.matches.size() >= GrepExecutor::kMaxMatches) {
+                    s.hitMatchCap = true;
+                    stoppingAtMatchCap = true;
+                }
+            } else if (afterRemaining > 0) {
+                if (lineNo > lastOutputLine) {
+                    appendOutput(lineNo, line, false, false);
+                }
+                --afterRemaining;
+            }
+
+            recent.push_back({ lineNo, line });
+            while (recent.size() > s.contextLines) recent.pop_front();
+
+            // Once the match cap fires, retain only the requested trailing
+            // context for the final accepted match, then stop the whole walk.
+            if (stoppingAtMatchCap && afterRemaining == 0) return false;
+        }
+        return !stoppingAtMatchCap;
+    }
 
     std::string line;
     size_t lineNo = 0;
@@ -229,8 +472,7 @@ bool SearchFile(const std::string& absPath,
         m.path   = relPath;
         m.lineNo = lineNo;
         if (line.size() > GrepExecutor::kMaxLineLength) {
-            m.line = line.substr(0, GrepExecutor::kMaxLineLength - 3);
-            m.line += "...";
+            m.line = ClampMatchLine(line);   // UTF-8-boundary safe
         } else {
             m.line = std::move(line);
         }
@@ -257,7 +499,10 @@ bool WalkAndSearch(const std::string& absDir,
     std::wstring wPat = Utf8ToWide(absDir) + L"\\*";
     WIN32_FIND_DATAW fd{};
     HANDLE hFind = ::FindFirstFileW(wPat.c_str(), &fd);
-    if (hFind == INVALID_HANDLE_VALUE) return true;   // silently skip unreadable dir
+    if (hFind == INVALID_HANDLE_VALUE) {
+        ++s.skippedUnreadable;   // unreadable dir — counted, no longer silent
+        return true;
+    }
 
     std::vector<std::pair<std::string, bool>> fileEntries; // name, dummy false
     std::vector<std::string>                   dirEntries; // name
@@ -270,7 +515,7 @@ bool WalkAndSearch(const std::string& absDir,
         std::string name = WideToUtf8(wname);
 
         if (isDir) {
-            if (ShouldSkipDir(name)) continue;
+            if (ShouldSkipDir(name)) { ++s.prunedDirs; continue; }
             dirEntries.push_back(std::move(name));
         } else {
             fileEntries.emplace_back(std::move(name), false);
@@ -315,7 +560,8 @@ public:
                std::string pattern,
                std::string resolvedPath,
                std::string commandEcho,
-               ToolContext ctx)
+               ToolContext ctx,
+               size_t contextLines)
         : wxThread(wxTHREAD_DETACHED)
         , m_handler(handler)
         , m_alive(std::move(alive))
@@ -325,6 +571,7 @@ public:
         , m_resolvedPath(std::move(resolvedPath))
         , m_commandEcho(std::move(commandEcho))
         , m_ctx(std::move(ctx))
+        , m_contextLines(contextLines)
     {}
 
     ExitCode Entry() override
@@ -338,12 +585,19 @@ public:
             m_cancel,
             m_ctx.timeoutMs,
             t0,
+            m_contextLines,
             /*matches*/    {},
+            /*contextOutput*/ {},
             /*filesScanned*/ 0,
             /*hitMatchCap*/  false,
             /*hitFileCap*/   false,
             /*cancelled*/    false,
             /*timedOut*/     false,
+            /*filesSearched*/     0,
+            /*skippedBinary*/     0,
+            /*skippedTooLarge*/   0,
+            /*skippedUnreadable*/ 0,
+            /*prunedDirs*/        0,
         };
 
         const bool isFile = IsFile(m_resolvedPath);
@@ -366,23 +620,61 @@ public:
 
         // ── Build body ───────────────────────────────────────────
         // Byte-cap bounds the output string regardless of how many
-        // matches we collected.  If we hit the byte cap we still
-        // truncate mid-output (match-granular, never mid-line).
+        // matches/context we collected.  If we hit the byte cap we still
+        // truncate at a whole output line, never mid-line.
         std::ostringstream body;
         const size_t byteCap = ComputeGrepByteCap(m_ctx.ctxTokens);
         size_t emittedMatches = 0;
         bool   hitByteCap = false;
 
-        for (const auto& m : s.matches) {
-            std::ostringstream line;
-            line << m.path << ":" << m.lineNo << ": " << m.line << "\n";
-            std::string ls = line.str();
-            if ((size_t)body.tellp() + ls.size() > byteCap) {
-                hitByteCap = true;
-                break;
+        if (m_contextLines == 0) {
+            // Compatibility path: preserve the original match-only format.
+            for (const auto& m : s.matches) {
+                std::ostringstream line;
+                line << m.path << ":" << m.lineNo << ": " << m.line << "\n";
+                std::string ls = line.str();
+                if ((size_t)body.tellp() + ls.size() > byteCap) {
+                    hitByteCap = true;
+                    break;
+                }
+                body << ls;
+                ++emittedMatches;
             }
-            body << ls;
-            ++emittedMatches;
+        } else {
+            // GNU-grep-style distinction: ':' marks a matching line and '-'
+            // marks surrounding context.  "--" separates disjoint groups
+            // and files; overlapping neighborhoods were already merged.
+            std::string group;
+            size_t groupMatches = 0;
+            bool emittedAnyGroup = false;
+
+            auto flushGroup = [&]() -> bool {
+                if (group.empty()) return true;
+                const size_t separatorBytes = emittedAnyGroup ? 3 : 0; // "--\n"
+                if ((size_t)body.tellp() + separatorBytes + group.size()
+                    > byteCap) {
+                    hitByteCap = true;
+                    return false;
+                }
+                if (emittedAnyGroup) body << "--\n";
+                body << group;
+                emittedMatches += groupMatches;
+                emittedAnyGroup = true;
+                group.clear();
+                groupMatches = 0;
+                return true;
+            };
+
+            for (const auto& item : s.contextOutput) {
+                if (item.separatorBefore && !flushGroup()) break;
+                std::ostringstream line;
+                const char sep = item.isMatch ? ':' : '-';
+                line << item.path << sep << item.lineNo << sep << ' '
+                     << item.line << "\n";
+                group += line.str();
+                if (item.isMatch) ++groupMatches;
+            }
+            if (!hitByteCap) flushGroup();
         }
 
         const bool anyTrunc = s.hitMatchCap || s.hitFileCap || hitByteCap;
@@ -400,11 +692,90 @@ public:
             body << " ...]\n";
         }
 
-        if (emittedMatches == 0 && !s.cancelled && !s.timedOut) {
+        // ── Skip summary ─────────────────────────────────────────
+        // Built before the "(no matches)" marker because it decides
+        // whether that marker is even truthful.  Reasons are listed
+        // individually: "binary" tells the caller to reach for a
+        // different tool, "too large" tells them to narrow the target,
+        // and the two need different remedies.
+        const size_t skippedFiles =
+            s.skippedBinary + s.skippedTooLarge + s.skippedUnreadable;
+
+        std::string skipReasons;
+        {
+            auto addReason = [&](size_t n, const char* label) {
+                if (n == 0) return;
+                if (!skipReasons.empty()) skipReasons += ", ";
+                skipReasons += std::to_string(n);
+                skipReasons += " ";
+                skipReasons += label;
+            };
+            addReason(s.skippedBinary,     "binary");
+            addReason(s.skippedTooLarge,   "over the 10 MiB per-file limit");
+            addReason(s.skippedUnreadable, "unreadable");
+        }
+
+        // Nothing was actually read, so there is no negative to report --
+        // only a failure.  This is the case that used to render as a
+        // confident "(no matches)" for a file grep can't search at all.
+        std::string skipError;
+        if (skippedFiles > 0 && s.filesSearched == 0 && s.matches.empty() &&
+            !s.cancelled && !s.timedOut) {
+            std::ostringstream e;
+            if (isFile) {
+                e << "Nothing was searched: " << Basename(m_resolvedPath);
+                if (s.skippedBinary > 0) {
+                    e << " looks like a binary file (a NUL byte within the first "
+                         "4 KiB), and grep only scans text. This is NOT a "
+                         "\"no matches\" result -- the file was never read. To read "
+                         "strings embedded in a binary, run it with a version or "
+                         "help flag via powershell, or extract them with py.";
+                } else if (s.skippedTooLarge > 0) {
+                    e << " is larger than grep's "
+                      << (GrepExecutor::kMaxFileBytes / (1024 * 1024))
+                      << " MiB per-file limit, so it was never read. Narrow the "
+                         "target or slice it with read_range.";
+                } else {
+                    e << " could not be opened (permissions or transient IO), so "
+                         "it was never read.";
+                }
+            } else {
+                e << "Nothing was searched under " << m_resolvedPath
+                  << ": every candidate file was skipped (" << skipReasons
+                  << "). This is NOT a \"no matches\" result -- no file was read.";
+                if (s.prunedDirs > 0) {
+                    e << " " << s.prunedDirs
+                      << (s.prunedDirs == 1 ? " directory was" : " directories were")
+                      << " also pruned (dot-directories and build/cache names such "
+                         "as node_modules, bin, obj, Debug, Release).";
+                }
+            }
+            skipError = e.str();
+        }
+
+        if (s.matches.empty() && !s.cancelled && !s.timedOut &&
+            skipError.empty()) {
             // Distinguish "no matches" from "you got nothing because
             // we bailed out" — cancelled/timedOut cases fall through
             // to the chips layer without a body marker.
             body << "(no matches)\n";
+            body << RegexAttemptHint(s.pattern);
+        }
+
+        // Partial searches still get the caveat inline: some files were
+        // read and some were not, so a match count alone is misleading.
+        if (skipError.empty() && skippedFiles > 0) {
+            body << "\n[" << skippedFiles
+                 << (skippedFiles == 1 ? " file was" : " files were")
+                 << " skipped and NOT searched: " << skipReasons
+                 << ". A match count says nothing about skipped content.]\n";
+        }
+        if (skipError.empty() && s.prunedDirs > 0 && s.matches.empty()) {
+            body << "\n[" << s.prunedDirs
+                 << (s.prunedDirs == 1 ? " directory was" : " directories were")
+                 << " pruned from the walk (dot-directories and build/cache "
+                    "names such as node_modules, bin, obj, Debug, Release). "
+                    "Point grep at one directly if the target lives there.]\n";
         }
 
         result.body = body.str();
@@ -419,16 +790,39 @@ public:
               << (s.matches.size() == 1 ? " match" : " matches");
             result.chips.push_back(c.str());
         }
+        if (m_contextLines > 0) {
+            result.chips.push_back(std::to_string(m_contextLines)
+                                   + " context lines");
+        }
         if (isDir) {
+            // filesSearched, not filesScanned: the old chip counted
+            // skipped files as scanned, which overstated coverage
+            // exactly when coverage mattered most.
             std::ostringstream c;
-            c << s.filesScanned
-              << (s.filesScanned == 1 ? " file scanned" : " files scanned");
+            c << s.filesSearched
+              << (s.filesSearched == 1 ? " file searched" : " files searched");
             result.chips.push_back(c.str());
+        }
+        if (skippedFiles > 0) {
+            result.chips.push_back(std::to_string(skippedFiles) + " skipped");
         }
         if (anyTrunc)       result.chips.push_back("truncated");
         if (s.cancelled)    result.chips.push_back("cancelled");
         if (s.timedOut)     result.chips.push_back("timed out");
         result.chips.push_back(FormatElapsed(elapsed));
+
+        // A search that read no files reports a failure, not an absence.
+        // errorBody is never demoted to a variable handle and marks the
+        // call failed for the repeat guard, both of which are correct
+        // here: the model must not build on this as evidence.
+        if (!skipError.empty()) {
+            result.errorBody = skipError;
+            result.body.clear();
+            result.chips.clear();
+            result.chips.push_back("failed");
+            result.chips.push_back(std::to_string(skippedFiles) + " skipped");
+            result.chips.push_back(FormatElapsed(elapsed));
+        }
 
         // ── Post back to UI thread, if it's still alive ──────────
         auto* evt = new wxCommandEvent(wxEVT_GREP_COMPLETE);
@@ -448,6 +842,7 @@ private:
     std::string                        m_resolvedPath;
     std::string                        m_commandEcho;
     ToolContext                        m_ctx;
+    size_t                             m_contextLines;
 };
 
 } // anonymous namespace
@@ -475,10 +870,12 @@ GrepExecutor::~GrepExecutor()
 bool GrepExecutor::Start(const std::string& pattern,
                          const std::string& resolvedPath,
                          const std::string& commandEcho,
-                         const ToolContext& ctx)
+                         const ToolContext& ctx,
+                         size_t contextLines)
 {
     if (IsRunning())     return false;
     if (pattern.empty()) return false;
+    if (contextLines > kMaxContextLines) return false;
 
     m_cancelFlag->store(false);
     m_isRunning->store(true);
@@ -487,7 +884,7 @@ bool GrepExecutor::Start(const std::string& pattern,
     // Detached, so we don't own the pointer after Run returns.
     auto* worker = new GrepWorker(
         m_eventHandler, m_aliveToken, m_cancelFlag, m_isRunning,
-        pattern, resolvedPath, commandEcho, ctx);
+        pattern, resolvedPath, commandEcho, ctx, contextLines);
 
     if (worker->Create() != wxTHREAD_NO_ERROR) {
         m_isRunning->store(false);

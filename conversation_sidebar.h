@@ -35,6 +35,8 @@
 #include <set>
 #include <unordered_map>
 
+class LbScrollRail;   // lb_scroll_rail.h
+
 // Forward declarations
 struct ThemeData;
 class HeaderDropTarget;  // Defined in conversation_sidebar.cpp; friend below.
@@ -133,15 +135,6 @@ private:
     // hyphen, never starts/ends with double underscore).
     static constexpr const char* kUnassignedId = "__unassigned__";
 
-    // Sentinel group id for the Goals section.  A project-less chat that
-    // carries a goal is bucketed here instead of Unassigned, so missions
-    // don't get lost among loose chats.  Same double-underscore namespace
-    // as kUnassignedId, so it can never collide with a real project id.
-    // A chat that has BOTH a project and a goal stays under its project
-    // (the container is the stronger fact) — only project-less goal chats
-    // land in this section.
-    static constexpr const char* kGoalsId = "__goals__";
-
     // ── Internal data ────────────────────────────────────────────
     struct ConversationEntry {
         std::string filePath;
@@ -155,13 +148,8 @@ private:
         // moves mtime.  DateBucketIdFor consults this to bucket such entries
         // as "older" instead of silently borrowing mtime.
         bool        hasActivityTime = false;
-        std::string projectId;     // Empty → Unassigned or Goals group
+        std::string projectId;     // Empty → Unassigned group
         std::string projectName;   // Display name; mirrors what's in the JSON
-        std::string goalObjective; // Non-empty → chat has a goal.  Drives the
-                                   // Goals section (project-less goal chats) and
-                                   // is kept for a future objective-subgrouping
-                                   // pass; the section header itself is just
-                                   // "Goals" today.
         bool        pinned = false;
         bool        archived = false;
     };
@@ -173,7 +161,7 @@ private:
         wxStaticText* iconLabel = nullptr;
         wxStaticText* titleLabel = nullptr;
         wxStaticText* timeLabel = nullptr;
-        wxPanel*      projectTag = nullptr;  // Custom-painted project/goal pill
+        wxPanel*      projectTag = nullptr;  // Custom-painted project pill
         wxStaticText* menuBtn = nullptr;     // Fixed-width ASCII three-dot actions control
 
         std::string filePath;
@@ -194,14 +182,13 @@ private:
         // hover/search/repaint paths.
         std::string projectId;
         std::string projectName;
-        bool        hasGoal = false;
         bool        pinned = false;
         bool        archived = false;
         std::string dateBucketId;
 
         // The group this row currently belongs to.  Used so a collapse
         // toggle can find every chat row under a header in O(rows).
-        std::string groupId;        // Real project id, kGoalsId, or kUnassignedId
+        std::string groupId;        // Real project id or kUnassignedId
     };
 
     struct HeaderWidgets {
@@ -210,7 +197,7 @@ private:
         wxStaticText* nameLabel = nullptr;
         wxPanel*      countBadge = nullptr; // Custom-painted rounded chat-count pill
 
-        std::string groupId;        // Real project id, kGoalsId, or kUnassignedId
+        std::string groupId;        // Real project id or kUnassignedId
         std::string displayName;
         int         chatCount = 0;
         bool        collapsed = false;
@@ -245,9 +232,17 @@ private:
     wxButton*         m_newWindowButton;  // "+ New Window" button (secondary weight)
     wxTextCtrl*       m_searchBox;        // Search/filter conversations
     bool              m_searchHintActive = false; // Custom high-contrast placeholder
+    wxPanel*          m_listClip = nullptr;   // Clips the list's native scrollbar out of view
     wxScrolledWindow* m_listWindow;       // Scrollable conversation list
+    LbScrollRail*     m_scrollRail = nullptr;  // Slim themed scrollbar beside the list
     wxBoxSizer*       m_listSizer;        // Sizer inside m_listWindow
-    wxButton*         m_archiveButton;    // Toggle normal / archived conversations
+    // Footer archive strip, one control for both directions:
+    //   normal:  "Archived chats ... N ->"     archive: "<- Back to chats ... ARCHIVED N"
+    // The whole strip is the click target; hidden when nothing is archived.
+    wxPanel*          m_archiveHeader = nullptr;
+    wxPanel*          m_archiveHeaderAccent = nullptr;
+    wxStaticText*     m_archiveBackLabel = nullptr;
+    wxStaticText*     m_archiveTitleLabel = nullptr;
 
     // ── State ────────────────────────────────────────────────────
     Callbacks    m_callbacks;
@@ -306,7 +301,6 @@ private:
         std::string        title;
         std::string        projectId;
         std::string        projectName;
-        std::string        goalObjective;
         bool               pinned = false;
         bool               archived = false;
         long long          activityTimeMs = 0; // parsed JSON updated_at; chat ordering/age
@@ -322,7 +316,6 @@ private:
     std::vector<ConversationEntry> ScanConversations();
     RowWidgets CreateRow(const ConversationEntry& entry);
     void UpdateRow(RowWidgets& row, const ConversationEntry& entry);
-    void RemoveRow(const std::string& filePath);
     void ShowContextMenu(const std::string& filePath);
 
     // Project header CRUD
@@ -334,7 +327,6 @@ private:
                              const std::string& displayName,
                              int chatCount,
                              bool collapsed);
-    void RemoveProjectHeader(const std::string& groupId);
     void OnProjectHeaderClicked(const std::string& groupId);
 
     // Time-section header CRUD.  Date headers are display-only; project
@@ -344,7 +336,6 @@ private:
                                        const std::string& displayLabel);
     void UpdateDateHeader(DateHeaderWidgets& header,
                           const std::string& displayLabel);
-    void RemoveDateHeader(const std::string& key);
     static std::string MakeDateHeaderKey(const std::string& groupId,
                                          const std::string& dateBucketId);
     bool IsGroupCollapsed(const std::string& groupId) const;
@@ -388,6 +379,8 @@ private:
     // Search helpers
     void FilterRows();
     void UpdateArchiveButton();
+    void SetArchiveMode(bool showArchived);
+    void ApplyArchiveHeaderAppearance(bool hovered);
     void ShowSearchHint();
     void HideSearchHint();
     void ClearSearch();

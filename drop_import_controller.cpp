@@ -115,7 +115,10 @@ bool DropImportController::QueueDroppedFileImport(
 
     wxFileName source(wxString::FromUTF8(filePath));
     if (!source.FileExists()) return false;
-    if (WxToUtf8Drop(source.GetExt().Lower()) != spec.extLower)
+    // Empty extLower = the caller already vetted the type (Phase B
+    // large-text route accepts the whole IsTextFile extension set).
+    if (!spec.extLower.empty() &&
+        WxToUtf8Drop(source.GetExt().Lower()) != spec.extLower)
         return false;
 
     source.Normalize(wxPATH_NORM_ABSOLUTE |
@@ -175,7 +178,7 @@ bool DropImportController::QueueDroppedFileImport(
         }
 
         // The copy above is durable user-visible disk state: this
-        // conversation must now persist so its workflow folder stays
+        // conversation must now persist so its chat folder stays
         // reachable (and deletable) from the sidebar.  Fired here, not
         // after spec.attach, so a later attach failure can't orphan
         // the folder.
@@ -270,6 +273,18 @@ bool DropImportController::QueueZipAttachmentFromDrop(
     spec.iconUtf8     = "\xF0\x9F\x93\xA6";   // 📦
     spec.byteCap      = 100ULL * 1024ULL * 1024ULL;
     spec.attach       = m_callbacks.attachZipFile;
+    return QueueDroppedFileImport(filePath, spec);
+}
+
+bool DropImportController::QueueLargeTextAttachmentFromDrop(
+    const std::string& filePath) const
+{
+    DroppedFileSpec spec;
+    spec.extLower     = "";                        // caller vetted via IsTextFile
+    spec.displayLabel = "Text file";
+    spec.iconUtf8     = "\xF0\x9F\x93\x84";       // (page facing up)
+    spec.byteCap      = 64ULL * 1024ULL * 1024ULL; // mirrors read-tool refusal
+    spec.attach       = m_callbacks.attachTextFileRef;
     return QueueDroppedFileImport(filePath, spec);
 }
 

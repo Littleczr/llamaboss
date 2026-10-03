@@ -36,6 +36,10 @@ struct DropImportControllerCallbacks {
                        const std::string& relPath)> attachCsvFile;
     std::function<bool(const std::string& absPath,
                        const std::string& relPath)> attachZipFile;
+    // RLM Phase B: large text files (over the varstore demotion
+    // threshold) import like CSV/PDF and attach as a handle card.
+    std::function<bool(const std::string& absPath,
+                       const std::string& relPath)> attachTextFileRef;
 };
 
 class DropImportController
@@ -48,6 +52,9 @@ public:
     bool QueueDocxAttachmentFromDrop(const std::string& filePath) const;
     bool QueueCsvAttachmentFromDrop(const std::string& filePath) const;
     bool QueueZipAttachmentFromDrop(const std::string& filePath) const;
+    // Large text/code files — any extension the caller already vetted
+    // via AttachmentManager::IsTextFile.  spec ext gating is skipped.
+    bool QueueLargeTextAttachmentFromDrop(const std::string& filePath) const;
 
     void NotifyDocmDropRejected(const std::string& filePath) const;
 

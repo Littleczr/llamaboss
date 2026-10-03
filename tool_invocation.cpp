@@ -11,6 +11,7 @@
 
 #include "tool_invocation.h"
 #include "tool_router.h"
+#include "tool_call_elision.h"   // copied-elision-marker guard
 
 bool IsKnownToolName(const std::string& name)
 {
@@ -24,6 +25,14 @@ bool ValidateToolArgs(const std::string& name,
     const ToolSpec* spec = GetGlobalRouter().Find(name);
     if (!spec) {
         reasonOut = "unknown tool: " + name;
+        return false;
+    }
+    // A shortened old tool call copied into a new one (2026-10-01).
+    // Every protocol funnels through here (XML, slash, native after
+    // projection; native raw JSON is also checked in agent_controller),
+    // so no tool can run or write a truncated copy.
+    if (lb_toolcall_elision::ContainsArgElisionMarker(args)) {
+        reasonOut = lb_toolcall_elision::CopiedElisionRejection(args);
         return false;
     }
     if (!spec->validate) {

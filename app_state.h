@@ -90,6 +90,11 @@ public:
     bool GetContextMeterOn() const { return m_contextMeterOn; }
     void SetContextMeterOn(bool on);
 
+    // Context details panel (ctx meter click) open when the app last
+    // closed; reopened at launch.  Persisted.  Default: false.
+    bool GetContextHudOpen() const { return m_contextHudOpen; }
+    void SetContextHudOpen(bool open);
+
     // 8-bit KV cache: launch the local llama-server with q8_0 K/V
     // cache types (halves KV memory — roughly doubles the context
     // that fits in VRAM).  Launch-argument setting: changes require
@@ -137,7 +142,6 @@ public:
     // Utility methods
     void LogStartupMessage() const;
     void LogShutdownMessage() const;
-    bool HasValidConfiguration() const;
 
     // Window state persistence
     void SaveWindowState(wxFrame* frame);
@@ -220,9 +224,10 @@ private:
     int         m_fontSize = 15;   // points — default chat font size
     bool        m_agentDefaultOn = false;  // seed for new chats / app launches
     bool        m_contextMeterOn = true;   // top-bar context occupancy readout
+    bool        m_contextHudOpen = false;  // context panel open at last exit
     bool        m_kvCacheQ8 = true;        // q8_0 KV cache on local launches
     bool        m_mtpEnabled = true;       // auto MTP detection on local launches
-    int         m_agentMaxToolSteps = 12;  // agent tool-step safety cap
+    int         m_agentMaxToolSteps = 40;  // agent tool-step safety cap (default was 12 before 1.0)
 
     // Application components
     Poco::Logger* m_logger;
@@ -250,6 +255,7 @@ private:
     static const char* CONFIG_FONT_SIZE_KEY;
     static const char* CONFIG_AGENT_DEFAULT_ON_KEY;
     static const char* CONFIG_CONTEXT_METER_KEY;
+    static const char* CONFIG_CONTEXT_HUD_OPEN_KEY;
     static const char* CONFIG_KV_CACHE_Q8_KEY;
     static const char* CONFIG_MTP_ENABLED_KEY;
     static const char* CONFIG_AGENT_MAX_TOOL_STEPS_KEY;

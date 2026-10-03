@@ -53,13 +53,23 @@ public:
     static std::string GetSecretsFilePath();
 
     // Load from disk.  Missing file is not an error — the store
-    // simply starts empty.  Malformed JSON logs a warning and the
-    // store starts empty so the user can re-enter credentials.
+    // simply starts empty.  A file that exists but can't be read or
+    // parsed marks the store as load-failed: it starts empty in memory,
+    // a copy of the file is kept alongside, and Save() refuses to write
+    // until Load() succeeds or ResetAfterFailedLoad() is called.
     bool Load();
 
     // Atomically rewrite secrets.json from the in-memory map.
-    // Writes to a temp file alongside, then renames.
+    // Writes to a temp file alongside, then renames.  Returns false
+    // without writing while LoadFailed().
     bool Save();
+
+    // Load-failure state (see Load).  ResetAfterFailedLoad is the
+    // explicit "start fresh" choice: it re-enables Save().
+    bool LoadFailed() const { return m_loadFailed; }
+    const std::string& LoadError() const { return m_loadError; }
+    const std::string& LoadBackupPath() const { return m_loadBackupPath; }
+    void ResetAfterFailedLoad();
 
     // ── Per-secret access ────────────────────────────────────────
     // Semantic view of one configured entry.  For direct values, value
@@ -102,9 +112,6 @@ public:
     // entry if it becomes empty.
     void RemoveSecret(const std::string& provider,
                       const std::string& key);
-
-    // Removes an entire provider and every key under it.
-    void RemoveProvider(const std::string& provider);
 
     // ── UI helpers ───────────────────────────────────────────────
     // Snapshot of (provider, key, isEnvRef, displayHint) tuples for
@@ -150,4 +157,7 @@ private:
              std::map<std::string, std::string>> m_providers;
 
     bool m_loaded = false;
+    bool m_loadFailed = false;
+    std::string m_loadError;
+    std::string m_loadBackupPath;
 };

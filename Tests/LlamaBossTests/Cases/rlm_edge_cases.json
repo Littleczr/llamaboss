@@ -1,0 +1,139 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {
+      "name": "GrepAcceptsCompactContextSyntax",
+      "action": "parse_grep",
+      "input": {
+        "args": "-C3 PA-17 raw2.txt",
+        "max_context_lines": 50
+      },
+      "expect": {
+        "pattern": "PA-17",
+        "path": "raw2.txt",
+        "context_lines": 3,
+        "error": ""
+      }
+    },
+    {
+      "name": "GrepAcceptsSpacedContextWithQuotedPattern",
+      "action": "parse_grep",
+      "input": {
+        "args": "-C 7 \"Record key: PA-17\" raw2.txt",
+        "max_context_lines": 50
+      },
+      "expect": {
+        "pattern": "Record key: PA-17",
+        "path": "raw2.txt",
+        "context_lines": 7,
+        "error": ""
+      }
+    },
+    {
+      "name": "GrepAcceptsNativeContextMarkerAndMultilinePath",
+      "action": "parse_grep",
+      "input": {
+        "args": "@context=4\nRecord key: PA-17\nraw2.txt",
+        "max_context_lines": 50
+      },
+      "expect": {
+        "pattern": "Record key: PA-17",
+        "path": "raw2.txt",
+        "context_lines": 4,
+        "error": ""
+      }
+    },
+    {
+      "name": "GrepRejectsUnterminatedQuotedPattern",
+      "action": "parse_grep",
+      "input": {
+        "args": "\"Record key: PA-17 raw2.txt",
+        "max_context_lines": 50
+      },
+      "expect": {
+        "pattern": "",
+        "path": "",
+        "context_lines": 0,
+        "error": "Unterminated quoted grep pattern."
+      }
+    },
+    {
+      "name": "GrepRejectsContextAboveMaximum",
+      "action": "parse_grep",
+      "input": {
+        "args": "-C51 PA-17 raw2.txt",
+        "max_context_lines": 50
+      },
+      "expect": {
+        "pattern": "",
+        "path": "",
+        "context_lines": 0,
+        "error": "grep -C context exceeds maximum 50"
+      }
+    },
+    {
+      "name": "ReadRangeRejectsStartBeyondEndOfFile",
+      "action": "read_ranges",
+      "setup": {
+        "file": "numbered.txt",
+        "numbered_lines": 100
+      },
+      "input": {
+        "path": "numbered.txt",
+        "ctx_tokens": 131072,
+        "ranges": [
+          { "start": 101, "end": 105 }
+        ]
+      },
+      "expect": {
+        "success": false,
+        "body_mode": "empty",
+        "error_contains": "Range starts beyond end of file"
+      }
+    },
+    {
+      "name": "MultiRangeMergesOverlappingIntervals",
+      "action": "read_ranges",
+      "setup": {
+        "file": "numbered.txt",
+        "numbered_lines": 100
+      },
+      "input": {
+        "path": "numbered.txt",
+        "ctx_tokens": 131072,
+        "ranges": [
+          { "start": 10, "end": 20 },
+          { "start": 20, "end": 30 }
+        ]
+      },
+      "expect": {
+        "success": true,
+        "body_mode": "unchecked",
+        "body_contains": ["line 0010", "line 0020", "line 0030"],
+        "body_not_contains": ["line 0009", "line 0031"],
+        "chips_contain": ["ranges merged"]
+      }
+    },
+    {
+      "name": "MultiRangeUsesContextAwareBudgetAt8K",
+      "action": "read_ranges",
+      "setup": {
+        "file": "numbered.txt",
+        "numbered_lines": 100
+      },
+      "input": {
+        "path": "numbered.txt",
+        "ctx_tokens": 8192,
+        "ranges": [
+          { "start": 1, "end": 2 },
+          { "start": 99, "end": 100 }
+        ]
+      },
+      "expect": {
+        "success": true,
+        "body_mode": "numbered_ranges",
+        "history_inline_budget_bytes": 15576
+      }
+    }
+  ]
+}

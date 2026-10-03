@@ -25,8 +25,10 @@
 #pragma once
 
 #include <string>
+#include <vector>
 
 #include "tool_path.h"  // ResolveToolPath
+#include "chat_folders.h"  // chat folder recognizer
 
 namespace tool_path_safety {
 
@@ -143,6 +145,25 @@ inline bool IsKnownProjectRelativePath(const std::string& input)
     }
     if (s.empty()) return false;
 
+    // Reject traversal components anywhere in the relative path.  The old
+    // prefix-only check caught "..\\Inputs" but still classified
+    // "Inputs\\..\\..\\outside.txt" as a known project-lane path.  Final
+    // write containment remained a second line of defense, but classification
+    // itself must fail closed and leave traversal-shaped inputs on the legacy
+    // cwd resolver path.
+    {
+        size_t segmentStart = 0;
+        while (segmentStart <= s.size()) {
+            const size_t separator = s.find_first_of("\\/", segmentStart);
+            const size_t segmentEnd =
+                (separator == std::string::npos) ? s.size() : separator;
+            if (s.substr(segmentStart, segmentEnd - segmentStart) == "..")
+                return false;
+            if (separator == std::string::npos) break;
+            segmentStart = separator + 1;
+        }
+    }
+
     // Absolute paths and traversal attempts keep the existing resolver
     // behavior.  This helper is only for normal project-relative lanes.
     if (s.size() >= 3 && ((s[0] >= 'A' && s[0] <= 'Z') ||
@@ -202,20 +223,177 @@ inline std::string ResolveProjectAwareToolPath(const std::string& input,
     return ResolveToolPath(input, cwd);
 }
 
+// Resolve an explicit chat-folder lane path for read-only tools.
+//
+// Conversation artifacts intentionally live beside the default Workspace:
+//
+//   ...\Chats\<date>_<slug>_<id>\Workspace
+//   ...\Chats\<date>_<slug>_<id>\Extracted
+//   ...\Chats\<date>_<slug>_<id>\Scripts
+//
+// A model naturally addresses those artifacts as `Extracted\repo\file.cpp`
+// or `Scripts\helper.py`. Resolving such a path against cwd first points at
+// the nonexistent `Workspace\Extracted` / `Workspace\Scripts` tree and used
+// to cost a failed tool call plus an absolute-path retry. Keep the alias
+// narrow and read-only: only known lane prefixes, only the recognized
+// conversation/default Workspace shape, never traversal, and only after the
+// ordinary cwd/project path failed to name an existing item.
+inline std::string TryResolveConversationLanePath(const std::string& input,
+                                                  const std::string& cwd)
+{
+    auto trim = [](std::string s) {
+        size_t a = s.find_first_not_of(" \t\r\n");
+        if (a == std::string::npos) return std::string();
+        size_t b = s.find_last_not_of(" \t\r\n");
+        return s.substr(a, b - a + 1);
+    };
+    auto trimTrailingSeparators = [](std::string s) {
+        while (!s.empty() && (s.back() == '\\' || s.back() == '/'))
+            s.pop_back();
+        return s;
+    };
+    auto parentDir = [&](const std::string& path) {
+        std::string s = trimTrailingSeparators(path);
+        size_t pos = s.find_last_of("\\/");
+        return pos == std::string::npos ? std::string() : s.substr(0, pos);
+    };
+    auto baseName = [&](const std::string& path) {
+        std::string s = trimTrailingSeparators(path);
+        size_t pos = s.find_last_of("\\/");
+        return pos == std::string::npos ? s : s.substr(pos + 1);
+    };
+    auto lower = [](std::string s) {
+        for (char& c : s) c = LowerAscii(c);
+        return s;
+    };
+
+    std::string requested = trim(input);
+    if (requested.size() >= 2 &&
+        ((requested.front() == '"' && requested.back() == '"') ||
+         (requested.front() == '\'' && requested.back() == '\''))) {
+        requested = trim(requested.substr(1, requested.size() - 2));
+    }
+    while (requested.rfind(".\\", 0) == 0 ||
+           requested.rfind("./", 0) == 0) {
+        requested = requested.substr(2);
+    }
+    if (requested.empty() || requested.front() == '\\' ||
+        requested.front() == '/') return std::string();
+    if (requested.size() >= 3 &&
+        ((requested[0] >= 'A' && requested[0] <= 'Z') ||
+         (requested[0] >= 'a' && requested[0] <= 'z')) &&
+        requested[1] == ':' &&
+        (requested[2] == '\\' || requested[2] == '/')) {
+        return std::string();
+    }
+
+    // Reject traversal components before rebasing the path into a sibling
+    // lane. ResolveToolPath canonicalizes too, but the alias classifier itself
+    // should fail closed instead of accepting an escape-shaped request.
+    size_t segmentStart = 0;
+    while (segmentStart <= requested.size()) {
+        size_t separator = requested.find_first_of("\\/", segmentStart);
+        size_t segmentEnd = separator == std::string::npos
+            ? requested.size() : separator;
+        if (requested.substr(segmentStart, segmentEnd - segmentStart) == "..")
+            return std::string();
+        if (separator == std::string::npos) break;
+        segmentStart = separator + 1;
+    }
+
+    const size_t firstSep = requested.find_first_of("\\/");
+    const std::string first = lower(requested.substr(0, firstSep));
+    std::string lane;
+    if      (first == "extracted")    lane = "Extracted";
+    else if (first == "scripts")      lane = "Scripts";
+    else if (first == "documents")    lane = "Documents";
+    else if (first == "spreadsheets") lane = "Spreadsheets";
+    else if (first == "pdfs")         lane = "PDFs";
+    else if (first == "filled forms") lane = "Filled Forms";
+    else if (first == "word")         lane = "Word";
+    else if (first == "tooloutputs")  lane = "ToolOutputs";
+    else return std::string();
+
+    const std::string cleanCwd = trimTrailingSeparators(cwd);
+    if (lower(baseName(cleanCwd)) != "workspace") return std::string();
+
+    const std::string workspaceParent = parentDir(cleanCwd);
+    if (workspaceParent.empty()) return std::string();
+
+    std::string laneBase = chat_folders::ChatFolderFromWorkspaceCwd(cleanCwd);
+    if (laneBase.empty()) {
+        // Unsaved/default Workspace layout:
+        //   %USERPROFILE%\LlamaBoss\Shared\Workspace   (current)
+        //   %USERPROFILE%\LlamaBoss\Workspace           (pre-Shared builds)
+        const std::string parentBase = lower(baseName(workspaceParent));
+        const bool sharedLayout = parentBase == "shared" &&
+            lower(baseName(parentDir(workspaceParent))) == "llamaboss";
+        if (!sharedLayout && parentBase != "llamaboss")
+            return std::string();
+        laneBase = workspaceParent;
+    }
+
+    std::string laneRoot = ResolveToolPath(lane, laneBase);
+    if (laneRoot.empty()) return std::string();
+
+    std::string remainder;
+    if (firstSep != std::string::npos)
+        remainder = requested.substr(firstSep + 1);
+
+    std::string resolved = remainder.empty()
+        ? laneRoot
+        : ResolveToolPath(remainder, laneRoot);
+    if (resolved.empty() || !IsUnderCwd(resolved, laneRoot))
+        return std::string();
+    return resolved;
+}
+
+// Read-only resolver with collision-safe precedence:
+//   1. existing project/cwd path;
+//   2. explicit conversation-lane alias;
+//   3. unresolved ordinary path, so the caller can report its normal error.
+// `usedConversationLane` is optional and lets presentation code add a chip or
+// preserve an absolute helper argument only when the alias actually won.
+inline std::string ResolveReadOnlyToolPath(const std::string& input,
+                                           const std::string& cwd,
+                                           const std::string& activeProjectRoot,
+                                           bool* usedConversationLane = nullptr)
+{
+    if (usedConversationLane) *usedConversationLane = false;
+
+    std::string primary = ResolveProjectAwareToolPath(
+        input, cwd, activeProjectRoot);
+    if (!primary.empty() && (IsFile(primary) || IsDirectory(primary)))
+        return primary;
+
+    std::string lane = TryResolveConversationLanePath(input, cwd);
+    if (!lane.empty() && (IsFile(lane) || IsDirectory(lane))) {
+        if (usedConversationLane) *usedConversationLane = true;
+        return lane;
+    }
+
+    return primary;
+}
+
 inline bool IsUnderAllowedWriteRoot(const std::string& absPath,
                                     const std::string& cwd,
                                     const std::string& activeProjectRoot,
-                                    const std::string& skillsRoot)
+                                    const std::string& skillsRoot,
+                                    const std::vector<std::string>& additionalWriteRoots = {})
 {
     if (IsUnderCwd(absPath, cwd)) return true;
     if (!activeProjectRoot.empty() && IsUnderCwd(absPath, activeProjectRoot)) return true;
     if (!skillsRoot.empty() && IsUnderCwd(absPath, skillsRoot)) return true;
+    for (const std::string& root : additionalWriteRoots) {
+        if (!root.empty() && IsUnderCwd(absPath, root)) return true;
+    }
     return false;
 }
 
 inline std::string AllowedWriteRootsDiagnostic(const std::string& cwd,
                                                const std::string& activeProjectRoot,
-                                               const std::string& skillsRoot)
+                                               const std::string& skillsRoot,
+                                               const std::vector<std::string>& additionalWriteRoots = {})
 {
     std::string s = "\n  cwd:      " + cwd;
     if (!activeProjectRoot.empty()) {
@@ -224,7 +402,24 @@ inline std::string AllowedWriteRootsDiagnostic(const std::string& cwd,
     if (!skillsRoot.empty()) {
         s += "\n  skills:   " + skillsRoot;
     }
+    for (const std::string& root : additionalWriteRoots) {
+        if (!root.empty()) s += "\n  granted:  " + root;
+    }
     return s;
+}
+
+// Drive roots are deliberately too broad for a one-click chat grant.  When
+// the parent of a target is a drive root, the approval layer grants the exact
+// target path instead (a file-sized capability, or the directory being
+// created) rather than silently granting all of C:\\ or D:\\.
+inline bool IsDriveRoot(const std::string& path)
+{
+    const std::string n = NormalizeForCompare(path);
+    return n.size() == 3 &&
+           n[1] == ':' &&
+           n[2] == '\\' &&
+           ((n[0] >= 'a' && n[0] <= 'z') ||
+            (n[0] >= 'A' && n[0] <= 'Z'));
 }
 
 // Returns the basename portion of an absolute Windows path.  Empty

@@ -53,6 +53,7 @@ public:
     void OnCmdError(wxCommandEvent& evt);
     void OnPythonComplete(wxCommandEvent& evt);
     void OnPythonError(wxCommandEvent& evt);
+    void OnPySessionComplete(wxCommandEvent& evt);
     void OnGrepComplete(wxCommandEvent& evt);
     void OnWebFetchComplete(wxCommandEvent& evt);
     void OnWebFetchError(wxCommandEvent& evt);

@@ -13,11 +13,17 @@
 #include "widgets.h"
 #include "theme.h"
 #include "ui_event_post.h"
+#include "lb_string_utils.h"   // LbUtf8SafeTruncate
 
 #include <wx/filedlg.h>
 #include <wx/textdlg.h>
 #include <wx/filename.h>
 #include <wx/dir.h>
+#include <wx/dirdlg.h>
+#include <wx/msgdlg.h>
+#include <wx/stdpaths.h>
+#include <wx/file.h>
+#include <wx/datetime.h>
 
 #include <algorithm>
 #include <cctype>
@@ -89,10 +95,9 @@ static bool StartsWith(const std::string& s, const std::string& prefix)
 
 static bool IsHiddenGoalReplaySystemMessage(const std::string& content)
 {
-    // Goal continuation instructions are intentionally persisted in the
-    // transcript so future model turns retain the control context, but they
-    // are internal orchestration prompts and should not render back into the
-    // visible chat when a saved conversation is replayed.
+    // Legacy: the retired Goals feature persisted its continuation
+    // instructions as system messages.  They are internal orchestration
+    // prompts, so keep hiding them when older saved conversations replay.
     return StartsWith(content, "Goal continuation instruction:");
 }
 
@@ -540,7 +545,9 @@ void ConversationController::OnSaveConversation()
     WaitForPendingSaves();
 
     if (m_chatHistory->HasFilePath()) {
-        ChatHistory::EnsureWorkflowDir(m_chatHistory->GetFilePath());
+        ChatHistory::EnsureChatFolder(m_chatHistory->GetFilePath(),
+                                      m_chatHistory->GetChatFolderTitle());
+        m_chatHistory->SetModelSelection(m_modelSwitcher.GetConversationSelectionKeyForSave());
         if (m_chatHistory->SaveToFile("", m_modelSwitcher.GetConversationModelForSave())) {
             m_chatDisplay->DisplaySystemMessage("Conversation saved.");
         }
@@ -587,7 +594,8 @@ void ConversationController::OnSaveConversation()
             return;
         }
 
-        ChatHistory::EnsureWorkflowDir(path);
+        ChatHistory::EnsureChatFolder(path, m_chatHistory->GetChatFolderTitle());
+        m_chatHistory->SetModelSelection(m_modelSwitcher.GetConversationSelectionKeyForSave());
         if (m_chatHistory->SaveToFile(path, m_modelSwitcher.GetConversationModelForSave())) {
             // Save-As just changed this window's current path — refresh
             // the registry claim so no other window can open the new
@@ -603,6 +611,12 @@ void ConversationController::OnSaveConversation()
             if (m_chatHistory->IsChatApprovalTrustEnabled()) {
                 wxGetApp().GetConversationRegistry().RememberSessionTrust(
                     m_chatHistory->GetFilePath());
+            }
+            for (const std::string& root :
+                 m_chatHistory->GetChatWriteRoots()) {
+                wxGetApp().GetConversationRegistry()
+                    .RememberSessionWriteRoot(
+                        m_chatHistory->GetFilePath(), root);
             }
             UpdateWindowTitle();
             m_chatDisplay->DisplaySystemMessage("Conversation saved.");
@@ -629,20 +643,19 @@ void ConversationController::OnLoadConversation()
 
     if (dlg.ShowModal() == wxID_CANCEL) return;
 
-    if (!LoadConversationFromPath(dlg.GetPath().ToUTF8().data())) {
-        wxMessageBox("Failed to load conversation file", "Error", wxOK | wxICON_ERROR);
-    }
+    LoadConversationFromPath(dlg.GetPath().ToUTF8().data());
 }
 
 // ═════════════════════════════════════════════════════════════════
 //  AUTO-SAVE
 // ═════════════════════════════════════════════════════════════════
 
-void ConversationController::AutoSaveConversation(bool refreshSidebar,
+bool ConversationController::AutoSaveConversation(bool refreshSidebar,
                                                     bool durable,
                                                     bool touchActivityTimestamp)
 {
-    if (!m_chatHistory->HasPersistableContent()) return;
+    if (durable && m_cb.beforeDurableSave) m_cb.beforeDurableSave();
+    if (!m_chatHistory->HasPersistableContent()) return true;
 
     // A destructive transition must not leave an older background writer in
     // flight, even when an earlier same-revision completion has already
@@ -652,13 +665,15 @@ void ConversationController::AutoSaveConversation(bool refreshSidebar,
     if (durable)
         WaitForPendingSaves();
 
-    if (!m_chatHistory->IsDirty() && m_chatHistory->HasFilePath()) return;
+    // A background completion only proves a non-durable write succeeded.
+    // Flush again before destroying the in-memory copy, even if it is clean.
+    if (!durable && !m_chatHistory->IsDirty() && m_chatHistory->HasFilePath()) return true;
 
     if (!m_chatHistory->HasFilePath())
         m_chatHistory->SetFilePath(ChatHistory::GenerateFilePath());
 
     const std::string savePath = m_chatHistory->GetFilePath();
-    ChatHistory::EnsureWorkflowDir(savePath);
+    ChatHistory::EnsureChatFolder(savePath, m_chatHistory->GetChatFolderTitle());
 
     // Session trust: an unsaved chat can be granted one-approval mode
     // before it has a file path (HandleApprovalCommand ignores empty
@@ -667,10 +682,17 @@ void ConversationController::AutoSaveConversation(bool refreshSidebar,
     if (m_chatHistory->IsChatApprovalTrustEnabled()) {
         wxGetApp().GetConversationRegistry().RememberSessionTrust(savePath);
     }
+    for (const std::string& root : m_chatHistory->GetChatWriteRoots()) {
+        wxGetApp().GetConversationRegistry()
+            .RememberSessionWriteRoot(savePath, root);
+    }
 
     const std::vector<std::string> models{
         m_modelSwitcher.GetConversationModelForSave()
     };
+    // Persist the exact connection with the model id (see
+    // ChatHistory::GetModelSelection).
+    m_chatHistory->SetModelSelection(m_modelSwitcher.GetConversationSelectionKeyForSave());
 
     if (durable) {
         // Earlier queued snapshots were drained above before the clean
@@ -684,25 +706,469 @@ void ConversationController::AutoSaveConversation(bool refreshSidebar,
                 m_sidebar.Refresh(savePath);
             if (auto* logger = m_appState.GetLogger())
                 logger->debug("Durably saved conversation: " + savePath);
+            return true;
         }
-        return;
+        if (auto* logger = m_appState.GetLogger())
+            logger->warning("Durable conversation save failed: " + savePath);
+        return false;
     }
 
     ChatHistory::SaveSnapshot snapshot;
     if (!m_chatHistory->CreateSaveSnapshot("", models, snapshot,
-                                             touchActivityTimestamp)) return;
+                                             touchActivityTimestamp)) return false;
 
     // Claim/update immediately: the in-memory conversation already owns this
     // generated path, while disk construction proceeds in the worker.
     wxGetApp().GetConversationRegistry().SetCurrent(&m_frame, savePath);
     UpdateWindowTitle();
 
-    if (m_asyncSave)
+    if (m_asyncSave) {
         m_asyncSave->Queue(std::move(snapshot), refreshSidebar);
+        return true;
+    }
+    return false;
 }
+// Recovery before a destructive transition.
+bool ConversationController::SaveBeforeLeaving(bool allowRecoveryDialog)
+{
+    // Recovery dialogs pump events. Prevent nested close/load actions from
+    // clearing history underneath a recovery attempt.
+    if (m_saveRecoveryActive) return false;
+    struct RecoveryScope {
+        bool& active;
+        explicit RecoveryScope(bool& value) : active(value) { active = true; }
+        ~RecoveryScope() { active = false; }
+    } scope(m_saveRecoveryActive);
+
+    for (;;) {
+        if (AutoSaveConversation(false, /*durable=*/true)) return true;
+        if (!allowRecoveryDialog) return false;
+
+        wxMessageDialog prompt(&m_frame,
+            "The conversation could not be saved. It is still open in memory.\n\n"
+            "Retry after fixing the disk or file access problem, or save a recovery "
+            "copy in another folder. Save Elsewhere keeps the original filename "
+            "so the copy can still find this conversation's existing workspace and attachments.",
+            "Conversation Not Saved", wxYES_NO | wxCANCEL | wxICON_WARNING);
+        prompt.SetYesNoCancelLabels("Retry", "Save Elsewhere...", "Keep Chat Open");
+        const int answer = prompt.ShowModal();
+        if (answer == wxID_YES) continue;
+        if (answer != wxID_NO) return false;
+
+        wxDirDialog folder(&m_frame, "Choose a folder for the recovery conversation",
+                           wxEmptyString, wxDD_DEFAULT_STYLE | wxDD_DIR_MUST_EXIST);
+        if (folder.ShowModal() != wxID_OK) return false;
+
+        const wxFileName original(wxString::FromUTF8(m_chatHistory->GetFilePath()));
+        const wxString destination = wxFileName(folder.GetPath(), original.GetFullName()).GetFullPath();
+        const std::string path(destination.ToUTF8().data());
+        if (wxFrame* owner = wxGetApp().GetConversationRegistry().OwnerOf(path, &m_frame)) {
+            owner->RequestUserAttention(wxUSER_ATTENTION_INFO);
+            wxMessageBox("That conversation is open in another window. Choose another folder.",
+                         "Conversation In Use", wxOK | wxICON_WARNING, &m_frame);
+            continue;
+        }
+        if (wxFileExists(destination) && wxMessageBox(
+                "Replace the existing conversation in this folder?",
+                "Replace Conversation", wxYES_NO | wxNO_DEFAULT | wxICON_WARNING,
+                &m_frame) != wxYES) return false;
+
+        // Dialogs may have delivered more stream/tool results. Drain old
+        // writes and take a fresh snapshot. This recovery export deliberately
+        // preserves the live conversation's identity and dirty state.
+        WaitForPendingSaves();
+        if (m_cb.beforeDurableSave) m_cb.beforeDurableSave();
+        m_chatHistory->SetModelSelection(m_modelSwitcher.GetConversationSelectionKeyForSave());
+        ChatHistory::SaveSnapshot snapshot;
+        if (m_chatHistory->CreateSaveSnapshot("",
+                std::vector<std::string>{m_modelSwitcher.GetConversationModelForSave()}, snapshot)) {
+            snapshot.filePath = path;
+            snapshot.titleMarkerPath.clear();
+            if (ChatHistory::WriteSaveSnapshot(snapshot, /*durable=*/true)) return true;
+        }
+        wxMessageBox("The recovery copy could not be saved. Your conversation is still open.",
+                     "Save Failed", wxOK | wxICON_ERROR, &m_frame);
+    }
+}
+
 // ═════════════════════════════════════════════════════════════════
 //  SIDEBAR MANAGEMENT: rename / pin / archive
 // ═════════════════════════════════════════════════════════════════
+
+// ═════════════════════════════════════════════════════════════════
+//  EXPORT (Markdown transcript)
+// ═════════════════════════════════════════════════════════════════
+
+namespace {
+
+// Remove <think>…</think> reasoning (also an unterminated open tag, and
+// the "orphan close" shape where the template prefilled <think>).
+std::string ExportStripThinking(std::string s)
+{
+    static const std::string kOpen = "<think>", kClose = "</think>";
+    const size_t firstOpen = s.find(kOpen);
+    const size_t firstClose = s.find(kClose);
+    if (firstClose != std::string::npos &&
+        (firstOpen == std::string::npos || firstClose < firstOpen)) {
+        s.erase(0, firstClose + kClose.size());
+    }
+    for (;;) {
+        const size_t open = s.find(kOpen);
+        if (open == std::string::npos) break;
+        const size_t close = s.find(kClose, open + kOpen.size());
+        if (close == std::string::npos) { s.erase(open); break; }
+        s.erase(open, close + kClose.size() - open);
+    }
+    return TrimCopy(s);
+}
+
+// A fence longer than any backtick run inside the body, so tool output
+// that itself contains ``` cannot break out of its code block.
+std::string ExportFenceFor(const std::string& body)
+{
+    size_t longest = 0, run = 0;
+    for (char c : body) {
+        run = (c == '`') ? run + 1 : 0;
+        longest = std::max(longest, run);
+    }
+    return std::string(std::max<size_t>(3, longest + 1), '`');
+}
+
+// Inline code span that survives backticks inside the text.
+std::string ExportInlineCode(const std::string& text)
+{
+    size_t longest = 0, run = 0;
+    for (char c : text) {
+        run = (c == '`') ? run + 1 : 0;
+        longest = std::max(longest, run);
+    }
+    const std::string ticks(longest + 1, '`');
+    const bool pad = !text.empty() && (text.front() == '`' || text.back() == '`');
+    return ticks + (pad ? " " : "") + text + (pad ? " " : "") + ticks;
+}
+
+size_t ExportCountLines(const std::string& s)
+{
+    if (s.empty()) return 0;
+    size_t n = static_cast<size_t>(std::count(s.begin(), s.end(), '\n'));
+    return (s.back() == '\n') ? n : n + 1;
+}
+
+// Long tool output (file reads, directory listings) would dominate the
+// transcript.  Keep the first part and say how much was left out; the
+// full text stays in the conversation JSON.
+constexpr size_t kExportMaxToolLines = 400;
+
+void ExportAppendCollapsible(std::string& md, const std::string& summary,
+                             const std::string& body, const std::string& lang)
+{
+    std::string text = body;
+    const size_t total = ExportCountLines(text);
+    std::string note;
+    if (total > kExportMaxToolLines) {
+        size_t pos = 0;
+        for (size_t i = 0; i < kExportMaxToolLines && pos != std::string::npos; ++i) {
+            pos = text.find('\n', pos);
+            if (pos != std::string::npos) ++pos;
+        }
+        if (pos != std::string::npos) text.erase(pos);
+        note = "\n_\xE2\x80\xA6 " + std::to_string(total - kExportMaxToolLines) +
+               " more lines not included in this export._\n";
+    }
+    while (!text.empty() && (text.back() == '\n' || text.back() == '\r'))
+        text.pop_back();
+
+    const std::string fence = ExportFenceFor(text);
+    md += "<details><summary>" + summary + " (" + std::to_string(total) +
+          (total == 1 ? " line" : " lines") + ")</summary>\n\n";
+    md += fence + lang + "\n" + text + "\n" + fence + "\n" + note;
+    md += "\n</details>\n\n";
+}
+
+// "notes_read" -> "Notes Read".  Known tools already arrive pretty
+// ("PowerShell"); the generic fallback only capitalises the first letter.
+std::string ExportToolName(std::string name)
+{
+    bool startWord = true;
+    for (char& c : name) {
+        if (c == '_') { c = ' '; startWord = true; continue; }
+        if (startWord)
+            c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        startWord = (c == ' ');
+    }
+    return name;
+}
+
+// LlamaBoss appends a "[workspace changes]" note to tool output for the
+// model's benefit.  It is noise in a human transcript.
+std::string ExportStripToolFooter(std::string body)
+{
+    const size_t pos = body.rfind("\n[workspace changes]");
+    if (pos != std::string::npos)
+        body.erase(pos);
+    else if (body.rfind("[workspace changes]", 0) == 0)
+        body.clear();
+    return body;
+}
+
+std::string ExportSafeFileName(std::string name)
+{
+    static const std::string kBad = "<>:\"/\\|?*";
+    for (char& c : name) {
+        if (static_cast<unsigned char>(c) < 32 || kBad.find(c) != std::string::npos)
+            c = '_';
+    }
+    name = TrimCopy(name);
+    while (!name.empty() && (name.back() == '.' || name.back() == ' '))
+        name.pop_back();
+    if (name.size() > 80) name = LbUtf8SafeTruncate(name, 80);
+    return name.empty() ? std::string("conversation") : name;
+}
+
+std::string BuildConversationMarkdown(const ChatHistory& history,
+                                      const std::string& fallbackModel)
+{
+    std::string title = history.GetTitle();
+    if (title.empty()) title = history.GenerateTitle();
+    if (title.empty()) title = "Conversation";
+
+    std::string md;
+    md += "# " + title + "\n\n";
+    if (!fallbackModel.empty())
+        md += "- **Model:** " + ServerManager::ModelDisplayName(fallbackModel) + "\n";
+    if (!history.GetCreatedAt().empty())
+        md += "- **Created:** " + history.GetCreatedAt() + "\n";
+    md += "- **Exported:** " +
+          std::string(wxDateTime::Now().Format("%Y-%m-%d %H:%M").ToUTF8().data()) +
+          " from LlamaBoss\n";
+
+    // Speaker headings.  Native tool-call turns store an assistant message
+    // with empty content plus a tool_calls sidecar, then the results as
+    // user-role messages; without tracking, every tool result would land
+    // under "## You".  Tool results and the final answer are grouped under
+    // the model that issued the calls, with one heading per run.
+    std::string lastHeading;
+    std::string pendingModel = fallbackModel;
+    auto modelHeading = [&](const std::string& model) {
+        return model.empty() ? std::string("Assistant")
+                             : ServerManager::ModelDisplayName(model);
+    };
+    auto emitAssistantHeading = [&](const std::string& model) {
+        const std::string heading = modelHeading(model);
+        if (heading == lastHeading) return;
+        md += "## " + heading + "\n\n";
+        lastHeading = heading;
+    };
+
+    for (const auto& msg : history.GetMessages()) {
+        try {
+            if (!msg || !msg->has("role") || msg->isNull("role")) continue;
+            const std::string role = msg->getValue<std::string>("role");
+            std::string content;
+            if (msg->has("content") && !msg->isNull("content"))
+                content = msg->getValue<std::string>("content");
+
+            if (role == "user") {
+                ChatDisplay::ToolBlock tool;
+                if (ParseSavedToolBlock(content, tool)) {
+                    emitAssistantHeading(pendingModel);
+                    tool.body = ExportStripToolFooter(tool.body);
+                    tool.errorBody = ExportStripToolFooter(tool.errorBody);
+                    // Long or multi-line commands (agent PowerShell one-liners
+                    // run to thousands of characters) are shortened in the
+                    // summary line; the full text goes in a Command block.
+                    constexpr size_t kMaxInlineCommand = 120;
+                    const std::string& echo = tool.commandEcho;
+                    const bool longEcho = echo.size() > kMaxInlineCommand ||
+                                          echo.find('\n') != std::string::npos;
+                    md += "> **" + ExportToolName(tool.toolName) + "**";
+                    if (!echo.empty()) {
+                        std::string shown = echo.substr(0, echo.find('\n'));
+                        if (longEcho) {
+                            shown = LbUtf8SafeTruncate(shown, 100);
+                            while (!shown.empty() && shown.back() == ' ')
+                                shown.pop_back();
+                            shown += " \xE2\x80\xA6";
+                        }
+                        md += " \xE2\x80\x94 " + ExportInlineCode(shown);
+                    }
+                    if (!tool.statusChips.empty()) {
+                        md += " \xC2\xB7 ";
+                        for (size_t i = 0; i < tool.statusChips.size(); ++i)
+                            md += (i ? ", " : "") + tool.statusChips[i];
+                    }
+                    md += "\n\n";
+                    if (longEcho) {
+                        const std::string lang =
+                            LowerCopy(tool.toolName) == "powershell"
+                                ? "powershell" : "";
+                        ExportAppendCollapsible(md, "Command", echo, lang);
+                    }
+                    if (!TrimCopy(tool.body).empty())
+                        ExportAppendCollapsible(md, "Output", tool.body, tool.bodyLang);
+                    if (!TrimCopy(tool.errorBody).empty())
+                        ExportAppendCollapsible(md, "Error", tool.errorBody, "");
+                    // Short file lists inline; long ones (test runs can
+                    // attach dozens) folded so they don't flood the page.
+                    const size_t nFiles = tool.presentedFiles.size();
+                    if (nFiles > 3)
+                        md += "<details><summary>Files (" +
+                              std::to_string(nFiles) + ")</summary>\n\n";
+                    for (const auto& f : tool.presentedFiles)
+                        md += "- " + ExportInlineCode(f.diskPath) + "\n";
+                    if (nFiles > 3) md += "\n</details>\n";
+                    if (nFiles) md += "\n";
+                    continue;
+                }
+
+                // Same cleanup as replay: drop the per-turn session header.
+                if (content.rfind("[Session context:", 0) == 0) {
+                    const size_t cut = content.find("\n\n");
+                    content = (cut == std::string::npos) ? std::string()
+                                                         : content.substr(cut + 2);
+                }
+
+                std::string attachments;
+                if (msg->has("attachments") && !msg->isNull("attachments")) {
+                    auto arr = msg->getArray("attachments");
+                    for (unsigned i = 0; arr && i < arr->size(); ++i) {
+                        auto att = arr->getObject(i);
+                        if (!att) continue;
+                        std::string name = att->optValue<std::string>("filename", "");
+                        if (name.empty())
+                            name = att->optValue<std::string>("kind", "") == "image"
+                                ? "image" : "file";
+                        if (!attachments.empty()) attachments += ", ";
+                        attachments += ExportInlineCode(name);
+                    }
+                }
+
+                content = TrimCopy(content);
+                if (content.empty() && attachments.empty()) continue;
+
+                const std::string target = ChatHistory::GetMessageTarget(msg);
+                while (md.size() > 1 && md.back() == '\n' &&
+                       md[md.size() - 2] == '\n')
+                    md.pop_back();               // exactly one blank line
+                md += "\n---\n\n## You";
+                if (!target.empty())
+                    md += " \xE2\x86\x92 " + ServerManager::ModelDisplayName(target);
+                md += "\n\n";
+                lastHeading = "You";
+                if (!attachments.empty())
+                    md += "_Attachments: " + attachments + "_\n\n";
+                if (!content.empty())
+                    md += content + "\n\n";
+            }
+            else if (role == "assistant") {
+                content = ExportStripThinking(content);
+                {
+                    std::string m = ChatHistory::GetMessageModel(msg);
+                    pendingModel = m.empty() ? fallbackModel : m;
+                }
+
+                std::vector<std::string> images;
+                if (msg->has("images") && !msg->isNull("images")) {
+                    auto arr = msg->getArray("images");
+                    for (unsigned i = 0; arr && i < arr->size(); ++i) {
+                        try { images.push_back(arr->get(i).convert<std::string>()); }
+                        catch (...) {}
+                    }
+                }
+                if (content.empty() && images.empty()) continue;
+
+                emitAssistantHeading(pendingModel);
+                if (!content.empty())
+                    md += content + "\n\n";
+                for (const auto& img : images)
+                    md += "_Generated image: " + ExportInlineCode(img) + "_\n\n";
+            }
+            else if (role == "system") {
+                content = TrimCopy(content);
+                if (content.empty() || IsHiddenGoalReplaySystemMessage(content))
+                    continue;
+                md += "> _" + content + "_\n\n";
+            }
+        } catch (...) {
+            continue;   // one malformed message must not sink the export
+        }
+    }
+
+    while (!md.empty() && (md.back() == '\n' || md.back() == ' '))
+        md.pop_back();
+    return md;   // caller appends the single final newline
+}
+
+} // anonymous namespace
+
+void ConversationController::ExportConversation(const std::string& path)
+{
+    if (path.empty()) return;
+
+    // Read-only.  The active chat exports from memory (includes anything
+    // not yet autosaved) unless a response is streaming, in which case the
+    // last saved file is the consistent snapshot.  Every other chat,
+    // including ones open in another window, is read from disk.
+    const std::string activePath = m_chatHistory->GetFilePath();
+    const bool isActive = !activePath.empty() && path == activePath;
+    const bool busy = m_cb.isBusy && m_cb.isBusy();
+
+    std::string markdown;
+    std::string title;
+    if (isActive && !busy) {
+        markdown = BuildConversationMarkdown(
+            *m_chatHistory, m_modelSwitcher.GetConversationModelForSave());
+        title = m_chatHistory->GetTitle();
+        if (title.empty()) title = m_chatHistory->GenerateTitle();
+    }
+    else {
+        ChatHistory tmp;
+        std::vector<std::string> models;
+        if (!tmp.LoadFromFile(path, models)) {
+            wxMessageBox("The conversation could not be opened for export.",
+                         "Export Conversation", wxOK | wxICON_WARNING, &m_frame);
+            return;
+        }
+        markdown = BuildConversationMarkdown(
+            tmp, models.empty() ? std::string() : models.front());
+        title = tmp.GetTitle();
+        if (title.empty()) title = tmp.GenerateTitle();
+    }
+
+    // Remember the folder for the rest of the session; start in Documents.
+    static wxString s_lastExportDir;
+    if (s_lastExportDir.empty() || !wxDirExists(s_lastExportDir))
+        s_lastExportDir = wxStandardPaths::Get().GetDocumentsDir();
+
+    wxFileDialog dlg(&m_frame, "Export Conversation", s_lastExportDir,
+        wxString::FromUTF8(ExportSafeFileName(title) + ".md"),
+        "Markdown (*.md)|*.md|Text (*.txt)|*.txt",
+        wxFD_SAVE | wxFD_OVERWRITE_PROMPT);
+    if (dlg.ShowModal() == wxID_CANCEL) return;
+
+    wxFileName out(dlg.GetPath());
+    if (out.GetExt().empty())
+        out.SetExt(dlg.GetFilterIndex() == 1 ? "txt" : "md");
+    s_lastExportDir = out.GetPath();
+
+    wxFile file;
+    bool ok = file.Create(out.GetFullPath(), /*overwrite=*/true);
+    if (ok) {
+        markdown += "\n";
+        ok = file.Write(markdown.data(), markdown.size()) == markdown.size();
+        ok = file.Close() && ok;
+    }
+    if (!ok) {
+        wxMessageBox("Could not write:\n" + out.GetFullPath(),
+                     "Export Conversation", wxOK | wxICON_WARNING, &m_frame);
+        return;
+    }
+
+    if (m_chatDisplay)
+        m_chatDisplay->DisplaySystemMessage(
+            std::string("Exported conversation to ") +
+            out.GetFullPath().ToUTF8().data());
+}
 
 void ConversationController::RenameConversation(const std::string& path)
 {
@@ -1008,7 +1474,7 @@ void ConversationController::DeleteConversations(
     // ── Cross-window ownership guard (Phase 3b) ──────────────────
     // Deleting a conversation another window has open would pull the
     // file out from under it (its next autosave resurrects a ghost;
-    // its workflow folder vanishes mid-use).  Filter those out BEFORE
+    // its chat folder vanishes mid-use).  Filter those out BEFORE
     // the confirmation so the dialog quotes an honest count.  The
     // local |filePaths| keeps the rest of this function byte-for-byte
     // identical to the single-window version.
@@ -1049,11 +1515,11 @@ void ConversationController::DeleteConversations(
     wxString msg;
     if (filePaths.size() == 1) {
         msg = "Delete this conversation? This cannot be undone.\n\n"
-              "Any files in this conversation's workflow folder will also be deleted.";
+              "Any files in this conversation's chat folder will also be deleted.";
     } else {
         msg = wxString::Format(
             "Delete %zu conversations? This cannot be undone.\n\n"
-            "Any files in those conversations' workflow folders will also be deleted.",
+            "Any files in those conversations' chat folders will also be deleted.",
             filePaths.size());
     }
 
@@ -1068,7 +1534,7 @@ void ConversationController::DeleteConversations(
     // one of these conversations in another window's sidebar (or a
     // second-launch handoff could open a new window onto one), and
     // that window is now live on the file — possibly mid-agent-run,
-    // writing into its workflow folder.  Deleting on the pre-modal
+    // writing into its chat folder.  Deleting on the pre-modal
     // filter would recursively remove that folder out from under it.
     // Registry claims mutate on the main thread only and no modal
     // runs between here and the delete loops below, so this second
@@ -1098,13 +1564,13 @@ void ConversationController::DeleteConversations(
     // rows visibly disappear, and only then do the slow recursive
     // directory cleanups (Pass 2 below).  Without this split the UI
     // thread is wedged inside wxFileName::Rmdir for every chat's
-    // attachments/files/Workflows tree before anything updates, which
+    // attachments/files/Chats tree before anything updates, which
     // is what makes bulk delete feel sluggish at higher chat counts.
     struct PendingCleanup {
         std::string filePath;
         wxString    attachDir;
         wxString    filesDir;
-        wxString    workflowDir;
+        wxString    chatDir;
     };
     std::vector<PendingCleanup> cleanups;
     cleanups.reserve(filePaths.size());
@@ -1127,8 +1593,9 @@ void ConversationController::DeleteConversations(
             ChatHistory::GetConversationsDir() + "/attachments/" + stem);
         pc.filesDir    = wxString::FromUTF8(
             ChatHistory::GetConversationsDir() + "/files/" + stem);
-        pc.workflowDir = wxString::FromUTF8(
-            ChatHistory::GetWorkflowDir(filePath));
+        pc.chatDir     = wxString::FromUTF8(
+            ChatHistory::GetChatFolder(filePath));
+        ChatHistory::ForgetChatFolder(filePath);
         cleanups.push_back(std::move(pc));
 
         // If deleting the currently active conversation, clear the
@@ -1151,7 +1618,7 @@ void ConversationController::DeleteConversations(
             m_sidebar.Refresh(m_chatHistory->GetFilePath());
     }
 
-    // ── Pass 2 (slow): recursive sidecar/workflow cleanup ──
+    // ── Pass 2 (slow): recursive sidecar/chat-folder cleanup ──
     //
     // Wait cursor while these run so the user sees work is still in
     // progress even though the sidebar already updated.  This loop
@@ -1179,12 +1646,12 @@ void ConversationController::DeleteConversations(
                             std::string(pc.filesDir.ToUTF8().data()));
                 }
             }
-            if (wxDirExists(pc.workflowDir)) {
+            if (wxDirExists(pc.chatDir)) {
                 wxLogNull suppressErrors;
-                if (!wxFileName::Rmdir(pc.workflowDir, wxPATH_RMDIR_RECURSIVE)) {
+                if (!wxFileName::Rmdir(pc.chatDir, wxPATH_RMDIR_RECURSIVE)) {
                     if (auto* logger = m_appState.GetLogger())
-                        logger->warning("Could not fully remove workflow dir: " +
-                            std::string(pc.workflowDir.ToUTF8().data()));
+                        logger->warning("Could not fully remove chat folder: " +
+                            std::string(pc.chatDir.ToUTF8().data()));
                 }
             }
 
@@ -1221,18 +1688,8 @@ bool ConversationController::LoadConversationFromPath(const std::string& path)
         return false;
     }
 
-    // Switching conversations cancels any prompt the frame had queued behind
-    // a deferred model load — it was queued for the conversation we're about
-    // to leave and must not fire into this one.
-    if (m_cb.cancelPendingSend) m_cb.cancelPendingSend();
-
-    // Save current conversation before loading.  Project attachments can
-    // be set before the first chat message, so check persistable metadata
-    // rather than messages-only emptiness.  Durable: this history is
-    // about to be replaced — the file becomes the only copy.
-    if (m_chatHistory->HasPersistableContent()) {
-        AutoSaveConversation(false, /*durable=*/true);
-    }
+    // Do not cancel queued work or replace history until persistence succeeds.
+    if (!SaveBeforeLeaving()) return false;
 
     // KV fast path, save side: snapshot the outgoing conversation's
     // slot state before its history is replaced.  Fire-and-forget;
@@ -1248,8 +1705,13 @@ bool ConversationController::LoadConversationFromPath(const std::string& path)
     std::vector<std::string> loadedModels;
     auto newHistory = std::make_unique<ChatHistory>();
     if (!newHistory->LoadFromFile(path, loadedModels)) {
+        wxMessageBox("Failed to load conversation file. The current conversation is still open.",
+                     "Load Failed", wxOK | wxICON_ERROR, &m_frame);
         return false;
     }
+
+    // The load succeeded and the outgoing history is safe on disk.
+    if (m_cb.cancelPendingSend) m_cb.cancelPendingSend();
 
     // Replace current history (through the unique_ptr reference)
     m_chatHistory = std::move(newHistory);
@@ -1267,6 +1729,11 @@ bool ConversationController::LoadConversationFromPath(const std::string& path)
             m_chatHistory->GetFilePath())) {
         m_chatHistory->RememberAllToolApprovalsForChat();
     }
+    for (const std::string& root :
+         wxGetApp().GetConversationRegistry().SessionWriteRoots(
+             m_chatHistory->GetFilePath())) {
+        m_chatHistory->GrantWriteRootForChat(root);
+    }
 
     // ── Model handling: frame-owned preference, deferred service switch ──
     // Loading a conversation must not rewrite the app-global active target or
@@ -1274,11 +1741,13 @@ bool ConversationController::LoadConversationFromPath(const std::string& path)
     // if the shared service is already on that model it can send immediately,
     // otherwise the first Send requests the global switch.
     std::string primaryModel = loadedModels.empty() ? "" : loadedModels.front();
+    bool needsModelPickNotice = false;   // shown after the transcript replays
 
     const bool savedModelIsLocal =
         !primaryModel.empty() && wxFileExists(wxString::FromUTF8(primaryModel));
     if (!primaryModel.empty() &&
-        m_modelSwitcher.SetConversationPreferredSavedModel(primaryModel)) {
+        m_modelSwitcher.SetConversationPreferredSavedModel(
+            primaryModel, m_chatHistory->GetModelSelection())) {
         if (m_modelSwitcher.IsConversationTargetActive() &&
             m_modelSwitcher.IsServerReady()) {
             m_modelSwitcher.ClearPendingDeferredModel();
@@ -1297,15 +1766,19 @@ bool ConversationController::LoadConversationFromPath(const std::string& path)
         }
     }
     else if (!primaryModel.empty()) {
-        // Missing local path or ambiguous/removed remote endpoint. Keep this
-        // frame on the current service target rather than poisoning global
-        // model metadata or guessing a provider.
-        m_modelSwitcher.AdoptActiveTargetForConversation();
+        // Missing local path, or a model id from an older file that no single
+        // connection offers.  Never guess a provider: with a remote target
+        // active the chat waits for an explicit model pick; with a local
+        // target it adopts that (nothing leaves the machine).
+        const bool needsPick =
+            m_modelSwitcher.HandleUnresolvedSavedModel(primaryModel);
         if (m_statusDot)
             m_statusDot->SetConnected(m_modelSwitcher.IsServerReady());
+        needsModelPickNotice = needsPick;
         if (auto* logger = m_appState.GetLogger())
             logger->warning("Conversation model could not be resolved: " +
-                primaryModel + " — keeping current model");
+                primaryModel + (needsPick ? " — waiting for an explicit model selection"
+                                          : " — keeping current local model"));
     }
     else {
         m_modelSwitcher.AdoptActiveTargetForConversation();
@@ -1323,6 +1796,12 @@ bool ConversationController::LoadConversationFromPath(const std::string& path)
         m_chatDisplay->Clear();
         m_attachments.Clear();
         ReplayConversation();
+    }
+    if (needsModelPickNotice) {
+        m_chatDisplay->DisplaySystemMessage(
+            "This chat was saved with " + primaryModel + ", which doesn't "
+            "match a single AI connection. Pick a model from the model menu "
+            "before sending.");
     }
     UpdateWindowTitle();
     if (m_sidebar.IsVisible())
@@ -1394,7 +1873,7 @@ void ConversationController::ReplayConversation()
                     if (arr && arr->size() > 0) {
                         std::string prefix;
                         std::string convDir = ChatHistory::GetConversationsDir();
-                        std::string workflowDir = ChatHistory::GetWorkflowDir(m_chatHistory->GetFilePath());
+                        std::string chatDir = ChatHistory::GetChatFolder(m_chatHistory->GetFilePath());
 
                         for (unsigned ai = 0; ai < arr->size(); ++ai) {
                             auto att = arr->getObject(ai);
@@ -1415,9 +1894,9 @@ void ConversationController::ReplayConversation()
                                 if (att->has("storage_path") && !att->isNull("storage_path")) {
                                     std::string sp = att->getValue<std::string>("storage_path");
                                     if (!sp.empty()) {
-                                        std::string workflowPath = workflowDir + "/" + sp;
-                                        if (wxFileExists(wxString::FromUTF8(workflowPath)))
-                                            imagePaths.push_back(workflowPath);
+                                        std::string chatFilePath = chatDir + "/" + sp;
+                                        if (wxFileExists(wxString::FromUTF8(chatFilePath)))
+                                            imagePaths.push_back(chatFilePath);
                                         else
                                             imagePaths.push_back(convDir + "/" + sp); // legacy sidecar path
                                     }
@@ -1430,7 +1909,7 @@ void ConversationController::ReplayConversation()
                             }
                         }
                         if (!prefix.empty())
-                            displayContent = "[" + prefix + "] " + content;
+                            displayContent = "[" + prefix + "] " + displayContent;
                     }
                 }
 
@@ -1445,16 +1924,16 @@ void ConversationController::ReplayConversation()
                     m_appState.GetTheme().chatAssistant
                 );
 
-                // Generated-images sidecar: resolve the workflow-
+                // Generated-images sidecar: resolve the chat-folder-
                 // relative paths and redisplay the thumbnails.
-                // Missing files (deleted workflow folder) skip
+                // Missing files (deleted chat folder) skip
                 // silently inside DisplayInlineImages.
                 if (msg->has("images") && !msg->isNull("images")) {
                     try {
                         auto imgs = msg->getArray("images");
                         if (imgs && imgs->size() > 0) {
-                            const std::string workflowDir =
-                                ChatHistory::GetWorkflowDir(
+                            const std::string chatDir =
+                                ChatHistory::GetChatFolder(
                                     m_chatHistory->GetFilePath());
                             std::vector<std::string> paths;
                             for (unsigned ii = 0; ii < imgs->size(); ++ii) {
@@ -1464,7 +1943,7 @@ void ConversationController::ReplayConversation()
                                               .convert<std::string>();
                                 } catch (...) { continue; }
                                 if (!rel.empty())
-                                    paths.push_back(workflowDir + "/" + rel);
+                                    paths.push_back(chatDir + "/" + rel);
                             }
                             if (!paths.empty())
                                 m_chatDisplay->DisplayInlineImages(paths);
@@ -1508,7 +1987,7 @@ void ConversationController::UpdateWindowTitle()
         }
         if (!convTitle.empty() && convTitle != "Untitled conversation") {
             if (convTitle.size() > 40) {
-                convTitle = convTitle.substr(0, 37) + "...";
+                convTitle = LbUtf8SafeTruncate(convTitle, 37) + "...";
             }
             title = convTitle + " - LlamaBoss";
         }
@@ -1517,7 +1996,7 @@ void ConversationController::UpdateWindowTitle()
     if (m_chatHistory->HasProject()) {
         std::string projectName = m_chatHistory->GetProjectName();
         if (projectName.size() > 28) {
-            projectName = projectName.substr(0, 25) + "...";
+            projectName = LbUtf8SafeTruncate(projectName, 25) + "...";
         }
         title = "[" + projectName + "] " + title;
     }

@@ -37,6 +37,11 @@ public:
         // normally does in OnServerReady: apply the endpoint's configured
         // tool protocol and refresh the protocol chip.
         std::function<void(ToolProtocol)> onRemoteActivated;
+
+        // Appends the per-conversation "Thinking" submenu to the model
+        // picker menu (MyFrame owns the modes; the switcher only offers
+        // the slot so the picker and the pill chip stay in sync).
+        std::function<void(wxMenu&)> appendThinkingSubmenu;
     };
 
     // Takes both the service and its ServerManager (the latter is
@@ -79,12 +84,28 @@ public:
     void SetConversationPreferredRemoteModel(const std::string& selectionKey,
                                               const std::string& wireModel);
     // Resolve the model value persisted in a conversation. Local GGUF paths
-    // remain paths; a remote wire-model id is mapped to the active/unique
-    // configured endpoint without changing the shared target.
-    bool SetConversationPreferredSavedModel(const std::string& savedModel);
+    // remain paths.  A remote model uses savedSelection (the exact
+    // "remote:<endpoint>/<model>" key) when the file has one -- even if that
+    // connection is gone, in which case sends fail with an explicit
+    // "connection unavailable" message instead of going elsewhere.  Files
+    // from older builds (no selection) resolve only when exactly one
+    // configured connection offers the model id.  Returns false when the
+    // model can't be resolved; see HandleUnresolvedSavedModel.
+    bool SetConversationPreferredSavedModel(const std::string& savedModel,
+                                            const std::string& savedSelection = "");
+    // Called when SetConversationPreferredSavedModel returned false.  If the
+    // shared target is a remote provider, the conversation is parked until
+    // the user explicitly picks a model: its history is never sent to a
+    // provider it wasn't saved with.  If the shared target is local, the
+    // conversation adopts it as before (nothing leaves the machine).
+    // Returns true when an explicit selection is now required.
+    bool HandleUnresolvedSavedModel(const std::string& savedModel);
     void AdoptActiveTargetForConversation();
     void ClearConversationPreference();
     std::string GetConversationModelForSave() const;
+    // Exact selection key to persist with the conversation (remote only;
+    // empty for local models or when nothing is pinned).
+    std::string GetConversationSelectionKeyForSave() const;
     bool IsConversationTargetActive() const;
     bool NeedsRemoteActivationForConversation() const;
     bool ActivateConversationPreferredRemoteTarget();
@@ -95,10 +116,18 @@ public:
     // this frame's FrameBusyKind probe.
     bool SessionUsesLocalServer() const;
 
+    // Context budget (tokens) for this conversation's lane: the Settings
+    // context length for local models, kRemoteContextTokens for remote
+    // endpoints.  Cheap (no SecretsStore access), so the ctx meter can
+    // call it on every refresh.  Use this, not AppState::GetCtxSize(),
+    // anywhere a request is shaped or measured; GetCtxSize() remains the
+    // llama-server LAUNCH length only.
+    int ConversationContextTokens() const;
+
     // Where does THIS frame's next request go?  Remote conversations
     // resolve their endpoint from EndpointStore on every send WITHOUT
     // touching the app-global target — pinning an in-flight agent
-    // loop / goal run / skill draft to its own model even if another
+    // loop / skill draft to its own model even if another
     // window flips the global target mid-run.  Local conversations
     // (and frames with no preference yet) return the global target
     // unchanged.  This is the per-frame override seam the
@@ -114,21 +143,16 @@ public:
     bool IsServerReady() const;
 
     // ── KV slot ownership forwarding ─────────────────────────────
-    // GoalController and SkillDraftController hold a ModelSwitcher&
-    // but not a ServerManager&; these thin pass-throughs let them
-    // participate in KV slot ownership tracking without growing a
-    // new dependency.  See ServerManager for semantics.
+    // SkillDraftController holds a ModelSwitcher& but not a
+    // ServerManager&; this thin pass-through lets it participate in KV
+    // slot ownership tracking without growing a new dependency.  See
+    // ServerManager for semantics.
     //
     // InvalidateKvSlotOwner: call at the dispatch of a generation
     // that runs against the local slot with a throwaway history
-    // (goal contract builder, goal verifier, Skill draft builder) —
-    // the slot is about to hold state belonging to no conversation.
-    //
-    // NoteKvSlotOwner: call at the dispatch of a generation that
-    // extends a real conversation (goal auto-continuation) —
-    // mirrors the main chat send path's NoteSlotOwner stamp.
+    // (Skill draft builder) — the slot is about to hold state
+    // belonging to no conversation.
     void InvalidateKvSlotOwner();
-    void NoteKvSlotOwner(const std::string& conversationPath);
     void MarkServerNotReady();
 
     // Deferred-model slot used by lazy conversation loading.
@@ -213,6 +237,13 @@ private:
     // window's active model metadata or readiness.
     std::string m_conversationSelectionKey;
     std::string m_conversationModelForSave;
+
+    // Set by HandleUnresolvedSavedModel: the saved conversation's model
+    // couldn't be matched to one connection and the shared target is
+    // remote.  Blocks every send path until an explicit selection
+    // (any SetConversationPreferred*/Adopt/Clear call) clears it.
+    bool m_conversationNeedsExplicitSelection = false;
+    std::string ExplicitSelectionMessage() const;
 
     // True between "first-run download succeeded, server is loading"
     // and "server became ready." Gates the one-shot MarkFirstRunComplete

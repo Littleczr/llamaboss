@@ -47,6 +47,19 @@ struct DownloadableModel
     bool firstRunStarter = false;
 };
 
+// ── Pasted-link pre-check (Manage Models) ────────────────────────
+// Blocking: call from a worker thread.  Fetches only the first 4 bytes
+// of `url` (following redirects) to learn the file size and confirm the
+// GGUF magic before a real download starts.  sizeBytes is -1 when the
+// server didn't say.  On failure, `error` is a user-facing sentence.
+struct ModelUrlProbe
+{
+    bool        ok = false;
+    long long   sizeBytes = -1;
+    std::string error;
+};
+ModelUrlProbe ProbeModelUrl(const std::string& url);
+
 // ── Events posted to the dialog by the download thread ───────────
 // Progress: ExtraLong = 0–100 pct; String = "receivedBytes|totalBytes"
 // Complete: String = final file path
@@ -75,7 +88,8 @@ public:
                    long long          expectedBytes,
                    std::shared_ptr<std::atomic<bool>> cancelFlag,
                    std::weak_ptr<std::atomic<bool>>   aliveToken,
-                   long               generation);
+                   long               generation,
+                   bool               expectedBytesExact = false);
 protected:
     ExitCode Entry() override;
 private:
@@ -85,6 +99,12 @@ private:
     std::string   m_url;
     std::string   m_destPath;
     long long     m_expectedBytes;
+    // True when m_expectedBytes came from the server itself (the pasted-link
+    // probe's Content-Range / Content-Length) rather than an approximate
+    // catalog figure.  Exact sizes are enforced before the file is promoted:
+    // a later request that returns a shorter body -- even one whose own
+    // Content-Length matches it -- must not install a truncated model.
+    bool          m_expectedBytesExact = false;
     std::shared_ptr<std::atomic<bool>> m_cancelFlag;
     std::weak_ptr<std::atomic<bool>>   m_aliveToken;
 
@@ -160,6 +180,10 @@ private:
     // Download control
     void OnDownloadClicked(size_t idx);
     void OnCancelClicked();
+    // Starts the vision-projector stage for row `idx` (m_activeRow must
+    // already be idx).  On thread-start failure puts the row in the
+    // Retry state and returns false.
+    bool StartMmprojStage(size_t idx);
 
     // Thread event handlers
     void OnDownloadProgress(wxCommandEvent& ev);
@@ -168,7 +192,12 @@ private:
     void OnClose(wxCloseEvent& ev);
 
     // Helpers
+    // Complete = weights AND (for vision entries) the projector are on
+    // disk.  Downloads land via temp file + rename after a size check,
+    // so a file at the destination path is a finished download.
     bool        IsAlreadyDownloaded(const DownloadableModel& m) const;
+    bool        IsWeightsDownloaded(const DownloadableModel& m) const;
+    bool        IsProjectorDownloaded(const DownloadableModel& m) const;
     std::string BuildUrl(const DownloadableModel& m) const;
     std::string BuildDestPath(const DownloadableModel& m) const;
     std::string FormatBytes(long long bytes) const;

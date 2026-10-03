@@ -54,6 +54,9 @@ public:
     bool        GetSelectedKvCacheQ8()    const { return m_selectedKvCacheQ8; }
     bool        GetSelectedMtpEnabled()   const { return m_selectedMtpEnabled; }
 
+    // Non-empty when guided setup requested immediate use of a remote model.
+    const std::string& GetConnectionModelToUse() const { return m_connectionModelToUse; }
+
     // Change flags
     bool WasModelChanged()        const { return m_modelChanged; }
     bool WasThemeChanged()        const { return m_themeChanged; }
@@ -66,6 +69,7 @@ public:
     bool WasMtpEnabledChanged()   const { return m_mtpEnabledChanged; }
 
 private:
+    std::string m_connectionModelToUse;
     void OnOK(wxCommandEvent& event);
     void OnCancel(wxCommandEvent& event);
     void OnManageModels(wxCommandEvent& event);

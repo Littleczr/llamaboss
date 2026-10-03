@@ -62,6 +62,17 @@ struct ThemeData
     wxColour mdHorizontalRule;  // Horizontal rule line
 };
 
+// Hover / "this is clickable" highlight used by every toolbar control
+// (hamburger, +, settings cogwheel, about, model pill, thinking chip,
+// [ Project ] / [ Skills ], attach, agent toggle).  One rule, one place:
+// the original LlamaBoss Dark theme uses its mint assistant colour; every
+// other theme uses its palette accent, because in those themes
+// chatAssistant is plain foreground text and would barely change on hover.
+inline const wxColour& LbInteractiveAccent(const ThemeData& theme)
+{
+    return (theme.name == "dark") ? theme.chatAssistant : theme.accentButton;
+}
+
 // ═══════════════════════════════════════════════════════════════════
 //  ThemeManager — preset themes and active theme tracking
 // ═══════════════════════════════════════════════════════════════════

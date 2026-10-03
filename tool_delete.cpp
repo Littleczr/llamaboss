@@ -5,6 +5,7 @@
 #include "tool_path_safety.h"   // IsUnderAllowedWriteRoot, SamePath, Basename
 #include "tool_open.h"          // ClassifyForOpen, FileRisk
 #include "path_safety.h"
+#include "tool_mutation_guard.h"
 
 #include <chrono>
 #include <sstream>
@@ -145,11 +146,25 @@ DeleteResult DeleteEntry(const std::string& pathIn,
     }
 
     // ── Containment ──────────────────────────────────────────────
-    if (!tool_path_safety::IsUnderAllowedWriteRoot(resolved, ctx.cwd, ctx.activeProjectRoot, ctx.skillsRoot)) {
+    if (!tool_path_safety::IsUnderAllowedWriteRoot(
+            resolved, ctx.cwd, ctx.activeProjectRoot, ctx.skillsRoot,
+            ctx.additionalWriteRoots)) {
         r.chips.push_back("blocked");
         r.errorBody = "Refuses to delete outside the allowed write roots."
                       "\n  resolved: " + resolved +
-                      tool_path_safety::AllowedWriteRootsDiagnostic(ctx.cwd, ctx.activeProjectRoot, ctx.skillsRoot);
+                      tool_path_safety::AllowedWriteRootsDiagnostic(
+                          ctx.cwd, ctx.activeProjectRoot, ctx.skillsRoot,
+                          ctx.additionalWriteRoots);
+        r.chips.push_back(ElapsedChip(t0));
+        return r;
+    }
+
+    // Coordinate native mutations across chat windows and pin the real
+    // directory chain before touching the target. Reparse points fail closed.
+    tool_mutation_guard::Guard mutation;
+    if (!mutation.Begin(resolved)) {
+        r.chips.push_back("blocked");
+        r.errorBody = mutation.Error();
         r.chips.push_back(ElapsedChip(t0));
         return r;
     }
@@ -174,6 +189,17 @@ DeleteResult DeleteEntry(const std::string& pathIn,
                           "itself: " + resolved;
             r.chips.push_back(ElapsedChip(t0));
             return r;
+        }
+        for (const std::string& root : ctx.additionalWriteRoots) {
+            if (!root.empty() &&
+                tool_path_safety::SamePath(resolved, root) &&
+                IsDirectory(resolved)) {
+                r.chips.push_back("blocked");
+                r.errorBody = "Refuses to delete a chat-granted write root "
+                              "itself: " + resolved;
+                r.chips.push_back(ElapsedChip(t0));
+                return r;
+            }
         }
     }
 
@@ -224,6 +250,14 @@ DeleteResult DeleteEntry(const std::string& pathIn,
     if (isFile) {
         const size_t bytes = FileSize(resolved);
 
+        if (!mutation.VerifyUnchanged()) {
+            r.chips.push_back("conflict");
+            r.errorBody = mutation.Error();
+            r.chips.push_back(ElapsedChip(t0));
+            return r;
+        }
+        mutation.ReleaseTargetForCommit();
+
         if (!::DeleteFileW(wPath.c_str())) {
             DWORD err = ::GetLastError();
             r.chips.push_back("failed");
@@ -261,6 +295,14 @@ DeleteResult DeleteEntry(const std::string& pathIn,
         r.chips.push_back(ElapsedChip(t0));
         return r;
     }
+
+    if (!mutation.VerifyUnchanged()) {
+        r.chips.push_back("conflict");
+        r.errorBody = mutation.Error();
+        r.chips.push_back(ElapsedChip(t0));
+        return r;
+    }
+    mutation.ReleaseTargetForCommit();
 
     if (!::RemoveDirectoryW(wPath.c_str())) {
         DWORD err = ::GetLastError();

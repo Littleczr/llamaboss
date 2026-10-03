@@ -329,6 +329,20 @@ void ModelService::RestoreSlotStateForConversation(
     m_serverManager->RestoreSlotStateForConversation(conversationPath);
 }
 
+bool ModelService::PrewarmPromptPrefix(const wxEvtHandler* self,
+                                       const std::string& chatRequestBody,
+                                       const std::string& marker,
+                                       const std::string& key,
+                                       std::string& why)
+{
+    wxASSERT(wxIsMainThread());
+    if (AnyOtherWindowBusyOnLocalServer(self)) {
+        why = "another window is using the model";
+        return false;
+    }
+    return m_serverManager->PrewarmPromptPrefix(chatRequestBody, marker, key, why);
+}
+
 void ModelService::Shutdown()
 {
     LbMarkUiEventTargetDead(m_alive);

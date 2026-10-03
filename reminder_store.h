@@ -440,7 +440,7 @@ public:
         }
 
         ReminderToolResult out;
-        out.chips = { "cancelled" };
+        out.chips = { "removed" };
         out.body = "Cancelled reminder `" + id + "`.";
         out.bodyLang = "markdown";
         return out;

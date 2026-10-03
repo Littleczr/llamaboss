@@ -270,20 +270,6 @@ std::string BasenameLower(const std::string& path)
     return ToLowerAscii(base);
 }
 
-// Returns the basename without extension (and without directory).
-// Used as the canonical match target for fuzzy matching: the user
-// types "the eagles", not "the eagles - hotel california.mp3", so
-// the extension contributes noise without information.
-std::string BasenameStemLower(const std::string& path)
-{
-    size_t slash = path.find_last_of("/\\");
-    std::string base = (slash == std::string::npos)
-                       ? path : path.substr(slash + 1);
-    size_t dot = base.rfind('.');
-    if (dot != std::string::npos && dot > 0) base = base.substr(0, dot);
-    return ToLowerAscii(base);
-}
-
 // ─── Risky / text-like extension lists ───────────────────────────
 // The risky list is the security floor: anything here is blocked from
 // ShellExecute even if the user explicitly asked for it.  Phase 2b
@@ -618,15 +604,6 @@ bool ExtractGetChildItemSpec(const std::string& command,
     return true;
 }
 
-bool ExtractGetChildItemPathArg(const std::string& command,
-                                std::string&       outDirRaw)
-{
-    PowerShellGciSpec spec;
-    if (!ExtractGetChildItemSpec(command, spec)) return false;
-    outDirRaw = spec.dirRaw;
-    return true;
-}
-
 bool ExtractPowerShellGetChildItemSpec(const std::string& content,
                                        PowerShellGciSpec& outSpec)
 {
@@ -646,15 +623,6 @@ bool ExtractPowerShellGetChildItemSpec(const std::string& content,
 
     std::string command = TrimAscii(echo.substr(2));
     return ExtractGetChildItemSpec(command, outSpec);
-}
-
-bool ExtractPowerShellGetChildItemDir(const std::string& content,
-                                      std::string&       outDirRaw)
-{
-    PowerShellGciSpec spec;
-    if (!ExtractPowerShellGetChildItemSpec(content, spec)) return false;
-    outDirRaw = spec.dirRaw;
-    return true;
 }
 
 bool EnumerateDirectoryEntryNames(const std::string& directory,
@@ -1112,7 +1080,8 @@ OpenResult OpenFile(const std::string&                  inputPath,
     // ── Resolution: direct path first ────────────────────────────
     std::string resolved;
     {
-        std::string r0 = tool_path_safety::ResolveProjectAwareToolPath(openInput, ctx.cwd, ctx.activeProjectRoot);
+        std::string r0 = tool_path_safety::ResolveReadOnlyToolPath(
+            openInput, ctx.cwd, ctx.activeProjectRoot);
         if (!r0.empty() && (IsFile(r0) || IsDirectory(r0))) {
             resolved = std::move(r0);
         }
@@ -1128,7 +1097,8 @@ OpenResult OpenFile(const std::string&                  inputPath,
         std::string parentRaw = ParentPartRaw(openInput);
         std::string leafRaw   = LeafPartRaw(openInput);
         if (!parentRaw.empty() && !leafRaw.empty()) {
-            std::string parentDir = tool_path_safety::ResolveProjectAwareToolPath(parentRaw, ctx.cwd, ctx.activeProjectRoot);
+            std::string parentDir = tool_path_safety::ResolveReadOnlyToolPath(
+                parentRaw, ctx.cwd, ctx.activeProjectRoot);
             std::vector<std::string> entries;
             if (!parentDir.empty() && IsDirectory(parentDir)) {
                 if (EnumerateDirectoryEntryNames(parentDir, entries)) {

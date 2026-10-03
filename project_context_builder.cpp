@@ -211,8 +211,11 @@ void ProjectContextBuilder::AppendSkillsBlock(std::ostringstream& p) const
             // rebuilds, and FingerprintItems already mixes each SKILL.md
             // mtime into the signature, so an edited description
             // invalidates the cached prompt.
+            // 500 matches the authoring contract (skill_prompt_builder.cpp asks
+            // for descriptions "under 500 characters").  The old 300 default cut
+            // the trailing "Do not use for..." clauses that disambiguate skills.
             const std::string description =
-                LbReadSkillFrontmatterDescription(skill.path);
+                LbReadSkillFrontmatterDescription(skill.path, 500);
             if (!description.empty()) {
                 p << "      Description: " << description << "\n";
             }
@@ -257,7 +260,7 @@ std::string ProjectContextBuilder::BuildActiveProjectContextBlockFresh() const
       << "  The active project root is an allowed write root for write/mkdir/edit/delete. Other arbitrary relative paths still resolve against the chat workspace, so prefer the standard project lane prefixes above for project files.\n"
       << "  Follow PROJECT.md for project-related requests. For unrelated general questions or casual chat, answer normally and do not force the request into this project.\n"
       << "  Do not invent project sources, templates, workflows, or policies that are not provided. Do not modify PROJECT.md or other project files unless the user explicitly asks.\n"
-      << "  Project-aware file use: when the user asks to inspect, summarize, open, extract, report on, or fill a file that appears in Project Sources, use the listed project source path or the source filename with the appropriate read/open/helper tool. Source files are read-only reference inputs; built-in helper artifacts still save to conversation workflow folders unless a workflow or user explicitly asks for a project output path.\n"
+      << "  Project-aware file use: when the user asks to inspect, summarize, open, extract, report on, or fill a file that appears in Project Sources, use the listed project source path or the source filename with the appropriate read/open/helper tool. Source files are read-only reference inputs; built-in helper artifacts still save to the chat folder unless a project workflow or the user explicitly asks for a project output path.\n"
       << "  Project workflows: workflow files are reusable Markdown instruction plans in Workflows/. When the user asks to run or use a workflow, read the relevant workflow file first, then follow its steps using normal tools and approval rules. A workflow file is not automatic code execution by itself.\n"
       << "  Project workflow Python scripts: optional .py helper scripts may live in Workflows/. Do not run a project workflow script unless the workflow file or user request calls for it. python_run_script can run an active project's workflow script by filename or in-lane path; if the script needs runtime inputs, put the script filename/path on the first args line and each optional command-line argument on its own later line. read/open/ls/write/edit/delete/mkdir can use Workflows\\... project-relative paths; scripts run from the conversation workspace and can infer the project root from their own file path.\n"
       << "  Project notes: durable project-specific memory lives in Notes/NOTES.md. If the user says save this to my notes while this project is active, use notes_append so the full note is saved to project notes and a compact pointer is saved to global NOTES.md. If the user specifically says project notes, use project_notes_append.\n";

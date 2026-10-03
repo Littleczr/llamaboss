@@ -23,11 +23,14 @@
 #include "cmd_executor.h"
 #include "wait_executor.h"
 #include "python_runner.h"
+#include "python_session.h"
 #include "tool_grep.h"
 #include "tool_web_fetch.h"
 #include "tool_invocation.h"   // tool_names::*
 #include "tool_dispatcher.h"   // ToolInvocationResult (full definition)
+#include "tool_router.h"       // registry-backed helper presentation metadata
 #include "presented_file.h"
+#include "var_store.h"
 #include "artifact_presentation.h"
 #include "python_package_recovery.h"
 
@@ -38,6 +41,15 @@ std::string WxToUtf8(const wxString& s)
     wxScopedCharBuffer buf = s.ToUTF8();
     if (!buf) return std::string();
     return std::string(buf.data());
+}
+
+varstore::DemotionConfig DemotionConfigForResult(
+    const ToolInvocationResult& r)
+{
+    varstore::DemotionConfig cfg;
+    if (r.historyInlineBudgetBytes > 0)
+        cfg.thresholdBytes = r.historyInlineBudgetBytes;
+    return cfg;
 }
 
 } // namespace
@@ -79,15 +91,35 @@ void ToolResultController::RenderAndPersistSlashResult(const ToolInvocationResul
     tb.presentedFiles = r.presentedFiles;
     m_chatDisplay->DisplayToolBlock(tb, /*startExpanded=*/true);
 
+    // RLM Phase A: the history copy of a large body is demoted to a
+    // Vars\ handle card; the ToolBlock rendered above keeps the full
+    // body (display is not context).
+    std::string historyBody = r.body;
+    {
+        std::string cwd = m_chatHistory->GetToolCwd();
+        if (cwd.empty()) {
+            const std::string fp = m_chatHistory->GetFilePath();
+            if (!fp.empty())
+                cwd = ChatHistory::GetConversationWorkspaceDir(fp);
+        }
+        varstore::DemoteOutcome d = varstore::MaybeDemoteToolBody(
+            r.toolTag, r.commandEcho, r.body, cwd,
+            DemotionConfigForResult(r));
+        if (d.demoted) historyBody = d.cardBody;
+    }
+
     std::string formatted = ChatHistory::FormatToolBlockAsUserMessage(
         r.toolTag,
         r.commandEcho,
-        r.body,
+        historyBody,
         r.errorBody,
         r.chips,
         r.bodyLang,
         r.presentedFiles);
     m_chatHistory->AddUserMessage(formatted);
+    // /view_image: the pixels ride as a sidecar, projected with the
+    // user's next message (see ChatHistory's tool-image carrier).
+    m_chatHistory->SetLastMessageToolImages(r.viewImages);
 }
 
 
@@ -227,6 +259,9 @@ void ToolResultController::OnCmdComplete(wxCommandEvent& evt)
         tir.chips.push_back(ts.str());
     }
     if (r.truncated) tir.chips.push_back("truncated");
+    if (r.descendantsTerminated)
+        tir.chips.push_back(r.buildHelpersCleaned
+            ? "build helpers cleaned" : "background stopped");
 
     RenderAndPersistSlashResult(tir);
 
@@ -307,83 +342,33 @@ void ToolResultController::OnPythonComplete(wxCommandEvent& evt)
         if (consumed) return;
     }
 
-    const bool isInspect = (r.toolName == tool_names::kCsvInspect ||
-                            r.helperName == tool_names::kCsvInspect);
-    const bool isReport  = (r.toolName == tool_names::kCsvReport ||
-                            r.helperName == tool_names::kCsvReport);
-    const bool isCsvToXlsx = (r.toolName == tool_names::kCsvToXlsx ||
-                              r.helperName == tool_names::kCsvToXlsx);
-    const bool isXlsxIns = (r.toolName == tool_names::kXlsxInspect ||
-                            r.helperName == tool_names::kXlsxInspect);
-    const bool isXlsxRep = (r.toolName == tool_names::kXlsxReport ||
-                            r.helperName == tool_names::kXlsxReport);
-    const bool isXlsxCreate = (r.toolName == tool_names::kXlsxCreateWorkbook ||
-                               r.helperName == tool_names::kXlsxCreateWorkbook);
-    const bool isPdf     = (r.toolName == tool_names::kPdfExtractText ||
-                            r.helperName == tool_names::kPdfExtractText);
-    const bool isPdfInspect = (r.toolName == tool_names::kPdfInspectForm ||
-                               r.helperName == tool_names::kPdfInspectForm);
-    const bool isPdfFill = (r.toolName == tool_names::kPdfFillForm ||
-                            r.helperName == tool_names::kPdfFillForm);
-    const bool isDocxExtract = (r.toolName == tool_names::kDocxExtractText ||
-                                r.helperName == tool_names::kDocxExtractText);
-    const bool isDocxInspect = (r.toolName == tool_names::kDocxInspect ||
-                                r.helperName == tool_names::kDocxInspect);
-    const bool isRun     = (r.toolName == tool_names::kPythonRunScript ||
-                            r.helperName == tool_names::kPythonRunScript);
-    const bool isInstall = (r.toolName == tool_names::kPythonInstallPackage ||
-                            r.helperName == tool_names::kPythonInstallPackage);
+    // PythonRunner carries the canonical helper id. Resolve presentation from
+    // the same ToolSpec registry used by AgentController instead of maintaining
+    // a second helper-name ternary ladder. The old ladder omitted zip_inspect
+    // and zip_extract, so direct slash invocations were rendered and persisted
+    // as Python Health despite carrying ZIP output.
+    std::string helperTag = !r.helperName.empty() ? r.helperName : r.toolName;
+    const ToolSpec* helperSpec = GetGlobalRouter().Find(helperTag);
+    if (!helperSpec) {
+        helperTag = tool_names::kPythonHealth;
+        helperSpec = GetGlobalRouter().Find(helperTag);
+    }
+
+    const bool isPdf        = helperTag == tool_names::kPdfExtractText;
+    const bool isRun        = helperTag == tool_names::kPythonRunScript;
+    const bool isInstall    = helperTag == tool_names::kPythonInstallPackage;
+
     ToolInvocationResult tir;
-    tir.toolTag       = isInstall ? std::string(tool_names::kPythonInstallPackage)
-                     : isRun ? std::string(tool_names::kPythonRunScript)
-                     : isPdf ? std::string(tool_names::kPdfExtractText)
-                     : isPdfInspect ? std::string(tool_names::kPdfInspectForm)
-                     : isPdfFill ? std::string(tool_names::kPdfFillForm)
-                     : isDocxExtract ? std::string(tool_names::kDocxExtractText)
-                     : isDocxInspect ? std::string(tool_names::kDocxInspect)
-                     : isXlsxCreate ? std::string(tool_names::kXlsxCreateWorkbook)
-                     : isCsvToXlsx ? std::string(tool_names::kCsvToXlsx)
-                     : isXlsxRep ? std::string(tool_names::kXlsxReport)
-                     : isXlsxIns ? std::string(tool_names::kXlsxInspect)
-                     : isReport ? std::string(tool_names::kCsvReport)
-                     : isInspect ? std::string(tool_names::kCsvInspect)
-                                 : std::string(tool_names::kPythonHealth);
+    tir.toolTag       = helperTag;
     tir.invocationRaw.clear();
-    tir.iconUtf8      = (isPdf || isPdfInspect || isPdfFill ||
-                           isDocxExtract || isDocxInspect) ? std::string("\xF0\x9F\x93\x84")  // 📄
-                     : (isXlsxRep || isXlsxCreate || isCsvToXlsx) ? std::string("\xF0\x9F\x93\x97")       // 📗
-                     : isReport ? std::string("\xF0\x9F\x93\x9D")        // 📝
-                     : (isInspect || isXlsxIns) ? std::string("\xF0\x9F\x93\x8A") // 📊
-                                 : std::string("\xF0\x9F\x90\x8D");      // 🐍
-    tir.toolName      = isInstall ? std::string("Install Python Package")
-                     : isRun ? std::string("Python Run")
-                     : isPdf ? std::string("PDF Extract Text")
-                     : isPdfInspect ? std::string("PDF Inspect Form")
-                     : isPdfFill ? std::string("PDF Fill Form")
-                     : isDocxExtract ? std::string("DOCX Extract Text")
-                     : isDocxInspect ? std::string("DOCX Inspect")
-                     : isXlsxCreate ? std::string("Create Workbook")
-                     : isCsvToXlsx ? std::string("CSV to XLSX")
-                     : isXlsxRep ? std::string("XLSX Report")
-                     : isXlsxIns ? std::string("XLSX Inspect")
-                     : isReport ? std::string("CSV Report")
-                     : isInspect ? std::string("CSV Inspect")
-                                 : std::string("Python Health");
+    tir.iconUtf8      = helperSpec && !helperSpec->iconUtf8.empty()
+                         ? helperSpec->iconUtf8
+                         : std::string("\xF0\x9F\x90\x8D");       // 🐍
+    tir.toolName      = helperSpec && !helperSpec->displayName.empty()
+                         ? helperSpec->displayName
+                         : std::string("Python Health");
     tir.commandEcho   = r.commandEcho.empty()
-                            ? (isInstall ? std::string("python_install_package")
-                              : isRun ? std::string("python_run_script")
-                              : isPdf ? std::string("pdf_extract_text")
-                              : isPdfInspect ? std::string("pdf_inspect_form")
-                              : isPdfFill ? std::string("pdf_fill_form")
-                              : isDocxExtract ? std::string("docx_extract_text")
-                              : isDocxInspect ? std::string("docx_inspect")
-                              : isXlsxCreate ? std::string("xlsx_create_workbook")
-                              : isCsvToXlsx ? std::string("csv_to_xlsx")
-                              : isXlsxRep ? std::string("xlsx_report")
-                              : isXlsxIns ? std::string("xlsx_inspect")
-                              : isReport ? std::string("csv_report")
-                              : isInspect ? std::string("csv_inspect")
-                                          : std::string("python_health"))
+                            ? helperTag
                             : r.commandEcho;
     tir.body          = r.stdoutText;
     tir.errorBody     = r.stderrText;
@@ -451,6 +436,46 @@ void ToolResultController::OnPythonComplete(wxCommandEvent& evt)
             tir.bodyLang.clear();
         }
     }
+
+    RenderAndPersistSlashResult(tir);
+
+    FinishToolTurn();
+}
+
+// ── persistent Python session completion (RLM step 2, S2) ────────
+// Same shape as OnPythonComplete: claim payload, bail if closing,
+// offer the result to the agent loop, otherwise render + persist a
+// slash tool card.  Card parts come from BuildPySessionCardParts so
+// this rendering and the agent's can never drift.
+void ToolResultController::OnPySessionComplete(wxCommandEvent& evt)
+{
+    // Payload ownership -- claim before any early return.
+    std::unique_ptr<wxClientData> payloadOwner(evt.GetClientObject());
+    evt.SetClientObject(nullptr);
+
+    if (IsClosing()) return;
+
+    auto* data = static_cast<PySessionResultClientData*>(payloadOwner.get());
+    if (!data) {
+        if (m_cb.setStreamingState) m_cb.setStreamingState(false);
+        return;
+    }
+    const PySessionResult& r = data->GetResult();
+
+    if (m_agentController.IsActive()) {
+        bool consumed = m_agentController.HandlePySessionComplete(r);
+        if (consumed) return;
+    }
+
+    ToolInvocationResult tir;
+    tir.toolTag     = tool_names::kPy;
+    tir.invocationRaw.clear();
+    tir.iconUtf8    = "\xF0\x9F\x90\x8D";   // 🐍
+    tir.toolName    = "Python Session";
+    tir.commandEcho = r.commandEcho.empty() ? std::string("/py")
+                                            : r.commandEcho;
+    tir.bodyLang.clear();
+    BuildPySessionCardParts(r, tir.body, tir.errorBody, tir.chips);
 
     RenderAndPersistSlashResult(tir);
 

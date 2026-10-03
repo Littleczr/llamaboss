@@ -24,8 +24,10 @@
 namespace tool_names {
     constexpr const char* kRead       = "read";
     constexpr const char* kReadHead   = "read_head";
+    constexpr const char* kReadRange  = "read_range";
     constexpr const char* kLs         = "ls";
     constexpr const char* kGrep       = "grep";
+    constexpr const char* kSetupConnection = "setup_connection";
     constexpr const char* kPwd        = "pwd";
     constexpr const char* kPowerShell = "powershell";
     constexpr const char* kPythonHealth = "python_health";
@@ -42,9 +44,11 @@ namespace tool_names {
     constexpr const char* kDocxInspect     = "docx_inspect";
     constexpr const char* kZipInspect      = "zip_inspect";
     constexpr const char* kZipExtract      = "zip_extract";
+    constexpr const char* kViewImage       = "view_image";
     constexpr const char* kPythonCreateScript = "python_create_script";
     constexpr const char* kPythonRunScript = "python_run_script";
     constexpr const char* kPythonInstallPackage = "python_install_package";
+    constexpr const char* kPy         = "py";
     constexpr const char* kOpen       = "open";
     constexpr const char* kWrite      = "write";
     constexpr const char* kOverwriteFile = "overwrite_file";
@@ -85,6 +89,11 @@ struct ToolInvocation {
     std::string args;
     std::string rawBlock;
     bool        valid = false;
+
+    // Optional, bounded timeout requested by this invocation.  Currently
+    // supported by PowerShell only.  Zero means use ToolContext's resolved
+    // default/per-conversation value.
+    unsigned long timeoutMsOverride = 0;
 
     // Human-readable reason the invocation is invalid.  Empty when
     // valid == true.  Surfaced to the model as a <tool_result> with

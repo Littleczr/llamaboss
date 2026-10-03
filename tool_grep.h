@@ -44,8 +44,10 @@ struct GrepResult {
     // "timed out", "cancelled"), with elapsed always last.
     std::vector<std::string> chips;
 
-    // Body — matches formatted as "path:line: content".  Relative
-    // paths for recursive searches; basename for single-file.
+    // Body — match-only mode uses "path:line: content".  Context mode
+    // uses ':' for matches, '-' for surrounding lines, and "--" between
+    // disjoint groups/files. Relative paths for recursive searches;
+    // basename for single-file.
     std::string body;
 
     // Populated when the search couldn't run at all (path resolution
@@ -78,6 +80,7 @@ public:
     static constexpr size_t kMaxFilesScanned  = 5000;
     static constexpr size_t kMaxLineLength    =  200;  // per-match line truncation
     static constexpr size_t kMaxFileBytes     = 10 * 1024 * 1024;  // 10 MiB per file
+    static constexpr size_t kMaxContextLines  =   50;  // before + after each match
 
     GrepExecutor(wxEvtHandler* eventHandler,
                  std::weak_ptr<std::atomic<bool>> aliveToken);
@@ -91,12 +94,15 @@ public:
     //     either a file or a directory
     //   - `ctx.cwd` is populated (used as the search root prefix
     //     for computing relative paths in match output)
+    //   - `contextLines` is 0..kMaxContextLines; 0 preserves the original
+    //     match-only body, N returns N lines before and after each match
     // Returns false if a grep is already running or the worker
     // could not be spawned.
     bool Start(const std::string& pattern,
                const std::string& resolvedPath,
                const std::string& commandEcho,
-               const ToolContext& ctx);
+               const ToolContext& ctx,
+               size_t contextLines = 0);
 
     // Safe to call whether or not anything is running.
     void Cancel();

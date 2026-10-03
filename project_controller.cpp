@@ -63,7 +63,7 @@ void ProjectController::SetCallbacks(Callbacks cb)
 {
     m_cb = std::move(cb);
     // All callbacks are required; surface a wiring mistake immediately
-    // in debug builds, same contract as GoalController::SetCallbacks.
+    // in debug builds, same contract as SkillDraftController::SetCallbacks.
     wxASSERT(m_cb.isBusy);
     wxASSERT(m_cb.refreshProjectStrip);
 }
@@ -363,7 +363,7 @@ void ProjectController::MoveChatsToProject(const std::vector<std::string>& paths
 void ProjectController::NewProject()
 {
     if (m_cb.isBusy()) {
-        m_chatDisplay->DisplaySystemMessage(
+        m_chatDisplay->DisplaySystemNotice(
             "Finish the current response or tool run before creating a project.");
         return;
     }
@@ -377,7 +377,7 @@ void ProjectController::NewProject()
 void ProjectController::AttachOrSwitchProject()
 {
     if (m_cb.isBusy()) {
-        m_chatDisplay->DisplaySystemMessage(
+        m_chatDisplay->DisplaySystemNotice(
             "Finish the current response or tool run before changing projects.");
         return;
     }
@@ -407,7 +407,7 @@ void ProjectController::AttachOrSwitchProject()
 void ProjectController::DeleteProjectViaPicker()
 {
     if (m_cb.isBusy()) {
-        m_chatDisplay->DisplaySystemMessage(
+        m_chatDisplay->DisplaySystemNotice(
             "Finish the current response or tool run before deleting a project.");
         return;
     }

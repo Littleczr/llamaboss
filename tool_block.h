@@ -21,6 +21,11 @@
 
 #include "presented_file.h"
 
+enum class ToolApprovalPresentation {
+    ToolAction,
+    WriteRootGrant,
+};
+
 struct ToolBlock {
     std::string              iconUtf8;      // e.g. "\xE2\x9A\x99" (⚙)
     std::string              toolName;      // e.g. "PowerShell", "Read"
@@ -47,21 +52,30 @@ struct ToolBlock {
     // remains as a keyboard safety net.
     bool requiresApproval = false;
 
+    // Folder grants use a purpose-built two-button row instead of the
+    // generic Allow Once / Allow Always choices.  The first choice still
+    // maps to ApprovalChoice::Always internally, but AgentController/MyFrame
+    // interpret it as "grant this exact root for the current chat" rather
+    // than enabling general tool trust.
+    ToolApprovalPresentation approvalPresentation =
+        ToolApprovalPresentation::ToolAction;
+
     // ── Live progress metadata ───────────────────────────────────
     // Set ONLY by AgentController::EmitPendingToolBlock.  isPending
     // marks this card as the start-of-async acknowledgement (worker
-    // dispatch or wait), telling the frame to arm the ChatDisplay
-    // live progress line right after rendering it.  A terminal
+    // dispatch or wait), telling ChatDisplay to arm its live progress
+    // line right after rendering it. A terminal
     // result block leaves these at their defaults, so rendering it
     // both removes the line (DisplayToolBlock clears defensively)
     // and does not restart it.
     //
-    // pendingWaitTotalSec > 0 selects the countdown-bar mode for the
-    // wait tool (total requested seconds); 0 selects the generic
-    // spinner + elapsed mode.  pendingWaitReason is the model's
-    // optional human-readable wait label, shown after the bar.
+    // pendingWaitTotalSec > 0 selects countdown mode for the wait tool;
+    // 0 selects generic elapsed mode. pendingTimeoutSec is an optional
+    // hard deadline shown for executors such as PowerShell.
+    // pendingWaitReason is the model's optional human-readable wait label.
     // UI-only — none of this is serialized into chat history.
     bool        isPending          = false;
     int         pendingWaitTotalSec = 0;
+    int         pendingTimeoutSec   = 0;
     std::string pendingWaitReason;
 };

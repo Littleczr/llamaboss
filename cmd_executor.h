@@ -28,8 +28,23 @@
 #include "presented_file.h"
 
 // ─── Custom events for thread -> UI communication ────────────────
+// Which shell the powershell tool launches: PowerShell 7 (pwsh.exe) from
+// %ProgramFiles%\PowerShell\7 when installed, else Windows PowerShell 5.1.
+// LLAMABOSS_WINDOWS_POWERSHELL=1 forces 5.1.  The note is one sentence for
+// the agent prompt so the model writes scripts for the right version.
+bool        LbToolUsesPowerShell7();
+std::string LbPowerShellPromptNote();
+
 wxDECLARE_EVENT(wxEVT_CMD_COMPLETE, wxCommandEvent);
 wxDECLARE_EVENT(wxEVT_CMD_ERROR,    wxCommandEvent);
+
+// Live progress: while a command runs, the worker posts the most recent
+// complete output line (stdout or stderr, whichever wrote last) at most
+// every kLiveTailIntervalMs.  Carriage-return redraws (yt-dlp, pip,
+// ffmpeg, curl) are treated as line terminators so a progress bar that
+// rewrites one line still surfaces its latest state.  GetString() holds
+// the line (UTF-8).  UI-only: nothing here is added to chat history.
+wxDECLARE_EVENT(wxEVT_CMD_OUTPUT,   wxCommandEvent);
 
 // ─── Result payload ──────────────────────────────────────────────
 struct CmdResult {
@@ -43,6 +58,16 @@ struct CmdResult {
     bool        stdoutTruncated = false;
     bool        stderrTruncated = false;
     bool        cancelled  = false;   // true if the user cancelled
+
+    // PowerShell exited while one or more child processes were still alive.
+    // Ordinary PowerShell calls are foreground-only, so the executor
+    // terminated the remaining job before returning.
+    bool        descendantsTerminated = false;
+
+    // Successful command; every observed survivor was a recognized MSVC
+    // helper, and no process-state lookup or output-drain failure occurred.
+    // Helpers are still killed with the job; only result severity changes.
+    bool        buildHelpersCleaned = false;
 
     // Large-output UX: if stdout/stderr would flood the chat, the
     // executor saves captured output to the conversation ToolOutputs
@@ -81,11 +106,13 @@ private:
 // ─── Executor facade ─────────────────────────────────────────────
 class CmdExecutor {
 public:
-    // kDefaultTimeoutMs is the hard ceiling for a single /cmd invocation.
-    // kMaxOutputBytes caps stdout AND stderr independently; anything past
-    // the cap is discarded and `truncated` is set on the result.
-    static constexpr unsigned long kDefaultTimeoutMs = 60000;     // 60 s
+    // kDefaultTimeoutMs is the fallback deadline for a single /cmd
+    // invocation. Callers may pass a different bounded timeout. Output is
+    // capped independently for stdout and stderr; anything past the cap is
+    // discarded and `truncated` is set on the result.
+    static constexpr unsigned long kDefaultTimeoutMs = 5UL * 60UL * 1000UL;
     static constexpr size_t        kMaxOutputBytes   = 4 * 1024 * 1024;  // 4 MiB per stream; display is previewed if large
+    static constexpr unsigned long kLiveTailIntervalMs = 500;            // wxEVT_CMD_OUTPUT throttle
 
     CmdExecutor(wxEvtHandler* eventHandler,
                 std::weak_ptr<std::atomic<bool>> aliveToken);
@@ -96,7 +123,7 @@ public:
     // empty/whitespace, or if the worker could not be spawned.
     //
     // Convenience overload — uses %USERPROFILE% as CWD and the default
-    // 60s timeout.  Equivalent to Start(command, "", kDefaultTimeoutMs).
+    // five-minute timeout. Equivalent to Start(command, "", kDefaultTimeoutMs).
     bool Start(const std::string& command);
 
     // Full overload.  `cwd` is a UTF-8 absolute path; pass empty to fall

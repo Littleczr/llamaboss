@@ -1,5 +1,6 @@
 // chat_display.cpp
 #include "chat_display.h"
+#include "chat_display_ctrl.h"
 #include "markdown_renderer.h"
 #include "ascii_animation.h"
 #include "theme.h"
@@ -14,7 +15,7 @@
 #include <wx/menu.h>       // image thumbnail context menu
 #include <wx/statbmp.h>    // image viewer lightbox
 #include <wx/dialog.h>     // image viewer lightbox
-#include "lb_modal_scrim.h" // LbShowModalWithScrim for the image viewer
+#include "image_lightbox.h" // shared full-size image viewer
 #include <wx/utils.h>
 #include <wx/stdpaths.h>   // thumbnail cache location
 #include <wx/log.h>        // wxLogNull around cache reads
@@ -430,18 +431,35 @@ ChatDisplay::ChatDisplay(wxRichTextCtrl* displayCtrl)
     });
 
     // ── Sticky autoscroll: follow-mode tracking ───────────────────
-    // The renderer consults follow mode before its per-delta scrolls,
-    // and any user scroll input (wheel or scrollbar) re-evaluates the
-    // flag AFTER the scroll has been applied.  The check is deferred
-    // with CallAfter because this handler runs before the control's
-    // default scroll processing; the weak token makes a late-firing
-    // check on a destroyed ChatDisplay a silent no-op.
+    // The renderer consults follow mode before its per-delta scrolls.
+    // Direct control input (wheel, keys, pan, selection drag) reports
+    // through ChatDisplayCtrl below; native scrollbar events are observed
+    // separately after wxRichTextCtrl applies them.
     m_markdownRenderer->SetAutoScrollPredicate(
         [this]() { return m_followStream; });
+
+    // ChatDisplayCtrl owns several direct scrolling paths that do not
+    // consistently produce wxScrollWinEvent: keyboard navigation,
+    // Windows middle-click panning, and timer-driven drag-selection
+    // autoscroll. Route all of them back into the same near-bottom test
+    // used by the ordinary wheel/scrollbar path. The weak token makes a
+    // deferred control notification harmless if ChatDisplay was destroyed.
+    if (auto* transcript = dynamic_cast<ChatDisplayCtrl*>(m_displayCtrl)) {
+        std::weak_ptr<int> alive = m_followCheckAlive;
+        transcript->SetViewportChangingHandler([this, alive]() {
+            if (!alive.expired()) m_followStream = false;
+        });
+        transcript->SetViewportChangedHandler([this, alive]() {
+            if (alive.expired()) return;
+            UpdateFollowFromScrollPosition();
+        });
+    }
 
     {
         std::weak_ptr<int> alive = m_followCheckAlive;
         auto scheduleFollowCheck = [this, alive](wxEvent& event) {
+            if (alive.expired()) { event.Skip(); return; }
+            m_followStream = false; // user input takes priority over queued deltas
             event.Skip();   // let the control actually scroll first
             if (!m_displayCtrl) return;
             m_displayCtrl->CallAfter([this, alive]() {
@@ -449,7 +467,6 @@ ChatDisplay::ChatDisplay(wxRichTextCtrl* displayCtrl)
                 UpdateFollowFromScrollPosition();
             });
         };
-        m_displayCtrl->Bind(wxEVT_MOUSEWHEEL, scheduleFollowCheck);
         const wxEventTypeTag<wxScrollWinEvent> kScrollTypes[] = {
             wxEVT_SCROLLWIN_TOP,        wxEVT_SCROLLWIN_BOTTOM,
             wxEVT_SCROLLWIN_LINEUP,     wxEVT_SCROLLWIN_LINEDOWN,
@@ -665,9 +682,28 @@ void ChatDisplay::ThinkingTimer::Notify()
     if (m_owner) m_owner->OnThinkingTick();
 }
 
+// Classic terminal spinner (pipe, slash, dash, backslash).
+// Plain ASCII on purpose.  The previous Braille frames (U+280B...) are
+// not in Consolas, so Windows font-linked them from Segoe UI Symbol,
+// whose metrics put the glyph above the Consolas baseline -- the dots
+// visibly floated next to the model name.  These four characters are
+// native to every monospace face, sit on the text baseline, and are one
+// cell wide on every frame, so the swap below never changes the line's
+// width or wraps.
+namespace {
+const wchar_t* const kThinkingFrames[] = {
+    L"|", L"/", L"-", L"\\",
+};
+constexpr int kThinkingFrameCount =
+    (int)(sizeof(kThinkingFrames) / sizeof(kThinkingFrames[0]));
+constexpr int kThinkingFrameMs = 120;  // ~8 fps; 4 frames spin faster per
+                                       // tick than the old 10, so slow it a bit
+}
+
 void ChatDisplay::StartThinkingIndicator()
 {
     if (m_thinkingActive || !m_displayCtrl) return;
+    TranscriptUpdateGuard update(m_displayCtrl, m_followStream, !IsReplayBatchActive());
 
     // Replay renders saved assistant messages synchronously. Starting and then
     // immediately clearing the animated dots for every historical assistant
@@ -681,32 +717,34 @@ void ChatDisplay::StartThinkingIndicator()
     SetInsertionPointToEnd();
     m_thinkingDotsStartPos = m_displayCtrl->GetInsertionPoint();
 
-    // Write the first frame: a single dot in the thought color.
+    // Write the first spinner frame in the thought color.
     wxRichTextAttr attr;
     attr.SetTextColour(m_thoughtColor);
     attr.SetFontWeight(wxFONTWEIGHT_NORMAL);
     attr.SetFontStyle(wxFONTSTYLE_NORMAL);
     m_displayCtrl->BeginStyle(attr);
-    m_displayCtrl->WriteText(".");
+    m_displayCtrl->WriteText(wxString(kThinkingFrames[0]));
     m_displayCtrl->EndStyle();
     m_thinkingDotsEndPos = m_displayCtrl->GetInsertionPoint();
     EnsureVisibleAtEndIfFollowing();
 
     if (!m_thinkingTimer)
         m_thinkingTimer = std::make_unique<ThinkingTimer>(this);
-    m_thinkingTimer->Start(400);  // 400 ms per frame — smooth but not jittery
+    m_thinkingTimer->Start(kThinkingFrameMs);
 }
 
 void ChatDisplay::OnThinkingTick()
 {
     if (!m_thinkingActive || !m_displayCtrl) return;
+    TranscriptUpdateGuard update(m_displayCtrl, m_followStream, !IsReplayBatchActive());
 
-    // Cycle through 1, 2, 3 dots.
-    m_thinkingDotsFrame = (m_thinkingDotsFrame + 1) % 3;
-    const int dotCount = m_thinkingDotsFrame + 1;
+    // Advance the braille spinner one frame.
+    m_thinkingDotsFrame = (m_thinkingDotsFrame + 1) % kThinkingFrameCount;
 
-    // Swap old dots for new by removing the existing range and writing
-    // fresh dots at the same start position.  Using Remove + WriteText
+    // Swap the old glyph for the new one by removing the existing range
+    // and writing the next frame at the same start position.  (Undo is
+    // suppressed on the transcript control, so the faster tick adds no
+    // undo-history growth.)  Using Remove + WriteText
     // keeps styling/position bookkeeping simple.
     if (m_thinkingDotsEndPos > m_thinkingDotsStartPos) {
         m_displayCtrl->Remove(m_thinkingDotsStartPos, m_thinkingDotsEndPos);
@@ -718,9 +756,13 @@ void ChatDisplay::OnThinkingTick()
     attr.SetFontWeight(wxFONTWEIGHT_NORMAL);
     attr.SetFontStyle(wxFONTSTYLE_NORMAL);
     m_displayCtrl->BeginStyle(attr);
-    m_displayCtrl->WriteText(wxString::FromUTF8(std::string(dotCount, '.')));
+    m_displayCtrl->WriteText(wxString(kThinkingFrames[m_thinkingDotsFrame]));
     m_displayCtrl->EndStyle();
     m_thinkingDotsEndPos = m_displayCtrl->GetInsertionPoint();
+    // The spinner is on the header line, not at the document end; put the
+    // caret back at the end so any writer that forgets to reposition
+    // cannot land text inside the header.
+    SetInsertionPointToEnd();
     // Don't scroll on every tick — dots sit at a fixed position, and
     // scrolling here would fight the user if they've scrolled up to read.
     HideRichTextCaret(m_displayCtrl);
@@ -729,14 +771,17 @@ void ChatDisplay::OnThinkingTick()
 void ChatDisplay::ClearThinkingIndicator()
 {
     if (!m_thinkingActive) return;
+    TranscriptUpdateGuard update(m_displayCtrl, m_followStream, !IsReplayBatchActive());
 
     if (m_thinkingTimer) m_thinkingTimer->Stop();
 
     if (m_displayCtrl && m_thinkingDotsEndPos > m_thinkingDotsStartPos) {
         m_displayCtrl->Remove(m_thinkingDotsStartPos, m_thinkingDotsEndPos);
-        // After Remove, the end of the document is exactly where the dots
-        // began.  Subsequent render calls will use SetInsertionPointToEnd()
-        // themselves, so no extra positioning needed here.
+        // The spinner sits on the header line, before the header's line
+        // break, so it is no longer at the document end.  Every render
+        // call uses SetInsertionPointToEnd() itself; restore the end
+        // position here too so nothing inherits a mid-document caret.
+        SetInsertionPointToEnd();
         HideRichTextCaret(m_displayCtrl);
     }
 
@@ -744,6 +789,47 @@ void ChatDisplay::ClearThinkingIndicator()
     m_thinkingDotsStartPos = -1;
     m_thinkingDotsEndPos   = -1;
     m_thinkingDotsFrame    = 0;
+}
+
+// ── Live async-tool progress ─────────────────────────────────────
+void ChatDisplay::SetPendingToolCallbacks(
+    std::function<void(const ToolBlock&)> onStarted,
+    std::function<void()>                 onEnded)
+{
+    m_onPendingToolStarted = std::move(onStarted);
+    m_onPendingToolEnded   = std::move(onEnded);
+}
+
+void ChatDisplay::StartPendingToolProgress(const ToolBlock& block,
+                                           long pendingCardStart,
+                                           long pendingCardEnd)
+{
+    if (!block.isPending || !m_displayCtrl || IsReplayBatchActive()) return;
+
+    m_pendingCardStartPos   = pendingCardStart;
+    m_pendingCardEndPos     = pendingCardEnd;
+    m_pendingProgressActive = true;
+
+    if (m_onPendingToolStarted) m_onPendingToolStarted(block);
+}
+
+void ChatDisplay::ClearPendingToolProgress()
+{
+    TranscriptUpdateGuard update(m_displayCtrl, m_followStream, !IsReplayBatchActive());
+    const bool wasActive = m_pendingProgressActive;
+
+    // The pending card is UI-only and is replaced by the terminal result,
+    // not retained as a stale "running" row above it.
+    if (m_displayCtrl && m_pendingCardEndPos > m_pendingCardStartPos) {
+        m_displayCtrl->Remove(m_pendingCardStartPos, m_pendingCardEndPos);
+        HideRichTextCaret(m_displayCtrl);
+    }
+
+    m_pendingProgressActive = false;
+    m_pendingCardStartPos   = -1;
+    m_pendingCardEndPos     = -1;
+
+    if (wasActive && m_onPendingToolEnded) m_onPendingToolEnded();
 }
 
 // ── File chip: render ────────────────────────────────────────────
@@ -976,8 +1062,25 @@ int ChatDisplay::HitTestToolBlockAffordance(long pos) const
     return -1;
 }
 
+bool ChatDisplay::IsStderrFailure(const std::vector<std::string>& chips)
+{
+    bool exitZero = false;
+    for (const auto& chip : chips) {
+        if (chip == "blocked" || chip == "cancelled" ||
+            chip == "timed out" || chip == "error")
+            return true;
+        if (chip.size() > 5 && chip.compare(0, 5, "exit ") == 0) {
+            if (chip != "exit 0") return true;
+            exitZero = true;
+        }
+    }
+    // No exit chip at all (read/grep/policy errors): errorBody IS the error.
+    return !exitZero;
+}
+
 long ChatDisplay::WriteToolBodyAtCursor(const std::string& body,
-                                        const std::string& errorBody)
+                                        const std::string& errorBody,
+                                        bool errorIsFailure)
 {
     const int baseSize = ResolveBaseFontSize(m_displayCtrl);
 
@@ -1009,7 +1112,11 @@ long ChatDisplay::WriteToolBodyAtCursor(const std::string& body,
         m_displayCtrl->EndStyle();
     }
     if (!errorTrim.empty()) {
-        wxRichTextAttr errAttr = MakeMonoAttr(wxColour(220, 90, 90), baseSize);
+        // Red is reserved for output that needs attention.  stderr from a
+        // command that exited 0 (progress remnants, llama-server log
+        // lines) uses the muted system color instead.
+        wxRichTextAttr errAttr = MakeMonoAttr(
+            errorIsFailure ? wxColour(220, 90, 90) : m_systemColor, baseSize);
 
         m_displayCtrl->BeginStyle(errAttr);
         m_displayCtrl->WriteText(wxString::FromUTF8(errorTrim));
@@ -1053,6 +1160,24 @@ void ChatDisplay::ShiftOtherRegions(const ToolBlockRegion* skip,
     // hit-test then matched unrelated prose, and MarkCopyLinkCopied
     // would Remove() a stale range and write "Copied" into it.
     if (m_markdownRenderer) m_markdownRenderer->ShiftCopyLinks(pivot, delta);
+
+    // Live tail indicators are position-tracked too.  Without this, a
+    // [show details] toggle ABOVE a running tool card or the thinking
+    // dots left their ranges stale, and the next tick / clear would
+    // Remove() the wrong characters.  DisplaySystemNotice relies on this
+    // as well.
+    if (m_pendingProgressActive) {
+        if (m_pendingCardStartPos >= pivot) m_pendingCardStartPos += delta;
+        if (m_pendingCardEndPos   >= pivot) m_pendingCardEndPos   += delta;
+    }
+    if (m_thinkingActive) {
+        if (m_thinkingDotsStartPos >= pivot) m_thinkingDotsStartPos += delta;
+        if (m_thinkingDotsEndPos   >= pivot) m_thinkingDotsEndPos   += delta;
+    }
+    if (m_currentAssistantStartPos >= 0 &&
+        m_currentAssistantStartPos >= pivot) {
+        m_currentAssistantStartPos += delta;
+    }
 }
 
 void ChatDisplay::SetAffordanceText(ToolBlockRegion& r, const wxString& newText)
@@ -1141,7 +1266,7 @@ void ChatDisplay::HandleToolBlockAffordanceClick(size_t idx)
     } else {
         // ── Expand ──
         m_displayCtrl->SetInsertionPoint(r.bodyStart);
-        long inserted = WriteToolBodyAtCursor(r.body, r.errorBody);
+        long inserted = WriteToolBodyAtCursor(r.body, r.errorBody, r.errorIsFailure);
         long pivot = r.bodyStart;
         long delta = inserted;
 
@@ -1235,8 +1360,16 @@ void ChatDisplay::DisplayUserMessage(const std::string& text,
                                      const std::string& target,
                                      const std::vector<std::string>& inlineImages)
 {
+    if (!IsReplayBatchActive()) m_followStream = true;
+    TranscriptUpdateGuard update(m_displayCtrl, true, !IsReplayBatchActive());
     ClearThinkingIndicator();  // defensive: shouldn't happen mid-stream, but kill dots if so
     SetInsertionPointToEnd();
+    const long userStart = m_displayCtrl->GetInsertionPoint();
+    wxClientDC measure(m_displayCtrl);
+    measure.SetFont(m_displayCtrl->GetFont());
+    wxCoord naturalWidth = 0, naturalHeight = 0;
+    measure.GetMultiLineTextExtent(wxString::FromUTF8(text), &naturalWidth, &naturalHeight);
+    naturalWidth = std::max(naturalWidth, m_displayCtrl->FromDIP(120));
 
     wxRichTextAttr prefixAttr;
     prefixAttr.SetTextColour(m_userColor);
@@ -1251,16 +1384,17 @@ void ChatDisplay::DisplayUserMessage(const std::string& text,
         if (slash != std::string::npos && slash + 1 < shortTarget.size())
             shortTarget = shortTarget.substr(slash + 1);
 
-        m_displayCtrl->WriteText(wxString::FromUTF8(
-            "You \xe2\x86\x92 " + shortTarget + ": "));  // → arrow
+        const std::string label = std::string("YOU \xe2\x86\x92 ") + shortTarget + "\n";
+        m_displayCtrl->WriteText(wxString::FromUTF8(label));
+        naturalWidth = std::max(naturalWidth, measure.GetTextExtent(wxString::FromUTF8(label)).x);
     }
     else {
-        m_displayCtrl->WriteText("You: ");
+        m_displayCtrl->WriteText("YOU\n");
     }
     m_displayCtrl->EndStyle();
 
     wxRichTextAttr textAttr;
-    textAttr.SetTextColour(m_userColor);
+    textAttr.SetTextColour(m_stdoutColor);
     textAttr.SetFontWeight(wxFONTWEIGHT_NORMAL);
     m_displayCtrl->BeginStyle(textAttr);
     m_displayCtrl->WriteText(wxString::FromUTF8(text + "\n"));
@@ -1274,14 +1408,19 @@ void ChatDisplay::DisplayUserMessage(const std::string& text,
         wxImage img;
         if (LoadImageThumbnailCached(imgPath, kImageMaxWidth,
                                      kImageMaxHeight, img)) {
+            naturalWidth = std::max(naturalWidth, img.GetWidth());
             m_displayCtrl->WriteImage(img);
             TagLastWrittenImage(imgPath);
             m_displayCtrl->WriteText("\n");
         }
     }
 
-    // Trailing spacing
+    const long userEnd = m_displayCtrl->GetInsertionPoint() - 1;
+    // Create the following empty paragraph before tagging the user block,
+    // so subsequent assistant/tool paragraphs cannot inherit user metadata.
     m_displayCtrl->WriteText("\n");
+    if (auto* transcript = dynamic_cast<ChatDisplayCtrl*>(m_displayCtrl))
+        transcript->MarkUserMessage(userStart, userEnd, naturalWidth);
 
     EnsureVisibleAtEnd();
 }
@@ -1386,113 +1525,25 @@ void ChatDisplay::ShowImageViewer(const wxString& srcPath)
     wxWindow* top = wxGetTopLevelParent(m_displayCtrl);
     if (!top) top = m_displayCtrl;
 
-    // Fit within ~85% of the frame client area, minus a reservation
-    // for the close-X header row and padding ring.  Downscale only —
-    // upscaling past native resolution just trades sharpness for
-    // size, and native is almost always larger than the thumbnail.
-    const wxSize avail = top->GetClientSize();
-    const int maxW = std::max(320, (int)(avail.GetWidth()  * 0.85));
-    const int maxH = std::max(240, (int)(avail.GetHeight() * 0.85) - 48);
-
-    int w = full.GetWidth();
-    int h = full.GetHeight();
-    if (w > maxW || h > maxH) {
-        const double scale = std::min((double)maxW / (double)w,
-                                      (double)maxH / (double)h);
-        w = std::max(1, (int)(w * scale));
-        h = std::max(1, (int)(h * scale));
-        full.Rescale(w, h, wxIMAGE_QUALITY_HIGH);
-    }
-
-    // Borderless lightbox over the modal scrim: the scrim dims the
-    // frame, the dialog is just the image on the chat background
-    // with a thin padding ring and a close "X" in the top-right
-    // corner.  Any click or key dismisses it; the X is an explicit
-    // affordance so the exit is discoverable.
-    wxDialog dlg(top, wxID_ANY, wxEmptyString,
-                 wxDefaultPosition, wxDefaultSize, wxBORDER_NONE);
-    const wxColour bg = m_displayCtrl->GetBackgroundColour();
-    const wxColour fg = m_displayCtrl->GetForegroundColour();
-    dlg.SetBackgroundColour(bg);
-
-    // Muted at rest, full foreground on hover — works in both dark
-    // and light themes since it's derived from the live palette.
-    const wxColour mutedFg((fg.Red()   + bg.Red())   / 2,
-                           (fg.Green() + bg.Green()) / 2,
-                           (fg.Blue()  + bg.Blue())  / 2);
-
-    auto* closeX = new wxStaticText(&dlg, wxID_ANY, wxString(L"\u2715"));
-    closeX->SetForegroundColour(mutedFg);
-    closeX->SetBackgroundColour(bg);
-    {
-        wxFont f = closeX->GetFont();
-        f.SetPointSize(f.GetPointSize() + 3);
-        closeX->SetFont(f);
-    }
-    closeX->SetCursor(wxCursor(wxCURSOR_HAND));
-    closeX->SetToolTip("Close (Esc)");
-    closeX->Bind(wxEVT_ENTER_WINDOW, [closeX, fg](wxMouseEvent& e) {
-        closeX->SetForegroundColour(fg);
-        closeX->Refresh();
-        e.Skip();
-    });
-    closeX->Bind(wxEVT_LEAVE_WINDOW, [closeX, mutedFg](wxMouseEvent& e) {
-        closeX->SetForegroundColour(mutedFg);
-        closeX->Refresh();
-        e.Skip();
-    });
-
-    auto* bitmap = new wxStaticBitmap(&dlg, wxID_ANY, wxBitmap(full));
-
-    auto* topRow = new wxBoxSizer(wxHORIZONTAL);
-    topRow->AddStretchSpacer(1);
-    topRow->Add(closeX, 0, wxTOP | wxRIGHT, 10);
-
-    auto* sizer = new wxBoxSizer(wxVERTICAL);
-    sizer->Add(topRow, 0, wxEXPAND);
-    sizer->Add(bitmap, 0, wxLEFT | wxRIGHT | wxBOTTOM, 12);
-    dlg.SetSizerAndFit(sizer);
-    dlg.CentreOnParent();
-
-    const auto dismiss = [&dlg](wxMouseEvent&) {
-        dlg.EndModal(wxID_OK);
-    };
-    closeX->Bind(wxEVT_LEFT_UP, dismiss);
-    bitmap->Bind(wxEVT_LEFT_UP, dismiss);
-    dlg.Bind(wxEVT_LEFT_UP, dismiss);
-
-    // Right-click parity with the chat thumbnail: the same Save /
-    // Show-in-folder menu is available while the image is expanded
-    // ("View image" is omitted — it is already in view).  Bound on
-    // both the bitmap and the dialog; wxContextMenuEvent propagates,
-    // and the handled event is not Skip()ed, so it fires once.
-    // srcPath is captured by value: the viewer runs a nested modal
-    // loop and must not depend on the caller's reference outliving
-    // menu callbacks.
+    // The viewer itself (scrim, fit-to-frame, close badge, caption,
+    // Esc / backdrop-click dismissal) lives in image_lightbox.h so the
+    // composer's pending-attachment cards open the same one.
+    //
+    // Right-click parity with the chat thumbnail: Save / Show-in-folder
+    // ("View image" is omitted — it is already in view).  srcPath is
+    // captured by value: the viewer runs a nested modal loop.
     const wxString viewerSrc = srcPath;
-    const auto contextMenu =
-        [this, &dlg, viewerSrc](wxContextMenuEvent&) {
-            enum { kIdSaveAs = 1, kIdShowInFolder };
-            wxMenu menu;
-            menu.Append(kIdSaveAs,       "Save image as...");
-            menu.Append(kIdShowInFolder, "Show in folder");
+    std::vector<LbLightboxAction> actions;
+    actions.push_back({ "Save image as...",
+                        [this, viewerSrc]() { SaveImageAs(viewerSrc); } });
+    actions.push_back({ "Show in folder",
+                        [this, viewerSrc]() { ShowInFolder(viewerSrc); } });
 
-            const int sel = dlg.GetPopupMenuSelectionFromUser(menu);
-            if      (sel == kIdSaveAs)       SaveImageAs(viewerSrc);
-            else if (sel == kIdShowInFolder) ShowInFolder(viewerSrc);
-        };
-    bitmap->Bind(wxEVT_CONTEXT_MENU, contextMenu);
-    dlg.Bind(wxEVT_CONTEXT_MENU, contextMenu);
-    dlg.Bind(wxEVT_CHAR_HOOK, [&dlg](wxKeyEvent& e) {
-        const int key = e.GetKeyCode();
-        if (key == WXK_ESCAPE || key == WXK_RETURN || key == WXK_SPACE) {
-            dlg.EndModal(wxID_CANCEL);
-        } else {
-            e.Skip();
-        }
-    });
-
-    LbShowModalWithScrim(*top, dlg);
+    LbShowImageLightbox(*top, std::move(full),
+                        m_displayCtrl->GetBackgroundColour(),
+                        m_displayCtrl->GetForegroundColour(),
+                        wxFileName(srcPath).GetFullName(),
+                        std::move(actions));
 }
 
 void ChatDisplay::SaveImageAs(const wxString& srcPath)
@@ -1536,6 +1587,7 @@ void ChatDisplay::ShowInFolder(const wxString& path)
 void ChatDisplay::DisplayInlineImages(const std::vector<std::string>& imagePaths)
 {
     if (imagePaths.empty()) return;
+    TranscriptUpdateGuard update(m_displayCtrl, m_followStream, !IsReplayBatchActive());
 
     SetInsertionPointToEnd();
 
@@ -1556,7 +1608,7 @@ void ChatDisplay::DisplayInlineImages(const std::vector<std::string>& imagePaths
 
     if (wroteAny) {
         m_displayCtrl->WriteText("\n");
-        EnsureVisibleAtEnd();
+        EnsureVisibleAtEndIfFollowing();
     }
 }
 
@@ -1566,6 +1618,7 @@ void ChatDisplay::DisplaySystemMessage(const std::string& text)
     // calls DisplaySystemMessage directly without going through
     // DisplayAssistantComplete, so stray dots would otherwise remain.
     ClearThinkingIndicator();
+    ClearPendingToolProgress();
     SetInsertionPointToEnd();
 
     wxRichTextAttr attr;
@@ -1576,6 +1629,68 @@ void ChatDisplay::DisplaySystemMessage(const std::string& text)
     m_displayCtrl->EndStyle();
 
     EnsureVisibleAtEnd();
+}
+
+void ChatDisplay::DisplaySystemNotice(const std::string& text)
+{
+    if (!m_displayCtrl) return;
+
+    // Find the earliest live indicator at the transcript tail.
+    long anchor = -1;
+    auto consider = [&anchor](long pos) {
+        if (pos < 0) return;
+        anchor = (anchor < 0) ? pos : std::min(anchor, pos);
+    };
+
+    if (m_pendingProgressActive &&
+        m_pendingCardEndPos > m_pendingCardStartPos) {
+        consider(m_pendingCardStartPos);
+    }
+
+    if (m_thinkingActive &&
+        m_thinkingDotsEndPos > m_thinkingDotsStartPos) {
+        // The spinner sits on the model-name header line.  Put the
+        // notice above the prefix, not between prefix and dots, and never
+        // inside the range CancelPendingAssistantDisplay() would remove.
+        if (m_currentAssistantStartPos >= 0 &&
+            m_currentAssistantStartPos <= m_thinkingDotsStartPos &&
+            !m_hasRenderedAssistantContent) {
+            consider(m_currentAssistantStartPos);
+        } else {
+            consider(m_thinkingDotsStartPos);
+        }
+    }
+
+    // Nothing live to protect, or assistant text is mid-stream (the
+    // markdown renderer tracks its own partial-line position, so inserting
+    // above it is not safe): keep the historical behaviour.
+    if (anchor < 0) {
+        DisplaySystemMessage(text);
+        return;
+    }
+
+    TranscriptUpdateGuard update(m_displayCtrl, m_followStream, !IsReplayBatchActive());
+
+    m_displayCtrl->SetInsertionPoint(anchor);
+
+    wxRichTextAttr attr;
+    attr.SetTextColour(m_systemColor);
+    attr.SetFontStyle(wxFONTSTYLE_ITALIC);
+    attr.SetFontWeight(wxFONTWEIGHT_NORMAL);
+    m_displayCtrl->BeginStyle(attr);
+    m_displayCtrl->WriteText(wxString::FromUTF8(text + "\n\n"));
+    m_displayCtrl->EndStyle();
+
+    const long delta = m_displayCtrl->GetInsertionPoint() - anchor;
+
+    // Everything at or after the anchor moved down by `delta`: the live
+    // indicators, the assistant start, and any registered click regions
+    // (the pending card's own [show details], approval rows, etc.).
+    if (delta > 0) ShiftOtherRegions(nullptr, anchor, delta);
+
+    SetInsertionPointToEnd();
+    EnsureVisibleAtEndIfFollowing();
+    HideRichTextCaret(m_displayCtrl);
 }
 
 // ─── Generic tool-result block ──────────────────────────────────
@@ -1611,8 +1726,11 @@ bool ChatDisplay::IsToolBlockFailure(const ToolBlock& block)
 
 void ChatDisplay::DisplayToolBlock(const ToolBlock& block, bool startExpanded)
 {
+    TranscriptUpdateGuard update(m_displayCtrl, m_followStream, !IsReplayBatchActive());
     ClearThinkingIndicator();
+    ClearPendingToolProgress();
     SetInsertionPointToEnd();
+    const long toolBlockStartPos = m_displayCtrl->GetInsertionPoint();
 
     wxFont baseFont = m_displayCtrl->GetFont();
     int baseSize = baseFont.GetPointSize();
@@ -1731,8 +1849,9 @@ void ChatDisplay::DisplayToolBlock(const ToolBlock& block, bool startExpanded)
     // Initial expanded state was decided before the command echo so the
     // command chevron can render with the correct direction.
     long bodyStart = m_displayCtrl->GetInsertionPoint();
+    const bool errorIsFailure = IsStderrFailure(block.statusChips);
     long bodyChars = expanded
-        ? WriteToolBodyAtCursor(detailBody, block.errorBody)
+        ? WriteToolBodyAtCursor(detailBody, block.errorBody, errorIsFailure)
         : 0;
     long bodyEnd   = bodyStart + bodyChars;
 
@@ -1764,6 +1883,7 @@ void ChatDisplay::DisplayToolBlock(const ToolBlock& block, bool startExpanded)
         region.body            = detailBody;
         region.errorBody       = block.errorBody;
         region.expanded        = expanded;
+        region.errorIsFailure  = errorIsFailure;
         m_toolBlocks.push_back(region);
 
         m_displayCtrl->WriteText("\n");
@@ -1790,20 +1910,32 @@ void ChatDisplay::DisplayToolBlock(const ToolBlock& block, bool startExpanded)
 
         m_displayCtrl->BeginStyle(btnAttr);
 
-        long onceStart = m_displayCtrl->GetInsertionPoint();
-        m_displayCtrl->WriteText("[ Allow Once ]");
-        long onceEnd = m_displayCtrl->GetInsertionPoint();
-
-        m_displayCtrl->WriteText("   ");
-
+        long onceStart = -1;
+        long onceEnd = -1;
         long alwaysStart = m_displayCtrl->GetInsertionPoint();
-        m_displayCtrl->WriteText("[ Allow Always ]");
+
+        if (block.approvalPresentation ==
+            ToolApprovalPresentation::WriteRootGrant) {
+            m_displayCtrl->WriteText("[ Grant Folder for Chat ]");
+        } else {
+            onceStart = m_displayCtrl->GetInsertionPoint();
+            m_displayCtrl->WriteText("[ Allow Once ]");
+            onceEnd = m_displayCtrl->GetInsertionPoint();
+
+            m_displayCtrl->WriteText("   ");
+            alwaysStart = m_displayCtrl->GetInsertionPoint();
+            m_displayCtrl->WriteText("[ Allow Always ]");
+        }
         long alwaysEnd = m_displayCtrl->GetInsertionPoint();
 
         m_displayCtrl->WriteText("   ");
 
         long denyStart = m_displayCtrl->GetInsertionPoint();
-        m_displayCtrl->WriteText("[ Deny ]");
+        m_displayCtrl->WriteText(
+            block.approvalPresentation ==
+                    ToolApprovalPresentation::WriteRootGrant
+                ? "[ Cancel ]"
+                : "[ Deny ]");
         long denyEnd = m_displayCtrl->GetInsertionPoint();
 
         m_displayCtrl->EndStyle();
@@ -1811,10 +1943,14 @@ void ChatDisplay::DisplayToolBlock(const ToolBlock& block, bool startExpanded)
 
         long rowEnd = m_displayCtrl->GetInsertionPoint();
 
-        ApprovalButtonRegion once   { onceStart,   onceEnd,   ApprovalChoice::Once   };
         ApprovalButtonRegion always { alwaysStart, alwaysEnd, ApprovalChoice::Always };
         ApprovalButtonRegion deny   { denyStart,   denyEnd,   ApprovalChoice::Deny   };
-        m_approvalButtons.push_back(once);
+        if (onceStart >= 0) {
+            ApprovalButtonRegion once {
+                onceStart, onceEnd, ApprovalChoice::Once
+            };
+            m_approvalButtons.push_back(once);
+        }
         m_approvalButtons.push_back(always);
         m_approvalButtons.push_back(deny);
         m_approvalRowStart = rowStart;
@@ -1823,6 +1959,11 @@ void ChatDisplay::DisplayToolBlock(const ToolBlock& block, bool startExpanded)
 
     // Trailing blank line for separation.
     m_displayCtrl->WriteText("\n");
+
+    if (block.isPending) {
+        const long toolBlockEndPos = m_displayCtrl->GetInsertionPoint();
+        StartPendingToolProgress(block, toolBlockStartPos, toolBlockEndPos);
+    }
 
     EnsureVisibleAtEndIfFollowing();
     HideRichTextCaret(m_displayCtrl);
@@ -1835,6 +1976,8 @@ void ChatDisplay::DisplayAssistantPrefix(const std::string& modelName)
 
 void ChatDisplay::DisplayAssistantPrefix(const std::string& modelName, const wxColour& accentColor)
 {
+    TranscriptUpdateGuard update(m_displayCtrl, m_followStream, !IsReplayBatchActive());
+    ClearPendingToolProgress();
     SetInsertionPointToEnd();
     m_currentAssistantStartPos = m_displayCtrl->GetInsertionPoint();
 
@@ -1861,18 +2004,34 @@ void ChatDisplay::DisplayAssistantPrefix(const std::string& modelName, const wxC
         prefixAttr.SetFontFaceName(baseFont.GetFaceName());
     }
 
+    // The model name is a header on its own line; the reply starts on
+    // the line below.  Inline "name: reply" made the name read as just
+    // more bold text in replies that are full of bold text.  Starting the
+    // reply on a fresh line also means a reply that opens with a list or
+    // heading renders at a real line start.
     m_displayCtrl->BeginStyle(prefixAttr);
-    m_displayCtrl->WriteText(wxString::FromUTF8(modelName + ": "));
+    m_displayCtrl->WriteText(wxString::FromUTF8(modelName));
     m_displayCtrl->EndStyle();
 
-    // Kick off the animated dots.  They'll be cleared by the first delta
-    // that carries visible characters (see DisplayAssistantDelta).
+    // Spinner sits on the header line after the name:  "gpt-6-luna  |"
+    m_displayCtrl->WriteText("  ");
+
+    // Kick off the spinner.  It is cleared by the first delta that
+    // carries visible characters (see DisplayAssistantDelta), leaving
+    // "name  \n" behind.  StartThinkingIndicator writes at the document
+    // end, so the header's line break is written AFTER it: the spinner's
+    // range stays on the header line and removing it later cannot pull
+    // the reply up onto that line.  Replay batches skip the spinner but
+    // still get the line break.
     StartThinkingIndicator();
+    SetInsertionPointToEnd();
+    m_displayCtrl->WriteText("\n");
     HideRichTextCaret(m_displayCtrl);
 }
 
 void ChatDisplay::DisplayAssistantDelta(const std::string& delta)
 {
+    TranscriptUpdateGuard update(m_displayCtrl, m_followStream, !IsReplayBatchActive());
     SetInsertionPointToEnd();
     std::string remainingDelta = delta;
 
@@ -2091,6 +2250,7 @@ void ChatDisplay::DisplayAssistantDelta(const std::string& delta)
 
 void ChatDisplay::DisplayAssistantComplete()
 {
+    TranscriptUpdateGuard update(m_displayCtrl, m_followStream, !IsReplayBatchActive());
     // Stop the dots immediately — either we're about to render buffered
     // content, or the message ended with nothing visible at all.
     ClearThinkingIndicator();
@@ -2202,8 +2362,8 @@ void ChatDisplay::DisplayAssistantMessage(const std::string& modelName,
     ClearThinkingIndicator();  // kill the dots the prefix just started
 
     if (!content.empty()) {
-        // Strip leading whitespace/newlines so the first paragraph renders
-        // flush with the prefix — matches the trim that DisplayAssistantDelta
+        // Strip leading whitespace/newlines so the first paragraph starts
+        // directly under the name header — matches the trim that DisplayAssistantDelta
         // performs on the streaming path.
         std::string trimmed = content;
         size_t first = trimmed.find_first_not_of(" \t\r\n");
@@ -2326,28 +2486,14 @@ void ChatDisplay::EndReplayBatch()
             // stream-follow mode for whatever streams next.
             m_followStream = true;
 
-            // Scroll AFTER Thaw, not before.  ShowPosition against a
-            // frozen control computes from a stale layout on MSW; image
-            // thumbnails and code-block sizing finish only after the
-            // thaw, so the document grows and a pre-thaw scroll lands
-            // short of the true bottom (the "old chat opens scrolled
-            // slightly up" bug).
-            m_displayCtrl->LayoutContent();
-            m_displayCtrl->SetInsertionPointEnd();
-            m_displayCtrl->ShowPosition(m_displayCtrl->GetLastPosition());
+            EnsureVisibleAtEnd();
 
-            // Second, deferred pass once pending size/layout events have
-            // settled.  Scrolling to the virtual-size bottom (rather than
-            // a character position) is what deterministically pins the
-            // view to the end of a large restored conversation.
-            wxRichTextCtrl* ctrl = m_displayCtrl;
-            ctrl->CallAfter([ctrl]() {
-                ctrl->SetInsertionPointEnd();
-                ctrl->ShowPosition(ctrl->GetLastPosition());
-                int vx = 0, vy = 0, ppuX = 0, ppuY = 0;
-                ctrl->GetVirtualSize(&vx, &vy);
-                ctrl->GetScrollPixelsPerUnit(&ppuX, &ppuY);
-                if (ppuY > 0) ctrl->Scroll(-1, vy / ppuY);
+            // Settle any queued resize/image layout, unless the reader has
+            // already moved away. Use the same single-scroll transaction.
+            std::weak_ptr<int> alive = m_followCheckAlive;
+            m_displayCtrl->CallAfter([this, alive]() {
+                if (alive.expired() || !m_followStream) return;
+                EnsureVisibleAtEndIfFollowing();
             });
         }
 
@@ -2369,6 +2515,7 @@ void ChatDisplay::Clear()
     // Must stop the timer before wiping the document, otherwise the next
     // tick will try to Remove() a range that no longer exists.
     ClearThinkingIndicator();
+    ClearPendingToolProgress();
 
     // Char-position ranges in m_fileChips become invalid once the document
     // is cleared — drop them so the click handler can't hit stale regions.
@@ -2412,31 +2559,6 @@ void ChatDisplay::Clear()
     }
 }
 
-void ChatDisplay::ScrollToBottom()
-{
-    EnsureVisibleAtEnd();
-}
-
-void ChatDisplay::SetUserColor(const wxColour& color)
-{
-    m_userColor = color;
-}
-
-void ChatDisplay::SetAssistantColor(const wxColour& color)
-{
-    m_assistantColor = color;
-}
-
-void ChatDisplay::SetSystemColor(const wxColour& color)
-{
-    m_systemColor = color;
-}
-
-void ChatDisplay::SetThoughtColor(const wxColour& color)
-{
-    m_thoughtColor = color;
-}
-
 void ChatDisplay::SetFont(const wxFont& font)
 {
     if (m_displayCtrl) {
@@ -2446,11 +2568,18 @@ void ChatDisplay::SetFont(const wxFont& font)
 
 void ChatDisplay::ApplyTheme(const ThemeData& theme)
 {
-    m_userColor = theme.chatUser;
     m_assistantColor = theme.chatAssistant;
     m_systemColor = theme.chatSystem;
     m_thoughtColor = theme.chatThought;
     m_stdoutColor = theme.textPrimary;
+
+    auto blend = [](const wxColour& a, const wxColour& b, int percent) {
+        auto channel = [percent](int x, int y) { return (x * (100 - percent) + y * percent) / 100; };
+        return wxColour(channel(a.Red(), b.Red()), channel(a.Green(), b.Green()), channel(a.Blue(), b.Blue()));
+    };
+    m_userColor = blend(theme.chatUser, theme.textPrimary, 45);
+    if (auto* transcript = dynamic_cast<ChatDisplayCtrl*>(m_displayCtrl))
+        transcript->SetUserBubbleColor(blend(theme.bgMain, theme.chatUser, 27));
 
     if (m_markdownRenderer) {
         m_markdownRenderer->SetCodeColor(theme.mdCode);
@@ -2567,10 +2696,10 @@ void ChatDisplay::EnsureVisibleAtEnd()
     }
 
     // A deliberate jump to the end always re-engages follow mode:
-    // sending a message, /commands, ScrollToBottom, replay end.
+    // sending a message, /commands, replay end.
     m_followStream = true;
 
-    m_displayCtrl->ShowPosition(m_displayCtrl->GetLastPosition());
+    TranscriptUpdateGuard update(m_displayCtrl, true);
     HideRichTextCaret(m_displayCtrl);
 }
 
@@ -2585,7 +2714,7 @@ void ChatDisplay::EnsureVisibleAtEndIfFollowing()
     }
 
     if (m_followStream) {
-        m_displayCtrl->ShowPosition(m_displayCtrl->GetLastPosition());
+        TranscriptUpdateGuard update(m_displayCtrl, true);
     }
     HideRichTextCaret(m_displayCtrl);
 }
@@ -2604,12 +2733,13 @@ bool ChatDisplay::IsNearBottom() const
     const int clientH = m_displayCtrl->GetClientSize().GetHeight();
     const int topPx   = (ppuY > 0) ? vy * ppuY : vy;
     const int gap     = vh - (topPx + clientH);
-    return gap <= kFollowSlackPx;
+    return gap < std::max(ppuY, m_displayCtrl->FromDIP(kFollowSlackPx));
 }
 
 void ChatDisplay::UpdateFollowFromScrollPosition()
 {
     // Wherever the user's scroll input landed decides follow mode:
     // near the bottom = follow the stream, anywhere else = stay put.
-    m_followStream = IsNearBottom();
+    // A selection drag must not re-engage following underneath the mouse.
+    m_followStream = m_displayCtrl && !m_displayCtrl->HasCapture() && IsNearBottom();
 }

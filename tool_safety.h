@@ -158,9 +158,10 @@ struct ToolSafetyProfile {
     // underlying tool/policy allows the path.
     bool mayInspectOutsideCwd = false;
 
-    // True when writes/mutations are restricted to the conversation
-    // working directory, plus the active project root when a project
-    // is attached.
+    // Legacy field name. True when writes/mutations are restricted to the
+    // trusted write-root set: conversation cwd, attached project, Skills,
+    // plus explicit chat-scoped folder grants. Kept to avoid a broad metadata
+    // rename; the runtime containment check remains authoritative.
     bool writesInsideCwdOnly = false;
 
     // ── Network + remote-side-effect footprint ──────────────────

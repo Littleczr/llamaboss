@@ -7,6 +7,7 @@
 #include "tool_open.h"           // ClassifyForOpen, FileRisk
 #include "tool_python_syntax.h"  // tool_python_syntax::CheckFile
 #include "path_safety.h"
+#include "tool_mutation_guard.h"
 
 #include <algorithm>
 #include <chrono>
@@ -184,11 +185,25 @@ WriteResult WriteFileContent(const std::string& argsBlob,
     // This is where "../../etc/passwd"-style traversal dies, even
     // though GetFullPathNameW happily resolved it -- the resolved
     // absolute path won't start with ctx.cwd anymore.
-    if (!tool_path_safety::IsUnderAllowedWriteRoot(resolved, ctx.cwd, ctx.activeProjectRoot, ctx.skillsRoot)) {
+    if (!tool_path_safety::IsUnderAllowedWriteRoot(
+            resolved, ctx.cwd, ctx.activeProjectRoot, ctx.skillsRoot,
+            ctx.additionalWriteRoots)) {
         r.chips.push_back("blocked");
         r.errorBody = "Refuses to write outside the allowed write roots."
                       "\n  resolved: " + resolved +
-                      tool_path_safety::AllowedWriteRootsDiagnostic(ctx.cwd, ctx.activeProjectRoot, ctx.skillsRoot);
+                      tool_path_safety::AllowedWriteRootsDiagnostic(
+                          ctx.cwd, ctx.activeProjectRoot, ctx.skillsRoot,
+                          ctx.additionalWriteRoots);
+        r.chips.push_back(ElapsedChip(t0));
+        return r;
+    }
+
+    // Coordinate native mutations across chat windows and pin the real
+    // directory chain before touching the target. Reparse points fail closed.
+    tool_mutation_guard::Guard mutation;
+    if (!mutation.Begin(resolved)) {
+        r.chips.push_back("blocked");
+        r.errorBody = mutation.Error();
         r.chips.push_back(ElapsedChip(t0));
         return r;
     }
@@ -273,9 +288,9 @@ WriteResult WriteFileContent(const std::string& argsBlob,
     // ── Atomic-ish write: unique sibling temp then rename ─────────
     // Step 1: create a fresh temp file with CREATE_NEW so we never
     // overwrite a real user-owned "<path>.tmp" file.  Step 2: write
-    // the bytes.  Step 3: MoveFileEx -- create-new with no
-    // REPLACE_EXISTING (fail if the target appeared during staging);
-    // overwrite_file with REPLACE_EXISTING (atomically swap the file).
+    // the bytes. Step 3: rename within the same pinned parent -- create-new
+    // refuses replacement; overwrite_file may atomically replace the verified
+    // existing target. A target that appeared during staging still fails.
     // No partial real file is ever visible.
     std::wstring wFinal = path_safety::Utf8ToWide(resolved);
     if (wFinal.empty()) {
@@ -369,15 +384,19 @@ WriteResult WriteFileContent(const std::string& argsBlob,
         }
     }
 
-    // Atomic rename. write refuses if the destination appeared during
-    // staging; overwrite_file atomically replaces an existing regular file.
-    DWORD moveFlags = MOVEFILE_WRITE_THROUGH;
-    if (overwriteExisting) moveFlags |= MOVEFILE_REPLACE_EXISTING;
+    if (!mutation.VerifyUnchanged()) {
+        r.chips.push_back("conflict");
+        r.errorBody = mutation.Error() + "\nThe proposed file is preserved at: " + tmpPath;
+        r.chips.push_back(ElapsedChip(t0));
+        return r;
+    }
+    // Even overwrite_file must not clobber a file that appeared after a
+    // create-new snapshot. Existing targets were version-checked above.
+    const bool replaceExisting = overwriteExisting && mutation.TargetExisted();
+    mutation.ReleaseTargetForCommit();
 
-    BOOL movedOK = ::MoveFileExW(
-        wTmp.c_str(),
-        wFinal.c_str(),
-        moveFlags);
+    BOOL movedOK = tool_staged_write::PromoteSiblingTempFile(
+        wTmp, wFinal, replaceExisting);
 
     if (!movedOK) {
         DWORD err = ::GetLastError();

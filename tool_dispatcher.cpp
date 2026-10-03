@@ -189,7 +189,8 @@ DispatchOutcome DispatchInvocation(const ToolInvocation& inv,
                                    GrepExecutor*         grepExec,
                                    CmdExecutor*          cmdExec,
                                    PythonRunner*         pythonRunner,
-                                   WebFetchExecutor*     webFetchExec)
+                                   WebFetchExecutor*     webFetchExec,
+                                   PythonSessionManager* pySession)
 {
     if (!inv.valid) {
         return MakeInvalidOutcome(inv, inv.invalidReason);
@@ -208,6 +209,7 @@ DispatchOutcome DispatchInvocation(const ToolInvocation& inv,
     deps.grepExec     = grepExec;
     deps.cmdExec      = cmdExec;
     deps.pythonRunner = pythonRunner;
+    deps.pySession    = pySession;
     deps.webFetchExec = webFetchExec;
 
     DispatchOutcome outcome = spec->dispatch(inv, ctx, deps);

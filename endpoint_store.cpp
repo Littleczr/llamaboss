@@ -2,12 +2,15 @@
 #define _CRT_SECURE_NO_WARNINGS
 
 #include "endpoint_store.h"
+#include "openai_responses.h"
 #include "secrets_store.h"
 
 #include <wx/wx.h>
 #include <wx/stdpaths.h>
 #include <wx/filename.h>
 #include <wx/log.h>
+#include <wx/datetime.h>
+#include <wx/filefn.h>
 
 #include <Poco/JSON/Parser.h>
 #include <Poco/JSON/Object.h>
@@ -25,13 +28,39 @@ namespace {
 // Kept local rather than shared to keep this checkpoint self-contained;
 // a later cleanup can factor ReadWholeFile/WriteWholeFileAtomic into a
 // common lb_file_io unit used by both stores.
-std::string ReadWholeFile(const wxString& path)
+// Returns false when the file exists but could not be read (locked,
+// permissions, I/O error) -- distinct from an empty file.
+bool ReadWholeFile(const wxString& path, std::string& out)
 {
+    out.clear();
     std::ifstream f(path.fn_str(), std::ios::in | std::ios::binary);
-    if (!f) return {};
+    if (!f) return false;
     std::ostringstream ss;
     ss << f.rdbuf();
-    return ss.str();
+    if (f.bad()) return false;
+    out = ss.str();
+    return true;
+}
+
+// Keeps a copy of a settings file that failed to load, next to it, so a
+// later "start fresh" can never destroy the only copy.  Returns the
+// backup path, or empty when no copy could be made.
+std::string BackupUnreadableFile(const wxString& path)
+{
+    const wxString stamp = wxDateTime::Now().Format("%Y%m%d-%H%M%S");
+    wxLogNull quiet;
+    // Retry can fail again within the same second; never overwrite an
+    // earlier backup, pick the next free name instead.
+    for (int n = 0; n < 100; ++n) {
+        wxString dest = path + ".unreadable-" + stamp;
+        if (n > 0) dest << "-" << n;
+        dest << ".bak";
+        if (wxFileExists(dest)) continue;
+        if (wxCopyFile(path, dest, /*overwrite=*/false))
+            return std::string(dest.ToUTF8().data());
+        return std::string();
+    }
+    return std::string();
 }
 
 bool WriteWholeFileAtomic(const wxString& path, const std::string& body)
@@ -50,13 +79,20 @@ bool WriteWholeFileAtomic(const wxString& path, const std::string& body)
 // ── enum <-> string ──────────────────────────────────────────────
 std::string AuthSchemeToString(EndpointStore::AuthScheme s)
 {
-    return (s == EndpointStore::AuthScheme::XApiKey) ? "x-api-key" : "bearer";
+    switch (s) {
+        case EndpointStore::AuthScheme::XApiKey: return "x-api-key";
+        case EndpointStore::AuthScheme::None:    return "none";
+        default:                                 return "bearer";
+    }
 }
 
 EndpointStore::AuthScheme AuthSchemeFromString(const std::string& s)
 {
-    return (s == "x-api-key") ? EndpointStore::AuthScheme::XApiKey
-                              : EndpointStore::AuthScheme::Bearer;
+    if (s == "x-api-key") return EndpointStore::AuthScheme::XApiKey;
+    if (s == "none")      return EndpointStore::AuthScheme::None;
+    return EndpointStore::AuthScheme::Bearer;   // unknown values stay
+                                                // on the historical
+                                                // default
 }
 
 std::string ProtocolToString(ToolProtocol p)
@@ -117,6 +153,9 @@ bool EndpointStore::Load()
 {
     m_endpoints.clear();
     m_loaded = true;
+    m_loadFailed = false;
+    m_loadError.clear();
+    m_loadBackupPath.clear();
 
     wxString path = wxString::FromUTF8(GetEndpointsFilePath().c_str());
     if (!wxFileExists(path)) {
@@ -126,10 +165,25 @@ bool EndpointStore::Load()
         return true;
     }
 
-    std::string body = ReadWholeFile(path);
+    // A present file that can't be read or parsed must not be replaced by
+    // the seeded default on the next save.  Seed in memory so the picker
+    // still works, keep a copy of the file, and block Save() until a
+    // reload succeeds or the user explicitly starts fresh.
+    auto fail = [&](const std::string& why) {
+        SeedDefaults();
+        m_loadFailed = true;
+        m_loadError = why;
+        m_loadBackupPath = BackupUnreadableFile(path);
+        wxLogWarning("EndpointStore: %s; saving is disabled until this is resolved.",
+                     wxString::FromUTF8(why));
+        return false;
+    };
+
+    std::string body;
+    if (!ReadWholeFile(path, body))
+        return fail("endpoints.json could not be read");
     if (body.empty()) {
-        // Present but unreadable/empty — treat like a fresh seed rather
-        // than leaving the user with no endpoints at all.
+        // Present but empty (nothing to lose) — seed a fresh default.
         SeedDefaults();
         return true;
     }
@@ -138,18 +192,19 @@ bool EndpointStore::Load()
         Poco::JSON::Parser parser;
         auto val  = parser.parse(body);
         auto root = val.extract<Poco::JSON::Object::Ptr>();
-        if (!root) { SeedDefaults(); return false; }
+        if (!root) return fail("endpoints.json is not a JSON object");
 
-        auto arr = root->getArray("endpoints");
-        if (!arr) {
+        if (!root->has("endpoints")) {
             // A present file with no endpoints array: respect it as empty
             // (do NOT re-seed — the user may have cleared the list).
             return true;
         }
+        auto arr = root->getArray("endpoints");
+        if (!arr) return fail("endpoints.json has a malformed \"endpoints\" list");
 
         for (size_t i = 0; i < arr->size(); ++i) {
             auto obj = arr->getObject(i);
-            if (!obj) continue;
+            if (!obj) return fail("endpoints.json has a malformed connection entry");
 
             Endpoint ep;
             auto getStr = [&](const char* k, const std::string& dflt) {
@@ -165,6 +220,9 @@ bool EndpointStore::Load()
             ep.secretProvider = getStr("secret_provider", ep.id);
             ep.secretKey      = getStr("secret_key", "api_key");
             ep.protocol       = ProtocolFromString(getStr("protocol", "native"));
+            // Optional /think dialect override; empty means "sniff the
+            // base URL at resolve time" (the backward-compatible path).
+            ep.reasoningDialect = getStr("reasoning_dialect", "");
 
             if (obj->has("extra_headers")) {
                 auto hdrs = obj->getObject("extra_headers");
@@ -198,6 +256,17 @@ bool EndpointStore::Load()
                                     mo->getValue<bool>("image_output");
                             } catch (...) { /* non-bool — leave false */ }
                         }
+                        if (mo->has("no_tools")) {
+                            try {
+                                model.noTools =
+                                    mo->getValue<bool>("no_tools");
+                            } catch (...) { /* non-bool — leave false */ }
+                        }
+                        if (mo->has("show_in_picker")) {
+                            try {
+                                model.showInPicker = mo->getValue<bool>("show_in_picker");
+                            } catch (...) { /* non-bool — keep visible */ }
+                        }
                         ep.models.push_back(std::move(model));
                     }
                 }
@@ -208,15 +277,23 @@ bool EndpointStore::Load()
         return true;
     }
     catch (const std::exception& e) {
-        wxLogWarning("EndpointStore: failed to parse endpoints.json (%s); "
-                     "starting from the default endpoint.", e.what());
-        SeedDefaults();
-        return false;
+        return fail(std::string("endpoints.json could not be parsed (") + e.what() + ")");
     }
+}
+
+void EndpointStore::ResetAfterFailedLoad()
+{
+    // Explicit user choice: keep the current in-memory list and let the
+    // next Save() replace the unreadable file (a copy was kept if possible).
+    m_loadFailed = false;
+    m_loadError.clear();
 }
 
 bool EndpointStore::Save()
 {
+    // Never overwrite a file that failed to load (see Load()).
+    if (m_loadFailed) return false;
+
     Poco::JSON::Object::Ptr root = new Poco::JSON::Object(true);
     root->set("version", 1);
 
@@ -231,6 +308,10 @@ bool EndpointStore::Save()
         obj->set("secret_provider", ep.secretProvider);
         obj->set("secret_key",      ep.secretKey);
         obj->set("protocol",        ProtocolToString(ep.protocol));
+        // Sparse like the per-model flags: absent means "auto-sniff",
+        // which is the common case, and keeps hand-edited files clean.
+        if (!ep.reasoningDialect.empty())
+            obj->set("reasoning_dialect", ep.reasoningDialect);
 
         if (!ep.extraHeaders.empty()) {
             Poco::JSON::Object::Ptr hdrs = new Poco::JSON::Object(true);
@@ -248,6 +329,8 @@ bool EndpointStore::Save()
             // Only written when set — keeps hand-edited files clean
             // and the absent-key default (false) is the common case.
             if (m.imageOutput) mo->set("image_output", true);
+            if (m.noTools)     mo->set("no_tools", true);
+            if (!m.showInPicker) mo->set("show_in_picker", false);
             models->add(mo);
         }
         obj->set("models", models);
@@ -311,12 +394,21 @@ bool EndpointStore::ResolveTarget(const std::string&  endpointId,
         return false;
     }
 
-    const std::string key = secrets.GetSecret(ep->secretProvider, ep->secretKey);
-    if (key.empty()) {
-        outReason = "No API key for '" + ep->displayName +
-                    "'. Add one under Settings -> Connections (provider \"" +
-                    ep->secretProvider + "\", key \"" + ep->secretKey + "\").";
-        return false;
+    // AuthScheme::None endpoints (local or SSH-tunneled servers such
+    // as FreeToken or a bare llama-server) skip the SecretsStore
+    // lookup entirely and send no auth header — the transport only
+    // sets the header when both name and value are non-empty, which
+    // is exactly how the managed local lane has always worked.
+    std::string key;
+    if (ep->authScheme != AuthScheme::None) {
+        key = secrets.GetSecret(ep->secretProvider, ep->secretKey);
+        if (key.empty()) {
+            outReason = "No API key for '" + ep->displayName +
+                        "'. Open Settings -> Remote Endpoints, edit the endpoint, "
+                        "and paste the key into its API key field (connection \"" +
+                        ep->secretProvider + "\", key \"" + ep->secretKey + "\").";
+            return false;
+        }
     }
 
     InferenceTarget t;
@@ -327,25 +419,82 @@ bool EndpointStore::ResolveTarget(const std::string&  endpointId,
     if (ep->authScheme == AuthScheme::XApiKey) {
         t.authHeaderName  = "x-api-key";
         t.authHeaderValue = key;
-    } else {
+    } else if (ep->authScheme != AuthScheme::None) {
         t.authHeaderName  = "Authorization";
         t.authHeaderValue = "Bearer " + key;
     }
+    // None: both auth fields stay empty and no header is emitted.
 
     t.extraHeaders = ep->extraHeaders;
     t.managed      = false;
     t.protocol     = ep->protocol;
     t.modelId      = wireModelId;
 
-    // Per-model image-output flag.  wireModelId may name a model that
-    // isn't in the configured list (typed into the picker manually);
-    // in that case the flag stays false and the model is treated as a
-    // plain text model — same behavior as before this feature.
+    // Reasoning dialect for /think: an explicit endpoint override wins;
+    // otherwise sniff the host.  Only direct OpenAI needs the
+    // reasoning_effort string — it rejects unknown body fields, so the
+    // historical OpenRouter reasoning object 400s there.  Every other
+    // remote keeps the historical shape byte-for-byte.
+    //
+    // The sniff parses the HOST out of the base URL and compares it
+    // lowercased and exactly, rather than substring-matching the whole
+    // URL: "API.OpenAI.com" still classifies, and a look-alike host
+    // ("api.openai.com.evil.example") or a path that merely contains
+    // the string does NOT.
+    {
+        std::string d = ep->reasoningDialect;
+        for (char& c : d)
+            if (c >= 'A' && c <= 'Z') c = (char)(c + 32);
+        if (d == "openai") {
+            t.reasoningDialect = ReasoningDialect::OpenAIStyle;
+        } else if (d == "openrouter") {
+            t.reasoningDialect = ReasoningDialect::OpenRouterStyle;
+        } else if (d == "template") {
+            // Remote server that applies the model's own chat template
+            // (FreeToken, vLLM, SGLang).  Never chosen by the sniff —
+            // endpoint opt-in only.
+            t.reasoningDialect = ReasoningDialect::TemplateKwargs;
+        } else {
+            std::string host = ep->baseUrl;
+            const size_t scheme = host.find("://");
+            if (scheme != std::string::npos) host.erase(0, scheme + 3);
+            const size_t cut = host.find_first_of("/?#");
+            if (cut != std::string::npos) host.erase(cut);
+            const size_t at = host.rfind('@');           // strip userinfo
+            if (at != std::string::npos) host.erase(0, at + 1);
+            const size_t port = host.rfind(':');         // strip port
+            if (port != std::string::npos) host.erase(port);
+            for (char& c : host)
+                if (c >= 'A' && c <= 'Z') c = (char)(c + 32);
+            if (host == "api.openai.com")
+                t.reasoningDialect = ReasoningDialect::OpenAIStyle;
+            // default (struct initializer) stays OpenRouterStyle
+        }
+    }
+
+    // Include hidden model records: removing a model from the picker must
+    // not change the behavior of chats already using it.
+    // Per-model behavior flags.  wireModelId may name a model that isn't
+    // in the configured list (typed into the picker manually); in that
+    // case both stay false and the model is treated as an ordinary,
+    // tool-capable text model — the backward-compatible default.
     for (const auto& m : ep->models) {
         if (m.id == wireModelId) {
             t.imageOutput = m.imageOutput;
+            t.noTools     = m.noTools;
             break;
         }
+    }
+
+    if (!t.imageOutput)
+        t.chatPath = lb_responses::ResolveChatPath(t.baseUrl, t.chatPath, t.modelId);
+    t.responsesApi = lb_responses::IsResponsesPath(t.chatPath);
+    if (t.responsesApi) {
+        // Responses speaks the OpenAI reasoning vocabulary by definition.
+        // Phase 2: agent tools work on this lane (function tools +
+        // encrypted reasoning replay), so the model's own Allow agent
+        // tools flag is the only gate — no forced noTools any more.
+        t.reasoningDialect = ReasoningDialect::OpenAIStyle;
     }
 
     out = std::move(t);

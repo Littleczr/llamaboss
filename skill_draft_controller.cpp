@@ -10,7 +10,6 @@
 #include "chat_display.h"
 #include "chat_history.h"
 #include "conversation_controller.h"
-#include "goal_verifier_support.h"
 #include "lb_string_utils.h"
 #include "model_switcher.h"
 #include "server_manager.h"
@@ -138,13 +137,13 @@ std::string SkillDraftController::BuildPendingSkillDesignConversationBrief() con
 
         transcript << (role == "user" ? "User" : "Assistant")
                    << ":\n"
-                   << LbClipForGoalVerifier(content, 1800)
+                   << LbClipForPrompt(content, 1800)
                    << "\n\n";
         wroteAny = true;
     }
 
     if (!wroteAny) return std::string();
-    return LbClipForGoalVerifier(transcript.str(), 12000);
+    return LbClipForPrompt(transcript.str(), 12000);
 }
 
 void SkillDraftController::PrepareDraftFromDesignConversationBrief(
@@ -199,8 +198,7 @@ void SkillDraftController::BeginDraftBuildFromPendingDescription()
     builderHistory.AddUserMessage(
         BuildSkillDraftBuilderUserPrompt(skillPromptInput));
 
-    int ctxTokens = m_appState.GetCtxSize();
-    if (ctxTokens <= 0) ctxTokens = 8192;
+    const int ctxTokens = m_modelSwitcher.ConversationContextTokens();
 
     std::string body = builderHistory.BuildChatRequestJson(
         model,

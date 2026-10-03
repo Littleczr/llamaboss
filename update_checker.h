@@ -22,8 +22,14 @@ struct UpdateInfo {
     bool        ok        = false;   // network + parse succeeded
     bool        available = false;   // a strictly newer version exists
     std::string latest;              // remote version, e.g. "0.1.5"
-    std::string url;                 // download URL (may be empty)
+    std::string url;                 // download PAGE URL (may be empty)
     std::string notes;               // short release note (may be empty)
+
+    // In-app install (optional).  Both must be present and well-formed for
+    // the About dialog to offer "Download and Install"; otherwise it falls
+    // back to opening the download page, exactly like older manifests.
+    std::string installerUrl;        // direct .exe URL ("installer_url")
+    std::string sha256;              // lowercase hex, 64 chars ("sha256")
     std::string error;               // human-readable reason when !ok
 };
 

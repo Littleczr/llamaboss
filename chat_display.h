@@ -4,6 +4,7 @@
 #include <wx/wx.h>
 #include <wx/richtext/richtextctrl.h>
 #include <wx/timer.h>
+#include <chrono>
 #include <string>
 #include <vector>
 #include <memory>
@@ -28,19 +29,31 @@ public:
     ~ChatDisplay();
 
     // Display different types of messages
-    // target: if non-empty, shows "You → target:" instead of "You:"
+    // target: if non-empty, shows "YOU → target" above the bubble text
     // inlineImages: absolute file paths of images to show as thumbnails
     void DisplayUserMessage(const std::string& text,
                             const std::string& target = "",
                             const std::vector<std::string>& inlineImages = {});
     void DisplaySystemMessage(const std::string& text);
 
+    // Informational notice that must NOT disturb live work (e.g. "Can't
+    // switch models while a response is streaming").  DisplaySystemMessage
+    // tears down the live pending-tool card and thinking dots because it
+    // doubles as the terminal message on error paths; that also ended the
+    // ActivityStrip mid-run, so a PowerShell command looked stopped when it
+    // was still running.  This variant writes the notice ABOVE any live
+    // indicator (the pending tool card, or the assistant prefix + thinking
+    // dots) and leaves them running.  With no live indicator, or while
+    // assistant text is actively streaming, it behaves exactly like
+    // DisplaySystemMessage.
+    void DisplaySystemNotice(const std::string& text);
+
     // Render image thumbnails at the chat tail, outside any message
     // prefix.  Used for assistant-generated images (image-output
     // models): after DisplayAssistantComplete on the live path, and
     // after DisplayAssistantMessage on conversation replay.  Absolute
     // file paths; unloadable/corrupt entries are skipped silently —
-    // a deleted workflow folder must not break conversation replay.
+    // a deleted chat folder must not break conversation replay.
     // Scaling matches DisplayUserMessage's thumbnail rules.
     void DisplayInlineImages(const std::vector<std::string>& imagePaths);
 
@@ -107,6 +120,9 @@ public:
     //
     //   [ Allow Once ]   [ Allow Always ]   [ Deny ]
     //
+    // Folder-access cards instead render:
+    //   [ Grant Folder for Chat ]   [ Cancel ]
+    //
     // Each label is a separately-registered click region styled the
     // same as the [show details] affordance (italic Consolas, soft
     // blue).  Clicks dispatch through the registered callback to the
@@ -126,6 +142,10 @@ public:
     // starts streaming.
     enum class ApprovalChoice { Once, Always, Deny };
     void SetApprovalCallback(std::function<void(ApprovalChoice)> callback);
+
+    // Live progress for a pending async tool (see private section).
+    void SetPendingToolCallbacks(std::function<void(const ToolBlock&)> onStarted,
+                                 std::function<void()>                 onEnded);
     void ClearApprovalButtons();
 
     void DisplayAssistantPrefix(const std::string& modelName);
@@ -163,7 +183,6 @@ public:
 
     // Utility methods
     void Clear();
-    void ScrollToBottom();
 
     // Long saved conversations can be expensive to replay into wxRichTextCtrl
     // because each rendered message normally scrolls/repaints the control.
@@ -174,10 +193,6 @@ public:
     bool IsReplayBatchActive() const { return m_replayBatchDepth > 0; }
 
     // Configuration methods for customizing appearance
-    void SetUserColor(const wxColour& color);
-    void SetAssistantColor(const wxColour& color);
-    void SetSystemColor(const wxColour& color);
-    void SetThoughtColor(const wxColour& color);
     void SetFont(const wxFont& font);
 
     // Apply all colors from a ThemeData
@@ -214,7 +229,7 @@ private:
     bool m_animActive   = false;
 
     // ── Thinking indicator state ─────────────────────────────────
-    // Shows animated dots (. -> .. -> ...) in the thought color after the
+    // Shows a braille spinner (U+280B..U+280F) in the thought color after the
     // assistant prefix while waiting for visible tokens to arrive.  Covers
     // the time-to-first-token gap on MoE/reasoning models and the probe
     // window while we're buffering bytes to detect a <think> tag.
@@ -228,12 +243,32 @@ private:
     std::unique_ptr<ThinkingTimer> m_thinkingTimer;
     long m_thinkingDotsStartPos = -1;   // Char pos where dots begin (right after prefix)
     long m_thinkingDotsEndPos   = -1;   // Char pos where dots end (for Remove range)
-    int  m_thinkingDotsFrame    = 0;    // Current animation frame: 0,1,2 -> 1,2,3 dots
+    int  m_thinkingDotsFrame    = 0;    // Current spinner frame index (0..9)
     bool m_thinkingActive       = false;
 
     void StartThinkingIndicator();
     void ClearThinkingIndicator();
     void OnThinkingTick();
+
+    // ── Live async-tool progress ────────────────────────────────
+    // The pending card in the transcript is static and UI-only; it is
+    // removed before the terminal tool card is rendered.  The *live*
+    // part (elapsed clock, output tail, gauge) is no longer drawn inside
+    // the rich text control — it is delegated to the owner via the
+    // callbacks below (MyFrame wires them to ActivityStrip).  Drawing it
+    // here re-laid-out the tail paragraph every second and fought the
+    // user's scroll position for the whole duration of a long command.
+    long m_pendingCardStartPos     = -1;
+    long m_pendingCardEndPos       = -1;
+    bool m_pendingProgressActive   = false;
+
+    std::function<void(const ToolBlock&)> m_onPendingToolStarted;
+    std::function<void()>                 m_onPendingToolEnded;
+
+    void StartPendingToolProgress(const ToolBlock& block,
+                                  long pendingCardStart,
+                                  long pendingCardEnd);
+    void ClearPendingToolProgress();
 
     // ── File card action registry ────────────────────────────────
     // Each clickable action inside an artifact:file card registers a
@@ -290,6 +325,7 @@ private:
         std::string body;       // stashed for re-render on expand
         std::string errorBody;  // stashed for re-render on expand
         bool        expanded;   // current visibility state
+        bool        errorIsFailure = true; // red stderr only when the call failed
     };
     std::vector<ToolBlockRegion> m_toolBlocks;
     bool m_toolBlockInteractionEnabled = true;
@@ -327,10 +363,15 @@ private:
 
     // Writes body + errorBody at the current insertion point with the
     // standard tool-block styling (Consolas, stdout color for body,
-    // red for errorBody, trailing \n if missing).  Returns the number
+    // red errorBody on failure / muted on exit 0, trailing \n if missing).  Returns the number
     // of chars written so callers can derive the (start, end) range.
     long WriteToolBodyAtCursor(const std::string& body,
-                               const std::string& errorBody);
+                               const std::string& errorBody,
+                               bool errorIsFailure = true);
+    // stderr from a call that otherwise succeeded ("exit 0" chip, no
+    // blocked/cancelled/timeout/error chip) is informational: progress
+    // remnants, native-tool log lines.  Rendered muted, not red.
+    static bool IsStderrFailure(const std::vector<std::string>& chips);
 
     // Swaps the details affordance between "[show details]" and
     // "[hide details]". Those labels intentionally have the same length so
@@ -356,18 +397,19 @@ private:
 
     // ── Sticky autoscroll (follow mode) ───────────────────────────
     // While the user is at (or near) the bottom, streamed content
-    // auto-scrolls to stay visible.  Any user scroll input (wheel or
-    // scrollbar) re-evaluates follow: scrolling up disengages it so
-    // the user can read while the model keeps typing below; scrolling
-    // back to the bottom — or any deliberate jump (sending a message,
-    // ScrollToBottom, replay end, Clear) — re-engages it.  Mirrors
+    // auto-scrolls to stay visible. Wherever the user's navigation landed
+    // (wheel, scrollbar, Page Up/Down, Home/End, arrows, middle-click pan,
+    // or drag-selection autoscroll) re-evaluates follow: moving up
+    // disengages it so the user can read while the model keeps typing
+    // below; returning to the bottom — or any deliberate jump (sending a
+    // message, replay end, Clear) — re-engages it. Mirrors
     // Claude/ChatGPT streaming behavior.
     //
     // EnsureVisibleAtEnd() stays the FORCED jump (and re-engages
     // follow); EnsureVisibleAtEndIfFollowing() is the gated variant
     // used by streaming-driven call sites (deltas, tool blocks,
     // thinking indicator, stream completion, animation frames).
-    static constexpr int kFollowSlackPx = 64;
+    static constexpr int kFollowSlackPx = 4;
     bool IsNearBottom() const;
     void UpdateFollowFromScrollPosition();
     void EnsureVisibleAtEndIfFollowing();
@@ -384,4 +426,3 @@ private:
     static constexpr int kImageMaxWidth  = 440;
     static constexpr int kImageMaxHeight = 440;
 };
-

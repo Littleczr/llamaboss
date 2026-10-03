@@ -6,6 +6,7 @@
 #include "tool_staged_write.h"  // StagedTempFile, CreateStagedTempFile
 #include "tool_open.h"          // ClassifyForOpen, FileRisk
 #include "path_safety.h"
+#include "tool_mutation_guard.h"
 
 #include <algorithm>
 #include <chrono>
@@ -13,6 +14,7 @@
 #include <fstream>
 #include <sstream>
 #include <utility>
+#include <vector>
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -309,6 +311,69 @@ std::string ToCrlf(const std::string& s)
     return out;
 }
 
+// LF view of `raw` for matching, plus an offset map back into `raw`.
+// Every CRLF collapses to LF (lone CRs are kept); rawIndexOut[i] is the
+// raw offset of LF-view byte i, and rawIndexOut[lf.size()] == raw.size()
+// so a match END maps cleanly too.
+//
+// Matching against this view instead of a majority-style conversion
+// fixes two mixed-ending failures:
+//   * mostly-LF file with some CRLF lines: an OLD block spanning the
+//     CRLF lines can now match (it used to be unfindable);
+//   * mostly-CRLF file with some LF lines: the edit is spliced into the
+//     ORIGINAL bytes, so lines outside the match keep their endings
+//     (it used to rewrite every LF line in the file to CRLF).
+std::string ToLfWithMap(const std::string& raw, std::vector<size_t>& rawIndexOut)
+{
+    std::string lf;
+    lf.reserve(raw.size());
+    rawIndexOut.clear();
+    rawIndexOut.reserve(raw.size() + 1);
+    for (size_t i = 0; i < raw.size(); ++i) {
+        if (raw[i] == '\r' && i + 1 < raw.size() && raw[i + 1] == '\n') {
+            // A CRLF becomes one LF-view '\n' that maps to the '\r', so a
+            // match ENDING at this line break leaves "\r\n" untouched and
+            // a match STARTING on it replaces both bytes.
+            rawIndexOut.push_back(i);
+            lf.push_back('\n');
+            ++i;
+            continue;
+        }
+        rawIndexOut.push_back(i);
+        lf.push_back(raw[i]);
+    }
+    rawIndexOut.push_back(raw.size());
+    return lf;
+}
+
+// Line-ending style to write the NEW text in: whatever the replaced
+// region itself used, else the line the match sits on, else the file's
+// dominant style.
+LineEnding LocalLineEnding(const std::string& raw,
+                           size_t rawStart, size_t rawEnd)
+{
+    size_t lf = 0, crlf = 0;
+    for (size_t i = rawStart; i < rawEnd && i < raw.size(); ++i) {
+        if (raw[i] == '\n') {
+            ++lf;
+            if (i > 0 && raw[i - 1] == '\r') ++crlf;
+        }
+    }
+    if (lf > 0) return (crlf * 2 >= lf) ? LineEnding::Crlf : LineEnding::Lf;
+
+    const size_t next = raw.find('\n', rawEnd);
+    if (next != std::string::npos)
+        return (next > 0 && raw[next - 1] == '\r') ? LineEnding::Crlf
+                                                     : LineEnding::Lf;
+    if (rawStart > 0) {
+        const size_t prev = raw.rfind('\n', rawStart - 1);
+        if (prev != std::string::npos)
+            return (prev > 0 && raw[prev - 1] == '\r') ? LineEnding::Crlf
+                                                         : LineEnding::Lf;
+    }
+    return DetectLineEnding(raw);
+}
+
 // ─── Diff rendering ──────────────────────────────────────────────
 //
 // Produce a unified-diff-style snippet showing the change region
@@ -521,11 +586,25 @@ EditResult EditFile(const std::string& argsBlob,
         return r;
     }
 
-    if (!tool_path_safety::IsUnderAllowedWriteRoot(resolved, ctx.cwd, ctx.activeProjectRoot, ctx.skillsRoot)) {
+    if (!tool_path_safety::IsUnderAllowedWriteRoot(
+            resolved, ctx.cwd, ctx.activeProjectRoot, ctx.skillsRoot,
+            ctx.additionalWriteRoots)) {
         r.chips.push_back("blocked");
         r.errorBody = "Refuses to edit outside the allowed write roots."
                       "\n  resolved: " + resolved +
-                      tool_path_safety::AllowedWriteRootsDiagnostic(ctx.cwd, ctx.activeProjectRoot, ctx.skillsRoot);
+                      tool_path_safety::AllowedWriteRootsDiagnostic(
+                          ctx.cwd, ctx.activeProjectRoot, ctx.skillsRoot,
+                          ctx.additionalWriteRoots);
+        r.chips.push_back(ElapsedChip(t0));
+        return r;
+    }
+
+    // Coordinate native mutations across chat windows and pin the real
+    // directory chain before touching the target. Reparse points fail closed.
+    tool_mutation_guard::Guard mutation;
+    if (!mutation.Begin(resolved)) {
+        r.chips.push_back("blocked");
+        r.errorBody = mutation.Error();
         r.chips.push_back(ElapsedChip(t0));
         return r;
     }
@@ -624,10 +703,11 @@ EditResult EditFile(const std::string& argsBlob,
         return r;
     }
 
-    // ── Detect dominant ending and normalize all sides to LF ─────
-    LineEnding native = DetectLineEnding(fileContent);
-    std::string fileLf = (native == LineEnding::Crlf) ? ToLf(fileContent)
-                                                       : fileContent;
+    // ── Normalize all sides to LF for matching ───────────────────
+    // Every CRLF in the file collapses (not just when CRLF dominates),
+    // and lfToRaw lets the substitution land in the original bytes.
+    std::vector<size_t> lfToRaw;
+    std::string fileLf = ToLfWithMap(fileContent, lfToRaw);
     std::string oldLf  = ToLf(parsed.oldString);
     std::string newLf  = ToLf(parsed.newString);
 
@@ -668,17 +748,21 @@ EditResult EditFile(const std::string& argsBlob,
         return r;
     }
 
-    // ── Substitute ───────────────────────────────────────────────
+    // ── Substitute into the ORIGINAL bytes ───────────────────────
+    // Only the matched span changes; every byte outside it (including
+    // the line endings of untouched lines) is written back verbatim.
     size_t matchPos = fileLf.find(oldLf);
-    std::string editedLf =
-        fileLf.substr(0, matchPos) +
-        newLf +
-        fileLf.substr(matchPos + oldLf.size());
+    const size_t rawStart = lfToRaw[matchPos];
+    const size_t rawEnd   = lfToRaw[matchPos + oldLf.size()];
 
-    // ── Restore native line ending and enforce the on-disk size cap ─
-    std::string outputBytes = (native == LineEnding::Crlf)
-                                  ? ToCrlf(editedLf)
-                                  : editedLf;
+    const LineEnding local = LocalLineEnding(fileContent, rawStart, rawEnd);
+    const std::string newStyled = (local == LineEnding::Crlf) ? ToCrlf(newLf)
+                                                              : newLf;
+
+    std::string outputBytes =
+        fileContent.substr(0, rawStart) +
+        newStyled +
+        fileContent.substr(rawEnd);
 
     if (outputBytes.size() > kEditMaxBytes) {
         r.chips.push_back("too large");
@@ -775,14 +859,18 @@ EditResult EditFile(const std::string& argsBlob,
         return r;
     }
 
-    // Atomic replace.  Unlike write, edit USES MOVEFILE_REPLACE_EXISTING
-    // because overwriting the original is the entire point.  The
-    // pre-checks above (file must exist, must be a regular file)
-    // make this safe.
-    BOOL movedOK = ::MoveFileExW(
-        wTmp.c_str(),
-        wPath.c_str(),
-        MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+    // Validate the exact source snapshot while the target is pinned. A
+    // conflict keeps both the original and the staged edit for inspection.
+    if (!mutation.VerifyUnchanged(&fileContent)) {
+        r.chips.push_back("conflict");
+        r.errorBody = mutation.Error() + "\nThe attempted edit is preserved at: " + tmpPath;
+        attachAttemptedDiff();
+        r.chips.push_back(ElapsedChip(t0));
+        return r;
+    }
+    mutation.ReleaseTargetForCommit();
+    BOOL movedOK = tool_staged_write::PromoteSiblingTempFile(
+        wTmp, wPath, /*replaceExisting=*/true);
 
     if (!movedOK) {
         DWORD err = ::GetLastError();

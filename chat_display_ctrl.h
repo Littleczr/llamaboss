@@ -23,6 +23,9 @@
 #include <wx/graphics.h>
 #include <algorithm>
 #include <cmath>
+#include <functional>
+#include <utility>
+#include <vector>
 
 #ifdef __WXMSW__
 // ── Pan-origin icon ─────────────────────────────────────────────
@@ -124,13 +127,18 @@ public:
         // browser chat instead of an editor.
         Bind(wxEVT_MOUSEWHEEL, &ChatDisplayCtrl::OnMouseWheel, this);
 
+        // Navigation keys are handled by wxRichTextCtrl after this event.
+        // Observe them on every platform so Page Up/Down, Home/End, arrow
+        // navigation, and Space can update transcript follow mode once the
+        // base control has moved the viewport.
+        Bind(wxEVT_KEY_DOWN, &ChatDisplayCtrl::OnKeyDown, this);
+
 #ifdef __WXMSW__
         // Middle-click auto-scroll is a Windows convention; keep the
         // feature MSW-only so the control matches native expectations
         // per platform.
         Bind(wxEVT_MIDDLE_DOWN, &ChatDisplayCtrl::OnMiddleDown, this);
         Bind(wxEVT_MIDDLE_UP, &ChatDisplayCtrl::OnMiddleUp, this);
-        Bind(wxEVT_KEY_DOWN, &ChatDisplayCtrl::OnKeyDownPan, this);
         Bind(wxEVT_TIMER, &ChatDisplayCtrl::OnPanTimer, this,
             m_panTimer.GetId());
 #endif
@@ -146,7 +154,251 @@ public:
         }
     }
 
+    // ChatDisplay installs this after construction. Direct scrolling done
+    // inside this custom control does not consistently emit wxScrollWinEvent,
+    // so follow mode cannot rely on the outer scrollbar bindings alone.
+    // Notifications are deferred and coalesced so the callback observes the
+    // final viewport after wxRichTextCtrl has processed the input event.
+    void SetViewportChangedHandler(std::function<void()> handler) {
+        m_viewportChangedHandler = std::move(handler);
+    }
+
+    // Right bubbles are the standard user-message presentation.
+    void SetUserBubbleColor(const wxColour& bubble) {
+        m_userBubble = bubble;
+        m_userLayoutWidth = -1;
+        GetBuffer().Invalidate(wxRICHTEXT_ALL);
+        Refresh(false);
+    }
+
+    void MarkUserMessage(long start, long end, int naturalWidth) {
+        if (end < start) return;
+        const long group = ++m_userMessageSerial;
+        wxRichTextParagraph* first = nullptr;
+        wxRichTextParagraph* last = nullptr;
+        for (auto node = GetBuffer().GetChildren().GetFirst(); node; node = node->GetNext()) {
+            auto* paragraph = dynamic_cast<wxRichTextParagraph*>(node->GetData());
+            if (!paragraph) continue;
+            const auto range = paragraph->GetRange();
+            if (range.GetEnd() < start) continue;
+            if (range.GetStart() > end) break;
+            auto& properties = paragraph->GetProperties();
+            properties.SetProperty("lb_user_group", group);
+            properties.SetProperty("lb_user_natural_width", static_cast<long>(naturalWidth));
+            if (!first) first = paragraph;
+            last = paragraph;
+        }
+        if (first) first->GetProperties().SetProperty("lb_user_first", true);
+        if (last) last->GetProperties().SetProperty("lb_user_last", true);
+        m_userLayoutWidth = -1;
+        GetBuffer().Invalidate(wxRICHTEXT_ALL);
+    }
+
+    // Live transcript writes are one transaction. Nested renderer/thinking
+    // updates share the outer snapshot; replay's existing freeze owns itself.
+    void BeginTranscriptUpdate(bool follow) {
+        if (m_transcriptUpdateDepth++ != 0) return;
+        m_transcriptOwnsFreeze = !IsFrozen();
+        if (!m_transcriptOwnsFreeze) return;
+        m_transcriptFollow = follow;
+        GetViewStart(&m_transcriptViewX, &m_transcriptViewY);
+        int ppuX = 0;
+        GetScrollPixelsPerUnit(&ppuX, &m_transcriptPpuY);
+        GetSelection(&m_transcriptSelectionStart, &m_transcriptSelectionEnd);
+        Freeze();
+    }
+
+    void EndTranscriptUpdate() {
+        if (m_transcriptUpdateDepth <= 0 || --m_transcriptUpdateDepth != 0) return;
+        if (!m_transcriptOwnsFreeze) return;
+        m_restoreTranscriptView = true;
+        Thaw(); // DoThaw below restores against the FINAL scrollbar range.
+        m_restoreTranscriptView = false;
+        m_transcriptOwnsFreeze = false;
+        SuppressCaret();
+    }
+
+    bool IsTranscriptUpdateActive() const {
+        return m_transcriptUpdateDepth > 0 || m_restoreTranscriptView;
+    }
+
+    void SetViewportChangingHandler(std::function<void()> handler) {
+        m_viewportChangingHandler = std::move(handler);
+    }
+
+protected:
+    // wxWidgets 3.3 changed layout APIs to the read-only DC interface.
+    // Keep the exact virtual signature on both supported API families.
+#if wxCHECK_VERSION(3, 3, 0)
+    using LayoutDC = wxReadOnlyDC;
+#else
+    using LayoutDC = wxDC;
+#endif
+    void DoLayoutBuffer(wxRichTextBuffer& buffer, LayoutDC& dc,
+                        wxRichTextDrawingContext& context, const wxRect& rect,
+                        const wxRect& parentRect, int flags) override {
+        if (m_userLayoutWidth != rect.width) {
+            m_userLayoutWidth = rect.width;
+            const int padding = FromDIP(14);
+            const int available = std::max(1, rect.width - buffer.GetLeftMargin() - buffer.GetRightMargin());
+            for (auto node = buffer.GetChildren().GetFirst(); node; node = node->GetNext()) {
+                auto* paragraph = dynamic_cast<wxRichTextParagraph*>(node->GetData());
+                if (!paragraph || !paragraph->GetProperties().HasProperty("lb_user_group")) continue;
+                auto& properties = paragraph->GetProperties();
+                auto& attr = paragraph->GetAttributes();
+                const int natural = static_cast<int>(properties.GetPropertyLong("lb_user_natural_width"));
+                // Short prompts fit their content; long prompts wrap at 78%
+                // of the transcript width. On narrow windows use more room.
+                const int cap = std::max(1, available < FromDIP(420)
+                    ? available * 94 / 100 : available * 78 / 100);
+                const int width = std::min(cap, std::max(FromDIP(180), natural + padding * 2));
+                const int left = available - width;
+                const int inset = std::min(padding, width / 4);
+                attr.SetLeftIndent(paragraph->ConvertPixelsToTenthsMM(dc, left + inset), 0);
+                attr.SetRightIndent(paragraph->ConvertPixelsToTenthsMM(dc, inset));
+                attr.SetParagraphSpacingBefore(properties.HasProperty("lb_user_first")
+                    ? paragraph->ConvertPixelsToTenthsMM(dc, padding) : 0);
+                attr.SetParagraphSpacingAfter(properties.HasProperty("lb_user_last")
+                    ? paragraph->ConvertPixelsToTenthsMM(dc, padding) : 0);
+                properties.SetProperty("lb_user_left", static_cast<long>(left));
+                properties.SetProperty("lb_user_width", static_cast<long>(width));
+                for (auto child = paragraph->GetChildren().GetFirst(); child; child = child->GetNext()) {
+                    if (auto* image = dynamic_cast<wxRichTextImage*>(child->GetData())) {
+                        image->GetAttributes().GetTextBoxAttr().GetMaxSize().GetWidth().SetValue(
+                            std::max(1, width - 2 * inset), wxTEXT_ATTR_UNITS_PIXELS);
+                    }
+                }
+            }
+            buffer.Invalidate(wxRICHTEXT_ALL);
+        }
+        wxRichTextCtrl::DoLayoutBuffer(buffer, dc, context, rect, parentRect, flags);
+        // Geometry is final here. Rebuild even when the width is unchanged:
+        // streaming, folding tool output, replay and removal can move cards.
+        // Store values, never paragraph pointers that edits could invalidate.
+        RebuildUserBubbleBounds(buffer);
+    }
+
+    void PaintBackground(wxDC& dc) override {
+        wxRichTextCtrl::PaintBackground(dc);
+        const wxRect visible(GetLogicalPoint(wxPoint(0, 0)), GetClientSize());
+        if (visible.IsEmpty() || m_userBubbleBounds.empty()) return;
+
+        // Prefix bottoms are monotonic even if an unusually tall card
+        // overlaps later cards. Find the first possible intersection without
+        // visiting the transcript or walking all preceding user messages.
+        auto first = std::lower_bound(
+            m_userBubbleBounds.begin(), m_userBubbleBounds.end(), visible.GetTop(),
+            [](const UserBubbleBounds& bubble, int top) {
+                return bubble.prefixBottom < top;
+            });
+        dc.SetPen(*wxTRANSPARENT_PEN);
+        dc.SetBrush(wxBrush(m_userBubble));
+        const int radius = FromDIP(12);
+        for (auto it = first; it != m_userBubbleBounds.end(); ++it) {
+            if (it->rect.GetTop() > visible.GetBottom()) break;
+            if (it->rect.Intersects(visible))
+                dc.DrawRoundedRectangle(it->rect, radius);
+        }
+    }
+
 private:
+    struct UserBubbleBounds {
+        wxRect rect;       // Same scaled document coordinates as painting.
+        int prefixBottom; // Maximum bottom among this and preceding cards.
+    };
+    std::vector<UserBubbleBounds> m_userBubbleBounds;
+
+    void RebuildUserBubbleBounds(wxRichTextBuffer& buffer) {
+        m_userBubbleBounds.clear(); // Also removes cards after clear/replay.
+        long group = 0;
+        wxRect card;
+        auto cacheCard = [&]() {
+            if (group == 0 || card.IsEmpty()) return;
+            const wxRect scaled = GetScaledRect(card);
+            if (!scaled.IsEmpty())
+                m_userBubbleBounds.push_back({scaled, scaled.GetBottom()});
+        };
+        for (auto node = buffer.GetChildren().GetFirst(); node; node = node->GetNext()) {
+            auto* paragraph = dynamic_cast<wxRichTextParagraph*>(node->GetData());
+            const long next = paragraph && paragraph->GetProperties().HasProperty("lb_user_group")
+                ? paragraph->GetProperties().GetPropertyLong("lb_user_group") : 0;
+            if (next != group) { cacheCard(); group = next; card = wxRect(); }
+            if (group == 0 || !paragraph) continue;
+            const auto& properties = paragraph->GetProperties();
+            wxRect part = paragraph->GetRect();
+            part.x += static_cast<int>(properties.GetPropertyLong("lb_user_left"));
+            part.width = static_cast<int>(properties.GetPropertyLong("lb_user_width"));
+            if (card.IsEmpty()) card = part;
+            else card.Union(part);
+        }
+        cacheCard();
+
+        // Paragraphs normally arrive in vertical order. Avoid sorting that
+        // common case while keeping the index correct for unusual layouts.
+        auto above = [](const UserBubbleBounds& a, const UserBubbleBounds& b) {
+            return a.rect.GetTop() < b.rect.GetTop();
+        };
+        if (!std::is_sorted(m_userBubbleBounds.begin(), m_userBubbleBounds.end(), above))
+            std::stable_sort(m_userBubbleBounds.begin(), m_userBubbleBounds.end(), above);
+        for (std::size_t i = 1; i < m_userBubbleBounds.size(); ++i)
+            m_userBubbleBounds[i].prefixBottom = std::max(
+                m_userBubbleBounds[i - 1].prefixBottom,
+                m_userBubbleBounds[i].rect.GetBottom());
+    }
+
+protected:
+    bool ScrollIntoView(long position, int keyCode) override {
+        // Programmatic writes must not run the editor's caret-follow scroll.
+        // User keyboard navigation outside a transcript update still uses it.
+        if (IsTranscriptUpdateActive()) return false;
+        return wxRichTextCtrl::ScrollIntoView(position, keyCode);
+    }
+
+    void DoThaw() override {
+        if (!m_restoreTranscriptView) {
+            wxRichTextCtrl::DoThaw();
+            return;
+        }
+
+        // Match wxRichTextCtrl::DoThaw's layout ordering, inserting viewport
+        // restoration before wxWindow re-enables painting. SetupScrollbars
+        // intentionally does nothing while frozen, so the old pre-Thaw fix
+        // used stale virtual dimensions and could scroll twice per frame.
+        if (GetBuffer().IsDirty()) LayoutContent();
+        else SetupScrollbars();
+
+        if (m_transcriptSelectionStart != m_transcriptSelectionEnd) {
+            const long end = GetLastPosition();
+            SetSelection(std::min(m_transcriptSelectionStart, end),
+                         std::min(m_transcriptSelectionEnd, end));
+        }
+
+        int ppuX = 0, ppuY = 0;
+        GetScrollPixelsPerUnit(&ppuX, &ppuY);
+        if (ppuY > 0) {
+            const int maxTop = std::max(0, GetVirtualSize().y - GetClientSize().y);
+            const int bottom = (maxTop + ppuY - 1) / ppuY;
+            const int anchor = m_transcriptPpuY > 0
+                ? static_cast<int>((static_cast<long long>(m_transcriptViewY) * m_transcriptPpuY) / ppuY)
+                : m_transcriptViewY;
+            Scroll(m_transcriptViewX, m_transcriptFollow ? bottom : std::min(anchor, bottom));
+        }
+        wxWindow::DoThaw();
+    }
+
+private:
+    int m_userLayoutWidth = -1;
+    long m_userMessageSerial = 0;
+    wxColour m_userBubble{65, 80, 99};
+
+    int m_transcriptUpdateDepth = 0;
+    bool m_transcriptOwnsFreeze = false;
+    bool m_restoreTranscriptView = false;
+    bool m_transcriptFollow = true;
+    int m_transcriptViewX = 0, m_transcriptViewY = 0, m_transcriptPpuY = 0;
+    long m_transcriptSelectionStart = 0, m_transcriptSelectionEnd = 0;
+    std::function<void()> m_viewportChangingHandler;
+
     // ── Tuning constants ────────────────────────────────────────
     // Wheel: 3x the system lines-per-notch.  With the default system
     // setting of 3 lines that is 9 scroll units per notch, which
@@ -166,6 +418,9 @@ private:
 
     int m_wheelAccum = 0;     // sub-notch rotation (trackpads, free wheels)
 
+    std::function<void()> m_viewportChangedHandler;
+    bool m_viewportNotifyPending = false;
+
     // Middle-click pan state (MSW).  Members exist on all platforms so
     // the class shape doesn't change per-build; only the bindings are
     // conditional.
@@ -183,6 +438,19 @@ private:
         CallAfter([this]() { SuppressCaret(); });
     }
 
+    void NotifyViewportChangedSoon() {
+        // Pause follow immediately, before another queued stream frame can
+        // undo the user's wheel/key/pan movement. Recheck after input settles.
+        if (m_viewportChangingHandler) m_viewportChangingHandler();
+        if (m_viewportNotifyPending) return;
+        m_viewportNotifyPending = true;
+
+        CallAfter([this]() {
+            m_viewportNotifyPending = false;
+            if (m_viewportChangedHandler) m_viewportChangedHandler();
+        });
+    }
+
     void OnFocusGained(wxFocusEvent& evt) {
         evt.Skip();
         SuppressCaretSoon();
@@ -191,14 +459,18 @@ private:
     void OnMouseDown(wxMouseEvent& evt) {
         // Any other click ends sticky pan mode (Windows behavior) and
         // swallows that click so it doesn't also move the selection.
+#ifdef __WXMSW__
         if (m_panning) { StopPan(); return; }
+#endif
         evt.Skip();
         SuppressCaretSoon();
     }
 
     // ── Wheel speed ─────────────────────────────────────────────
     void OnMouseWheel(wxMouseEvent& evt) {
+#ifdef __WXMSW__
         if (m_panning) StopPan();     // wheel input cancels pan mode
+#endif
 
         // Only own plain vertical scrolling.  Horizontal (shift/tilt)
         // and modified wheels keep default routing.
@@ -223,8 +495,28 @@ private:
         if (lines <= 0) lines = 3;
 
         ScrollLines(-notches * lines * kWheelSpeedMultiplier);
+        NotifyViewportChangedSoon();
         // Deliberately no evt.Skip(): the base handler would scroll a
         // second, slower time.
+    }
+
+    void OnKeyDown(wxKeyEvent& evt) {
+#ifdef __WXMSW__
+        // Any key exits sticky middle-click pan mode. Preserve the existing
+        // behavior: the cancelling key is consumed instead of also moving
+        // the caret/selection beneath the pan marker.
+        if (m_panning) { StopPan(); return; }
+#endif
+
+        const int key = evt.GetKeyCode();
+        const bool mayMoveViewport =
+            key == WXK_UP       || key == WXK_DOWN ||
+            key == WXK_PAGEUP   || key == WXK_PAGEDOWN ||
+            key == WXK_HOME     || key == WXK_END ||
+            key == WXK_SPACE;
+
+        evt.Skip();
+        if (mayMoveViewport) NotifyViewportChangedSoon();
     }
 
 #ifdef __WXMSW__
@@ -240,11 +532,6 @@ private:
         // release keeps sticky mode running until the next click, wheel,
         // or key press.
         if (m_panning && m_panMoved) StopPan();
-    }
-
-    void OnKeyDownPan(wxKeyEvent& evt) {
-        if (m_panning) { StopPan(); return; }
-        evt.Skip();
     }
 
     void StartPan(const wxPoint& clientPos) {
@@ -279,6 +566,7 @@ private:
         if (m_panIcon) m_panIcon->Hide();
         SetCursor(wxNullCursor);
         m_panAccum = 0.0;
+        NotifyViewportChangedSoon();
     }
 
     void OnPanTimer(wxTimerEvent&) {
@@ -302,6 +590,7 @@ private:
         if (units != 0) {
             m_panAccum -= units;
             ScrollLines(units);
+            NotifyViewportChangedSoon();
         }
     }
 #endif // __WXMSW__
@@ -315,6 +604,7 @@ private:
             return;
         }
 
+        NotifyViewportChangedSoon();
         int y = evt.GetPosition().y;
         int h = GetClientSize().y;
 
@@ -338,6 +628,7 @@ private:
     void OnDragEnd(wxMouseEvent& evt) {
         StopAutoScroll();
         evt.Skip();
+        NotifyViewportChangedSoon();
         SuppressCaretSoon();
     }
 
@@ -371,6 +662,7 @@ private:
         fake.SetEventObject(this);
         HandleWindowEvent(fake);
         m_inAutoScroll = false;
+        NotifyViewportChangedSoon();
         SuppressCaretSoon();
     }
 
@@ -380,4 +672,42 @@ private:
         m_scrollDirection = 0;
         m_scrollIntensity = 0;
     }
+};
+
+// Scoped transcript mutation used by both ChatDisplay and MarkdownRenderer.
+// The fallback keeps standalone renderers usable with a plain wxRichTextCtrl.
+class TranscriptUpdateGuard {
+public:
+    TranscriptUpdateGuard(wxRichTextCtrl* ctrl, bool follow, bool enabled = true)
+        : m_ctrl(enabled ? ctrl : nullptr), m_follow(follow) {
+        if (!m_ctrl) return;
+        m_transcript = dynamic_cast<ChatDisplayCtrl*>(m_ctrl);
+        if (m_transcript) m_transcript->BeginTranscriptUpdate(follow);
+        else if (!m_ctrl->IsFrozen()) {
+            m_fallback = true;
+            m_ctrl->GetViewStart(&m_x, &m_y);
+            m_ctrl->Freeze();
+        }
+    }
+    ~TranscriptUpdateGuard() {
+        if (m_transcript) m_transcript->EndTranscriptUpdate();
+        else if (m_fallback) {
+            m_ctrl->Thaw();
+            if (m_follow) {
+                int ppuX = 0, ppuY = 0;
+                m_ctrl->GetScrollPixelsPerUnit(&ppuX, &ppuY);
+                if (ppuY > 0) {
+                    const int maxTop = std::max(0, m_ctrl->GetVirtualSize().y - m_ctrl->GetClientSize().y);
+                    m_ctrl->Scroll(m_x, (maxTop + ppuY - 1) / ppuY);
+                }
+            } else m_ctrl->Scroll(m_x, m_y);
+        }
+    }
+    TranscriptUpdateGuard(const TranscriptUpdateGuard&) = delete;
+    TranscriptUpdateGuard& operator=(const TranscriptUpdateGuard&) = delete;
+private:
+    wxRichTextCtrl* m_ctrl = nullptr;
+    ChatDisplayCtrl* m_transcript = nullptr;
+    bool m_follow = false, m_fallback = false;
+    int m_x = 0, m_y = 0;
 };

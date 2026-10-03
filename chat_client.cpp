@@ -14,6 +14,7 @@
 //   data: [DONE]
 
 #include "chat_client.h"
+#include "openai_responses.h"
 
 // Poco headers for HTTP communication
 #include <Poco/URI.h>
@@ -40,6 +41,7 @@
 #include <istream>
 #include "ui_event_post.h"
 #include "lb_ssl.h"
+#include "repetition_guard.h"
 
 // ═══════════════════════════════════════════════════════════════════
 //  Stream limits
@@ -67,7 +69,7 @@ constexpr std::size_t kMaxErrorBodyBytes = 64ull * 1024;
 // Accumulated function-call arguments, per tool-call slot. Real tool
 // arguments are hundreds of bytes; anything past this is a stuck
 // generation, not a payload.
-constexpr std::size_t kMaxToolArgBytes = 4ull * 1024 * 1024;
+constexpr std::size_t kMaxToolArgBytes = lb_responses::kMaxToolArgumentBytes;
 
 // Generated images: per data URL, and across the whole response.
 constexpr std::size_t kMaxImageDataUrlBytes = 48ull * 1024 * 1024;
@@ -77,6 +79,48 @@ constexpr std::size_t kMaxTotalImageBytes   = 192ull * 1024 * 1024;
 // comes first.
 constexpr std::size_t kDeltaFlushBytes = 4096;
 constexpr int         kDeltaFlushMs    = 12;
+
+// ── Transport timeouts ───────────────────────────────────────────
+// Poco's HTTPClientSession::setTimeout sets the connect, send AND
+// receive timeouts to one value, so a single number cannot serve both
+// ends of this request: short enough that a dead host fails fast, and
+// long enough that a legitimate prompt-processing phase survives.
+// These were one flat 120s, which lost the second half.
+//
+// llama-server emits NOTHING while it prefills a prompt — no progress
+// event, no SSE keepalive — so the socket is legitimately silent for
+// however long prefill takes. On a large context that can exceed two
+// minutes, and the receive timeout then aborted a perfectly healthy
+// generation as "stream error". The wait that needs the headroom is
+// specifically the FIRST byte.
+//
+// Once deltas are flowing they arrive continuously, so the timeout is
+// tightened after the first one: a mid-stream stall is a real fault
+// and should surface promptly instead of parking a worker thread for
+// the whole prefill window. That also bounds the drain phase after
+// [DONE] against a server that holds the socket open.
+//
+// None of these replace cancellation — Stop aborts the socket through
+// ChatRequestControl no matter which wait is pending. kFirstByte is
+// the knob to raise for very large contexts on slow hardware.
+constexpr long kConnectTimeoutSeconds    =  30;
+constexpr long kFirstByteTimeoutSeconds  = 900;
+constexpr long kStreamIdleTimeoutSeconds = 120;
+
+// Set only the receive timeout on a session whose socket is already
+// connected, leaving the connect/send values from setTimeout() alone.
+// Poco throws if the socket does not exist yet; a failure here just
+// means the stream keeps its previous timeout, which is never worth
+// failing a request over.
+void SetReceiveTimeoutSeconds(Poco::Net::HTTPClientSession& session,
+                              long seconds)
+{
+    try {
+        session.socket().setReceiveTimeout(Poco::Timespan(seconds, 0));
+    } catch (...) {
+        // Keep whatever the session was already using.
+    }
+}
 
 // Bounded replacement for std::getline.
 //
@@ -254,6 +298,14 @@ bool ChatWorkerThread::SafeQueueEvent(wxCommandEvent* event)
 wxThread::ExitCode ChatWorkerThread::Entry()
 {
     std::string fullReply;
+    const bool responsesApi = m_target.responsesApi ||
+        lb_responses::IsResponsesPath(m_target.chatPath);
+    lb_responses::ChatStream responsesStream;
+    // Phase 2: function calls come back on the completion event in the
+    // Chat Completions shape the rest of the pipeline already consumes,
+    // plus the verbatim output array for reasoning replay.
+    std::string responsesToolCallsJson;
+    std::string responsesOutputJson;
 
     // ── Reasoning surfacing state ────────────────────────────────
     // With --jinja, llama-server extracts model thinking into
@@ -286,6 +338,9 @@ wxThread::ExitCode ChatWorkerThread::Entry()
         std::string type;     // "function" — kept for round-trip fidelity
         std::string name;
         std::string arguments;
+        // Repetition-guard bookkeeping for `arguments` (see
+        // checkToolArgRepetition below).
+        std::size_t repetitionCheckedAt = 0;
     };
     std::vector<ToolCallAcc> toolCalls;
 
@@ -324,6 +379,35 @@ wxThread::ExitCode ChatWorkerThread::Entry()
     // (choices: []) after finish_reason.  -1 = not reported.
     long usagePromptTokens     = -1;
     long usageCompletionTokens = -1;
+
+    // ── Turn stats: timings + detailed usage (turn_stats.h) ──────
+    // Wall-clock marks are milliseconds from the moment the request is
+    // sent.  markToken() is called for every non-empty reasoning,
+    // content, tool-call or image delta; `visible` distinguishes the
+    // answer/tool output from thinking so hidden-reasoning providers
+    // don't get an inflated tok/s.
+    TurnStats stats;
+    stats.modelId = m_target.modelId;
+    stats.modelRemote = m_target.managed ? 0 : 1;
+    std::chrono::steady_clock::time_point requestSentAt{};
+    bool requestSent = false;
+    auto msSinceSend = [&]() -> double {
+        if (!requestSent) return -1;
+        return std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - requestSentAt).count();
+    };
+    auto markToken = [&](bool visible) {
+        const double now = msSinceSend();
+        if (now < 0) return;
+        if (stats.firstTokenMs < 0) stats.firstTokenMs = now;
+        if (visible && stats.firstContentMs < 0) stats.firstContentMs = now;
+        stats.lastTokenMs = now;
+    };
+    // Numeric JSON field as double (llama-server mixes ints and floats).
+    auto readNumber = [](const Poco::JSON::Object::Ptr& o, const char* key) -> double {
+        if (!o || !o->has(key) || o->isNull(key)) return -1;
+        try { return o->get(key).convert<double>(); } catch (...) { return -1; }
+    };
 
     auto ensureToolCallSlot = [&](int idx) -> ToolCallAcc* {
         if (idx < 0) return nullptr;
@@ -371,6 +455,82 @@ wxThread::ExitCode ChatWorkerThread::Entry()
         return SafeQueueEvent(event);
     };
 
+    // ── Runaway-loop guard (repetition_guard.h) ──────────────────
+    // Every ~512 bytes of new output, check whether the reply now ends in
+    // the same block repeated back-to-back.  Callers append to fullReply
+    // before queueDelta, so the check sees the latest text.
+    //
+    // Policy follows what is streaming right now: thinking is strict
+    // (~1 KB of exact repetition), visible text lenient (32 KB) so
+    // requested repetitive output -- identical CSV rows, fixtures -- is
+    // not cut off.  When this trips, the read loop ends the reply as an
+    // INTERRUPTED turn (stats.stoppedForRepetition): no tool calls are
+    // serialized and the frame ends any agent loop instead of continuing.
+    bool argOverflow = false;      // native tool arguments passed kMaxToolArgBytes
+    // Set the payload flag at detection time: a terminal event can exit
+    // the read loop before its next iteration checks for repetition.
+    std::size_t repetitionCheckedAt = 0;
+    // Append streamed text to fullReply in 512-byte steps, checking at
+    // every boundary.  Checking only the end of a whole delta let one
+    // large chunk hide a repeating body behind a short tail -- e.g. an
+    // XML tool call's closing </args></tool_call>.  Callers pass
+    // homogeneous text (all thinking or all visible), so the policy is
+    // read from inReasoningBlock once per call.
+    auto appendReply = [&](const std::string& text) {
+        const repetition_guard::Policy pol = inReasoningBlock
+            ? repetition_guard::ThinkingPolicy()
+            : repetition_guard::OutputPolicy();
+        std::size_t offset = 0;
+        while (offset < text.size()) {
+            if (stats.stoppedForRepetition) {
+                fullReply.append(text, offset, std::string::npos);
+                return;
+            }
+            const std::size_t sinceCheck = fullReply.size() - repetitionCheckedAt;
+            const std::size_t untilCheck = sinceCheck >= 512 ? 0 : 512 - sinceCheck;
+            const std::size_t count = (std::min)(untilCheck, text.size() - offset);
+            fullReply.append(text, offset, count);
+            offset += count;
+            if (fullReply.size() - repetitionCheckedAt >= 512) {
+                repetitionCheckedAt = fullReply.size();
+                if (repetition_guard::EndsInRepetitionLoop(fullReply, pol))
+                    stats.stoppedForRepetition = true;
+            }
+        }
+    };
+    // Native tool-call arguments stream separately from fullReply, so a
+    // model looping while writing a file body through write/py would
+    // otherwise never be seen.  Same lenient policy as visible text:
+    // file contents may legitimately repeat.
+    //
+    // Append in 512-byte steps and check at every boundary, exactly like
+    // the Responses path (openai_responses.h AppendArgumentSuffix).  A
+    // provider that sends one large arguments chunk -- or the whole body
+    // at once -- must not hide a repeating body behind the closing JSON
+    // characters at the end of that chunk.
+    auto appendToolArgs = [&](ToolCallAcc& slot, const std::string& text) {
+        std::size_t offset = 0;
+        while (offset < text.size()) {
+            if (stats.stoppedForRepetition) {
+                slot.arguments.append(text, offset, std::string::npos);
+                return;
+            }
+            const std::size_t sinceCheck =
+                slot.arguments.size() - slot.repetitionCheckedAt;
+            const std::size_t untilCheck = sinceCheck >= 512 ? 0 : 512 - sinceCheck;
+            const std::size_t count =
+                (std::min)(untilCheck, text.size() - offset);
+            slot.arguments.append(text, offset, count);
+            offset += count;
+            if (slot.arguments.size() - slot.repetitionCheckedAt >= 512) {
+                slot.repetitionCheckedAt = slot.arguments.size();
+                if (repetition_guard::EndsInRepetitionLoop(
+                        slot.arguments, repetition_guard::OutputPolicy()))
+                    stats.stoppedForRepetition = true;
+            }
+        }
+    };
+
     auto queueDelta = [&](const std::string& text) -> bool {
         if (text.empty()) return true;
         pendingDelta += text;
@@ -399,6 +559,12 @@ wxThread::ExitCode ChatWorkerThread::Entry()
     std::size_t streamBytes = 0;
 
     try {
+        // Convert after the UI has finished message/attachment projection.
+        // The original conversation remains unchanged. Other endpoints keep
+        // their request bytes exactly as built by ChatHistory.
+        if (responsesApi)
+            m_requestBody = lb_responses::BuildChatRequest(m_requestBody);
+
         // ── Connect to the target's OpenAI-compatible endpoint ──
         // The path comes from the target so an Anthropic-native
         // adapter (future) can redirect to /v1/messages without
@@ -424,7 +590,11 @@ wxThread::ExitCode ChatWorkerThread::Entry()
             sess = std::make_shared<Poco::Net::HTTPClientSession>(
                 uri.getHost(), port);
         }
-        sess->setTimeout(Poco::Timespan(120, 0)); // 2min timeout for large models
+        // Governs connect and send. The receive timeout is raised
+        // separately once the socket exists (see below) — prefill can
+        // legitimately take far longer than we want to spend waiting
+        // on an unreachable host.
+        sess->setTimeout(Poco::Timespan(kConnectTimeoutSeconds, 0));
 
         // ── Register the transport for cancellation ──────────────
         // From here until the scope guard fires, StopGeneration() can
@@ -445,6 +615,7 @@ wxThread::ExitCode ChatWorkerThread::Entry()
             Poco::Net::HTTPMessage::HTTP_1_1
         );
         req.setContentType("application/json");
+        if (responsesApi) req.set("Accept", "text/event-stream");
         req.setContentLength((long)m_requestBody.size());
 
         // Auth + provider-fixed headers. Both are empty for local
@@ -459,9 +630,17 @@ wxThread::ExitCode ChatWorkerThread::Entry()
                 req.set(h.first, h.second);
         }
 
+        requestSentAt = std::chrono::steady_clock::now();
+        requestSent = true;
         std::ostream& out = sess->sendRequest(req);
         out << m_requestBody;
         out.flush();
+
+        // The socket is connected now, so its receive timeout can be
+        // set independently of the connect timeout above. Everything
+        // from here to the first delta is prompt processing, during
+        // which a healthy server sends no bytes at all.
+        SetReceiveTimeoutSeconds(*sess, kFirstByteTimeoutSeconds);
 
         Poco::Net::HTTPResponse resp;
         std::istream& in = sess->receiveResponse(resp);
@@ -478,6 +657,11 @@ wxThread::ExitCode ChatWorkerThread::Entry()
             return (ExitCode)0;
         }
 
+        if (responsesApi && resp.getContentType().find("text/event-stream") != 0) {
+            postError("The Responses endpoint did not return a streaming response.");
+            return (ExitCode)0;
+        }
+
         // ── Parse SSE stream ─────────────────────────────────────
         // Each event is: "data: <json>\n\n"
         // Final event is: "data: [DONE]\n\n"
@@ -488,6 +672,7 @@ wxThread::ExitCode ChatWorkerThread::Entry()
         bool sawTerminalEvent = false;
         bool sawAnySseData = false;
         std::string line;
+        std::string responseEventData;
 
         // One parser for the whole stream, reset between chunks.
         // Constructing a Poco::JSON::Parser allocates its handler and
@@ -506,6 +691,16 @@ wxThread::ExitCode ChatWorkerThread::Entry()
         // are real failures and are rethrown to the handlers below.
         try {
         for (;;) {
+            // Model stuck repeating itself: end the reply here.  It is
+            // delivered through COMPLETE (so usage-less stats and the
+            // partial text survive) but flagged stoppedForRepetition,
+            // which the frame treats as an interrupted turn: no tool
+            // dispatch, agent loop ended.  Leaving the loop drops the
+            // connection, which makes llama-server stop generating too.
+            if (stats.stoppedForRepetition) {
+                sawTerminalEvent = true;
+                break;
+            }
             bool lineOverflow = false;
             if (!ReadLineBounded(in, line, kMaxSseLineBytes, lineOverflow))
                 break;
@@ -528,30 +723,113 @@ wxThread::ExitCode ChatWorkerThread::Entry()
             if (!line.empty() && line.back() == '\r')
                 line.pop_back();
 
-            // Skip empty lines (SSE event boundaries)
-            if (line.empty()) continue;
-
-            // Only process "data:" prefixed lines. The SSE spec allows
-            // an optional single space after the colon — handle both.
-            if (line.size() < 5 || line.compare(0, 5, "data:") != 0)
-                continue;
-
-            std::string data = line.substr(5);
-            if (!data.empty() && data.front() == ' ')
-                data.erase(0, 1);
+            std::string data;
+            if (responsesApi) {
+                // Dispatch complete SSE records. Multiple data: lines are
+                // joined by newlines; event:/id:/comments carry no JSON.
+                if (line.empty()) {
+                    if (responseEventData.empty()) continue;
+                    data.swap(responseEventData);
+                } else {
+                    if (line.compare(0, 5, "data:") != 0) continue;
+                    std::string part = line.substr(5);
+                    if (!part.empty() && part.front() == ' ') part.erase(0, 1);
+                    if (responseEventData.size() + part.size() + 1 > kMaxSseLineBytes) {
+                        postError("Responses event exceeded the maximum buffered size.");
+                        return (ExitCode)0;
+                    }
+                    if (!responseEventData.empty()) responseEventData += '\n';
+                    responseEventData += part;
+                    continue;
+                }
+            } else {
+                // Preserve existing Chat Completions streaming behavior.
+                if (line.empty()) continue;
+                if (line.size() < 5 || line.compare(0, 5, "data:") != 0) continue;
+                data = line.substr(5);
+                if (!data.empty() && data.front() == ' ') data.erase(0, 1);
+            }
 
             // End of stream marker
             if (data == "[DONE]") {
-                sawTerminalEvent = true;
+                // Responses must emit response.completed. A Chat Completions
+                // marker alone cannot certify that an answer is complete.
+                if (!responsesApi) sawTerminalEvent = true;
                 break;
             }
 
+            // First real data event: prefill is over and deltas now
+            // arrive continuously, so drop back to the tighter
+            // between-deltas timeout. This also bounds the post-[DONE]
+            // drain phase described above.
+            if (!sawAnySseData && !responsesApi)
+                SetReceiveTimeoutSeconds(*sess, kStreamIdleTimeoutSeconds);
+
             sawAnySseData = true;
+            if (stats.firstByteMs < 0) stats.firstByteMs = msSinceSend();
 
             try {
                 sseParser.reset();
                 auto obj = sseParser.parse(data)
                                .extract<Poco::JSON::Object::Ptr>();
+
+                if (responsesApi) {
+                    lb_responses::StreamUpdate update;
+                    try {
+                        update = responsesStream.Consume(obj);
+                    } catch (const lb_responses::ToolArgumentRepetition&) {
+                        // This can be raised by a delta OR the terminal
+                        // snapshot. Mark the interruption before leaving
+                        // the loop so partial calls cannot be dispatched.
+                        stats.stoppedForRepetition = true;
+                        sawTerminalEvent = true;
+                        break;
+                    }
+                    if (!update.error.empty()) {
+                        postError(update.error);
+                        return (ExitCode)0;
+                    }
+                    if (!update.summary.empty()) markToken(false);
+                    if (!update.text.empty())    markToken(true);
+                    // Thinking and visible text are appended separately so
+                    // each is checked under its own repetition policy.
+                    if (!update.summary.empty()) {
+                        std::string thinking;
+                        if (!inReasoningBlock) {
+                            thinking = "<think>";
+                            inReasoningBlock = true;
+                        }
+                        thinking += update.summary;
+                        appendReply(thinking);
+                        if (!queueDelta(thinking)) return (ExitCode)0;
+                    }
+                    if (!update.text.empty()) {
+                        std::string visible;
+                        if (inReasoningBlock) {
+                            visible = "</think>";
+                            inReasoningBlock = false;
+                        }
+                        visible += update.text;
+                        appendReply(visible);
+                        if (!queueDelta(visible)) return (ExitCode)0;
+                    }
+                    if (update.completed) {
+                        usagePromptTokens = update.inputTokens;
+                        usageCompletionTokens = update.outputTokens;
+                        stats.cachedPromptTokens = update.cachedInputTokens;
+                        stats.reasoningTokens    = update.reasoningTokens;
+                        responsesToolCallsJson = update.toolCallsJson;
+                        responsesOutputJson = update.outputJson;
+                        sawTerminalEvent = true;
+                        break;
+                    }
+                    // Responses can announce created/in_progress long before
+                    // the first visible token. Keep the reasoning allowance
+                    // for this lane instead of switching to the short idle
+                    // timeout on a lifecycle/keepalive event. Stop still aborts
+                    // the socket through the existing cancellation control.
+                    continue;
+                }
 
                 // Mid-stream error (OOM, context overflow, model unload, etc.)
                 // llama-server emits `{"error": {"message": "..."}}` as a
@@ -576,6 +854,28 @@ wxThread::ExitCode ChatWorkerThread::Entry()
                     return (ExitCode)0;
                 }
 
+                // ── llama-server timings (final chunk) ──────────────
+                // Server-side prompt-processing and generation speeds,
+                // measured without network time.  Read BEFORE the usage
+                // block: when usage arrives on a trailing chunk after
+                // finish_reason, that block breaks out of the loop, and
+                // llama-server can put timings on that same chunk.
+                if (obj->has("timings") && !obj->isNull("timings")) {
+                    try {
+                        const auto tm = obj->getObject("timings");
+                        if (tm) {
+                            stats.hasServerTimings      = true;
+                            stats.serverPromptN         = (long)readNumber(tm, "prompt_n");
+                            stats.serverCacheN          = (long)readNumber(tm, "cache_n");
+                            stats.serverPredictedN      = (long)readNumber(tm, "predicted_n");
+                            stats.serverPromptMs        = readNumber(tm, "prompt_ms");
+                            stats.serverPredictedMs     = readNumber(tm, "predicted_ms");
+                            stats.serverPromptPerSec    = readNumber(tm, "prompt_per_second");
+                            stats.serverPredictedPerSec = readNumber(tm, "predicted_per_second");
+                        }
+                    } catch (...) { /* malformed timings — skip */ }
+                }
+
                 // ── Context meter: capture `usage` when present ──────
                 // Must run BEFORE the choices gate below: OpenAI-style
                 // trailing usage chunks carry "choices": [] and would be
@@ -595,6 +895,21 @@ wxThread::ExitCode ChatWorkerThread::Entry()
                                     usageCompletionTokens =
                                         usage->getValue<long>("completion_tokens");
                                 } catch (...) { /* non-numeric — skip */ }
+                            }
+                            // OpenAI-style detail objects (optional).
+                            if (usage->has("prompt_tokens_details") &&
+                                !usage->isNull("prompt_tokens_details")) {
+                                const double v = readNumber(
+                                    usage->getObject("prompt_tokens_details"),
+                                    "cached_tokens");
+                                if (v >= 0) stats.cachedPromptTokens = (long)v;
+                            }
+                            if (usage->has("completion_tokens_details") &&
+                                !usage->isNull("completion_tokens_details")) {
+                                const double v = readNumber(
+                                    usage->getObject("completion_tokens_details"),
+                                    "reasoning_tokens");
+                                if (v >= 0) stats.reasoningTokens = (long)v;
                             }
                         }
                     } catch (...) { /* malformed usage — skip */ }
@@ -645,13 +960,14 @@ wxThread::ExitCode ChatWorkerThread::Entry()
                         } catch (...) { /* non-string — skip */ }
                     }
                     if (!reasoningDelta.empty()) {
+                        markToken(false);
                         std::string out;
                         if (!inReasoningBlock) {
                             inReasoningBlock = true;
                             out = "<think>";
                         }
                         out += reasoningDelta;
-                        fullReply += out;
+                        appendReply(out);
 
                         if (!queueDelta(out))
                             return (ExitCode)0;
@@ -668,12 +984,13 @@ wxThread::ExitCode ChatWorkerThread::Entry()
                         // reply transition cleanly.  Empty content
                         // deltas (role-priming chunks) never close —
                         // reasoning may still be streaming.
+                        if (!content.empty()) markToken(true);
                         if (inReasoningBlock && !content.empty()) {
                             inReasoningBlock = false;
                             content = "</think>\n" + content;
                         }
 
-                        fullReply += content;
+                        appendReply(content);
 
                         if (!queueDelta(content))
                             return (ExitCode)0;
@@ -686,6 +1003,7 @@ wxThread::ExitCode ChatWorkerThread::Entry()
                     // too — providers vary and a skipped image is
                     // worse than a lenient parse.
                     if (delta->has("images") && !delta->isNull("images")) {
+                        markToken(true);
                         try {
                             auto imgArr = delta->getArray("images");
                             if (imgArr) {
@@ -731,6 +1049,7 @@ wxThread::ExitCode ChatWorkerThread::Entry()
                     // streaming format — each entry has an index
                     // and partial field updates that we accumulate.
                     if (delta->has("tool_calls") && !delta->isNull("tool_calls")) {
+                        markToken(true);
                         try {
                             auto tcArr = delta->getArray("tool_calls");
                             if (tcArr) {
@@ -772,22 +1091,31 @@ wxThread::ExitCode ChatWorkerThread::Entry()
                                                     } catch (...) { /* skip */ }
                                                 }
                                                 if (fn->has("arguments")) {
+                                                    std::string s;
                                                     try {
-                                                        std::string s = fn->getValue<std::string>("arguments");
-                                                        // A model stuck in a
-                                                        // generation loop emits
-                                                        // arguments forever.
-                                                        // Stop appending rather
-                                                        // than grow without
-                                                        // bound; the truncated
-                                                        // call fails to parse
-                                                        // downstream, which is
-                                                        // the correct outcome.
-                                                        if (slot->arguments.size() + s.size()
-                                                                <= kMaxToolArgBytes) {
-                                                            slot->arguments += s;
-                                                        }
+                                                        s = fn->getValue<std::string>("arguments");
                                                     } catch (...) { /* skip */ }
+                                                    // A model stuck in a
+                                                    // generation loop emits
+                                                    // arguments forever.  Only
+                                                    // refusing to store more
+                                                    // (the old behaviour) let
+                                                    // generation run on to
+                                                    // the context limit, so
+                                                    // abort the stream: the
+                                                    // error path ends the
+                                                    // agent loop and the call
+                                                    // is never dispatched.
+                                                    // (postError/return sit
+                                                    // outside the try so the
+                                                    // catch(...) below cannot
+                                                    // swallow them.)
+                                                    if (slot->arguments.size() + s.size()
+                                                            > kMaxToolArgBytes) {
+                                                        argOverflow = true;
+                                                    } else if (!s.empty()) {
+                                                        appendToolArgs(*slot, s);
+                                                    }
                                                 }
                                             }
                                         } catch (...) { /* skip */ }
@@ -799,6 +1127,14 @@ wxThread::ExitCode ChatWorkerThread::Entry()
                             // We continue parsing rather than abort
                             // the whole stream; a partial tool call
                             // accumulator becomes a partial result.
+                        }
+                        if (argOverflow) {
+                            postError("Stopped this reply: the model's tool-call "
+                                      "arguments passed " +
+                                      std::to_string(kMaxToolArgBytes / (1024 * 1024)) +
+                                      " MB, which usually means it is stuck in a "
+                                      "loop. The tool call was not run.");
+                            return (ExitCode)0;
                         }
                     }
                 }
@@ -829,10 +1165,18 @@ wxThread::ExitCode ChatWorkerThread::Entry()
                 }
             }
             catch (const Poco::JSON::JSONException&) {
+                if (responsesApi) {
+                    postError("Invalid JSON in the Responses stream.");
+                    return (ExitCode)0;
+                }
                 // Skip malformed JSON lines
                 continue;
             }
             catch (const Poco::Exception&) {
+                if (responsesApi) {
+                    postError("Malformed event in the Responses stream.");
+                    return (ExitCode)0;
+                }
                 // Belt-and-braces for the guards above: any other Poco
                 // failure inside ONE chunk (null Ptr deref, bad cast on
                 // an unexpected field type) skips that chunk instead of
@@ -866,7 +1210,7 @@ wxThread::ExitCode ChatWorkerThread::Entry()
             // cleanly before completion is signalled.
             if (inReasoningBlock) {
                 inReasoningBlock = false;
-                fullReply += "</think>";
+                appendReply("</think>");
 
                 if (!queueDelta("</think>"))
                     return (ExitCode)0;
@@ -880,6 +1224,17 @@ wxThread::ExitCode ChatWorkerThread::Entry()
             // slot the model didn't name (rare but per-spec OK; we
             // synthesize "call_<idx>" so downstream threading has
             // something stable).
+            // An interrupted (repetition-stopped) reply carries no tool
+            // calls: they are unfinished at best, and dispatching one
+            // after telling the user the reply stopped is the bug this
+            // guards against.  The frame also refuses them (belt and
+            // braces for XML-protocol calls embedded in fullReply).
+            if (stats.stoppedForRepetition) {
+                toolCalls.clear();
+                responsesToolCallsJson.clear();
+                responsesOutputJson.clear();
+            }
+
             std::string toolCallsJson;
             if (!toolCalls.empty()) {
                 Poco::JSON::Array::Ptr arr = new Poco::JSON::Array;
@@ -917,16 +1272,28 @@ wxThread::ExitCode ChatWorkerThread::Entry()
                 }
             }
 
+            // Responses lane: the adapter already produced the array in
+            // the same shape (id = call_id, which is what the next
+            // request threads function_call_output on).  The delta
+            // accumulator above is never fed on this lane.
+            if (responsesApi) toolCallsJson = responsesToolCallsJson;
+
             // Ordering is load-bearing: the UI accumulates deltas and
             // treats COMPLETE as "everything has arrived". Anything
             // still buffered here has to go out first.
             flushDelta(true);
 
+            stats.totalMs          = msSinceSend();
+            stats.promptTokens     = usagePromptTokens;
+            stats.completionTokens = usageCompletionTokens;
+
             wxCommandEvent* event = new wxCommandEvent(wxEVT_ASSISTANT_COMPLETE);
             event->SetString(wxString::FromUTF8(fullReply));
-            event->SetClientObject(new AssistantCompletePayload(
+            auto* payload = new AssistantCompletePayload(
                 toolCallsJson, usagePromptTokens, usageCompletionTokens,
-                std::move(imageDataUrls)));
+                std::move(imageDataUrls), std::move(responsesOutputJson));
+            payload->SetStats(stats);
+            event->SetClientObject(payload);
             SafeQueueEvent(event);
         }
     }
@@ -973,7 +1340,22 @@ bool ChatClient::SendMessage(const InferenceTarget& target,
 
     m_isStreaming = true;
     m_activeRequest = std::make_shared<ChatRequestControl>();
-
+    if (!target.resolutionError.empty() || target.baseUrl.empty()) {
+        // Accepted for asynchronous error delivery, but no network worker is
+        // started. Existing normal/agent/hidden-turn handlers all unwind via
+        // this generation-tagged event, just as they do for transport errors.
+        auto* event = new wxCommandEvent(wxEVT_ASSISTANT_ERROR);
+        event->SetExtraLong(generationId);
+        event->SetString(wxString::FromUTF8(target.resolutionError.empty()
+            ? std::string("Selected AI connection has no server address. No request was sent.")
+            : target.resolutionError));
+        if (!LbQueueEventIfAlive(m_eventHandler, m_aliveToken, event)) {
+            m_activeRequest.reset();
+            m_isStreaming = false;
+            return false;
+        }
+        return true;
+    }
     auto* thread = new ChatWorkerThread(
         m_eventHandler, target, requestBody,
         m_activeRequest, m_aliveToken, generationId);

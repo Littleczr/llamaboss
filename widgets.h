@@ -48,54 +48,10 @@ private:
     }
 };
 
-// ─── Attachment chip (file pill with × remove button) ────────────
-// A small colored panel showing icon + filename + clickable ×.
-class AttachmentChip : public wxPanel {
-public:
-    AttachmentChip(wxWindow* parent, size_t index,
-                   const std::string& icon, const std::string& name,
-                   const wxColour& chipBg, const wxColour& textColor,
-                   const wxColour& closeColor,
-                   std::function<void(size_t)> onRemove)
-        : wxPanel(parent, wxID_ANY)
-    {
-        SetBackgroundColour(chipBg);
-        auto* sizer = new wxBoxSizer(wxHORIZONTAL);
-
-        // Icon + filename
-        auto* label = new wxStaticText(this, wxID_ANY,
-            wxString::FromUTF8(icon + " " + name));
-        { wxFont f = label->GetFont(); f.SetPointSize(9); label->SetFont(f); }
-        label->SetForegroundColour(textColor);
-        label->SetBackgroundColour(chipBg);
-        sizer->Add(label, 0, wxALIGN_CENTER_VERTICAL | wxLEFT | wxTOP | wxBOTTOM, 5);
-
-        // × close button
-        auto* closeBtn = new wxStaticText(this, wxID_ANY,
-            wxString::FromUTF8(" \xC3\x97"));  // × (U+00D7)
-        { wxFont f = closeBtn->GetFont(); f.SetPointSize(11); closeBtn->SetFont(f); }
-        closeBtn->SetForegroundColour(closeColor);
-        closeBtn->SetBackgroundColour(chipBg);
-        closeBtn->SetCursor(wxCursor(wxCURSOR_HAND));
-
-        // Capture callback + index by value — chip may be destroyed during removal.
-        // CallAfter on the chip bar (parent) ensures the event handler has returned
-        // before RebuildAttachmentChips destroys all chips.
-        auto removeFn = onRemove;
-        size_t idx = index;
-        closeBtn->Bind(wxEVT_LEFT_UP, [parent, removeFn, idx](wxMouseEvent&) {
-            parent->CallAfter([removeFn, idx]() {
-                if (removeFn) removeFn(idx);
-            });
-        });
-
-        sizer->Add(closeBtn, 0, wxALIGN_CENTER_VERTICAL | wxLEFT, 2);
-        sizer->AddSpacer(6);
-
-        SetSizer(sizer);
-        Fit();
-    }
-};
+// ─── Attachment chip ─────────────────────────────────────────────
+// The composer's pending-attachment card lives in attachment_chip.h
+// now (owner-drawn thumbnail / file cards).  It needs theme.h and
+// wx/graphics.h, which this header deliberately avoids pulling in.
 
 // ─── Generic tick slider (snaps to discrete values) ──────────────
 // Custom-drawn horizontal slider with N preset tick positions. Used

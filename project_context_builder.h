@@ -6,8 +6,8 @@
 // current ChatHistory's project identity.
 //
 // The same brief cache also memoizes the source/workflow/script counts shown
-// in the project status strip, since project and goal call sites both refresh
-// the strip and would otherwise re-list the project tree on the UI thread.
+// in the project status strip, since many call sites refresh the strip and
+// would otherwise re-list the project tree on the UI thread.
 #pragma once
 
 #include <chrono>
@@ -100,10 +100,9 @@ private:
         CacheSignature recentProbeSig;
         std::chrono::steady_clock::time_point recentProbeAt{};
 
-        // The merged project/goal strip is refreshed by both project and goal
-        // call sites.  Reuse exact display counts briefly so goal-state churn
-        // does not repeatedly materialize full project source/workflow lists
-        // on the UI thread.
+        // The project strip is refreshed from many call sites.  Reuse exact
+        // display counts briefly so refresh churn does not repeatedly
+        // materialize full project source/workflow lists on the UI thread.
         bool hasRecentStripCounts = false;
         std::string recentStripCountsRoot;
         ProjectStripCounts recentStripCounts;

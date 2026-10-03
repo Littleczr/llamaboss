@@ -1,7 +1,10 @@
 // server_manager.cpp
 #include "server_manager.h"
+#include "server_log_hints.h"   // plain-language startup failure hints
 #include "path_safety.h"
 #include "gguf_metadata.h"
+#include "chat_folders.h"
+#include "prompt_prewarm.h"
 
 #include <wx/filename.h>
 #include <wx/dir.h>
@@ -376,6 +379,8 @@ wxThread::ExitCode ServerHealthThread::Entry()
                               + std::to_string(m_timeoutMs / 1000)
                               + " seconds.";
             std::string tail = ReadLogTail(m_logPath);
+            const std::string hint = server_log_hints::Explain(tail);
+            if (!hint.empty()) msg += "\n\n" + hint;
             if (!tail.empty()) msg += "\n\nLast log output:\n" + tail;
             else if (!m_logPath.empty())
                 msg += "\n\nSee log: " + m_logPath;
@@ -402,6 +407,8 @@ wxThread::ExitCode ServerHealthThread::Entry()
                               + std::to_string(exitCode)
                               + ") before becoming ready.";
             std::string tail = ReadLogTail(m_logPath);
+            const std::string hint = server_log_hints::Explain(tail);
+            if (!hint.empty()) msg += "\n\n" + hint;
             if (!tail.empty()) msg += "\n\nLast log output:\n" + tail;
 
             auto* ev = new wxCommandEvent(wxEVT_SERVER_ERROR);
@@ -500,13 +507,21 @@ struct SlotAction {
     // queue's live generation.
     ServerLaunchGeneration generation = kInvalidServerLaunchGeneration;
     std::string baseUrl;
-    std::string action;     // "save" | "restore"
-    std::string filename;
+    std::string action;     // "save" | "restore" | "prewarm"
+    std::string filename;   // cache file (save/restore); prewarm key (prewarm)
     // Outcome logging only.  A raw pointer is safe on the detached
     // worker because Poco loggers live in the process-lifetime
     // registry — unlike ServerManager members, which the worker must
     // never touch (it can outlive the object).
     Poco::Logger* logger = nullptr;
+    // "prewarm" only: the chat-completions body whose rendered prompt is
+    // primed, and the heading that starts its per-chat section.
+    std::string requestBody;
+    std::string marker;
+    // "prewarm" only: SlotActionQueue::slotEpoch at enqueue.  If anything
+    // else claims the slot before the prefix is submitted, the epochs no
+    // longer match and the /completion is never sent.
+    uint64_t    slotEpoch = 0;
 };
 
 struct SlotActionQueue {
@@ -528,7 +543,35 @@ struct SlotActionQueue {
     // socket from another thread; the blocking call then throws and
     // lands in the worker's existing catch(...).
     std::shared_ptr<Poco::Net::HTTPClientSession> inFlight;
+    std::string inFlightAction;   // action of `inFlight` ("prewarm" can be aborted early)
+    bool        inFlightCancelled = false;   // DropQueuedPrewarm aborted it on purpose
+
+    // ── Prewarm supersession / dedupe (all under `mutex`) ─────────
+    // Bumped by the UI thread whenever something other than a prewarm
+    // takes the slot (a generation dispatch, a throwaway generation, a
+    // restore, a server start/stop).  A prewarm stamped with an older
+    // epoch must not submit its /completion: a real request may already
+    // be on its way to llama-server, and priming after it would cut the
+    // slot back to the bare prefix under that conversation's ownership.
+    uint64_t    slotEpoch = 0;
+    // Key of the prewarm the worker has popped and is executing (empty
+    // otherwise).  Set in the same critical section that pops it, so a
+    // key is always visible as queued, running, or primed -- never none.
+    std::string runningPrewarmKey;
+    // Key of the last prewarm whose /completion SUCCEEDED and was not
+    // superseded.  Only this means "the slot holds this prefix".  A
+    // failed, aborted or superseded prewarm never sets it, so retrying
+    // after an HTTP error or timeout is not blocked.
+    std::string primedKey;
 };
+
+// Something other than a prewarm is taking the slot.  Caller holds
+// q->mutex.
+static void SupersedePrewarmLocked(SlotActionQueue& q)
+{
+    ++q.slotEpoch;
+    q.primedKey.clear();
+}
 
 // Clear queued actions, invalidate the live generation, and abort
 // whatever the worker is blocked on.  Safe to call with a null queue.
@@ -544,6 +587,7 @@ static void AbandonSlotQueue(const std::shared_ptr<SlotActionQueue>& q,
         purged = !q->items.empty();
         q->items.clear();
         q->liveGeneration = kInvalidServerLaunchGeneration;
+        SupersedePrewarmLocked(*q);
         inFlight = q->inFlight;
     }
 
@@ -779,6 +823,107 @@ static std::string SanitizeLogSnippet(std::string s)
     return s;
 }
 
+// Publishes |sess| as the queue's in-flight session for action |a|, but
+// only while the server |a| was queued for still owns the port.  The
+// generation check and the publication are one atomic step under the
+// queue mutex, so StopServer() either wins first (this action is never
+// sent) or sees and aborts exactly this session before killing the old
+// server and allowing a replacement launch.  Logs the drop reason.
+//
+// A prewarm is additionally checked for supersession (slotEpoch) in the
+// same critical section, before EACH of its two POSTs.  That is what
+// closes the race between /apply-template and /completion: once
+// NoteSlotOwner() has bumped the epoch for a real request, the prefix is
+// never submitted.  Superseded is not logged here -- the prewarm records
+// it as its outcome.
+enum class SlotClaim { Claimed, Stale, Superseded };
+
+static SlotClaim ClaimSlotSession(const SlotAction& a,
+                                  const std::shared_ptr<SlotActionQueue>& q,
+                                  const std::shared_ptr<Poco::Net::HTTPClientSession>& sess)
+{
+    ServerLaunchGeneration live = kInvalidServerLaunchGeneration;
+    bool queueStopped = false;
+    if (q) {
+        std::lock_guard<std::mutex> lock(q->mutex);
+        live = q->liveGeneration;
+        queueStopped = q->stop;
+        if (!queueStopped && live == a.generation) {
+            if (a.action == "prewarm" && a.slotEpoch != q->slotEpoch)
+                return SlotClaim::Superseded;
+            q->inFlight = sess;
+            q->inFlightAction = a.action;
+            return SlotClaim::Claimed;
+        }
+    }
+    if (a.logger) {
+        std::string reason;
+        if (!q)
+            reason = "queue unavailable";
+        else if (queueStopped)
+            reason = "queue stopped";
+        else
+            reason = "generation " + std::to_string(a.generation) +
+                     " != live " + std::to_string(live);
+        a.logger->information(
+            "kvslot: dropped stale " + a.action + " \"" +
+            a.filename + "\" before send (" + reason + ")");
+    }
+    return SlotClaim::Stale;
+}
+
+// Retracts the in-flight session under the queue mutex when the action
+// finishes.  RAII so an exception anywhere cannot leave a dangling handle.
+struct SlotInFlightGuard {
+    std::shared_ptr<SlotActionQueue> q;
+    ~SlotInFlightGuard() {
+        if (!q) return;
+        std::lock_guard<std::mutex> lock(q->mutex);
+        q->inFlight.reset();
+        q->inFlightAction.clear();
+        q->inFlightCancelled = false;
+        q->runningPrewarmKey.clear();
+    }
+};
+
+// PostSlotJson() results that are not HTTP statuses.
+constexpr int kSlotPostStale      = 0;    // launch gone; ClaimSlotSession logged it
+constexpr int kSlotPostSuperseded = -1;   // prewarm overtaken by a real request
+
+// One blocking JSON POST on a claimed session.  Returns the HTTP status,
+// or kSlotPostStale / kSlotPostSuperseded when nothing was sent; throws
+// on I/O errors.
+static int PostSlotJson(const SlotAction& a,
+                        const std::shared_ptr<SlotActionQueue>& q,
+                        const std::string& pathAndQuery,
+                        const std::string& body,
+                        int timeoutSeconds,
+                        std::string& respBody)
+{
+    Poco::URI uri(a.baseUrl + pathAndQuery);
+    auto sessPtr = std::make_shared<Poco::Net::HTTPClientSession>(
+        uri.getHost(), uri.getPort());
+    sessPtr->setTimeout(Poco::Timespan(timeoutSeconds, 0));
+    switch (ClaimSlotSession(a, q, sessPtr)) {
+        case SlotClaim::Claimed:    break;
+        case SlotClaim::Stale:      return kSlotPostStale;
+        case SlotClaim::Superseded: return kSlotPostSuperseded;
+    }
+
+    Poco::Net::HTTPRequest req(Poco::Net::HTTPRequest::HTTP_POST,
+                               uri.getPathAndQuery(),
+                               Poco::Net::HTTPMessage::HTTP_1_1);
+    req.setContentType("application/json");
+    req.setContentLength(static_cast<std::streamsize>(body.size()));
+    sessPtr->sendRequest(req) << body;
+
+    Poco::Net::HTTPResponse resp;
+    std::istream& in = sessPtr->receiveResponse(resp);
+    respBody.clear();
+    Poco::StreamCopier::copyToString(in, respBody);
+    return static_cast<int>(resp.getStatus());
+}
+
 // Blocking POST /slots/0?action=<save|restore>.  Runs on the worker
 // thread only.  Value copies, no UI, no ServerManager member access —
 // the worker can outlive the object.  Failures are non-fatal but no
@@ -786,82 +931,18 @@ static std::string SanitizeLogSnippet(std::string s)
 // equivalent to "no fast path this time" with full reprocess as the
 // fallback, and each outcome is logged so the fast path's actual hit
 // rate is measurable instead of an article of faith.
-static void ExecuteSlotAction(const SlotAction& a,
-                              const std::shared_ptr<SlotActionQueue>& q)
+static void ExecuteSlotFileAction(const SlotAction& a,
+                                  const std::shared_ptr<SlotActionQueue>& q)
 {
-    // Publishes/retracts the session under the queue mutex so a
-    // concurrent stop can abort it.  RAII so an exception anywhere
-    // below cannot leave a dangling handle behind.
-    struct InFlightGuard {
-        std::shared_ptr<SlotActionQueue> q;
-        ~InFlightGuard() {
-            if (!q) return;
-            std::lock_guard<std::mutex> lock(q->mutex);
-            q->inFlight.reset();
-        }
-    } guard{ q };
-
+    SlotInFlightGuard guard{ q };
     try {
-        Poco::URI uri(a.baseUrl + "/slots/0?action=" + a.action);
-        auto sessPtr = std::make_shared<Poco::Net::HTTPClientSession>(
-            uri.getHost(), uri.getPort());
-        Poco::Net::HTTPClientSession& sess = *sessPtr;
-        sess.setTimeout(Poco::Timespan(120, 0));   // multi-GB states take seconds
-
-        // Authoritative generation check and in-flight publication must be
-        // one atomic operation under the queue mutex.  The worker already
-        // checks when it pops the action, but StopServer() can invalidate the
-        // launch in the gap between that check and session creation.  By
-        // re-checking while publishing the session, either:
-        //   * stop wins first and this stale action is never sent, or
-        //   * this action wins first and stop sees/aborts this exact session
-        //     before killing the old server and allowing a replacement launch.
-        ServerLaunchGeneration live = kInvalidServerLaunchGeneration;
-        bool queueStopped = false;
-        bool claimed = false;
-        if (q) {
-            std::lock_guard<std::mutex> lock(q->mutex);
-            live = q->liveGeneration;
-            queueStopped = q->stop;
-            if (!queueStopped && live == a.generation) {
-                q->inFlight = sessPtr;
-                claimed = true;
-            }
-        }
-
-        if (!claimed) {
-            if (a.logger) {
-                std::string reason;
-                if (!q)
-                    reason = "queue unavailable";
-                else if (queueStopped)
-                    reason = "queue stopped";
-                else
-                    reason = "generation " + std::to_string(a.generation) +
-                             " != live " + std::to_string(live);
-
-                a.logger->information(
-                    "kvslot: dropped stale " + a.action + " \"" +
-                    a.filename + "\" before send (" + reason + ")");
-            }
-            return;
-        }
-
         const std::string body = "{\"filename\":\"" + a.filename + "\"}";
-
-        Poco::Net::HTTPRequest req(Poco::Net::HTTPRequest::HTTP_POST,
-                                   uri.getPathAndQuery(),
-                                   Poco::Net::HTTPMessage::HTTP_1_1);
-        req.setContentType("application/json");
-        req.setContentLength((int)body.size());
-        sess.sendRequest(req) << body;
-
-        Poco::Net::HTTPResponse resp;
-        std::istream& in = sess.receiveResponse(resp);
         std::string respBody;
-        Poco::StreamCopier::copyToString(in, respBody);
+        // multi-GB states take seconds
+        const int status = PostSlotJson(a, q, "/slots/0?action=" + a.action,
+                                        body, 120, respBody);
+        if (status <= kSlotPostStale) return;   // nothing sent (stale, logged)
 
-        const int status = static_cast<int>(resp.getStatus());
         if (status >= 200 && status < 300) {
             if (a.logger) {
                 const std::string details =
@@ -890,8 +971,137 @@ static void ExecuteSlotAction(const SlotAction& a,
     }
 }
 
+// Prompt-cache pre-warm (see prompt_prewarm.h): render the first real
+// request with the model's own template, cut it before the per-chat
+// section, and have llama-server process just that prefix.  Runs on the
+// same serialized worker as save/restore, so it can never overtake the
+// save-away of the chat being left, and a later restore waits for it (or
+// aborts it -- see AbortInFlightPrewarm).
+static void ExecutePrewarmAction(const SlotAction& a,
+                                 const std::shared_ptr<SlotActionQueue>& q)
+{
+    namespace pw = prompt_prewarm;
+    SlotInFlightGuard guard{ q };   // also clears runningPrewarmKey
+    pw::Outcome out;
+    const auto t0 = std::chrono::steady_clock::now();
+    bool dropped = false;
+
+    // Classifies a non-HTTP PostSlotJson result.  Returns true when
+    // nothing was sent and the prewarm must stop here.
+    auto notSent = [&](int status) {
+        if (status == kSlotPostStale) { dropped = true; return true; }
+        if (status == kSlotPostSuperseded) {
+            out.skipped = true;
+            out.error = "superseded (a chat request took the slot first)";
+            return true;
+        }
+        return false;
+    };
+
+    try {
+        std::string resp;
+        int status = PostSlotJson(a, q, "/apply-template", a.requestBody, 30, resp);
+        std::string rendered;
+        if (notSent(status)) {
+            // dropped / superseded
+        } else if (status < 200 || status >= 300) {
+            out.error = "HTTP " + std::to_string(status) + " from /apply-template" +
+                        (status == 404 ? " (llama-server too old?)" : "") +
+                        " | " + SanitizeLogSnippet(resp);
+        } else {
+            Poco::JSON::Parser parser;
+            auto obj = parser.parse(resp).extract<Poco::JSON::Object::Ptr>();
+            if (obj && obj->has("prompt")) rendered = obj->getValue<std::string>("prompt");
+            if (rendered.empty()) out.error = "/apply-template returned no prompt";
+        }
+
+        std::string prefix;
+        if (!dropped && !out.skipped && out.error.empty()) {
+            const pw::Cut cut = pw::CutStablePrefix(rendered, a.marker, prefix);
+            if (cut != pw::Cut::Ok) out.error = pw::CutName(cut);
+        }
+
+        if (!dropped && !out.skipped && out.error.empty()) {
+            out.prefixBytes = prefix.size();
+            // Generous: ~13k tokens is several seconds on a fast GPU and
+            // can be minutes on CPU offload.  PostSlotJson re-checks the
+            // slot epoch before sending: a real request dispatched while
+            // /apply-template was running wins, and this is never sent.
+            status = PostSlotJson(a, q, "/completion",
+                                  pw::BuildCompletionBody(prefix), 600, resp);
+            if (notSent(status)) {
+                // dropped / superseded
+            } else if (status < 200 || status >= 300) {
+                out.error = "HTTP " + std::to_string(status) + " from /completion | " +
+                            SanitizeLogSnippet(resp);
+            } else {
+                Poco::JSON::Parser parser;
+                auto obj = parser.parse(resp).extract<Poco::JSON::Object::Ptr>();
+                out.ok = true;
+                if (obj && obj->has("tokens_evaluated"))
+                    out.promptTokens = obj->getValue<long long>("tokens_evaluated");
+                if (obj && obj->has("timings")) {
+                    auto t = obj->getObject("timings");
+                    if (t && t->has("cache_n"))   out.cachedTokens = t->getValue<long long>("cache_n");
+                    if (t && t->has("prompt_n"))  out.processed    = t->getValue<long long>("prompt_n");
+                    if (t && t->has("prompt_ms")) out.promptMs     = t->getValue<double>("prompt_ms");
+                }
+            }
+        }
+    } catch (const Poco::Exception& e) {
+        out.ok = false;
+        out.error = "connection error/aborted (" + e.displayText() + ")";
+    } catch (const std::exception& e) {
+        out.ok = false;
+        out.error = std::string("error (") + e.what() + ")";
+    } catch (...) {
+        out.ok = false;
+        out.error = "connection error/aborted";
+    }
+    if (dropped) return;   // stale launch; ClaimSlotSession logged it
+
+    out.wallMs = static_cast<double>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - t0).count());
+
+    bool primed = false;
+    if (q) {
+        std::lock_guard<std::mutex> lock(q->mutex);
+        if (!out.ok && !out.skipped && q->inFlightCancelled)
+            out.error = "cancelled (the slot was needed for a restore)";
+        // Only a success that nothing has superseded since enqueue means
+        // "the slot holds exactly this prefix".  A real request that
+        // arrived during the /completion (allowed by design: it queues
+        // behind the prime inside llama-server and extends it) has bumped
+        // the epoch, so the slot now holds more than the prefix and a
+        // re-prime of this key must not be refused as a no-op.
+        if (out.ok && a.slotEpoch == q->slotEpoch &&
+            a.generation == q->liveGeneration) {
+            q->primedKey = a.filename;
+            primed = true;
+        }
+    }
+
+    std::string line = pw::Describe(out);
+    if (out.ok && !primed) line += " (slot since taken by a chat request)";
+    if (a.logger) {
+        const std::string msg = "prewarm: " + line + " [key " + a.filename +
+                                ", " + std::to_string(out.prefixBytes) + " bytes]";
+        if (out.ok || out.skipped) a.logger->information(msg);
+        else                       a.logger->warning(msg);
+    }
+}
+
+static void ExecuteSlotAction(const SlotAction& a,
+                              const std::shared_ptr<SlotActionQueue>& q)
+{
+    if (a.action == "prewarm") ExecutePrewarmAction(a, q);
+    else                       ExecuteSlotFileAction(a, q);
+}
+
 void ServerManager::EnqueueSlotAction(const std::string& action,
-                                      const std::string& filename)
+                                      const std::string& filename,
+                                      const std::string& requestBody,
+                                      const std::string& marker)
 {
     if (m_logger)
         m_logger->information("kvslot: dispatch " + action + " \"" + filename + "\"");
@@ -910,7 +1120,8 @@ void ServerManager::EnqueueSlotAction(const std::string& action,
     {
         std::lock_guard<std::mutex> lock(q->mutex);
         q->items.push_back({ m_launchGeneration, GetBaseUrl(),
-                             action, filename, m_logger });
+                             action, filename, m_logger,
+                             requestBody, marker, q->slotEpoch });
         if (!q->workerRunning) {
             q->workerRunning = true;
             spawnWorker = true;
@@ -931,6 +1142,14 @@ void ServerManager::EnqueueSlotAction(const std::string& action,
                     a = std::move(q->items.front());
                     q->items.pop_front();
                     live = q->liveGeneration;
+                    // Same critical section as the pop, so dedupe in
+                    // PrewarmPromptPrefix always sees this key somewhere.
+                    // The slot is about to change: whatever was primed
+                    // before no longer counts.
+                    if (a.action == "prewarm" && a.generation == live) {
+                        q->runningPrewarmKey = a.filename;
+                        q->primedKey.clear();
+                    }
                 }
 
                 // Stale: the server this was queued for is gone, and
@@ -1019,11 +1238,20 @@ void ServerManager::NoteSlotOwner(const std::string& conversationPath)
     // popped by the worker) is safe either way: once its POST reaches
     // the server, llama-server's per-slot task queue serializes the
     // generation behind it in arrival order.
+    //
+    // The same critical section bumps the slot epoch.  A prewarm the
+    // worker has already popped but whose /completion is not yet sent
+    // (still in /apply-template, or between the two POSTs) sees the new
+    // epoch at its claim and never sends: this request is dispatched
+    // after this call returns, so the prefix could otherwise land AFTER
+    // it and cut the slot back to the bare prefix under this
+    // conversation's ownership.
     bool purged = false;
     if (m_slotQueue) {
         std::lock_guard<std::mutex> lock(m_slotQueue->mutex);
         purged = !m_slotQueue->items.empty();
         m_slotQueue->items.clear();
+        SupersedePrewarmLocked(*m_slotQueue);
     }
     if (purged && m_logger)
         m_logger->information(
@@ -1032,18 +1260,31 @@ void ServerManager::NoteSlotOwner(const std::string& conversationPath)
 
     m_slotOwner = fname;
     m_slotDirty = true;
+    // A prewarm whose /completion is already in flight is NOT aborted:
+    // it reached llama-server first, so this request queues behind it and
+    // extends the primed prefix, which is the whole point.  Residual
+    // window: a prime that claimed its /completion session just before
+    // the epoch bump but whose bytes reach the server after this
+    // request's -- a localhost connect+write race, not a two-request gap.
 }
 
 void ServerManager::InvalidateSlotOwner()
 {
     // Called at the dispatch of any generation that runs against the
-    // local slot with a throwaway history (goal contract builder,
-    // goal verifier, Skill draft builder).  The slot's KV is about to
+    // local slot with a throwaway history (e.g. the Skill draft
+    // builder).  The slot's KV is about to
     // hold content belonging to no conversation; forgetting the owner
     // makes the next switch-away skip its save instead of serializing
     // that state under the active conversation's filename.  Stamped
     // ownership returns naturally on the next real conversation
     // request via NoteSlotOwner.
+    // The slot is about to hold throwaway content: a queued prewarm must
+    // not land after it (the order would be generation, then prewarm,
+    // leaving the slot as the prefix while ownership says otherwise), and
+    // the "slot already holds the primed prefix" note is no longer true.
+    DropQueuedPrewarm(/*abortInFlight*/ false);
+    SupersedePrewarm();
+
     if (m_slotOwner.empty() && !m_slotDirty) return;
 
     m_slotOwner.clear();
@@ -1088,13 +1329,128 @@ void ServerManager::RestoreSlotStateForConversation(const std::string& conversat
                   wxString::FromUTF8(fname));
     if (!fn.FileExists()) return;
 
+    // The restore replaces the slot wholesale, so a prewarm queued or
+    // running ahead of it is wasted work the user would wait behind.
+    DropQueuedPrewarm(/*abortInFlight*/ true);
+    SupersedePrewarm();
+
     EnqueueSlotAction("restore", fname);
     m_slotOwner = fname;
     m_slotDirty = false;
 }
 
+bool ServerManager::PrewarmPromptPrefix(const std::string& chatRequestBody,
+                                        const std::string& marker,
+                                        const std::string& key,
+                                        std::string& why)
+{
+    why.clear();
+    if (m_loadedModel.empty()) { why = "no local model loaded"; return false; }
+
+    // Dedupe against the worker's view, not a UI-side note taken at
+    // enqueue time: only a prime that actually succeeded (and wasn't
+    // superseded) makes a repeat a no-op.  A failed, aborted or
+    // superseded one leaves primedKey empty, so a retry goes through.
+    if (!key.empty() && m_slotQueue) {
+        bool primed = false, pending = false;
+        {
+            std::lock_guard<std::mutex> lock(m_slotQueue->mutex);
+            primed  = (m_slotQueue->primedKey == key);
+            pending = (m_slotQueue->runningPrewarmKey == key) ||
+                      std::any_of(m_slotQueue->items.begin(), m_slotQueue->items.end(),
+                          [&](const SlotAction& a) {
+                              return a.action == "prewarm" && a.filename == key;
+                          });
+        }
+        if (primed || pending) {
+            why = primed ? "the slot already holds this prefix"
+                         : "a prewarm of this prefix is already queued or running";
+            if (m_logger)
+                m_logger->information(std::string("prewarm: skipped, ") +
+                    (primed ? "slot already primed" : "already pending") +
+                    " [key " + key + "]");
+            return false;
+        }
+    }
+
+    // The slot is about to hold a prefix that belongs to no conversation.
+    // Same bookkeeping as InvalidateSlotOwner, minus its prewarm purge: a
+    // later switch-away must not save this under the active chat's name.
+    // Any save-away of the chat being left was enqueued before this, and
+    // the FIFO worker runs it first.
+    m_slotOwner.clear();
+    m_slotDirty = false;
+
+    EnqueueSlotAction("prewarm", key, chatRequestBody, marker);
+    return true;
+}
+
+void ServerManager::SupersedePrewarm()
+{
+    if (!m_slotQueue) return;
+    std::lock_guard<std::mutex> lock(m_slotQueue->mutex);
+    SupersedePrewarmLocked(*m_slotQueue);
+}
+
+void ServerManager::DropQueuedPrewarm(bool abortInFlight)
+{
+    if (!m_slotQueue) return;
+    std::shared_ptr<Poco::Net::HTTPClientSession> toAbort;
+    size_t dropped = 0;
+    {
+        std::lock_guard<std::mutex> lock(m_slotQueue->mutex);
+        auto& items = m_slotQueue->items;
+        const size_t before = items.size();
+        items.erase(std::remove_if(items.begin(), items.end(),
+                        [](const SlotAction& a) { return a.action == "prewarm"; }),
+                    items.end());
+        dropped = before - items.size();
+        if (abortInFlight && m_slotQueue->inFlightAction == "prewarm") {
+            toAbort = m_slotQueue->inFlight;
+            m_slotQueue->inFlightCancelled = true;
+        }
+    }
+    // Closing the socket makes llama-server cancel the task (it checks for
+    // a dropped connection while waiting on the result); the worker logs
+    // the prewarm as aborted and moves on to the next queued action.
+    if (toAbort) {
+        try { toAbort->abort(); } catch (...) { /* already done */ }
+    }
+    if (m_logger && (dropped || toAbort))
+        m_logger->information(std::string("prewarm: cancelled") +
+            (dropped ? " (dropped queued)" : "") +
+            (toAbort ? " (aborted in-flight)" : ""));
+}
+
 std::string ServerManager::ModelDisplayName(const std::string& ggufPath)
 {
+    if (ggufPath.empty())
+        return std::string();
+
+    // This helper is also used by shared chat/replay UI paths that receive
+    // the model value persisted on each assistant message.  For local turns
+    // that value is an absolute .gguf path, but for remote turns it is the
+    // provider's wire id (for example
+    // "nvidia/nemotron-3.5-nano:free").  Never feed a remote id through
+    // wxFileName or the bundled-model path normalizer: on Windows, the
+    // provider slash plus the non-drive colon in ":free" can be interpreted
+    // as malformed filesystem syntax and wxWidgets reports error 123.
+    //
+    // Remote ids don't need filesystem-aware formatting.  Preserve the
+    // historical short-label behavior by returning only their final path
+    // segment.  Actual GGUF paths continue through the existing bundle/
+    // loose-file logic below.
+    const std::string lower = ToLowerAscii(ggufPath);
+    const bool isGgufPath =
+        lower.size() >= 5 &&
+        lower.compare(lower.size() - 5, 5, ".gguf") == 0;
+    if (!isGgufPath) {
+        const size_t sep = ggufPath.find_last_of("/\\");
+        return (sep == std::string::npos || sep + 1 >= ggufPath.size())
+            ? ggufPath
+            : ggufPath.substr(sep + 1);
+    }
+
     // Prefer the bundle folder name when the model is bundled — this
     // surfaces clean, user-chosen names ("gemma-3-27b-it-abliterated")
     // in the UI instead of noisy quantization-tagged filenames
@@ -1285,84 +1641,49 @@ static std::string GetDefaultWorkspaceRootDir()
     return JoinPath(std::string(docs.ToUTF8().data()), "LlamaBoss");
 }
 
+// Folder under %USERPROFILE%\LlamaBoss holding the lanes used when a
+// tool's cwd is NOT a chat workspace (unsaved chat, /cd elsewhere):
+//   LlamaBoss\Shared\Workspace, \Scripts, \Documents, \ToolOutputs ...
+// Keeps the LlamaBoss root down to Chats, Projects, Skills, System and
+// the user's NOTES.md / REMINDERS.json.
+static const char* const kSharedLanesFolderName = "Shared";
+
+std::string ServerManager::GetSharedLanesRootDir()
+{
+    return JoinPath(GetDefaultWorkspaceRootDir(), kSharedLanesFolderName);
+}
+
 std::string ServerManager::GetDefaultWorkspaceDir()
 {
-    // Active default working directory for tools. Future document lanes
-    // are created beside it by EnsureWorkspaceDir().
-    return JoinPath(GetDefaultWorkspaceRootDir(), "Workspace");
+    // Active default working directory for tools. Sibling lanes
+    // (Scripts, Documents, ...) are created beside it on first use.
+    return JoinPath(GetSharedLanesRootDir(), "Workspace");
 }
 
 // ─── Conversation lane layout ─────────────────────────────────────
-// Single source of truth for recognizing the per-conversation folder
-// shape created by ChatHistory::EnsureWorkflowDir():
-//   %USERPROFILE%\LlamaBoss\Workflows\chat_xxxxxxxx\Workspace
+// Chat folder recognition lives in chat_folders.h (the single source of
+// truth for the layout ChatHistory::EnsureChatFolder creates):
+//   %USERPROFILE%\LlamaBoss\Chats\<date>_<slug>_<id>\Workspace
 // python_runner.cpp and agent_controller.cpp both delegate here; see
-// the header comment for why the duplication was a safety hazard.
-
-namespace {
-
-std::string LaneTrimTrailingSeparators(std::string s)
-{
-    while (!s.empty() && (s.back() == '/' || s.back() == '\\')) s.pop_back();
-    return s;
-}
-
-std::string LaneParentDirOf(const std::string& path)
-{
-    std::string s = LaneTrimTrailingSeparators(path);
-    size_t pos = s.find_last_of("/\\");
-    if (pos == std::string::npos) return std::string();
-    return s.substr(0, pos);
-}
-
-std::string LaneBaseNameOf(const std::string& path)
-{
-    std::string s = LaneTrimTrailingSeparators(path);
-    size_t pos = s.find_last_of("/\\");
-    return (pos == std::string::npos) ? s : s.substr(pos + 1);
-}
-
-std::string LaneLowerAscii(std::string s)
-{
-    for (char& ch : s) {
-        if (ch >= 'A' && ch <= 'Z') ch = static_cast<char>(ch + 32);
-    }
-    return s;
-}
-
-} // namespace
+// the header comment for why duplicated recognizers were a safety hazard.
 
 std::string ServerManager::GetLlamaBossRootDir()
 {
-    // Identical by construction to ParentDirOf(GetDefaultWorkspaceDir())
-    // — GetDefaultWorkspaceDir is GetDefaultWorkspaceRootDir() +
-    // "\Workspace" — but skips the string round-trip.
+    // %USERPROFILE%\LlamaBoss itself.  Lane fallbacks do NOT live here any
+    // more; they live under GetSharedLanesRootDir().
     return GetDefaultWorkspaceRootDir();
 }
 
-std::string ServerManager::ConversationWorkflowRootFromCwd(const std::string& cwd)
+std::string ServerManager::ChatFolderFromCwd(const std::string& cwd)
 {
-    std::string clean = LaneTrimTrailingSeparators(cwd);
-    if (clean.empty()) return std::string();
-
-    if (LaneLowerAscii(LaneBaseNameOf(clean)) != "workspace") return std::string();
-
-    std::string chatRoot      = LaneParentDirOf(clean);     // ...\chat_xxxxxxxx
-    std::string workflowsRoot = LaneParentDirOf(chatRoot);  // ...\Workflows
-    if (chatRoot.empty() || workflowsRoot.empty()) return std::string();
-
-    std::string chatBase = LaneLowerAscii(LaneBaseNameOf(chatRoot));
-    if (chatBase.rfind("chat_", 0) != 0) return std::string();
-    if (LaneLowerAscii(LaneBaseNameOf(workflowsRoot)) != "workflows") return std::string();
-
-    return chatRoot;
+    return chat_folders::ChatFolderFromWorkspaceCwd(cwd);
 }
 
 std::string ServerManager::ConversationLaneDirForCwd(const std::string& cwd,
                                                      const std::string& lane)
 {
-    std::string root = ConversationWorkflowRootFromCwd(cwd);
-    if (root.empty()) root = GetLlamaBossRootDir();
+    std::string root = ChatFolderFromCwd(cwd);
+    if (root.empty()) root = GetSharedLanesRootDir();
     if (root.empty()) return std::string();
     return JoinPath(root, lane);
 }
@@ -1383,13 +1704,6 @@ std::string ServerManager::GetWorkspaceDirOverride()
     return "";
 }
 
-void ServerManager::SetWorkspaceDirOverride(const std::string& path)
-{
-    wxFileConfig cfg("LlamaBoss");
-    cfg.Write("WorkspaceFolderOverride", wxString::FromUTF8(path));
-    cfg.Flush();
-}
-
 std::string ServerManager::GetWorkspaceDir()
 {
     // Active workspace: override if set, default otherwise. This is
@@ -1401,29 +1715,53 @@ std::string ServerManager::GetWorkspaceDir()
 
 void ServerManager::EnsureWorkspaceDir()
 {
+    // Move pre-Shared lanes first: creating Shared\Workspace before the
+    // move would make the migration see an existing destination and skip it.
+    if (GetWorkspaceDirOverride().empty())
+        MigrateRootLanesToShared();
+
     // Idempotent: wxPATH_MKDIR_FULL is "mkdir -p" semantics, so this
     // is a cheap no-op when the directory already exists.
+    //
+    // Only the Workspace itself is created up front (tools and Python
+    // need an existing cwd).  Every other lane -- Scripts, Documents,
+    // Spreadsheets, PDFs, ToolOutputs, ... -- is created by the code that
+    // first writes into it, so an unused lane never appears on disk.
+    // (Earlier builds pre-created Documents/Spreadsheets/PDFs/Scripts and
+    // an unused Downloads folder directly in the LlamaBoss root.)
     wxFileName::Mkdir(GetWorkspaceDir(), wxS_DIR_DEFAULT, wxPATH_MKDIR_FULL);
+}
 
-    // For the built-in default only, create the full LlamaBoss folder
-    // layout. If the user later picks a custom workspace folder, respect
-    // that exact override and do not create sibling folders around it.
-    if (GetWorkspaceDirOverride().empty()) {
-        const std::string root = GetDefaultWorkspaceRootDir();
-        wxFileName::Mkdir(root, wxS_DIR_DEFAULT, wxPATH_MKDIR_FULL);
+void ServerManager::MigrateRootLanesToShared()
+{
+    // One-time, idempotent tidy-up for installs from before the Shared
+    // folder existed: move LlamaBoss\<lane> into LlamaBoss\Shared\<lane>.
+    // Only moves a lane when Shared does not already have it (never
+    // merges), and leaves anything it cannot move exactly where it is.
+    const std::string root   = GetDefaultWorkspaceRootDir();
+    const std::string shared = GetSharedLanesRootDir();
 
-        const char* lanes[] = {
-            "Workspace",
-            "Documents",
-            "Spreadsheets",
-            "PDFs",
-            "Scripts",
-            "Downloads"
-        };
+    const char* lanes[] = {
+        "Workspace", "Documents", "Spreadsheets", "PDFs", "Word",
+        "Filled Forms", "Extracted", "Scripts", "ToolOutputs", "Web Pages"
+    };
+    for (const char* lane : lanes) {
+        const wxString src = wxString::FromUTF8(JoinPath(root, lane));
+        const wxString dst = wxString::FromUTF8(JoinPath(shared, lane));
+        if (!wxDirExists(src) || wxDirExists(dst)) continue;
+        wxFileName::Mkdir(wxString::FromUTF8(shared), wxS_DIR_DEFAULT, wxPATH_MKDIR_FULL);
+        wxRenameFile(src, dst, false);   // best effort; failure leaves it in place
+    }
 
-        for (const char* lane : lanes) {
-            wxFileName::Mkdir(JoinPath(root, lane), wxS_DIR_DEFAULT, wxPATH_MKDIR_FULL);
+    // Nothing ever wrote to the old Downloads lane; drop it when empty.
+    const wxString downloads = wxString::FromUTF8(JoinPath(root, "Downloads"));
+    if (wxDirExists(downloads)) {
+        bool empty = false;
+        {
+            wxDir dir(downloads);
+            empty = dir.IsOpened() && !dir.HasFiles() && !dir.HasSubDirs();
         }
+        if (empty) wxRmdir(downloads);
     }
 }
 
@@ -2441,6 +2779,7 @@ bool ServerManager::StartServer(const std::string& ggufPath, const ServerConfig&
     if (m_slotQueue) {
         std::lock_guard<std::mutex> lock(m_slotQueue->mutex);
         m_slotQueue->liveGeneration = launchGeneration;
+        SupersedePrewarmLocked(*m_slotQueue);   // fresh process, nothing primed
     }
 
     m_loadedModel         = ggufPath;
@@ -2557,6 +2896,7 @@ void ServerManager::StopServerInternal(bool invalidateGeneration)
     m_currentJinjaEnabled = false;
     m_slotOwner.clear();
     m_slotDirty = false;
+    // (AbandonSlotQueue above already superseded any prewarm.)
 }
 
 void ServerManager::StopServer()

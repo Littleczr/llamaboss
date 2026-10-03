@@ -14,6 +14,7 @@
 #pragma once
 
 #include "command_policy.h"
+#include "lb_string_utils.h"   // LbUtf8SafeTruncate
 #include "tool_block.h"
 #include "tool_context.h"
 #include "tool_dispatcher.h"
@@ -77,9 +78,11 @@ inline RiskTier ClassifyTier(const std::string& toolName)
 
 struct ApprovalDecision {
     bool        required = false;
+    bool        grantsWriteRoot = false;
     std::string reason;
     std::string target;
     std::string preview;
+    std::string writeRoot;
     ToolBlock   block;
 };
 
@@ -106,6 +109,12 @@ inline std::string FirstLine(const std::string& s)
 inline std::string CommandEcho(const ToolInvocation& inv)
 {
     if (inv.name == tool_names::kPowerShell) return inv.args;
+    if (inv.name == tool_names::kPy) {
+        std::string firstLine = FirstLine(Trim(inv.args));
+        firstLine = LbUtf8SafeTruncate(firstLine, 120);
+        const bool multiline = Trim(inv.args).find('\n') != std::string::npos;
+        return "/py " + firstLine + (multiline ? " ..." : "");
+    }
     if (inv.name == tool_names::kPythonHealth) return "python_health";
     if (inv.name == tool_names::kCsvInspect)
         return Trim(inv.args).empty() ? std::string("/csv_inspect")
@@ -241,14 +250,6 @@ inline std::string ResolveTargetForPreview(const std::string& requested,
     return resolved.empty() ? trimmed : resolved;
 }
 
-inline std::string ParentDirForApproval(std::string path)
-{
-    while (!path.empty() && (path.back() == '/' || path.back() == '\\')) path.pop_back();
-    size_t pos = path.find_last_of("/\\");
-    if (pos == std::string::npos) return std::string();
-    return path.substr(0, pos);
-}
-
 inline std::string JoinPathForApproval(const std::string& a, const std::string& b)
 {
     if (a.empty()) return b;
@@ -256,31 +257,32 @@ inline std::string JoinPathForApproval(const std::string& a, const std::string& 
     return a + "\\" + b;
 }
 
-inline std::string ScriptsDirForPreview()
+// The Scripts lane python_create_script will actually write to: this
+// chat's Scripts folder, or LlamaBoss\Shared\Scripts outside a chat.
+inline std::string ScriptsDirForPreview(const std::string& cwd)
 {
-    std::string root = ParentDirForApproval(ServerManager::GetDefaultWorkspaceDir());
-    if (root.empty()) root = ParentDirForApproval(ServerManager::GetWorkspaceDir());
-    return JoinPathForApproval(root, "Scripts");
+    return ServerManager::ConversationScriptsDirForCwd(cwd);
 }
 
-inline std::string ScriptPreviewPath(const std::string& requested)
+inline std::string ScriptPreviewPath(const std::string& requested,
+                                     const std::string& cwd)
 {
     std::string name = Trim(requested);
-    if (name.empty()) return ScriptsDirForPreview();
+    if (name.empty()) return ScriptsDirForPreview(cwd);
     if (name.find('.') == std::string::npos) name += ".py";
-    return JoinPathForApproval(ScriptsDirForPreview(), name);
+    return JoinPathForApproval(ScriptsDirForPreview(cwd), name);
 }
 
 inline std::string ProjectWorkflowScriptPreviewPath(const std::string& requested,
                                                     const ToolContext& ctx)
 {
     std::string name = Trim(requested);
-    if (name.empty()) return ScriptPreviewPath(requested);
+    if (name.empty()) return ScriptPreviewPath(requested, ctx.cwd);
     if (name.find('.') == std::string::npos) name += ".py";
     if (!ctx.activeProjectRoot.empty()) {
         return JoinPathForApproval(JoinPathForApproval(ctx.activeProjectRoot, "Workflows"), name);
     }
-    return ScriptPreviewPath(requested);
+    return ScriptPreviewPath(requested, ctx.cwd);
 }
 
 inline std::string PreviewForInvocation(const ToolInvocation& inv,
@@ -288,6 +290,21 @@ inline std::string PreviewForInvocation(const ToolInvocation& inv,
                                         std::string&          targetOut)
 {
     std::ostringstream p;
+
+    if (inv.name == tool_names::kPy) {
+        // The code IS the action: show it whole (limited) so the user
+        // approves exactly what will execute in the persistent session.
+        const std::string code = Trim(inv.args);
+        targetOut.clear();
+        p << "Session working directory: " << ctx.cwd << "\n"
+          << "Bytes: " << code.size() << "\n"
+          << "Lines: " << CountLines(code) << "\n\n"
+          << "Runs in this conversation's persistent Python session; "
+             "variables persist across py calls. No API keys are "
+             "injected.\n\n"
+          << LimitText(code.empty() ? std::string("[empty code]") : code);
+        return p.str();
+    }
 
     if (inv.name == tool_names::kWrite) {
         std::string path, content;
@@ -363,7 +380,7 @@ inline std::string PreviewForInvocation(const ToolInvocation& inv,
     if (inv.name == tool_names::kCsvReport) {
         targetOut = ResolveTargetForPreview(inv.args, ctx);
         p << "Target data file: " << targetOut << "\n"
-          << "Output: LlamaBoss Documents folder\n"
+          << "Output: this chat's Documents folder\n"
           << "Runs only the bundled csv_report helper. The helper reads a .csv/.tsv file inside the current LlamaBoss working directory and creates one Markdown report artifact. It does not accept arbitrary Python code, script paths, or output paths.";
         return p.str();
     }
@@ -378,7 +395,7 @@ inline std::string PreviewForInvocation(const ToolInvocation& inv,
     if (inv.name == tool_names::kXlsxReport) {
         targetOut = ResolveTargetForPreview(inv.args, ctx);
         p << "Target spreadsheet: " << targetOut << "\n"
-          << "Output: LlamaBoss Documents folder\n"
+          << "Output: this chat's Documents folder\n"
           << "Runs only the bundled xlsx_report helper. The helper reads an .xlsx file inside the current LlamaBoss working directory and creates one Markdown report artifact across all sheets. It does not accept arbitrary Python code, script paths, or output paths. Requires the openpyxl Python package.";
         return p.str();
     }
@@ -420,10 +437,10 @@ inline std::string PreviewForInvocation(const ToolInvocation& inv,
         p << "Target Python script: " << targetOut << "\n"
           << (!ctx.activeProjectRoot.empty()
                   ? "Output: active project Workflows folder\n"
-                  : "Output: LlamaBoss Scripts folder\n")
+                  : "Output: this chat's Scripts folder\n")
           << "Bytes: " << content.size() << "\n"
           << "Lines: " << CountLines(content) << "\n\n"
-          << "Creates a reviewable .py script artifact. In a project chat, the script is created in that project's Workflows folder; otherwise it is created in the LlamaBoss Scripts folder. If this task needs output, this approval also covers one immediate run of this exact script. Review the source below before approving.\n\n"
+          << "Creates a reviewable .py script artifact. In a project chat, the script is created in that project's Workflows folder; otherwise it is created in this chat's Scripts folder. If this task needs output, this approval also covers one immediate run of this exact script. Review the source below before approving.\n\n"
           << LimitText(content.empty() ? std::string("[empty script body]") : content);
         return p.str();
     }
@@ -431,7 +448,7 @@ inline std::string PreviewForInvocation(const ToolInvocation& inv,
     if (inv.name == tool_names::kPythonRunScript) {
         targetOut = ProjectWorkflowScriptPreviewPath(inv.args, ctx);
         p << "Target Python script: " << targetOut << "\n"
-          << "Conversation Scripts fallback: " << ScriptPreviewPath(inv.args) << "\n"
+          << "Conversation Scripts fallback: " << ScriptPreviewPath(inv.args, ctx.cwd) << "\n"
           << "Working directory: " << ctx.cwd << "\n"
           << "Runs one existing .py script from the fixed conversation Scripts folder, or an optional .py helper script from the active project's Workflows folder. "
           << "Captures stdout, stderr, exit code, runtime, and attaches newly created files under the LlamaBoss root as artifact cards. No command-line arguments, package installs, or automatic sends in this phase.";
@@ -453,6 +470,112 @@ inline std::string ApprovalActionVerb(const ToolInvocation& inv)
     if (inv.name == tool_names::kEdit) return "edit it";
     if (inv.name == tool_names::kDelete) return "delete it";
     return "run it";
+}
+
+inline bool IsNativePathMutation(const std::string& name)
+{
+    return name == tool_names::kWrite ||
+           name == tool_names::kOverwriteFile ||
+           name == tool_names::kWritePowerShellScript ||
+           name == tool_names::kEdit ||
+           name == tool_names::kMkdir ||
+           name == tool_names::kDelete;
+}
+
+inline bool RequestedMutationPath(const ToolInvocation& inv,
+                                  std::string& requestedOut)
+{
+    requestedOut.clear();
+
+    if (inv.name == tool_names::kWrite ||
+        inv.name == tool_names::kOverwriteFile ||
+        inv.name == tool_names::kWritePowerShellScript) {
+        std::string ignored;
+        SplitWriteArgs(inv.args, requestedOut, ignored);
+        return !requestedOut.empty();
+    }
+
+    if (inv.name == tool_names::kEdit) {
+        std::string oldText, newText;
+        return SplitEditArgs(inv.args, requestedOut, oldText, newText) &&
+               !requestedOut.empty();
+    }
+
+    if (inv.name == tool_names::kMkdir ||
+        inv.name == tool_names::kDelete) {
+        requestedOut = Trim(inv.args);
+        return !requestedOut.empty();
+    }
+
+    return false;
+}
+
+// Pre-dispatch capability gate for native path mutations.  This is separate
+// from ordinary Dangerous-tier approval: granting a folder authorizes WHERE
+// native tools may operate, not WHAT a particular tool may do.  After a grant
+// the caller must run the invocation through RequiresApproval again so delete
+// and other dangerous actions retain their normal action review.
+inline bool RequiresWriteRootGrant(const ToolInvocation& inv,
+                                   const ToolContext&    ctx,
+                                   ApprovalDecision&     out)
+{
+    out = ApprovalDecision{};
+    if (!inv.valid || !IsNativePathMutation(inv.name) || ctx.cwd.empty())
+        return false;
+
+    std::string requested;
+    if (!RequestedMutationPath(inv, requested)) return false;
+
+    const std::string resolved =
+        tool_path_safety::ResolveProjectAwareToolPath(
+            requested, ctx.cwd, ctx.activeProjectRoot);
+    if (resolved.empty()) return false;
+
+    if (tool_path_safety::IsUnderAllowedWriteRoot(
+            resolved, ctx.cwd, ctx.activeProjectRoot, ctx.skillsRoot,
+            ctx.additionalWriteRoots)) {
+        return false;
+    }
+
+    std::string grantRoot = tool_path_safety::ParentDir(resolved);
+    if (grantRoot.empty()) return false;
+
+    // Never turn a root-level file request into an all-drive capability.
+    // Equality still lets the one requested file (or directory being created)
+    // pass the containment check without authorizing its siblings.
+    if (tool_path_safety::IsDriveRoot(grantRoot)) grantRoot = resolved;
+
+    out.required        = true;
+    out.grantsWriteRoot = true;
+    out.target          = resolved;
+    out.writeRoot       = grantRoot;
+    out.reason =
+        "The requested native file change is outside this chat's current "
+        "writable workspace, attached project, Skills folder, and previously "
+        "granted folders.";
+
+    out.block.iconUtf8    = "\xF0\x9F\x94\x92"; // lock
+    out.block.toolName    = "Folder Access Required";
+    out.block.statusChips = { "pending", "write root" };
+    out.block.commandEcho = CommandEcho(inv);
+    out.block.approvalPresentation =
+        ToolApprovalPresentation::WriteRootGrant;
+
+    std::ostringstream body;
+    body << "Native editing access is required for this folder.\n\n"
+         << "Requested target: " << resolved << "\n"
+         << "Folder to grant: " << grantRoot << "\n\n"
+         << "Granting access adds only this exact folder to the current "
+            "chat's native write roots. The grant is not saved to the "
+            "conversation file and is cleared when LlamaBoss restarts.\n\n"
+         << "This folder grant does not approve a destructive action. If the "
+            "requested tool normally requires approval, its regular review "
+            "card appears next. PowerShell is not used as a workaround.\n\n"
+         << "Choose Grant Folder for Chat to continue, or Cancel. You can "
+            "also attach the project from the Project menu for durable "
+            "project context.";
+    out.block.body = body.str();
+    return true;
 }
 
 inline bool RequiresApproval(const ToolInvocation& inv,
@@ -515,7 +638,7 @@ inline bool RequiresApproval(const ToolInvocation& inv,
     }
     else if (inv.name == tool_names::kPythonCreateScript) {
         out.required = true;
-        out.reason = "Creates a reviewable Python script in the LlamaBoss Scripts folder. Review the source before approving.";
+        out.reason = "Creates a reviewable Python script in this chat's Scripts folder. Review the source before approving.";
     }
     else if (inv.name == tool_names::kPythonInstallPackage) {
         out.required = true;
@@ -524,6 +647,10 @@ inline bool RequiresApproval(const ToolInvocation& inv,
     else if (inv.name == tool_names::kWritePowerShellScript) {
         out.required = true;
         out.reason = "Creates or replaces a PowerShell .ps1 script. The script is written but not executed; review the source before approving.";
+    }
+    else if (inv.name == tool_names::kPy) {
+        out.required = true;
+        out.reason = "Executes arbitrary Python code in this conversation's persistent session. The code below runs immediately on approval, with full local file and network access (no API keys are injected). One-approval mode covers later py calls in this chat.";
     }
     else {
         // Defensive default for any future Dangerous-tier addition
