@@ -2431,6 +2431,10 @@ bool ChatHistory::WriteSaveSnapshot(const SaveSnapshot& snapshot,
         Poco::JSON::Stringifier::stringify(root, oss, 2);
         const std::string body = oss.str();
 
+#ifndef _WIN32
+        if (!tool_staged_write::AtomicReplaceFile(snapshot.filePath, body, durable))
+            return false;
+#else
         tool_staged_write::StagedTempFile tmp =
             tool_staged_write::CreateStagedTempFile(snapshot.filePath);
         if (tmp.handle == INVALID_HANDLE_VALUE) return false;
@@ -2474,6 +2478,7 @@ bool ChatHistory::WriteSaveSnapshot(const SaveSnapshot& snapshot,
             ::DeleteFileW(tmp.wPath.c_str());
             return false;
         }
+#endif
 
         if (!snapshot.titleMarkerPath.empty()) {
             try {

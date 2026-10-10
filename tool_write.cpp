@@ -279,11 +279,16 @@ WriteResult WriteFileContent(const std::string& argsBlob,
     // is almost always a malformed call (path line only, a misnamed
     // content field) rather than a request to blank the file.
     if (overwriteExisting && targetIsFile && content.empty()) {
+#ifdef _WIN32
         std::wstring wTarget = path_safety::Utf8ToWide(resolved);
         WIN32_FILE_ATTRIBUTE_DATA fad{};
         if (!wTarget.empty() &&
             ::GetFileAttributesExW(wTarget.c_str(), GetFileExInfoStandard, &fad) &&
             (fad.nFileSizeHigh != 0 || fad.nFileSizeLow != 0)) {
+#else
+        struct stat st {};
+        if (::stat(resolved.c_str(), &st) == 0 && st.st_size != 0) {
+#endif
             r.chips.push_back("blocked");
             r.errorBody = "overwrite_file received EMPTY content for an existing "
                           "non-empty file, so nothing was changed: " + resolved +
@@ -311,6 +316,7 @@ WriteResult WriteFileContent(const std::string& argsBlob,
         return r;
     }
 
+#ifdef _WIN32
     tool_staged_write::StagedTempFile tmp =
         tool_staged_write::CreateStagedTempFile(resolved);
     if (tmp.handle == INVALID_HANDLE_VALUE) {
@@ -426,6 +432,82 @@ WriteResult WriteFileContent(const std::string& argsBlob,
         r.chips.push_back(ElapsedChip(t0));
         return r;
     }
+
+#else
+    tool_staged_write::StagedTempFile tmp =
+        tool_staged_write::CreateStagedTempFile(resolved);
+    if (tmp.fd < 0) {
+        r.chips.push_back("failed");
+        r.errorBody = "Could not create unique temp file near '" +
+                      resolved + "' for writing (" + std::strerror(tmp.error) + ").";
+        if (!tmp.path.empty()) {
+            r.errorBody += "\nLast attempted temp path: " + tmp.path;
+        }
+        r.chips.push_back(ElapsedChip(t0));
+        return r;
+    }
+    const std::string& tmpPath = tmp.path;
+
+    int err = 0;
+    if (!tool_staged_write::WriteAll(tmp.fd, content.data(), content.size(), err) ||
+        !tool_staged_write::FlushToDisk(tmp.fd, err)) {
+        tool_staged_write::DiscardStagedTempFile(tmp);
+        r.chips.push_back("failed");
+        r.errorBody = std::string("Writing the temp file failed (") + std::strerror(err) + ").";
+        r.chips.push_back(ElapsedChip(t0));
+        return r;
+    }
+    if (::close(tmp.fd) != 0) {
+        err = errno;
+        tmp.fd = -1;
+        r.chips.push_back("failed");
+        r.errorBody = std::string("Closing the temp file failed (") + std::strerror(err) +
+                      "); tmp file preserved at: " + tmpPath;
+        r.chips.push_back(ElapsedChip(t0));
+        return r;
+    }
+    tmp.fd = -1;
+
+    if (HasPythonExtension(resolved)) {
+        tool_python_syntax::SyntaxCheckResult syntax =
+            tool_python_syntax::CheckFile(tmpPath);
+        if (!syntax.ok) {
+            tool_staged_write::DiscardStagedTempFile(tmp);
+            r.chips.push_back("failed");
+            r.chips.push_back("syntax error");
+            r.errorBody = "Python syntax check failed; the file was not " +
+                          std::string(overwriteExisting ? "overwritten" : "created") +
+                          ".\n\n" + syntax.message;
+            r.chips.push_back(ElapsedChip(t0));
+            return r;
+        }
+    }
+
+    if (!mutation.VerifyUnchanged()) {
+        r.chips.push_back("conflict");
+        r.errorBody = mutation.Error() + "\nThe proposed file is preserved at: " + tmpPath;
+        r.chips.push_back(ElapsedChip(t0));
+        return r;
+    }
+    const bool replaceExisting = overwriteExisting && mutation.TargetExisted();
+    mutation.ReleaseTargetForCommit();
+
+    if (!tool_staged_write::PromoteSiblingTempFile(tmpPath, resolved, replaceExisting, err)) {
+        r.chips.push_back("failed");
+        if (err == EEXIST) {
+            r.chips.clear();
+            r.chips.push_back("exists");
+            r.errorBody = "File appeared at the target path during write: " +
+                          resolved +
+                          ".\nThe staged content is preserved at: " + tmpPath;
+        } else {
+            r.errorBody = std::string("Rename failed (") + std::strerror(err) +
+                          ").\nThe staged content is preserved at: " + tmpPath;
+        }
+        r.chips.push_back(ElapsedChip(t0));
+        return r;
+    }
+#endif
 
     // ── Success ──────────────────────────────────────────────────
     const size_t bytes = content.size();

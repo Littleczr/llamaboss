@@ -8,8 +8,13 @@
 
 #include "lb_windows.h"
 
+#ifndef _WIN32
+#include "lb_process.h"
+#endif
+
 namespace {
 
+#ifdef _WIN32
 // Quote a single argument for the Windows CRT command-line parser.
 // Always quote, and use the full backslash-doubling rule so paths with
 // trailing backslashes or embedded quotes cannot reshape argv.
@@ -71,6 +76,8 @@ std::string ReadAllFromPipe(HANDLE h)
     return out;
 }
 
+#endif
+
 // Syntax check run with `python -c`.  Compiles the file in memory with
 // compile() and writes NOTHING to disk.  (It replaced `-m py_compile`,
 // which always writes a .pyc into a __pycache__ folder next to the script
@@ -86,6 +93,13 @@ const wchar_t* const kCompileCheckProgram =
     L"import sys,traceback as t;"
     L"sys.excepthook=lambda c,e,b:sys.stderr.write(''.join(t.format_exception_only(c,e)));"
     L"compile(open(sys.argv[1],'rb').read(),sys.argv[1],'exec',dont_inherit=True)";
+
+#ifndef _WIN32
+const char* const kCompileCheckProgramUtf8 =
+    "import sys,traceback as t;"
+    "sys.excepthook=lambda c,e,b:sys.stderr.write(''.join(t.format_exception_only(c,e)));"
+    "compile(open(sys.argv[1],'rb').read(),sys.argv[1],'exec',dont_inherit=True)";
+#endif
 
 // True if the checker's output names a genuine source-level error.
 // The checker prints the error class name on the final line, so a
@@ -114,6 +128,7 @@ SyntaxCheckResult CheckFile(const std::string& filePath)
         return result;
     }
 
+#ifdef _WIN32
     // -I (isolated): no cwd / user-site on sys.path, PYTHON* env ignored,
     // so a stray sys.py or traceback.py can't hijack the checker.
     // -B: belt and braces; compile() itself never writes bytecode.
@@ -251,6 +266,49 @@ SyntaxCheckResult CheckFile(const std::string& filePath)
     result.checked = false;
     result.message = startErrors;
     return result;
+#else
+    std::string startErrors;
+    for (const char* python : {"python3", "python"}) {
+        lb_process::Options opt;
+        opt.argv = {python, "-I", "-B", "-c", kCompileCheckProgramUtf8, filePath};
+        opt.mergeStderr = true;
+        opt.timeoutMs = 10000;
+        opt.maxCaptureBytes = 64 * 1024;
+        const lb_process::Result run = lb_process::Run(opt);
+        if (!run.started) {
+            startErrors += std::string("Could not start ") + python + " (" +
+                           std::strerror(run.spawnError) + ").\n";
+            continue;
+        }
+        std::string output = run.out;
+        if (run.truncated) output += "\n[... syntax-check output truncated ...]\n";
+
+        result.checked = true;
+        if (!run.timedOut && run.exitCode == 0) {
+            result.ok = true;
+            result.message.clear();
+            return result;
+        }
+        if (!run.timedOut && LooksLikeSyntaxError(output)) {
+            result.ok = false;
+            result.message = output;
+            return result;
+        }
+        result.ok = true;
+        result.checked = false;
+        result.message = run.timedOut
+            ? "Python syntax check timed out; not treated as a syntax failure."
+            : (output.empty() ? "Python syntax check could not run (exit " +
+                                    std::to_string(run.exitCode) + ")."
+                              : output);
+        return result;
+    }
+
+    result.ok = true;
+    result.checked = false;
+    result.message = startErrors;
+    return result;
+#endif
 }
 
 } // namespace tool_python_syntax

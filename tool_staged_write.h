@@ -26,13 +26,21 @@
 #include <cstring>
 #include <utility>
 #include <vector>
+#ifndef _WIN32
+#include <cstdio>
+#include <ctime>
+#endif
 
 #include "lb_windows.h"
+#ifdef _WIN32
 #include <winternl.h>
+#endif
 
 #include "path_safety.h"   // path_safety::Utf8ToWide
 
 namespace tool_staged_write {
+
+#ifdef _WIN32
 
 struct StagedTempFile {
     std::string  path;
@@ -229,5 +237,130 @@ inline BOOL PromoteSiblingTempFile(const std::wstring& stagedPath,
     ::SetLastError(error);
     return ok;
 }
+
+#else  // ── macOS / POSIX ──────────────────────────────────────────────
+
+// Same staging contract as the Win32 version: a unique sibling temp file
+// created with O_EXCL, written fully, fsync'd, closed, then renamed over the
+// target within the same directory (rename(2) is atomic on one volume).
+struct StagedTempFile {
+    std::string  path;
+    std::wstring wPath;
+    int          fd    = -1;
+    int          error = 0;    // errno of the last failure
+};
+
+inline std::string ParentDirForTemp(const std::string& absPath)
+{
+    const size_t p = absPath.find_last_of('/');
+    if (p == std::string::npos) return {};
+    return p == 0 ? std::string("/") : absPath.substr(0, p);
+}
+
+inline StagedTempFile CreateStagedTempFile(const std::string& finalPath)
+{
+    StagedTempFile out;
+    const std::string parent = ParentDirForTemp(finalPath);
+    if (parent.empty()) {
+        out.error = EINVAL;
+        return out;
+    }
+    const std::string base = parent == "/" ? parent : parent + "/";
+    const auto pid  = static_cast<long>(::getpid());
+    const auto tick = static_cast<long long>(::clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) / 1000000ull);
+
+    for (int attempt = 0; attempt < 64; ++attempt) {
+        std::string tmpPath = base + ".llamaboss-" + std::to_string(pid) + "-" +
+                              std::to_string(tick) + "-" + std::to_string(attempt) + ".tmp";
+        const int fd = ::open(tmpPath.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0644);
+        if (fd >= 0) {
+            out.path  = std::move(tmpPath);
+            out.wPath = path_safety::Utf8ToWide(out.path);
+            out.fd    = fd;
+            return out;
+        }
+        if (errno != EEXIST) {
+            out.path  = tmpPath;
+            out.error = errno;
+            return out;
+        }
+    }
+    out.error = EEXIST;
+    return out;
+}
+
+// Writes every byte; on failure returns false with errno in `err`.
+inline bool WriteAll(int fd, const char* data, size_t size, int& err)
+{
+    while (size > 0) {
+        const ssize_t n = ::write(fd, data, size);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) { err = n < 0 ? errno : EIO; return false; }
+        data += n;
+        size -= static_cast<size_t>(n);
+    }
+    return true;
+}
+
+// F_FULLFSYNC asks the drive itself to flush, which is what
+// FlushFileBuffers guarantees on Windows; plain fsync on macOS does not.
+inline bool FlushToDisk(int fd, int& err)
+{
+    if (::fcntl(fd, F_FULLFSYNC) == 0 || ::fsync(fd) == 0) return true;
+    err = errno;
+    return false;
+}
+
+// Close and remove a staging file after a failure (best effort).
+inline void DiscardStagedTempFile(StagedTempFile& tmp)
+{
+    if (tmp.fd >= 0) ::close(tmp.fd);
+    tmp.fd = -1;
+    if (!tmp.path.empty()) ::unlink(tmp.path.c_str());
+}
+
+// Atomically rename the staged sibling over (or onto) the final path.
+// Without replaceExisting, an existing target fails with EEXIST.
+inline bool PromoteSiblingTempFile(const std::string& stagedPath,
+                                   const std::string& finalPath,
+                                   bool replaceExisting,
+                                   int& err)
+{
+    if (ParentDirForTemp(stagedPath) != ParentDirForTemp(finalPath)) {
+        err = EINVAL;
+        return false;
+    }
+    struct stat st {};
+    if (::lstat(stagedPath.c_str(), &st) != 0) { err = errno; return false; }
+    if (!S_ISREG(st.st_mode)) { err = EACCES; return false; }
+    const int rc = replaceExisting
+        ? ::rename(stagedPath.c_str(), finalPath.c_str())
+        : ::renamex_np(stagedPath.c_str(), finalPath.c_str(), RENAME_EXCL);
+    if (rc != 0) { err = errno; return false; }
+    return true;
+}
+
+// Stage, optionally flush, and atomically replace `finalPath` with `body`.
+// Used by the whole-file savers (notes, chat history).
+inline bool AtomicReplaceFile(const std::string& finalPath, const std::string& body, bool durable)
+{
+    StagedTempFile tmp = CreateStagedTempFile(finalPath);
+    if (tmp.fd < 0) return false;
+    int err = 0;
+    if (!WriteAll(tmp.fd, body.data(), body.size(), err) ||
+        (durable && !FlushToDisk(tmp.fd, err))) {
+        DiscardStagedTempFile(tmp);
+        return false;
+    }
+    const int rc = ::close(tmp.fd);
+    tmp.fd = -1;
+    if (rc != 0 || !PromoteSiblingTempFile(tmp.path, finalPath, /*replaceExisting=*/true, err)) {
+        DiscardStagedTempFile(tmp);
+        return false;
+    }
+    return true;
+}
+
+#endif
 
 } // namespace tool_staged_write

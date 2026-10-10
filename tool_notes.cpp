@@ -195,6 +195,9 @@ size_t CountLines(const std::string& s)
 
 bool AtomicWriteFile(const std::string& finalPath, const std::string& body)
 {
+#ifndef _WIN32
+    return tool_staged_write::AtomicReplaceFile(finalPath, body, /*durable=*/false);
+#else
     tool_staged_write::StagedTempFile tmp =
         tool_staged_write::CreateStagedTempFile(finalPath);
     if (tmp.handle == INVALID_HANDLE_VALUE) return false;
@@ -236,6 +239,7 @@ bool AtomicWriteFile(const std::string& finalPath, const std::string& body)
     }
 
     return true;
+#endif
 }
 
 // Read a UTF-8 text file in full.  Returns true and fills `out` on

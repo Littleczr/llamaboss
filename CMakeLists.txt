@@ -65,6 +65,7 @@ elseif(LLAMABOSS_PLATFORM STREQUAL "macos")
         src/platform/process_executor_posix.cpp
         src/platform/process_io_posix.cpp
         src/platform/platform_dirs_macos.cpp
+        src/platform/lb_process_posix.cpp
         src/platform/secrets_backend_macos.cpp
         src/platform/desktop_open_macos.cpp
         src/platform/module_path_macos.cpp
@@ -80,6 +81,7 @@ elseif(LLAMABOSS_PLATFORM STREQUAL "linux")
         src/platform/process_executor_posix.cpp
         src/platform/process_io_posix.cpp
         src/platform/platform_dirs_linux.cpp
+        src/platform/lb_process_posix.cpp
         src/platform/secrets_backend_linux.cpp
         src/platform/desktop_open_linux.cpp
         src/platform/module_path_linux.cpp

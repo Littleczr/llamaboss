@@ -642,7 +642,7 @@ EditResult EditFile(const std::string& argsBlob,
         return r;
     }
 
-    std::ifstream f(wPath, std::ios::binary | std::ios::ate);
+    std::ifstream f(std::filesystem::path(wPath), std::ios::binary | std::ios::ate);
     if (!f.is_open()) {
         r.chips.push_back("failed");
         r.errorBody = "Could not open file for reading: " + resolved;
@@ -780,6 +780,7 @@ EditResult EditFile(const std::string& argsBlob,
 
     // ── Write atomically ─────────────────────────────────────────
 
+#ifdef _WIN32
     tool_staged_write::StagedTempFile tmp =
         tool_staged_write::CreateStagedTempFile(resolved);
     if (tmp.handle == INVALID_HANDLE_VALUE) {
@@ -870,6 +871,61 @@ EditResult EditFile(const std::string& argsBlob,
         r.chips.push_back(ElapsedChip(t0));
         return r;
     }
+
+#else
+    tool_staged_write::StagedTempFile tmp =
+        tool_staged_write::CreateStagedTempFile(resolved);
+    if (tmp.fd < 0) {
+        r.chips.push_back("failed");
+        r.errorBody = "Could not create unique temp file near '" +
+                      resolved + "' for writing (" + std::strerror(tmp.error) + ").";
+        if (!tmp.path.empty()) {
+            r.errorBody += "\nLast attempted temp path: " + tmp.path;
+        }
+        r.chips.push_back(ElapsedChip(t0));
+        return r;
+    }
+    const std::string& tmpPath = tmp.path;
+
+    int err = 0;
+    if (!tool_staged_write::WriteAll(tmp.fd, outputBytes.data(), outputBytes.size(), err) ||
+        !tool_staged_write::FlushToDisk(tmp.fd, err)) {
+        tool_staged_write::DiscardStagedTempFile(tmp);
+        r.chips.push_back("failed");
+        r.errorBody = std::string("Writing the temp file failed (") + std::strerror(err) + ").";
+        attachAttemptedDiff();
+        r.chips.push_back(ElapsedChip(t0));
+        return r;
+    }
+    if (::close(tmp.fd) != 0) {
+        err = errno;
+        tmp.fd = -1;
+        r.chips.push_back("failed");
+        r.errorBody = std::string("Closing the temp file failed (") + std::strerror(err) +
+                      "); tmp file preserved at: " + tmpPath;
+        attachAttemptedDiff();
+        r.chips.push_back(ElapsedChip(t0));
+        return r;
+    }
+    tmp.fd = -1;
+
+    if (!mutation.VerifyUnchanged(&fileContent)) {
+        r.chips.push_back("conflict");
+        r.errorBody = mutation.Error() + "\nThe attempted edit is preserved at: " + tmpPath;
+        attachAttemptedDiff();
+        r.chips.push_back(ElapsedChip(t0));
+        return r;
+    }
+    mutation.ReleaseTargetForCommit();
+    if (!tool_staged_write::PromoteSiblingTempFile(tmpPath, resolved, /*replaceExisting=*/true, err)) {
+        r.chips.push_back("failed");
+        r.errorBody = std::string("Rename failed (") + std::strerror(err) +
+                      ").\nThe edited content is preserved at: " + tmpPath;
+        attachAttemptedDiff();
+        r.chips.push_back(ElapsedChip(t0));
+        return r;
+    }
+#endif
 
     // ── Success ──────────────────────────────────────────────────
     r.chips.push_back("edited");
