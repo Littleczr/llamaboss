@@ -28,7 +28,7 @@ inline std::wstring Utf8ToWide(const std::string& in)
         else if ((c & 0xE0) == 0xC0) { cp = c & 0x1F; len = 2; }
         else if ((c & 0xF0) == 0xE0) { cp = c & 0x0F; len = 3; }
         else if ((c & 0xF8) == 0xF0) { cp = c & 0x07; len = 4; }
-        else { out.push_back(L'�'); ++i; continue; }
+        else { out.push_back(L'\uFFFD'); ++i; continue; }
 
         bool ok = i + len <= n;
         for (std::size_t k = 1; ok && k < len; ++k) {
@@ -40,7 +40,7 @@ inline std::wstring Utf8ToWide(const std::string& in)
                    (len == 4 && cp < 0x10000) || cp > 0x10FFFF ||
                    (cp >= 0xD800 && cp <= 0xDFFF)))
             ok = false;
-        if (!ok) { out.push_back(L'�'); ++i; continue; }
+        if (!ok) { out.push_back(L'\uFFFD'); ++i; continue; }
         out.push_back(static_cast<wchar_t>(cp));
         i += len;
     }
