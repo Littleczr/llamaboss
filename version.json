@@ -1,0 +1,5 @@
+{
+  "version": "0.1.21",
+  "url": "https://pub-2d2e18de339c4fe3ab067f6afd1e7656.r2.dev/LlamaBoss_Beta_v0.1.21_Setup.exe",
+  "notes": "Adds ChatGPT account sign-in, add-by-ID provider/model setup, exportable usage metrics, and improved conversation history and navigation. Retains the existing llama.cpp b11146 CPU and CUDA 12.4 binaries."
+}

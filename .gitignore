@@ -79,7 +79,7 @@ Vars/
 *.log
 .llama_cpp_update_*/
 Tests/LlamaBossTests/BenchmarkResults*/
-PATCH_NOTES*
+PATCH_NOTES.txt
 README_DROP_IN.txt
-version.json
 Zip-LlamaBossSource.ps1
+desktop.ini
