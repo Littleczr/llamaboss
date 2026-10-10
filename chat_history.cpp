@@ -485,7 +485,8 @@ std::string SpoolElidedToolResult(const std::string& content,
     char name[48];
     std::snprintf(name, sizeof(name), "elided_%016llx.txt",
                   static_cast<unsigned long long>(Fnv1a64(content)));
-    const std::string relPath = std::string(varstore::kVarsLaneName) + "\\" + name;
+    const std::string relPath = std::string(varstore::kVarsLaneName) +
+                                std::string(1, wxFILE_SEP_PATH) + name;
 
     try {
         const std::filesystem::path abs =

@@ -686,7 +686,7 @@ void InlineSmallPdfExtractedMarkdown(ToolInvocationResult& r)
 std::string AgentJoinPath(const std::string& a, const std::string& b)
 {
     if (a.empty()) return b;
-    const char sep = '\\';
+    const char sep = static_cast<char>(wxFILE_SEP_PATH);
     if (a.back() == '/' || a.back() == '\\') return a + b;
     return a + std::string(1, sep) + b;
 }

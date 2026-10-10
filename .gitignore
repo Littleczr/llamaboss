@@ -88,3 +88,6 @@ desktop.ini
 build_macos/
 *.o
 *.o.tmp
+
+# Downloaded llama.cpp release (bundled into the app by CMake)
+third_party/

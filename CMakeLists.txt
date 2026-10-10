@@ -123,4 +123,32 @@ if(APPLE)
     )
 endif()
 
+# ── Bundle llama-server (macOS) ──
+# Point LLAMABOSS_LLAMA_DIR at an unpacked llama.cpp macOS release
+# (https://github.com/ggml-org/llama.cpp/releases, llama-bNNNN-bin-macos-arm64).
+# llama-server and its dylibs are copied to Contents/Resources/llama.cpp,
+# where ServerManager::FindServerBinary looks first.
+if(APPLE)
+    file(GLOB _llama_default_dirs "${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp/llama-b*")
+    list(SORT _llama_default_dirs)
+    list(REVERSE _llama_default_dirs)
+    list(GET _llama_default_dirs 0 _llama_default)
+    set(LLAMABOSS_LLAMA_DIR "${_llama_default}" CACHE PATH "Unpacked llama.cpp macOS release")
+    if(LLAMABOSS_LLAMA_DIR AND EXISTS "${LLAMABOSS_LLAMA_DIR}/llama-server")
+        message(STATUS "Bundling llama-server from ${LLAMABOSS_LLAMA_DIR}")
+        file(GLOB _llama_dylibs "${LLAMABOSS_LLAMA_DIR}/*.dylib")
+        set(_llama_dest "$<TARGET_BUNDLE_CONTENT_DIR:LlamaBoss>/Resources/llama.cpp")
+        add_custom_command(TARGET LlamaBoss POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E make_directory "${_llama_dest}"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${LLAMABOSS_LLAMA_DIR}/llama-server" ${_llama_dylibs} "${_llama_dest}"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${LLAMABOSS_LLAMA_DIR}/LICENSE" "${_llama_dest}/LICENSE-llama.cpp"
+            COMMENT "Bundling llama-server")
+    else()
+        message(WARNING "llama-server not bundled: set LLAMABOSS_LLAMA_DIR to an unpacked "
+                        "llama.cpp macOS release (or install it with Homebrew for dev runs).")
+    endif()
+endif()
+
 install(TARGETS LlamaBoss RUNTIME DESTINATION bin BUNDLE DESTINATION .)

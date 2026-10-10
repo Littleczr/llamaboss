@@ -248,7 +248,11 @@ inline std::string JoinPathForApproval(const std::string& a, const std::string& 
 {
     if (a.empty()) return b;
     if (a.back() == '/' || a.back() == '\\') return a + b;
+#ifdef _WIN32
     return a + "\\" + b;
+#else
+    return a + "/" + b;
+#endif
 }
 
 // The Scripts lane python_create_script will actually write to: this
