@@ -5,12 +5,36 @@ Living checkpoint for the LlamaBoss macOS port. Update it at every milestone.
 ## Baseline
 
 - Branch: `macos/port-v0.1.21`
-- Based on GitHub `main` (v0.1.20, `9c73316`) plus the Windows source export
-  `LlamaBoss_Source_h_cpp_20261009_174144.zip` (v0.1.21), committed unchanged as `c9a0021`.
-  Every Mac change is a later commit, so `git diff c9a0021` shows the whole port.
+- **Base: release tag `v0.1.21` = `d914c1c` on `origin/main`** (rebased 2026-10-09).
+  `git diff v0.1.21` shows the whole port. Backup of the pre-rebase branch:
+  `macos/port-v0.1.21-backup` (based on the zip snapshot commit `c9a0021`).
+- The rebase dropped `c9a0021`. The only conflict was `.gitignore`: the release block was
+  kept verbatim and the Mac entries appended. Every other release file matches `v0.1.21`
+  exactly, and the Mac patch is byte-identical to the pre-rebase one.
 - The Windows build still uses `LlamaBoss.vcxproj`; nothing Mac-specific is in it.
   **Mac commits have not been compiled on Windows yet.** Build this branch in Visual
   Studio before merging.
+
+### Files added by the Mac commits
+
+| File(s) | Windows needs it? |
+| --- | --- |
+| `lb_utf.h` | **Yes, as an include**: `path_safety.cpp`, `cmd_executor.cpp`, `python_session.cpp`, `tool_ls.cpp`, `tool_grep.cpp`, `tool_web_fetch.cpp`, `tool_open.cpp` and `workspace_delta.h` include it unconditionally (it sits in the repo root, so it resolves without project changes). Only its functions are unused on Windows. Should be listed as a `ClInclude` in `LlamaBoss.vcxproj`/`.filters` for the IDE; not yet done. |
+| `src/platform/lb_process.h`, `lb_process_posix.cpp`, `secrets_backend.h`, `secrets_backend_macos.cpp` | Mac-only; included only under `#ifndef _WIN32` / `#ifndef __WXMSW__` |
+| Other `src/platform/*` (June Phase 0 layer, incl. `*_win.cpp`) | Not used by any app code on either platform; not in the vcxproj |
+| `CMakeLists.txt`, `macos/Info.plist`, `MAC_PORT_STATUS.md` | Mac build/docs only |
+
+### Windows-compiled lines the Mac commits changed (outside new `#ifdef` branches)
+
+All are intended to be behavior-identical on Windows, but none has been compiled with MSVC:
+- 30 `std::ifstream/ofstream(Utf8ToWide(p))` → `std::ifstream/ofstream(std::filesystem::path(Utf8ToWide(p)))`
+  (on MSVC both open through the wide path).
+- `secrets_store.cpp` (2): `SecureZeroMemory` → `wxSecureZeroMemory` (wx calls `SecureZeroMemory` on MSW).
+- `agent_controller.cpp` `AgentJoinPath`, `chat_history.cpp` elided relPath: `'\\'` → `wxFILE_SEP_PATH` (`'\\'` on MSW).
+- `tool_grep.cpp`: `"\\"` → `kPathSep` (`"\\"` on Windows).
+- `tool_mkdir.cpp`, `tool_delete.cpp`: the error check moved into a `const bool` set in each platform branch.
+- `server_manager.cpp` `StartServer`: the whole-function `#ifdef __WXMSW__` was narrowed to the spawn section;
+  the Windows statement sequence is unchanged.
 
 ## Toolchain (verified 2026-10-09)
 
@@ -108,6 +132,27 @@ CMake copies `llama-server` and its dylibs into
 ## Small follow-ups found while testing
 
 - "Could not load application icon": the app ships `app_icon.ico`; macOS needs an `.icns` (Phase 4).
+
+## Re-verification after rebase onto v0.1.21 (2026-10-09)
+
+- Clean CMake build (`rm -rf build_macos`): 0 errors, 2 warnings
+  (`posix_spawn_file_actions_addchdir_np` deprecated in macOS 26; still works).
+- Launched with `open`: auto-loaded Gemma 3 1B, server ready in 0.84 s, single slot verified.
+  A chat request to the app's server (port 8384) answered at about 91 tok/s. The in-app chat box was not
+  driven (no one was at the Mac); it was verified before the rebase with identical source.
+- Quit: a normal Apple Event quit of the pre-rebase instance stopped llama-server cleanly.
+  The fresh instance **could not be quit normally**, because a modal "LlamaBoss Error" popup was open
+  (see the bug below). It was stopped with SIGTERM, which left llama-server orphaned as
+  expected (the crash-cleanup gap). It was stopped by hand; nothing is left running and port 8384 is free.
+
+### Bug found: error popup on every Finder/`open` launch
+
+`AppState` loads the window icon with the relative path `"app_icon.ico"`. A Finder or
+`open` launch has working directory `/`, so the load fails and wxWidgets shows a modal
+"LlamaBoss Error" popup (its text goes to the popup, not the app log). It only
+went unnoticed earlier because a terminal launch from the repo folder found the file. Fix: on Mac, use
+the bundle icon (`.icns` in `Contents/Resources`) and do not try the `.ico`, or silence
+wx logging around the attempt.
 
 ## Next task
 
