@@ -145,7 +145,7 @@ CMake copies `llama-server` and its dylibs into
   (see the bug below). It was stopped with SIGTERM, which left llama-server orphaned as
   expected (the crash-cleanup gap). It was stopped by hand; nothing is left running and port 8384 is free.
 
-### Bug found: error popup on every Finder/`open` launch
+### Bug found: error popup on every Finder/`open` launch — **fixed**
 
 `AppState` loads the window icon with the relative path `"app_icon.ico"`. A Finder or
 `open` launch has working directory `/`, so the load fails and wxWidgets shows a modal
@@ -153,6 +153,12 @@ CMake copies `llama-server` and its dylibs into
 went unnoticed earlier because a terminal launch from the repo folder found the file. Fix: on Mac, use
 the bundle icon (`.icns` in `Contents/Resources`) and do not try the `.ico`, or silence
 wx logging around the attempt.
+
+Fixed: macOS skips the `.ico` load (the Dock icon comes from `app_icon.icns` in the bundle once
+added), and the Windows file fallback runs under `wxLogNull`. Re-verified with `open`: no popup,
+normal quit, llama-server stopped, port 8384 free. Commit authors were rewritten to the
+GitHub noreply identity before the first push; `macos/port-v0.1.21-backup` keeps the
+old author email and must stay local.
 
 ## Next task
 
