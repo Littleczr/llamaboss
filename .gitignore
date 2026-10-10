@@ -83,3 +83,8 @@ PATCH_NOTES.txt
 README_DROP_IN.txt
 Zip-LlamaBossSource.ps1
 desktop.ini
+
+# macOS build output
+build_macos/
+*.o
+*.o.tmp
