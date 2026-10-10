@@ -7,18 +7,31 @@
 #include "update_checker.h"
 
 #include "lb_windows.h"
+#ifdef _WIN32
 #include <winhttp.h>
 
 #pragma comment(lib, "winhttp.lib")
+#else
+#include "lb_ssl.h"
+#include <Poco/Net/HTTPSClientSession.h>
+#include <Poco/Net/HTTPRequest.h>
+#include <Poco/Net/HTTPResponse.h>
+#endif
 
 namespace {
 
 // ── Update manifest location ─────────────────────────────────────────
 // Astro serves files in /public at the site root, so dropping
 // version.json into the site's public/ folder publishes it here.
+#ifdef _WIN32
 const wchar_t* kHost = L"llamaboss.com";
 const wchar_t* kPath = L"/version.json";
 const wchar_t* kUserAgent = L"LlamaBoss-UpdateCheck";
+#else
+const char* kHost = "llamaboss.com";
+const char* kPath = "/version.json";
+const char* kUserAgent = "LlamaBoss-UpdateCheck";
+#endif
 
 // Network timeouts (ms): resolve / connect / send / receive.
 const int kTimeoutMs = 8000;
@@ -51,6 +64,7 @@ std::vector<int> CoreParts(std::string v)
     return parts;
 }
 
+#ifdef _WIN32
 // Blocking HTTPS GET via WinHTTP. Returns true on HTTP 200, filling 'body'.
 // On failure returns false and fills 'error'.
 bool HttpsGet(const wchar_t* host, const wchar_t* path,
@@ -147,6 +161,48 @@ bool HttpsGet(const wchar_t* host, const wchar_t* path,
     return ok;
 }
 
+#else
+// Blocking HTTPS GET via Poco (shared TLS setup in lb_ssl). Returns true on
+// HTTP 200, filling 'body'. On failure returns false and fills 'error'.
+bool HttpsGet(const char* host, const char* path,
+              std::string& body, std::string& error)
+{
+    body.clear();
+    error.clear();
+    try {
+        lb::EnsureSSLInitialized();
+        Poco::Net::HTTPSClientSession session(host, 443);
+        session.setTimeout(Poco::Timespan(0, kTimeoutMs * 1000));
+        Poco::Net::HTTPRequest req(Poco::Net::HTTPRequest::HTTP_GET, path,
+                                   Poco::Net::HTTPMessage::HTTP_1_1);
+        req.set("User-Agent", kUserAgent);
+        session.sendRequest(req);
+        Poco::Net::HTTPResponse resp;
+        std::istream& in = session.receiveResponse(resp);
+        if (resp.getStatus() != Poco::Net::HTTPResponse::HTTP_OK) {
+            error = "Update server returned HTTP " +
+                    std::to_string(static_cast<int>(resp.getStatus())) + ".";
+            return false;
+        }
+        char buf[8192];
+        while (in.read(buf, sizeof(buf)) || in.gcount() > 0) {
+            body.append(buf, static_cast<size_t>(in.gcount()));
+            // Cap the manifest size defensively (~256 KB).
+            if (body.size() > 256u * 1024u) {
+                error = "Update manifest is unexpectedly large.";
+                return false;
+            }
+        }
+        return true;
+    } catch (const Poco::Exception& e) {
+        error = "Could not reach the update server (" + e.displayText() + ").";
+    } catch (const std::exception& e) {
+        error = std::string("Could not reach the update server (") + e.what() + ").";
+    }
+    return false;
+}
+#endif
+
 std::string JsonStringOrEmpty(const Poco::JSON::Object::Ptr& obj,
                               const std::string& key)
 {
@@ -223,8 +279,13 @@ UpdateInfo CheckBlocking(const std::string& currentVersion)
         info.latest = JsonStringOrEmpty(obj, "version");
         info.url    = JsonStringOrEmpty(obj, "url");
         info.notes  = JsonStringOrEmpty(obj, "notes");
+#ifdef _WIN32
         info.installerUrl = JsonStringOrEmpty(obj, "installer_url");
         info.sha256       = JsonStringOrEmpty(obj, "sha256");
+#else
+        // The manifest's installer is a Windows .exe; Mac builds fall back
+        // to opening the download page until a Mac package is published.
+#endif
         for (char& c : info.sha256)
             if (c >= 'A' && c <= 'F') c = static_cast<char>(c - 'A' + 'a');
 

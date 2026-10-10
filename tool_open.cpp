@@ -11,7 +11,13 @@
 
 #include "lb_windows.h"
 #include "lb_utf.h"
+#ifdef _WIN32
 #include <shellapi.h>
+#else
+#include <dirent.h>
+#include <fnmatch.h>
+#include "lb_process.h"
+#endif
 
 namespace {
 
@@ -448,6 +454,7 @@ std::string LangForExtImpl(const std::string& ext)
 // Returns a human-readable error string on failure, empty on success.
 // Uses the W variant with explicit UTF-8 conversion; same rationale
 // as the server_manager fix from earlier work.
+#ifdef _WIN32
 std::string ShellOpenFile(const std::string& absPath)
 {
     std::wstring wPath = Utf8ToWide(absPath);
@@ -486,6 +493,28 @@ std::string ShellOpenFile(const std::string& absPath)
                                               std::to_string((int)code) + ").";
     }
 }
+#else
+std::string ShellOpenFile(const std::string& absPath)
+{
+    // /usr/bin/open hands the file to Launch Services (the default app for
+    // its type) and returns as soon as the request is accepted.
+    lb_process::Options opt;
+    opt.argv = {"/usr/bin/open", absPath};
+    opt.mergeStderr = true;
+    opt.timeoutMs = 15000;
+    opt.maxCaptureBytes = 4096;
+    const lb_process::Result run = lb_process::Run(opt);
+    if (!run.started) return std::string("Could not launch 'open' (") + std::strerror(run.spawnError) + ").";
+    if (run.timedOut) return "Opening the file timed out.";
+    if (run.exitCode == 0) return "";
+    std::string msg = run.out;
+    while (!msg.empty() && (msg.back() == '\n' || msg.back() == '\r')) msg.pop_back();
+    if (msg.find("No application knows how to open") != std::string::npos)
+        return "No application is associated with this file type. "
+               "Open it manually from Finder or set a default app.";
+    return msg.empty() ? "Launch failed (exit " + std::to_string(run.exitCode) + ")." : msg;
+}
+#endif
 
 // ─── Listing-from-history parser ─────────────────────────────────
 // FormatToolBlockAsUserMessage produces:
@@ -662,6 +691,7 @@ bool ExtractPowerShellGetChildItemSpec(const std::string& content,
     return ExtractGetChildItemSpec(command, outSpec);
 }
 
+#ifdef _WIN32
 bool EnumerateDirectoryEntryNames(const std::string& directory,
                                   std::vector<std::string>& outEntries)
 {
@@ -781,6 +811,71 @@ bool EnumerateDirectoryEntryNamesRecursiveFiltered(
     walk(rootW, "", 0);
     return true;
 }
+#else
+bool EnumerateDirectoryEntryNames(const std::string& directory,
+                                  std::vector<std::string>& outEntries)
+{
+    if (directory.empty() || !IsDirectory(directory)) return false;
+    DIR* d = ::opendir(directory.c_str());
+    if (!d) return false;
+    while (struct dirent* e = ::readdir(d)) {
+        const std::string name = e->d_name;
+        if (name == "." || name == "..") continue;
+        outEntries.push_back(name);
+    }
+    ::closedir(d);
+    return true;
+}
+
+bool EnumerateDirectoryEntryNamesRecursiveFiltered(
+    const std::string&        rootDirectory,
+    const std::string&        filterRaw,
+    std::vector<std::string>& outEntries)
+{
+    outEntries.clear();
+    if (rootDirectory.empty() || !IsDirectory(rootDirectory)) return false;
+
+    std::string filter = TrimAscii(StripMatchingQuotes(filterRaw));
+    if (filter.empty()) return false;
+    if (filter.find('/') != std::string::npos || filter.find('\\') != std::string::npos)
+        return false;
+
+    constexpr size_t kMaxDirs    = 20000;
+    constexpr size_t kMaxMatches = 500;
+    constexpr size_t kMaxDepth   = 64;
+    size_t dirsVisited = 0;
+
+    std::function<void(const std::string&, const std::string&, size_t)> walk;
+    walk = [&](const std::string& dir, const std::string& relPrefix, size_t depth) {
+        if (dirsVisited++ >= kMaxDirs || outEntries.size() >= kMaxMatches || depth > kMaxDepth)
+            return;
+        DIR* d = ::opendir(dir.c_str());
+        if (!d) return;
+        std::vector<std::string> subdirs;
+        while (struct dirent* e = ::readdir(d)) {
+            const std::string name = e->d_name;
+            if (name == "." || name == "..") continue;
+            // Case-insensitive, like PowerShell -Filter / FindFirstFile.
+            if (outEntries.size() < kMaxMatches &&
+                ::fnmatch(filter.c_str(), name.c_str(), FNM_CASEFOLD) == 0)
+                outEntries.push_back(relPrefix + name);
+            // Recurse into real directories only; symlinks are skipped so
+            // they cannot create cycles or wander outside the tree.
+            struct stat st {};
+            if (::lstat((dir + "/" + name).c_str(), &st) == 0 && S_ISDIR(st.st_mode))
+                subdirs.push_back(name);
+        }
+        ::closedir(d);
+        for (const auto& name : subdirs) {
+            if (dirsVisited >= kMaxDirs || outEntries.size() >= kMaxMatches) break;
+            walk(dir + "/" + name, relPrefix + name + "/", depth + 1);
+        }
+    };
+
+    walk(rootDirectory, "", 0);
+    return true;
+}
+#endif
 
 std::vector<std::string> RecursiveFiltersForPowerShellFilter(const std::string& filterRaw)
 {

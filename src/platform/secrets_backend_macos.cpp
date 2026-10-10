@@ -36,7 +36,9 @@ bool Set(std::string_view key, std::string_view value) {
 
     CFStringRef service = ToCFString(kServiceName);
     CFStringRef account = ToCFString(std::string(key));
-    CFStringRef data = ToCFString(std::string(value));
+    // Keychain item data is raw bytes (CFData), so binary values survive.
+    CFDataRef data = CFDataCreate(kCFAllocatorDefault,
+        reinterpret_cast<const UInt8*>(value.data()), static_cast<CFIndex>(value.size()));
 
     // Delete existing item first
     CFMutableDictionaryRef deleteQuery = CFDictionaryCreateMutable(kCFAllocatorDefault, 0,

@@ -4,7 +4,13 @@
 #include "chatgpt_auth_core.h"   // lb_chatgpt::Base64UrlEncode / Base64UrlDecode
 
 #include "lb_windows.h"
+#ifdef _WIN32
 #include <wincrypt.h>
+#else
+#include "secrets_backend.h"
+#include <openssl/evp.h>
+#include <openssl/rand.h>
+#endif
 #pragma comment(lib, "crypt32.lib")
 
 #include <wx/datetime.h>
@@ -227,6 +233,7 @@ std::string NormalizeDirectSecretValue(std::string value)
 const char kSecretsEntropy[] = "LlamaBoss.Secrets.v2";
 constexpr int kEncryptedFileVersion = 2;
 
+#ifdef _WIN32
 bool ProtectSecretsBody(const std::string& plain, std::string& encOut)
 {
     encOut.clear();
@@ -263,6 +270,94 @@ bool UnprotectSecretsBody(const std::string& enc, std::string& plainOut)
     LocalFree(out.pbData);
     return true;
 }
+
+#else
+// macOS: AES-256-GCM with a random per-user key held in the login
+// Keychain (readable only by this app's signature without a prompt).
+// Blob layout: 12-byte nonce | ciphertext | 16-byte tag, base64url'd.
+const char kSecretsKeyAccount[] = "secrets-file-key";
+constexpr const char* kProtectionLabel = "keychain-aes256gcm";
+
+bool SecretsKey(std::string& key, bool create)
+{
+    if (auto existing = secrets_backend::Get(kSecretsKeyAccount)) {
+        if (existing->size() == 32) { key = *existing; return true; }
+    }
+    if (!create) return false;
+    key.assign(32, '\0');
+    if (RAND_bytes(reinterpret_cast<unsigned char*>(&key[0]), 32) != 1) return false;
+    return secrets_backend::Set(kSecretsKeyAccount, key);
+}
+
+bool ProtectSecretsBody(const std::string& plain, std::string& encOut)
+{
+    encOut.clear();
+    std::string key;
+    if (!SecretsKey(key, /*create=*/true)) return false;
+
+    std::string blob(12 + plain.size() + 16, '\0');
+    auto* nonce = reinterpret_cast<unsigned char*>(&blob[0]);
+    auto* cipher = nonce + 12;
+    if (RAND_bytes(nonce, 12) != 1) return false;
+
+    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+    int len = 0, total = 0;
+    bool ok = ctx &&
+        EVP_EncryptInit_ex(ctx, EVP_aes_256_gcm(), nullptr,
+                           reinterpret_cast<const unsigned char*>(key.data()), nonce) == 1 &&
+        EVP_EncryptUpdate(ctx, nullptr, &len,
+                          reinterpret_cast<const unsigned char*>(kSecretsEntropy),
+                          static_cast<int>(sizeof(kSecretsEntropy) - 1)) == 1 &&
+        EVP_EncryptUpdate(ctx, cipher, &len,
+                          reinterpret_cast<const unsigned char*>(plain.data()),
+                          static_cast<int>(plain.size())) == 1;
+    total = len;
+    ok = ok && EVP_EncryptFinal_ex(ctx, cipher + total, &len) == 1;
+    total += len;
+    ok = ok && EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, 16, cipher + total) == 1;
+    EVP_CIPHER_CTX_free(ctx);
+    std::fill(key.begin(), key.end(), '\0');
+    if (!ok) return false;
+
+    encOut = lb_chatgpt::Base64UrlEncode(
+        reinterpret_cast<const std::uint8_t*>(blob.data()), blob.size());
+    return !encOut.empty();
+}
+
+bool UnprotectSecretsBody(const std::string& enc, std::string& plainOut)
+{
+    plainOut.clear();
+    std::string blob;
+    if (!lb_chatgpt::Base64UrlDecode(enc, blob) || blob.size() < 12 + 16) return false;
+    std::string key;
+    if (!SecretsKey(key, /*create=*/false)) return false;
+
+    const auto* nonce = reinterpret_cast<const unsigned char*>(blob.data());
+    const auto* cipher = nonce + 12;
+    const int cipherLen = static_cast<int>(blob.size() - 12 - 16);
+    std::string tag = blob.substr(blob.size() - 16);
+    std::string plain(static_cast<size_t>(cipherLen), '\0');
+
+    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+    int len = 0, total = 0;
+    bool ok = ctx &&
+        EVP_DecryptInit_ex(ctx, EVP_aes_256_gcm(), nullptr,
+                           reinterpret_cast<const unsigned char*>(key.data()), nonce) == 1 &&
+        EVP_DecryptUpdate(ctx, nullptr, &len,
+                          reinterpret_cast<const unsigned char*>(kSecretsEntropy),
+                          static_cast<int>(sizeof(kSecretsEntropy) - 1)) == 1 &&
+        EVP_DecryptUpdate(ctx, reinterpret_cast<unsigned char*>(&plain[0]), &len,
+                          cipher, cipherLen) == 1;
+    total = len;
+    ok = ok && EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, 16, &tag[0]) == 1 &&
+         EVP_DecryptFinal_ex(ctx, reinterpret_cast<unsigned char*>(&plain[0]) + total, &len) == 1;
+    EVP_CIPHER_CTX_free(ctx);
+    std::fill(key.begin(), key.end(), '\0');
+    if (!ok) return false;
+    plainOut = std::move(plain);
+    return true;
+}
+#endif
 
 }  // namespace
 
@@ -333,7 +428,7 @@ bool SecretsStore::Load()
                             "created by another Windows user or on another PC?)");
             Poco::JSON::Parser inner;
             auto innerVal = inner.parse(plain);
-            SecureZeroMemory(&plain[0], plain.size());
+            wxSecureZeroMemory(&plain[0], plain.size());
             root = innerVal.extract<Poco::JSON::Object::Ptr>();
             if (!root) return fail("secrets.json decrypted to a non-object");
         } else {
@@ -437,7 +532,7 @@ bool SecretsStore::Save()
     std::string plain = body.str();
     std::string enc;
     const bool protectedOk = ProtectSecretsBody(plain, enc);
-    if (!plain.empty()) SecureZeroMemory(&plain[0], plain.size());
+    if (!plain.empty()) wxSecureZeroMemory(&plain[0], plain.size());
     if (!protectedOk) {
         wxLogWarning("SecretsStore: DPAPI encryption failed; secrets.json was not written.");
         return false;
@@ -445,7 +540,11 @@ bool SecretsStore::Save()
 
     Poco::JSON::Object::Ptr outer = new Poco::JSON::Object(true);
     outer->set("version", kEncryptedFileVersion);
+#ifdef _WIN32
     outer->set("protection", "dpapi-current-user");
+#else
+    outer->set("protection", kProtectionLabel);
+#endif
     outer->set("note", "LlamaBoss Connection keys, encrypted for this Windows "
                        "user (DPAPI). Edit them in LlamaBoss > Connections; "
                        "this file is useless on another account or PC.");

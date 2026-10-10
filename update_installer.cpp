@@ -6,6 +6,8 @@
 //
 #include "update_installer.h"
 
+#ifdef _WIN32
+
 #include "lb_windows.h"
 #include <winhttp.h>
 #include <bcrypt.h>
@@ -400,3 +402,38 @@ void CleanupStaleDownloads()
 }
 
 } // namespace UpdateInstaller
+
+#else  // ── macOS: in-app install not available yet ────────────────────
+
+namespace UpdateInstaller {
+
+bool IsValidSha256Hex(const std::string& s)
+{
+    if (s.size() != 64) return false;
+    for (char c : s)
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')))
+            return false;
+    return true;
+}
+
+DownloadResult DownloadAndVerify(const std::string&, const std::string&,
+                                 const std::string&, const ProgressFn&,
+                                 const std::atomic<bool>&)
+{
+    DownloadResult r;
+    r.error = "In-app install is not available on macOS yet. "
+              "Download the new version from llamaboss.com.";
+    return r;
+}
+
+bool LaunchInstaller(const std::wstring&, std::string& error)
+{
+    error = "In-app install is not available on macOS yet.";
+    return false;
+}
+
+void CleanupStaleDownloads() {}
+
+} // namespace UpdateInstaller
+
+#endif
