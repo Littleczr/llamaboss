@@ -113,8 +113,13 @@ void SignalPrimaryInstanceToOpenWindow()
 #endif
     wxMessageBox(
         "LlamaBoss is already running, but it did not respond to the "
-        "new-window request.\n\nUse Ctrl+Shift+N in the existing window "
-        "to open another one.",
+        "new-window request.\n\nUse "
+#ifdef __WXMAC__
+        "Cmd+Shift+N"
+#else
+        "Ctrl+Shift+N"
+#endif
+        " in the existing window to open another one.",
         "LlamaBoss", wxOK | wxICON_INFORMATION);
 }
 

@@ -264,6 +264,8 @@ ServerHealthThread::ServerHealthThread(wxEvtHandler* handler,
                                        std::weak_ptr<std::atomic<bool>> aliveToken,
 #ifdef __WXMSW__
                                        HANDLE processHandle,
+#else
+                                       std::shared_ptr<lb_process::Child> child,
 #endif
                                        const std::string& logPath,
                                        ServerLaunchGeneration generation,
@@ -276,6 +278,8 @@ ServerHealthThread::ServerHealthThread(wxEvtHandler* handler,
     , m_aliveToken(aliveToken)
 #ifdef __WXMSW__
     , m_processHandle(INVALID_HANDLE_VALUE)
+#else
+    , m_child(std::move(child))
 #endif
     , m_logPath(logPath)
     , m_generation(generation)
@@ -392,6 +396,23 @@ wxThread::ExitCode ServerHealthThread::Entry()
             ev->SetString(wxString::FromUTF8(msg));
             SafePost(ev);
             CloseProcessHandle();
+            return (ExitCode)0;
+        }
+#else
+        int exitCode = 0;
+        if (m_child && m_child->Exited(&exitCode)) {
+            std::string msg = "llama-server exited (code "
+                              + std::to_string(exitCode)
+                              + ") before becoming ready.";
+            std::string tail = ReadLogTail(m_logPath);
+            const std::string hint = server_log_hints::Explain(tail);
+            if (!hint.empty()) msg += "\n\n" + hint;
+            if (!tail.empty()) msg += "\n\nLast log output:\n" + tail;
+
+            auto* ev = new wxCommandEvent(wxEVT_SERVER_ERROR);
+            SetServerEventGeneration(*ev, m_generation);
+            ev->SetString(wxString::FromUTF8(msg));
+            SafePost(ev);
             return (ExitCode)0;
         }
 #endif
@@ -1467,6 +1488,30 @@ Backend ServerManager::DetectBackend()
 
 std::string ServerManager::FindServerBinary(Backend backend)
 {
+#ifdef __APPLE__
+    // One macOS build covers Apple Silicon (Metal is compiled in), so the
+    // backend argument does not pick a folder here.
+    (void)backend;
+    wxFileName exeFn(wxStandardPaths::Get().GetExecutablePath());
+    // 1. Bundled: LlamaBoss.app/Contents/Resources/llama.cpp/llama-server
+    {
+        wxFileName bundled = wxFileName::DirName(exeFn.GetPath());
+        bundled.RemoveLastDir();                       // Contents/MacOS -> Contents
+        bundled.AppendDir("Resources");
+        bundled.AppendDir("llama.cpp");
+        bundled.SetFullName("llama-server");
+        if (wxFileExists(bundled.GetFullPath())) return bundled.GetFullPath().ToUTF8().data();
+    }
+    // 2. Developer layout: bin/llama-server next to (or above) the app.
+    wxFileName walkDir = wxFileName::DirName(exeFn.GetPath());
+    for (int level = 0; level < 5; ++level) {
+        const wxString p = walkDir.GetPath() + "/bin/llama-server";
+        if (wxFileExists(p)) return p.ToUTF8().data();
+        walkDir.RemoveLastDir();
+    }
+    // 3. Installed on PATH / Homebrew (brew install llama.cpp).
+    return lb_process::FindExecutable("llama-server");
+#else
     wxString exePath = wxStandardPaths::Get().GetExecutablePath();
     wxFileName exeFn(exePath);
     wxString exeDir = exeFn.GetPath();
@@ -1501,6 +1546,7 @@ std::string ServerManager::FindServerBinary(Backend backend)
     }
 
     return ""; // Not found
+#endif
 }
 
 // ── Data directories ─────────────────────────────────────────────
@@ -2257,7 +2303,6 @@ bool ServerManager::IsPortAnswering(int port) const
 
 bool ServerManager::StartServer(const std::string& ggufPath, const ServerConfig& config)
 {
-#ifdef __WXMSW__
     // Force-off flags may survive only while retrying the exact same
     // (model, config).  Any user-driven change is a fresh launch and
     // restores the normal "try MTP and --jinja first" behavior.
@@ -2344,12 +2389,22 @@ bool ServerManager::StartServer(const std::string& ggufPath, const ServerConfig&
 
         auto* ev = new wxCommandEvent(wxEVT_SERVER_ERROR);
         SetServerEventGeneration(*ev, launchGeneration);
+#ifdef __WXMSW__
         ev->SetString("llama-server.exe not found.\n\n"
                       "Download llama.cpp release binaries from:\n"
                       "https://github.com/ggml-org/llama.cpp/releases\n\n"
                       "Place them in a 'bin\\cpu\\' or 'bin\\cuda12\\' folder "
                       "next to LlamaBoss.exe.\n\n"
                       "Models go in:\n" + GetModelsDir());
+#else
+        ev->SetString("llama-server not found.\n\n"
+                      "It is normally bundled inside LlamaBoss.app "
+                      "(Contents/Resources/llama.cpp). For a development build, "
+                      "install it with 'brew install llama.cpp' or place the "
+                      "macOS release from https://github.com/ggml-org/llama.cpp/releases "
+                      "in a 'bin' folder next to the app.\n\n"
+                      "Models go in:\n" + GetModelsDir());
+#endif
         LbQueueEventIfAlive(m_eventHandler, m_aliveToken, ev);
         return false;
     }
@@ -2368,7 +2423,11 @@ bool ServerManager::StartServer(const std::string& ggufPath, const ServerConfig&
 
     if (m_logger) {
         m_logger->information("Starting llama-server: backend=" +
+#ifdef __APPLE__
+            std::string("Metal") +
+#else
             std::string(backend == Backend::CUDA12 ? "CUDA12" : "CPU") +
+#endif
             " model=" + ggufPath +
             " port=" + std::to_string(config.port) +
             " generation=" + std::to_string(launchGeneration) +
@@ -2579,6 +2638,7 @@ bool ServerManager::StartServer(const std::string& ggufPath, const ServerConfig&
     EnsureDataDirs();
     std::string logPath = GetLogsDir() + std::string(1, wxFILE_SEP_PATH) + "server.log";
 
+#ifdef __WXMSW__
     // ── UTF-8 → UTF-16 conversion ────────────────────────────────
     // Every path and command-line string we built above came out of
     // wxString::ToUTF8(), so the bytes are UTF-8.  The ANSI Win32
@@ -2746,6 +2806,61 @@ bool ServerManager::StartServer(const std::string& ggufPath, const ServerConfig&
     m_threadHandle        = pi.hThread;
     m_jobHandle           = jobHandle;
     m_processId           = pi.dwProcessId;
+#else
+    // POSIX: the command line above quotes paths with '"'; split it back
+    // into argv (no shell is involved).  A '"' inside a path cannot be
+    // represented, so refuse it explicitly instead of mis-splitting.
+    std::vector<std::string> argv;
+    bool badQuote = false;
+    {
+        std::string cur;
+        bool inQuotes = false, have = false;
+        for (char c : cmdLine) {
+            if (c == '"') { inQuotes = !inQuotes; have = true; continue; }
+            if (c == ' ' && !inQuotes) {
+                if (have) argv.push_back(cur);
+                cur.clear(); have = false;
+                continue;
+            }
+            cur += c; have = true;
+        }
+        if (have) argv.push_back(cur);
+        badQuote = inQuotes;
+    }
+    for (const std::string* p : std::initializer_list<const std::string*>{ &serverBin, &ggufPath, &launchMmproj })
+        if (p->find('"') != std::string::npos) badQuote = true;
+    if (badQuote || argv.empty()) {
+        auto* ev = new wxCommandEvent(wxEVT_SERVER_ERROR);
+        SetServerEventGeneration(*ev, launchGeneration);
+        ev->SetString("Cannot start llama-server: a model or program path contains "
+                      "a double-quote character. Rename the file and try again.");
+        LbQueueEventIfAlive(m_eventHandler, m_aliveToken, ev);
+        return false;
+    }
+
+    lb_process::SpawnOptions spawn;
+    spawn.argv = std::move(argv);
+    spawn.cwd = wxFileName(serverBin).GetPath().ToUTF8().data();
+    spawn.logPath = logPath;
+    const std::string healthLogPath = logPath;
+    int spawnErr = 0;
+    std::shared_ptr<lb_process::Child> child = lb_process::Spawn(spawn, spawnErr);
+    if (!child) {
+        if (m_logger)
+            m_logger->error("posix_spawn failed for llama-server: " +
+                            std::string(std::strerror(spawnErr)));
+        auto* ev = new wxCommandEvent(wxEVT_SERVER_ERROR);
+        SetServerEventGeneration(*ev, launchGeneration);
+        ev->SetString("Failed to start llama-server (" +
+                      std::string(std::strerror(spawnErr)) + ")");
+        LbQueueEventIfAlive(m_eventHandler, m_aliveToken, ev);
+        return false;
+    }
+    m_child = child;
+    // Local stand-in for the Win32 member so the shared log line below
+    // reports the PID on both platforms.
+    const long m_processId = static_cast<long>(child->Pid());
+#endif
     m_port                = config.port;
 
     // This launch now owns the port; slot actions enqueued from here
@@ -2776,7 +2891,12 @@ bool ServerManager::StartServer(const std::string& ggufPath, const ServerConfig&
     m_healthCancelFlag = std::make_shared<std::atomic<bool>>(false);
     auto* healthThread = new ServerHealthThread(
         m_eventHandler, GetBaseUrl(), m_healthCancelFlag, m_aliveToken,
-        m_processHandle, healthLogPath, launchGeneration, 120000, // 2min timeout
+#ifdef __WXMSW__
+        m_processHandle,
+#else
+        m_child,
+#endif
+        healthLogPath, launchGeneration, 120000, // 2min timeout
         m_logger);
 
     auto failHealthMonitorStart = [&](const std::string& detail) -> bool {
@@ -2813,11 +2933,6 @@ bool ServerManager::StartServer(const std::string& ggufPath, const ServerConfig&
     }
 
     return true;
-#else
-    // Non-Windows: not implemented
-    (void)ggufPath; (void)config;
-    return false;
-#endif
 }
 
 // ── Stop server ──────────────────────────────────────────────────
@@ -2998,6 +3113,8 @@ bool ServerManager::IsProcessRunning() const
     DWORD exitCode = 0;
     if (GetExitCodeProcess(m_processHandle, &exitCode))
         return exitCode == STILL_ACTIVE;
+#else
+    if (m_child) return !m_child->Exited();
 #endif
     return false;
 }
@@ -3064,5 +3181,17 @@ void ServerManager::KillProcess()
     }
 
     m_processId = 0;
+#else
+    if (m_child) {
+        if (m_logger)
+            m_logger->information("Stopping llama-server PID=" +
+                                  std::to_string(m_child->Pid()));
+        // SIGTERM lets llama-server release Metal buffers cleanly; the
+        // whole process group is killed if it has not exited in 10s.
+        if (!m_child->Terminate(10000) && m_logger)
+            m_logger->error("llama-server PID=" + std::to_string(m_child->Pid()) +
+                            " still appears to be running after SIGKILL");
+        m_child.reset();
+    }
 #endif
 }

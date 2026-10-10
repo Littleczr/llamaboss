@@ -249,4 +249,82 @@ Result Run(const Options& o)
     return r;
 }
 
+bool Child::Exited(int* exitCode)
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (!m_exited && m_pid > 0) {
+        int status = 0;
+        const pid_t r = ::waitpid(m_pid, &status, WNOHANG);
+        if (r == m_pid) {
+            m_exited = true;
+            m_exitCode = WIFEXITED(status) ? WEXITSTATUS(status)
+                       : WIFSIGNALED(status) ? 128 + WTERMSIG(status) : -1;
+        } else if (r < 0 && errno == ECHILD) {
+            m_exited = true;   // already reaped elsewhere; treat as gone
+        }
+    }
+    if (exitCode) *exitCode = m_exitCode;
+    return m_exited;
+}
+
+bool Child::Terminate(unsigned long graceMs)
+{
+    if (Exited()) return true;
+    ::kill(-m_pid, SIGTERM);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(graceMs);
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (Exited()) { ::kill(-m_pid, SIGKILL); return true; }  // sweep stragglers in the group
+        ::usleep(50000);
+    }
+    ::kill(-m_pid, SIGKILL);
+    for (int i = 0; i < 40; ++i) {          // up to ~2s for the kernel to reap
+        if (Exited()) return true;
+        ::usleep(50000);
+    }
+    return Exited();
+}
+
+std::shared_ptr<Child> Spawn(const SpawnOptions& o, int& error)
+{
+    error = 0;
+    if (o.argv.empty()) { error = EINVAL; return nullptr; }
+    const std::string exe = FindExecutable(o.argv[0]);
+    if (exe.empty()) { error = ENOENT; return nullptr; }
+
+    posix_spawn_file_actions_t fa;
+    posix_spawn_file_actions_init(&fa);
+    posix_spawn_file_actions_addopen(&fa, STDIN_FILENO, "/dev/null", O_RDONLY, 0);
+    if (o.logPath.empty()) {
+        posix_spawn_file_actions_addopen(&fa, STDOUT_FILENO, "/dev/null", O_WRONLY, 0);
+    } else {
+        posix_spawn_file_actions_addopen(&fa, STDOUT_FILENO, o.logPath.c_str(),
+                                         O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    }
+    posix_spawn_file_actions_adddup2(&fa, STDOUT_FILENO, STDERR_FILENO);
+    if (!o.cwd.empty()) posix_spawn_file_actions_addchdir_np(&fa, o.cwd.c_str());
+
+    posix_spawnattr_t attr;
+    posix_spawnattr_init(&attr);
+    sigset_t none, all;
+    sigemptyset(&none);
+    sigfillset(&all);
+    posix_spawnattr_setsigmask(&attr, &none);
+    posix_spawnattr_setsigdefault(&attr, &all);
+    posix_spawnattr_setpgroup(&attr, 0);
+    posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETPGROUP | POSIX_SPAWN_SETSIGMASK |
+                                     POSIX_SPAWN_SETSIGDEF | POSIX_SPAWN_CLOEXEC_DEFAULT);
+
+    std::vector<std::string> args = o.argv;
+    std::vector<char*> argv;
+    for (auto& a : args) argv.push_back(a.data());
+    argv.push_back(nullptr);
+
+    pid_t pid = -1;
+    const int rc = ::posix_spawn(&pid, exe.c_str(), &fa, &attr, argv.data(), environ);
+    posix_spawn_file_actions_destroy(&fa);
+    posix_spawnattr_destroy(&attr);
+    if (rc != 0) { error = rc; return nullptr; }
+    return std::make_shared<Child>(pid);
+}
+
 } // namespace lb_process

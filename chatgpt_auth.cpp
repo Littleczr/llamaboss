@@ -138,6 +138,10 @@ std::string Protect(const std::string& plain)
     SecureZeroMemory(out.pbData, out.cbData);
     LocalFree(out.pbData);
     return enc;
+#elif defined(__APPLE__)
+    // No protected storage on macOS yet: refuse rather than write tokens
+    // in recoverable form.  Sign-in is reported unavailable up front.
+    return std::string();
 #else
     return "plain:" + Base64UrlEncode(plain);   // unit-test builds only
 #endif
@@ -164,6 +168,8 @@ std::string Unprotect(const std::string& stored)
     SecureZeroMemory(out.pbData, out.cbData);
     LocalFree(out.pbData);
     return plain;
+#elif defined(__APPLE__)
+    return std::string();
 #else
     if (stored.rfind("plain:", 0) != 0) return std::string();
     std::string plain;
@@ -640,6 +646,12 @@ std::shared_ptr<SignInAttempt> Auth::BeginSignIn(const std::string& reauthClient
 {
     authorizeUrl.clear();
     error.clear();
+#ifdef __APPLE__
+    // Token protection and ID-token verification are Windows-only so far.
+    error = "Sign in with ChatGPT is not available on macOS yet. "
+            "Use an API key endpoint instead.";
+    return nullptr;
+#endif
     auto impl = Impl();
     if (!impl) { error = "ChatGPT sign-in storage is not ready. Restart LlamaBoss and try again."; return nullptr; }
 

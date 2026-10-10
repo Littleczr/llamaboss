@@ -12,6 +12,9 @@
 #include <limits>
 
 #include "lb_windows.h"
+#ifndef __WXMSW__
+#include "lb_process.h"
+#endif
 
 #include <Poco/Logger.h>
 
@@ -82,6 +85,8 @@ public:
                        std::weak_ptr<std::atomic<bool>> aliveToken,
 #ifdef __WXMSW__
                        HANDLE processHandle,
+#else
+                       std::shared_ptr<lb_process::Child> child,
 #endif
                        const std::string& logPath,
                        ServerLaunchGeneration generation,
@@ -109,6 +114,8 @@ private:
     // call it without any risk of a double close.
     HANDLE        m_processHandle;
     void CloseProcessHandle();
+#else
+    std::shared_ptr<lb_process::Child> m_child;   // shared with ServerManager
 #endif
     std::string   m_logPath;
     ServerLaunchGeneration m_generation;
@@ -364,6 +371,8 @@ private:
     HANDLE m_threadHandle  = INVALID_HANDLE_VALUE;
     HANDLE m_jobHandle     = NULL;   // Kills llama-server if LlamaBoss closes/crashes.
     DWORD  m_processId     = 0;
+#else
+    std::shared_ptr<lb_process::Child> m_child;   // own process group; see KillProcess
 #endif
 
     wxEvtHandler* m_eventHandler;

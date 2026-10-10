@@ -15,6 +15,9 @@
 
 #include <atomic>
 #include <functional>
+#include <memory>
+#include <mutex>
+#include <sys/types.h>
 #include <string>
 #include <vector>
 
@@ -47,6 +50,37 @@ struct Result {
 };
 
 Result Run(const Options& options);
+
+// ── Long-running children (servers) ─────────────────────────────────
+//
+// A detached child in its own process group with stdout/stderr sent to a
+// log file. The Child object is the ONLY place that reaps the process, so
+// several owners (the manager and a health-check thread) can share it the
+// way the Windows code shares duplicated process handles.
+struct SpawnOptions {
+    std::vector<std::string> argv;
+    std::string cwd;          // empty = inherit
+    std::string logPath;      // stdout+stderr, truncated; empty = /dev/null
+};
+
+class Child {
+public:
+    explicit Child(pid_t pid) : m_pid(pid) {}
+    pid_t Pid() const { return m_pid; }
+    // Non-blocking; true once the process has exited (exit code cached).
+    bool Exited(int* exitCode = nullptr);
+    // SIGTERM to the group, wait up to graceMs, then SIGKILL and reap.
+    // Returns true if the process is gone afterwards.
+    bool Terminate(unsigned long graceMs);
+private:
+    std::mutex m_mutex;
+    pid_t m_pid;
+    bool m_exited = false;
+    int m_exitCode = -1;
+};
+
+// Returns null on failure with errno-style code in `error`.
+std::shared_ptr<Child> Spawn(const SpawnOptions& options, int& error);
 
 // Resolve a program name on PATH (or return it unchanged when it already
 // contains a '/'). Empty when not found or not executable.
