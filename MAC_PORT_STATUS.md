@@ -55,8 +55,8 @@ CMake copies `llama-server` and its dylibs into
 | --- | --- | --- |
 | 1 | Reproducible arm64 build | **Done**: all 91 translation units compile and link |
 | 2 | App launches, main window | **Done**: main window and Welcome dialog open |
-| 3 | Conversations save and reopen (Unicode paths) | Not yet verified |
-| 4 | Local llama-server starts, reports errors, stops | Server verified standalone (Gemma 3 1B, ~92 tok/s); in-app launch not yet verified |
+| 3 | Conversations save and reopen (Unicode paths) | **Verified 2026-10-09** for ASCII titles: the chat saved to `~/LlamaBoss/Chats/…`, reopened after quit/relaunch, and the model auto-reloaded. Unicode file names not yet tested |
+| 4 | Local llama-server starts, reports errors, stops | **Verified 2026-10-09** with Gemma 3 1B Q4_K_M: bundled server on Metal, ready in 0.85 s, single slot confirmed, two chat turns, stopped cleanly on quit (0.1 s). The error path (bad model, crash at startup) is not yet exercised |
 | 5 | Remote endpoint streams; stop works | Not started |
 | 6 | Shell and Python tools | Stubbed (see below) |
 | 7 | File-tool boundaries, protected credentials, packaged app | Partly implemented, not verified |
@@ -105,7 +105,11 @@ CMake copies `llama-server` and its dylibs into
   launches just activate the running app.
 - Tests: the native test project (`Tests/`) has no CMake target yet.
 
+## Small follow-ups found while testing
+
+- "Could not load application icon": the app ships `app_icon.ico`; macOS needs an `.icns` (Phase 4).
+
 ## Next task
 
-Load Gemma 3 1B in the app, confirm the in-app server start/stop and a chat reply, and
-check that the conversation saves and reopens.
+Test the startup error path (a broken model file), then an OpenRouter endpoint
+(milestone 5), then the Phase 3 tool ports.
