@@ -386,8 +386,25 @@ bool AppState::LoadApplicationIcon(wxFrame* frame, const std::string& /*iconPath
     }
 #endif
 
+#ifdef __WXMAC__
+    // macOS shows no per-window icons; the Dock/Finder icon comes from the
+    // bundle (Info.plist CFBundleIconFile = app_icon.icns), not from code.
+    // The relative .ico fallback below would resolve against "/" on a
+    // Finder launch, so it is not attempted here.
+    if (m_logger) {
+        m_logger->information("Application icon: provided by the app bundle on macOS");
+    }
+    return true;
+#else
     wxIcon fileIcon;
-    if (fileIcon.LoadFile("app_icon.ico", wxBITMAP_TYPE_ICO)) {
+    bool fileLoaded = false;
+    {
+        // A missing icon is cosmetic: never let wx turn the failed load
+        // into a modal error popup.  The warning below still records it.
+        wxLogNull noLogPopup;
+        fileLoaded = fileIcon.LoadFile("app_icon.ico", wxBITMAP_TYPE_ICO);
+    }
+    if (fileLoaded) {
         frame->SetIcon(fileIcon);
         if (m_logger) {
             m_logger->information("Application icon loaded from file");
@@ -399,6 +416,7 @@ bool AppState::LoadApplicationIcon(wxFrame* frame, const std::string& /*iconPath
         m_logger->warning("Could not load application icon");
     }
     return false;
+#endif
 }
 
 bool AppState::UpdateSettings(const std::string& newModel, const std::string& newApiUrl,
