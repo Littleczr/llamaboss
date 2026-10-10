@@ -175,7 +175,7 @@ bool AttachmentManager::AttachTextFile(const std::string& filePath)
     if (fileSize == wxInvalidSize || fileSize.GetValue() > kMaxTextFileBytes)
         return false;
 
-    std::ifstream ifs(path_safety::Utf8ToWide(filePath), std::ios::binary);
+    std::ifstream ifs(std::filesystem::path(path_safety::Utf8ToWide(filePath)), std::ios::binary);
     if (!ifs.is_open()) return false;
 
     std::ostringstream oss;
@@ -270,7 +270,7 @@ bool AttachmentManager::AttachTextFileRef(const std::string& filePath,
     if (fileSize == wxInvalidSize || fileSize.GetValue() > kMaxRefBytes)
         return false;
 
-    std::ifstream ifs(path_safety::Utf8ToWide(filePath), std::ios::binary);
+    std::ifstream ifs(std::filesystem::path(path_safety::Utf8ToWide(filePath)), std::ios::binary);
     if (!ifs.is_open()) return false;
     std::ostringstream oss;
     oss << ifs.rdbuf();
@@ -1047,7 +1047,7 @@ bool AttachmentManager::SaveImagesToDisk(const std::string& attachDir,
             std::istringstream base64Stream(item.data);
             Poco::Base64Decoder decoder(base64Stream);
 
-            std::ofstream outFile(path_safety::Utf8ToWide(fullPath), std::ios::binary);
+            std::ofstream outFile(std::filesystem::path(path_safety::Utf8ToWide(fullPath)), std::ios::binary);
             if (!outFile.is_open()) {
                 allOk = false;
                 if (m_logger)
@@ -1224,7 +1224,7 @@ void AttachmentManager::NotifyChanged()
 
 std::string AttachmentManager::FileToBase64(const std::string& filePath)
 {
-    std::ifstream file(path_safety::Utf8ToWide(filePath), std::ios::binary);
+    std::ifstream file(std::filesystem::path(path_safety::Utf8ToWide(filePath)), std::ios::binary);
     if (!file.is_open()) return "";
 
     std::ostringstream base64Stream;

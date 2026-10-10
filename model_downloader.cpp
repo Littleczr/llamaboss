@@ -544,7 +544,7 @@ wxThread::ExitCode DownloadThread::Entry()
             }
             if (m_expectedBytesExact) totalBytes = m_expectedBytes;
 
-            std::ofstream out(path_safety::Utf8ToWide(tempPath), std::ios::binary | std::ios::trunc);
+            std::ofstream out(std::filesystem::path(path_safety::Utf8ToWide(tempPath)), std::ios::binary | std::ios::trunc);
             if (!out.is_open()) {
                 auto* ev = new wxCommandEvent(wxEVT_DOWNLOAD_ERROR);
                 ev->SetString("Cannot create temporary file:\n" + tempPath);
@@ -697,7 +697,7 @@ wxThread::ExitCode DownloadThread::Entry()
             // Second integrity check: verify the temp file on disk matches what
             // we believe we wrote before promoting it to the final .gguf path.
             {
-                std::ifstream verify(path_safety::Utf8ToWide(tempPath), std::ios::binary | std::ios::ate);
+                std::ifstream verify(std::filesystem::path(path_safety::Utf8ToWide(tempPath)), std::ios::binary | std::ios::ate);
                 if (!verify.is_open()) {
                     QuietRemoveFileUtf8(tempPath);
 

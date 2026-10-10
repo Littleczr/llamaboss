@@ -182,7 +182,7 @@ bool HasLowerSuffix(const std::string& s, const std::string& suffix)
 
 bool WriteUtf8File(const std::string& path, const std::string& body)
 {
-    std::ofstream f(path_safety::Utf8ToWide(path), std::ios::out | std::ios::trunc | std::ios::binary);
+    std::ofstream f(std::filesystem::path(path_safety::Utf8ToWide(path)), std::ios::out | std::ios::trunc | std::ios::binary);
     if (!f.is_open()) return false;
     f.write(body.data(), static_cast<std::streamsize>(body.size()));
     return f.good();
@@ -197,7 +197,7 @@ bool EnsureSubdir(const std::string& root, const char* name)
 
 unsigned long long FileSizeBytes(const std::string& path)
 {
-    std::ifstream f(path_safety::Utf8ToWide(path), std::ios::binary | std::ios::ate);
+    std::ifstream f(std::filesystem::path(path_safety::Utf8ToWide(path)), std::ios::binary | std::ios::ate);
     if (!f.is_open()) return 0;
     std::streamsize n = f.tellg();
     if (n < 0) return 0;
@@ -1959,7 +1959,7 @@ bool ProjectManager::ImportSkillFolder(const std::string& sourceFolder,
     // collision suffix the author could not have known about).
     const std::string destDoc = JoinProjectPath(destRoot, kSkillDocName);
     {
-        std::ifstream f(path_safety::Utf8ToWide(destDoc),
+        std::ifstream f(std::filesystem::path(path_safety::Utf8ToWide(destDoc)),
                         std::ios::in | std::ios::binary);
         if (f.is_open()) {
             std::string body((std::istreambuf_iterator<char>(f)),
@@ -2071,7 +2071,7 @@ bool ProjectManager::ExtractSkillZipToTemp(const std::string& zipPath,
                     }
                 }
 
-                std::ofstream outFile(path_safety::Utf8ToWide(dest),
+                std::ofstream outFile(std::filesystem::path(path_safety::Utf8ToWide(dest)),
                                       std::ios::binary | std::ios::trunc);
                 if (!outFile.is_open()) {
                     outError = "Could not write file: " + dest;
@@ -2210,7 +2210,7 @@ bool ProjectManager::ExportSkillToZip(const std::string& skillContractPath,
                     wxString::FromUTF8(stem + "/" + rel))) {
                 return false;
             }
-            std::ifstream in(path_safety::Utf8ToWide(absFile),
+            std::ifstream in(std::filesystem::path(path_safety::Utf8ToWide(absFile)),
                              std::ios::binary);
             if (!in.is_open()) return false;
             char buffer[64 * 1024];
@@ -2255,7 +2255,7 @@ bool ProjectManager::ReadProjectInstructions(const std::string& rootPath,
         return false;
     }
 
-    std::ifstream f(path_safety::Utf8ToWide(path), std::ios::in | std::ios::binary);
+    std::ifstream f(std::filesystem::path(path_safety::Utf8ToWide(path)), std::ios::in | std::ios::binary);
     if (!f.is_open()) {
         outStatus = "PROJECT.md could not be opened.";
         return false;
@@ -2291,7 +2291,7 @@ bool ProjectManager::LoadProjectByRoot(const std::string& rootPath,
                                        ProjectInfo& outProject)
 {
     outProject = ProjectInfo{};
-    std::ifstream f(path_safety::Utf8ToWide(ProjectJsonPath(rootPath)), std::ios::in | std::ios::binary);
+    std::ifstream f(std::filesystem::path(path_safety::Utf8ToWide(ProjectJsonPath(rootPath))), std::ios::in | std::ios::binary);
     if (!f.is_open()) return false;
 
     std::string body((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());

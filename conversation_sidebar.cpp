@@ -1967,7 +1967,7 @@ ConversationSidebar::ScanConversations()
             // metadata fields can't appear anymore and we'd just be
             // reading the body for nothing.
             try {
-                std::ifstream file(path_safety::Utf8ToWide(entry.filePath), std::ios::in);
+                std::ifstream file(std::filesystem::path(path_safety::Utf8ToWide(entry.filePath)), std::ios::in);
                 if (file.is_open()) {
                     bool sawTitle = false, sawProjectId = false, sawProjectName = false;
                     bool sawUpdatedAt = false;

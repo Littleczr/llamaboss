@@ -930,7 +930,7 @@ bool JsonStringField(const std::string& json,
 size_t FileSizeBytes(const std::string& path)
 {
     try {
-        std::ifstream f(Utf8ToWide(path), std::ios::binary | std::ios::ate);
+        std::ifstream f(std::filesystem::path(Utf8ToWide(path)), std::ios::binary | std::ios::ate);
         if (!f) return 0;
         return static_cast<size_t>(f.tellg());
     } catch (...) {
@@ -941,7 +941,7 @@ size_t FileSizeBytes(const std::string& path)
 int CountFileLines(const std::string& path)
 {
     try {
-        std::ifstream f(Utf8ToWide(path), std::ios::binary);
+        std::ifstream f(std::filesystem::path(Utf8ToWide(path)), std::ios::binary);
         if (!f) return 0;
         std::string data((std::istreambuf_iterator<char>(f)),
                          std::istreambuf_iterator<char>());
@@ -1062,7 +1062,7 @@ std::string BuildHeadTailPreviewForOutput(const std::string& text,
 bool WriteUtf8TextFileForOutput(const std::string& path, const std::string& content)
 {
     try {
-        std::ofstream f(Utf8ToWide(path), std::ios::binary | std::ios::trunc);
+        std::ofstream f(std::filesystem::path(Utf8ToWide(path)), std::ios::binary | std::ios::trunc);
         if (!f) return false;
         f.write(content.data(), static_cast<std::streamsize>(content.size()));
         return f.good();

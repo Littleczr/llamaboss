@@ -10,6 +10,7 @@
 #include <regex>
 
 #include "lb_windows.h"
+#include "lb_utf.h"
 #include <shellapi.h>
 
 namespace {
@@ -214,6 +215,9 @@ std::string StripCopiedPowerShellListingColumns(const std::string& input)
 // tool_util consolidation pass picks up these duplicates.
 std::wstring Utf8ToWide(const std::string& s)
 {
+#ifndef _WIN32
+    return lb_utf::Utf8ToWide(s);
+#else
     if (s.empty()) return L"";
     int len = ::MultiByteToWideChar(CP_UTF8, 0, s.data(),
                                     (int)s.size(), nullptr, 0);
@@ -222,10 +226,14 @@ std::wstring Utf8ToWide(const std::string& s)
     ::MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(),
                           &w[0], len);
     return w;
+#endif
 }
 
 std::string WideToUtf8(const std::wstring& w)
 {
+#ifndef _WIN32
+    return lb_utf::WideToUtf8(w);
+#else
     if (w.empty()) return "";
     int len = ::WideCharToMultiByte(CP_UTF8, 0, w.data(),
                                     (int)w.size(),
@@ -235,6 +243,7 @@ std::string WideToUtf8(const std::wstring& w)
     ::WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(),
                           &s[0], len, nullptr, nullptr);
     return s;
+#endif
 }
 
 // Returns the lowercase extension (no leading dot) or empty if none.

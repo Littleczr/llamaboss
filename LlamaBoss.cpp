@@ -4590,7 +4590,7 @@ private:
 #ifdef _WIN32
                 return std::string(wxString(path.wstring()).ToUTF8().data());
 #else
-                return path.u8string();
+                return path.string();  // native paths are UTF-8 on POSIX
 #endif
             };
 

@@ -4,6 +4,8 @@
 
 #include "lb_windows.h"
 
+#ifdef _WIN32
+
 namespace {
 
 // UTF-8 → UTF-16 via MultiByteToWideChar.  Empty input → empty output.
@@ -190,3 +192,113 @@ bool IsFile(const std::string& absPath)
     if (attrs == INVALID_FILE_ATTRIBUTES) return false;
     return (attrs & FILE_ATTRIBUTE_DIRECTORY) == 0;
 }
+
+#else  // ── macOS / POSIX ──────────────────────────────────────────────
+
+#include <cstdlib>
+#include <filesystem>
+#include <sys/stat.h>
+
+namespace {
+
+std::string TrimAscii(const std::string& s)
+{
+    size_t a = s.find_first_not_of(" \t\r\n");
+    if (a == std::string::npos) return {};
+    size_t b = s.find_last_not_of(" \t\r\n");
+    return s.substr(a, b - a + 1);
+}
+
+std::string StripMatchingQuotes(std::string s)
+{
+    s = TrimAscii(s);
+    if (s.size() >= 2 &&
+        ((s.front() == '"'  && s.back() == '"') ||
+         (s.front() == '\'' && s.back() == '\''))) {
+        s = s.substr(1, s.size() - 2);
+    }
+    return s;
+}
+
+bool IsVarChar(char c)
+{
+    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+           (c >= '0' && c <= '9') || c == '_';
+}
+
+// Expands a leading "~" plus $VAR, ${VAR} and %VAR% references. Unknown
+// variables are left as written, as ExpandEnvironmentStringsW does.
+std::string ExpandEnv(const std::string& in)
+{
+    std::string s = in;
+    if (!s.empty() && s[0] == '~' && (s.size() == 1 || s[1] == '/')) {
+        if (const char* home = std::getenv("HOME")) s = home + s.substr(1);
+    }
+    std::string out;
+    for (size_t i = 0; i < s.size();) {
+        const char c = s[i];
+        if (c == '$' && i + 1 < s.size() && s[i + 1] == '{') {
+            const size_t close = s.find('}', i + 2);
+            if (close != std::string::npos) {
+                const std::string name = s.substr(i + 2, close - i - 2);
+                if (const char* v = std::getenv(name.c_str())) {
+                    out += v; i = close + 1; continue;
+                }
+            }
+        } else if (c == '$' && i + 1 < s.size() && IsVarChar(s[i + 1])) {
+            size_t end = i + 1;
+            while (end < s.size() && IsVarChar(s[end])) ++end;
+            const std::string name = s.substr(i + 1, end - i - 1);
+            if (const char* v = std::getenv(name.c_str())) {
+                out += v; i = end; continue;
+            }
+        } else if (c == '%') {
+            const size_t close = s.find('%', i + 1);
+            if (close != std::string::npos && close > i + 1) {
+                const std::string name = s.substr(i + 1, close - i - 1);
+                if (const char* v = std::getenv(name.c_str())) {
+                    out += v; i = close + 1; continue;
+                }
+            }
+        }
+        out += c;
+        ++i;
+    }
+    return out;
+}
+
+} // anonymous namespace
+
+std::string ResolveToolPath(const std::string& input,
+                            const std::string& cwd)
+{
+    std::string normalized = ExpandEnv(StripMatchingQuotes(input));
+    if (normalized.empty()) return "";
+
+    namespace fs = std::filesystem;
+    fs::path p(normalized);
+    if (p.is_relative()) {
+        if (cwd.empty()) return "";
+        fs::path base(cwd);
+        if (base.is_relative()) return "";
+        p = base / p;
+    }
+    p = p.lexically_normal();
+    std::string out = p.string();
+    while (out.size() > 1 && out.back() == '/') out.pop_back();
+    return out;
+}
+
+bool IsDirectory(const std::string& absPath)
+{
+    struct stat st {};
+    return !absPath.empty() && ::stat(absPath.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+bool IsFile(const std::string& absPath)
+{
+    struct stat st {};
+    return !absPath.empty() && ::stat(absPath.c_str(), &st) == 0 && !S_ISDIR(st.st_mode);
+}
+
+#endif

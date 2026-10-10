@@ -9,6 +9,7 @@
 #include "chat_folders.h"   // chat folder recognizer
 
 #include "lb_windows.h"
+#include "lb_utf.h"
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <winhttp.h>
@@ -140,6 +141,9 @@ std::string TruncateUtf8AtBoundary(const std::string& s, std::size_t maxBytes)
 
 std::wstring Utf8ToWide(const std::string& s)
 {
+#ifndef _WIN32
+    return lb_utf::Utf8ToWide(s);
+#else
     if (s.empty()) return std::wstring();
     int needed = ::MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
                                        s.data(), static_cast<int>(s.size()),
@@ -159,10 +163,14 @@ std::wstring Utf8ToWide(const std::string& s)
                           s.data(), static_cast<int>(s.size()),
                           out.data(), needed);
     return out;
+#endif
 }
 
 std::string WideToUtf8(const std::wstring& s)
 {
+#ifndef _WIN32
+    return lb_utf::WideToUtf8(s);
+#else
     if (s.empty()) return std::string();
     int needed = ::WideCharToMultiByte(CP_UTF8, 0,
                                        s.data(), static_cast<int>(s.size()),
@@ -173,6 +181,7 @@ std::string WideToUtf8(const std::wstring& s)
                           s.data(), static_cast<int>(s.size()),
                           out.data(), needed, nullptr, nullptr);
     return out;
+#endif
 }
 
 std::string WinErr(DWORD err)

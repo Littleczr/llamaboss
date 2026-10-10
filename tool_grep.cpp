@@ -6,11 +6,22 @@
 #include <deque>
 
 #include "lb_windows.h"
+#ifndef _WIN32
+#include <dirent.h>
+#include <strings.h>
+#endif
+#include "lb_utf.h"
 #include "ui_event_post.h"
 
 wxDEFINE_EVENT(wxEVT_GREP_COMPLETE, wxCommandEvent);
 
 namespace {
+
+#ifdef _WIN32
+constexpr const char* kPathSep = "\\";
+#else
+constexpr const char* kPathSep = "/";
+#endif
 
 // ─── Limits ──────────────────────────────────────────────────────
 // Same ctx-aware byte-cap formula as /read and /ls.  Applied after
@@ -72,6 +83,9 @@ std::string ClampMatchLine(const std::string& text)
 
 std::wstring Utf8ToWide(const std::string& s)
 {
+#ifndef _WIN32
+    return lb_utf::Utf8ToWide(s);
+#else
     if (s.empty()) return L"";
     int len = ::MultiByteToWideChar(CP_UTF8, 0, s.data(),
                                     (int)s.size(), nullptr, 0);
@@ -80,10 +94,14 @@ std::wstring Utf8ToWide(const std::string& s)
     ::MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(),
                           &w[0], len);
     return w;
+#endif
 }
 
 std::string WideToUtf8(const std::wstring& w)
 {
+#ifndef _WIN32
+    return lb_utf::WideToUtf8(w);
+#else
     if (w.empty()) return "";
     int len = ::WideCharToMultiByte(CP_UTF8, 0, w.data(),
                                     (int)w.size(),
@@ -93,6 +111,7 @@ std::string WideToUtf8(const std::wstring& w)
     ::WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(),
                           &s[0], len, nullptr, nullptr);
     return s;
+#endif
 }
 
 // ─── Dir-skip policy ─────────────────────────────────────────────
@@ -119,7 +138,11 @@ bool ShouldSkipDir(const std::string& name)
         "__pycache__",
     };
     for (const char* b : kBlacklist) {
+#ifdef _WIN32
         if (_stricmp(name.c_str(), b) == 0) return true;
+#else
+        if (::strcasecmp(name.c_str(), b) == 0) return true;
+#endif
     }
     return false;
 }
@@ -302,7 +325,7 @@ bool SearchFile(const std::string& absPath,
     // Open in binary mode so we see \r explicitly (and can strip it
     // reliably from getline output on Windows line endings).  MSVC
     // accepts std::wstring paths as an extension.
-    std::ifstream f(Utf8ToWide(absPath), std::ios::binary);
+    std::ifstream f(std::filesystem::path(Utf8ToWide(absPath)), std::ios::binary);
     if (!f) {
         ++s.skippedUnreadable;   // permissions, transient IO — skip, keep walking
         return true;
@@ -486,6 +509,7 @@ bool WalkAndSearch(const std::string& absDir,
 {
     if (!CheckLimits(s)) return false;
 
+#ifdef _WIN32
     std::wstring wPat = Utf8ToWide(absDir) + L"\\*";
     WIN32_FIND_DATAW fd{};
     HANDLE hFind = ::FindFirstFileW(wPat.c_str(), &fd);
@@ -513,6 +537,43 @@ bool WalkAndSearch(const std::string& absDir,
     } while (::FindNextFileW(hFind, &fd));
     ::FindClose(hFind);
 
+#else
+    DIR* dirp = ::opendir(absDir.c_str());
+    if (!dirp) {
+        ++s.skippedUnreadable;   // unreadable dir — counted, no longer silent
+        return true;
+    }
+
+    std::vector<std::pair<std::string, bool>> fileEntries; // name, dummy false
+    std::vector<std::string>                   dirEntries; // name
+
+    while (struct dirent* de = ::readdir(dirp)) {
+        std::string name = de->d_name;
+        if (name == "." || name == "..") continue;
+
+        bool isDir = de->d_type == DT_DIR;
+        if (de->d_type == DT_UNKNOWN || de->d_type == DT_LNK) {
+            // Symlinked files are searched; symlinked directories are not
+            // followed, so a link cycle cannot trap the walk.
+            struct stat st {};
+            const std::string full = absDir + "/" + name;
+            if (::lstat(full.c_str(), &st) != 0) continue;
+            if (S_ISLNK(st.st_mode)) {
+                if (::stat(full.c_str(), &st) != 0 || S_ISDIR(st.st_mode)) continue;
+            }
+            isDir = S_ISDIR(st.st_mode);
+        }
+
+        if (isDir) {
+            if (ShouldSkipDir(name)) { ++s.prunedDirs; continue; }
+            dirEntries.push_back(std::move(name));
+        } else {
+            fileEntries.emplace_back(std::move(name), false);
+        }
+    }
+    ::closedir(dirp);
+#endif
+
     std::sort(fileEntries.begin(), fileEntries.end(),
               [](const auto& a, const auto& b){ return a.first < b.first; });
     std::sort(dirEntries.begin(), dirEntries.end());
@@ -520,13 +581,13 @@ bool WalkAndSearch(const std::string& absDir,
     // Files first — this directory's matches land contiguous in the
     // output before we dive into subdirs.
     for (const auto& [name, _] : fileEntries) {
-        std::string childAbs = absDir + "\\" + name;
-        std::string childRel = relPrefix.empty() ? name : (relPrefix + "\\" + name);
+        std::string childAbs = absDir + kPathSep + name;
+        std::string childRel = relPrefix.empty() ? name : (relPrefix + kPathSep + name);
         if (!SearchFile(childAbs, childRel, s)) return false;
     }
     for (const auto& name : dirEntries) {
-        std::string childAbs = absDir + "\\" + name;
-        std::string childRel = relPrefix.empty() ? name : (relPrefix + "\\" + name);
+        std::string childAbs = absDir + kPathSep + name;
+        std::string childRel = relPrefix.empty() ? name : (relPrefix + kPathSep + name);
         if (!WalkAndSearch(childAbs, childRel, s)) return false;
     }
     return true;

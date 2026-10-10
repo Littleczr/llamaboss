@@ -1541,7 +1541,7 @@ bool HasViewableImageExtension(const std::string& path)
 // still sent with the correct data-URI type.
 std::string SniffImageMime(const std::string& absPath)
 {
-    std::ifstream f(path_safety::Utf8ToWide(absPath), std::ios::binary);
+    std::ifstream f(std::filesystem::path(path_safety::Utf8ToWide(absPath)), std::ios::binary);
     if (!f.is_open()) return std::string();
     unsigned char h[12] = {};
     f.read(reinterpret_cast<char*>(h), sizeof(h));

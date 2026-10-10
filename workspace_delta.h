@@ -35,6 +35,7 @@
 
 #ifdef _WIN32
     #include "lb_windows.h"
+#include "lb_utf.h"
 #else
     #include <dirent.h>
     #include <sys/stat.h>
@@ -115,6 +116,9 @@ inline bool ShouldSkipScanDir(const std::string& name)
 
 inline std::wstring Utf8ToWide(const std::string& s)
 {
+#ifndef _WIN32
+    return lb_utf::Utf8ToWide(s);
+#else
     if (s.empty()) return std::wstring();
     int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(),
                                 static_cast<int>(s.size()), nullptr, 0);
@@ -123,10 +127,14 @@ inline std::wstring Utf8ToWide(const std::string& s)
     MultiByteToWideChar(CP_UTF8, 0, s.c_str(),
                         static_cast<int>(s.size()), &out[0], n);
     return out;
+#endif
 }
 
 inline std::string WideToUtf8(const std::wstring& s)
 {
+#ifndef _WIN32
+    return lb_utf::WideToUtf8(s);
+#else
     if (s.empty()) return std::string();
     int n = WideCharToMultiByte(CP_UTF8, 0, s.c_str(),
                                 static_cast<int>(s.size()),
@@ -137,6 +145,7 @@ inline std::string WideToUtf8(const std::wstring& s)
                         static_cast<int>(s.size()),
                         &out[0], n, nullptr, nullptr);
     return out;
+#endif
 }
 
 inline void ScanRecursive(const std::string& dir,
@@ -209,7 +218,13 @@ inline void ScanRecursive(const std::string& dir,
             sig.sizeBytes  = static_cast<unsigned long long>(st.st_size);
             sig.mtimeTicks =
                 static_cast<unsigned long long>(st.st_mtime) * 1000000000ull +
-                static_cast<unsigned long long>(st.st_mtim.tv_nsec);
+                static_cast<unsigned long long>(
+#ifdef __APPLE__
+                    st.st_mtimespec.tv_nsec
+#else
+                    st.st_mtim.tv_nsec
+#endif
+                );
             out.files.emplace(std::move(path), sig);
         }
     }

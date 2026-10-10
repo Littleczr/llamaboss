@@ -166,9 +166,16 @@ MkdirResult MakeDirectory(const std::string& pathIn,
             return r;
         }
 
+#ifdef _WIN32
         if (!::CreateDirectoryW(wDir.c_str(), nullptr)) {
             DWORD err = ::GetLastError();
-            if (err == ERROR_ALREADY_EXISTS && IsDirectory(dir)) {
+            const bool alreadyExists = err == ERROR_ALREADY_EXISTS;
+#else
+        if (::mkdir(dir.c_str(), 0755) != 0) {
+            const int err = errno;
+            const bool alreadyExists = err == EEXIST;
+#endif
+            if (alreadyExists && IsDirectory(dir)) {
                 // Pin and inspect even an already-existing segment before
                 // proceeding: another process could have inserted a junction.
                 if (!mutation.PinCreatedDirectory(dir)) {
@@ -180,11 +187,15 @@ MkdirResult MakeDirectory(const std::string& pathIn,
                 continue;
             }
             r.chips.push_back("failed");
-            if (err == ERROR_ALREADY_EXISTS) {
+            if (alreadyExists) {
                 r.errorBody = "A file appeared where a directory is needed: " + dir;
             } else {
+#ifdef _WIN32
                 r.errorBody = "CreateDirectory failed for " + dir +
                               " (Win32 error " + std::to_string(err) + ").";
+#else
+                r.errorBody = "mkdir failed for " + dir + " (" + std::strerror(err) + ").";
+#endif
             }
             r.chips.push_back(ElapsedChip(t0));
             return r;

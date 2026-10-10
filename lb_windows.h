@@ -15,7 +15,8 @@
 // harnesses), which is why headers and those .cpp files keep including
 // it directly.
 //
-// Safe to include on non-Windows builds: it does nothing there.
+// On non-Windows builds it instead pulls in the small set of POSIX
+// headers the #else branches of Win32 code rely on (open/read/stat/errno).
 #pragma once
 
 #ifdef _WIN32
@@ -26,4 +27,11 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#else
+#include <cerrno>
+#include <cstring>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
 #endif

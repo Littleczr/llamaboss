@@ -243,7 +243,7 @@ bool AtomicWriteFile(const std::string& finalPath, const std::string& body)
 // caller — see NotesRead's branch on wxFileExists.
 bool ReadFileUtf8(const std::string& path, std::string& out)
 {
-    std::ifstream file(path_safety::Utf8ToWide(path), std::ios::in | std::ios::binary);
+    std::ifstream file(std::filesystem::path(path_safety::Utf8ToWide(path)), std::ios::in | std::ios::binary);
     if (!file.is_open()) return false;
 
     std::ostringstream ss;

@@ -32,6 +32,7 @@
 
 // Win32
 #include "lb_windows.h"
+#include "lb_utf.h"
 #include <shlobj.h>       // SHGetKnownFolderPath (PowerShell 7 location)
 #include <knownfolders.h>
 
@@ -47,6 +48,9 @@ namespace {
 // UTF-8 string -> UTF-16LE bytes.  PowerShell's -EncodedCommand expects
 // UTF-16LE, base64-encoded.
 std::wstring Utf8ToWide(const std::string& in) {
+#ifndef _WIN32
+    return lb_utf::Utf8ToWide(in);
+#else
     if (in.empty()) return std::wstring();
     int n = MultiByteToWideChar(CP_UTF8, 0, in.data(), (int)in.size(),
                                 nullptr, 0);
@@ -55,6 +59,7 @@ std::wstring Utf8ToWide(const std::string& in) {
     MultiByteToWideChar(CP_UTF8, 0, in.data(), (int)in.size(),
                         out.data(), n);
     return out;
+#endif
 }
 
 // Base64-encode the raw bytes of a wide string (UTF-16LE on Windows).
@@ -265,6 +270,9 @@ const PowerShellChoice& ResolvePowerShell()
 }
 
 std::string WideToUtf8(const std::wstring& in) {
+#ifndef _WIN32
+    return lb_utf::WideToUtf8(in);
+#else
     if (in.empty()) return std::string();
     int n = WideCharToMultiByte(CP_UTF8, 0, in.data(), (int)in.size(),
                                 nullptr, 0, nullptr, nullptr);
@@ -273,6 +281,7 @@ std::string WideToUtf8(const std::wstring& in) {
     WideCharToMultiByte(CP_UTF8, 0, in.data(), (int)in.size(),
                         out.data(), n, nullptr, nullptr);
     return out;
+#endif
 }
 
 std::string JoinPathLocal(const std::string& a, const std::string& b)
@@ -455,7 +464,7 @@ size_t FileSizeLocal(const std::string& path)
 bool WriteUtf8TextFileLocal(const std::string& path, const std::string& content)
 {
     try {
-        std::ofstream f(Utf8ToWide(path), std::ios::binary | std::ios::trunc);
+        std::ofstream f(std::filesystem::path(Utf8ToWide(path)), std::ios::binary | std::ios::trunc);
         if (!f) return false;
         f.write(content.data(), static_cast<std::streamsize>(content.size()));
         return f.good();

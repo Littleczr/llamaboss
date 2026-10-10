@@ -471,6 +471,7 @@ DemoteOutcome MaybeDemoteToolBody(const std::string& toolTag,
             std::string cand  = path_safety::WideToUtf8(
                 (std::filesystem::path(path_safety::Utf8ToWide(varsAbs)) /
                  path_safety::Utf8ToWide(fname)).wstring());
+#ifdef _WIN32
             HANDLE h = ::CreateFileW(path_safety::Utf8ToWide(cand).c_str(),
                                      GENERIC_WRITE, 0, nullptr,
                                      CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -496,6 +497,27 @@ DemoteOutcome MaybeDemoteToolBody(const std::string& toolTag,
                 return out;                                            // fall back whole
             }
             relPath = std::string(kVarsLaneName) + "\\" + fname;
+#else
+            const int fd = ::open(cand.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
+            if (fd < 0) {
+                if (errno == EEXIST) continue;                         // next index
+                return out;                                            // I/O trouble → no demote
+            }
+            const char* p = body.data();
+            size_t left = body.size();
+            bool ok = true;
+            while (left > 0) {
+                const ssize_t wrote = ::write(fd, p, std::min<size_t>(left, 1u << 20));
+                if (wrote <= 0) { ok = false; break; }
+                p += wrote; left -= static_cast<size_t>(wrote);
+            }
+            ::close(fd);
+            if (!ok) {
+                ::unlink(cand.c_str());
+                return out;                                            // fall back whole
+            }
+            relPath = std::string(kVarsLaneName) + "/" + fname;
+#endif
             absPath = cand;
             break;
         }

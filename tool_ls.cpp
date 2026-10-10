@@ -5,6 +5,11 @@
 #include "tool_path_safety.h"
 
 #include "lb_windows.h"
+#ifndef _WIN32
+#include <ctime>
+#include <dirent.h>
+#endif
+#include "lb_utf.h"
 
 namespace {
 
@@ -42,6 +47,9 @@ constexpr size_t kSizeColWidth    = 10;   // enough for "1023.9 MB"
 // needs them too (YAGNI until then).
 std::wstring Utf8ToWide(const std::string& s)
 {
+#ifndef _WIN32
+    return lb_utf::Utf8ToWide(s);
+#else
     if (s.empty()) return L"";
     int len = ::MultiByteToWideChar(CP_UTF8, 0, s.data(),
                                     (int)s.size(), nullptr, 0);
@@ -50,10 +58,14 @@ std::wstring Utf8ToWide(const std::string& s)
     ::MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(),
                           &w[0], len);
     return w;
+#endif
 }
 
 std::string WideToUtf8(const std::wstring& w)
 {
+#ifndef _WIN32
+    return lb_utf::WideToUtf8(w);
+#else
     if (w.empty()) return "";
     int len = ::WideCharToMultiByte(CP_UTF8, 0, w.data(),
                                     (int)w.size(),
@@ -63,6 +75,7 @@ std::string WideToUtf8(const std::wstring& w)
     ::WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(),
                           &s[0], len, nullptr, nullptr);
     return s;
+#endif
 }
 
 // Human-readable byte count — duplicated from tool_read.cpp for the
@@ -86,6 +99,7 @@ std::string HumanBytes(uint64_t b)
     return ss.str();
 }
 
+#ifdef _WIN32
 // FILETIME → "YYYY-MM-DD HH:MM" in local time.  Zero FILETIME
 // (e.g. root special dirs) collapses to "—" so the column stays
 // aligned.
@@ -106,6 +120,19 @@ std::string FormatFileTime(const FILETIME& ft)
                   (unsigned)st.wMinute);
     return std::string(buf);
 }
+
+#else
+// mtime → "YYYY-MM-DD HH:MM" in local time.
+std::string FormatFileTime(time_t t)
+{
+    if (t == 0) return "\xE2\x80\x94"; // em-dash
+    struct tm lt {};
+    if (!::localtime_r(&t, &lt)) return "\xE2\x80\x94";
+    char buf[32];
+    std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M", &lt);
+    return std::string(buf);
+}
+#endif
 
 // Case-insensitive < on UTF-8 strings.  Falls back to byte-wise
 // compare after lowercasing ASCII; non-ASCII entries sort in byte
@@ -177,6 +204,7 @@ LsResult ListDirectory(const std::string& inputPath, const ToolContext& ctx)
         return r;
     }
 
+#ifdef _WIN32
     // ── Enumerate via FindFirstFileW ─────────────────────────────
     // Pattern "<dir>\*" yields every entry; we filter . and .. as
     // we go.  UNC paths ("\\server\share\*") work identically.
@@ -220,6 +248,48 @@ LsResult ListDirectory(const std::string& inputPath, const ToolContext& ctx)
         else               files.push_back(std::move(e));
     } while (::FindNextFileW(hFind, &fd));
     ::FindClose(hFind);
+
+#else
+    DIR* dirp = ::opendir(resolved.c_str());
+    if (!dirp) {
+        const int err = errno;
+        r.chips.push_back("failed");
+        r.errorBody = "Could not read directory: " + resolved;
+        if (err == EACCES || err == EPERM) r.errorBody += " (access denied)";
+        else if (err == ENOENT)            r.errorBody += " (no entries)";
+        r.chips.push_back(ElapsedChip(t0));
+        return r;
+    }
+
+    std::vector<LsEntry> dirs, files;
+    bool hitEntryCap = false;
+    size_t totalScanned = 0;
+
+    while (struct dirent* de = ::readdir(dirp)) {
+        const std::string name = de->d_name;
+        if (name == "." || name == "..") continue;
+
+        ++totalScanned;
+        if (dirs.size() + files.size() >= kLsEntryCap) {
+            hitEntryCap = true;
+            continue;
+        }
+
+        const std::string full = resolved + (resolved.back() == '/' ? "" : "/") + name;
+        struct stat st {};
+        if (::stat(full.c_str(), &st) != 0 && ::lstat(full.c_str(), &st) != 0) continue;
+
+        LsEntry e;
+        e.name = name;
+        e.isDirectory = S_ISDIR(st.st_mode);
+        e.sizeBytes = e.isDirectory ? 0 : static_cast<uint64_t>(st.st_size);
+        e.mtimeFormatted = FormatFileTime(st.st_mtime);
+
+        if (e.isDirectory) dirs.push_back(std::move(e));
+        else               files.push_back(std::move(e));
+    }
+    ::closedir(dirp);
+#endif
 
     // Keep counting beyond the cap so "X of Y+" is honest.
     // (FindNextFileW loop exited at EOF, not at the cap.)  The

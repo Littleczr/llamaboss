@@ -5,6 +5,7 @@
 #include <utility>
 
 #include "lb_windows.h"
+#include "lb_utf.h"
 
 #include <wx/filename.h>
 
@@ -189,6 +190,10 @@ std::string SanitizeFilename(const std::string& raw,
 // tool_path.cpp.  Those duplicates can be migrated to call these in
 // a future cleanup pass; new code should use these directly.
 
+#ifndef _WIN32
+std::wstring Utf8ToWide(const std::string& in) { return lb_utf::Utf8ToWide(in); }
+std::string  WideToUtf8(const std::wstring& in) { return lb_utf::WideToUtf8(in); }
+#else
 std::wstring Utf8ToWide(const std::string& in)
 {
     if (in.empty()) return std::wstring();
@@ -212,6 +217,7 @@ std::string WideToUtf8(const std::wstring& in)
                           &out[0], n, nullptr, nullptr);
     return out;
 }
+#endif
 
 // ═══════════════════════════════════════════════════════════════════
 //  Model/settings path normalization

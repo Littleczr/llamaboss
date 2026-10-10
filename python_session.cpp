@@ -22,6 +22,7 @@
 #include "ui_event_post.h"
 
 #include "lb_windows.h"
+#include "lb_utf.h"
 
 wxDEFINE_EVENT(wxEVT_PY_SESSION_COMPLETE, wxCommandEvent);
 
@@ -60,7 +61,11 @@ namespace {
 
 std::wstring Utf8ToWide(const std::string& s)
 {
+#ifndef _WIN32
+    return lb_utf::Utf8ToWide(s);
+#else
     return path_safety::Utf8ToWide(s);
+#endif
 }
 
 double NowSec()

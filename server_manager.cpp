@@ -23,7 +23,7 @@ wxDEFINE_EVENT(wxEVT_SERVER_ERROR, wxCommandEvent);
 static std::string ReadLogTail(const std::string& path, size_t maxBytes = 4096)
 {
     try {
-        std::ifstream f(path_safety::Utf8ToWide(path), std::ios::binary | std::ios::ate);
+        std::ifstream f(std::filesystem::path(path_safety::Utf8ToWide(path)), std::ios::binary | std::ios::ate);
         if (!f) return "";
         std::streampos size = f.tellg();
         if (size <= 0) return "";

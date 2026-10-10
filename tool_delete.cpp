@@ -8,6 +8,9 @@
 #include "tool_mutation_guard.h"
 
 #include "lb_windows.h"
+#ifndef _WIN32
+#include <dirent.h>
+#endif
 
 namespace {
 
@@ -54,6 +57,8 @@ std::string Trim(const std::string& s)
 // just to keep the diagnostic display readable when a model tries
 // to delete a directory with thousands of files; we stop counting
 // after a small ceiling and add a "+" to the count chip.
+#ifdef _WIN32
+
 size_t CountDirEntries(const std::string& absDir, size_t cap)
 {
     std::wstring wDir = path_safety::Utf8ToWide(absDir);
@@ -109,6 +114,30 @@ size_t FileSize(const std::string& absPath)
                ? (size_t)-1
                : (size_t)li.QuadPart;
 }
+
+#else
+
+size_t CountDirEntries(const std::string& absDir, size_t cap)
+{
+    DIR* d = ::opendir(absDir.c_str());
+    if (!d) return 0;
+    size_t count = 0;
+    while (struct dirent* e = ::readdir(d)) {
+        if (std::strcmp(e->d_name, ".") == 0 || std::strcmp(e->d_name, "..") == 0) continue;
+        if (++count >= cap) break;
+    }
+    ::closedir(d);
+    return count;
+}
+
+size_t FileSize(const std::string& absPath)
+{
+    struct stat st {};
+    if (::stat(absPath.c_str(), &st) != 0) return 0;
+    return static_cast<size_t>(st.st_size);
+}
+
+#endif
 
 } // anonymous namespace
 
@@ -254,11 +283,18 @@ DeleteResult DeleteEntry(const std::string& pathIn,
         }
         mutation.ReleaseTargetForCommit();
 
+#ifdef _WIN32
         if (!::DeleteFileW(wPath.c_str())) {
             DWORD err = ::GetLastError();
             r.chips.push_back("failed");
             r.errorBody = "DeleteFile failed (Win32 error " +
                           std::to_string(err) + ").";
+#else
+        if (::unlink(resolved.c_str()) != 0) {
+            const int err = errno;
+            r.chips.push_back("failed");
+            r.errorBody = std::string("Delete failed (") + std::strerror(err) + ").";
+#endif
             r.chips.push_back(ElapsedChip(t0));
             return r;
         }
@@ -300,20 +336,31 @@ DeleteResult DeleteEntry(const std::string& pathIn,
     }
     mutation.ReleaseTargetForCommit();
 
+#ifdef _WIN32
     if (!::RemoveDirectoryW(wPath.c_str())) {
         DWORD err = ::GetLastError();
+        const bool notEmpty = err == ERROR_DIR_NOT_EMPTY;
+#else
+    if (::rmdir(resolved.c_str()) != 0) {
+        const int err = errno;
+        const bool notEmpty = err == ENOTEMPTY || err == EEXIST;
+#endif
         // Race: another process / user added a file to the dir
         // between CountDirEntries and now, making it non-empty.
         // Treat that as "not empty" with a recoverable diagnostic
         // rather than a generic failure.
-        if (err == ERROR_DIR_NOT_EMPTY) {
+        if (notEmpty) {
             r.chips.push_back("not empty");
             r.errorBody = "Directory became non-empty during the "
                           "operation: " + resolved;
         } else {
             r.chips.push_back("failed");
+#ifdef _WIN32
             r.errorBody = "RemoveDirectory failed (Win32 error " +
                           std::to_string(err) + ").";
+#else
+            r.errorBody = std::string("Remove directory failed (") + std::strerror(err) + ").";
+#endif
         }
         r.chips.push_back(ElapsedChip(t0));
         return r;

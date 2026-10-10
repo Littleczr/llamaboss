@@ -341,7 +341,7 @@ ReadResult ReadFile(const std::string& inputPath, const ToolContext& ctx)
     }
 
     // ── Size check (ate + tellg) ─────────────────────────────────
-    std::ifstream f(path_safety::Utf8ToWide(resolved), std::ios::binary | std::ios::ate);
+    std::ifstream f(std::filesystem::path(path_safety::Utf8ToWide(resolved)), std::ios::binary | std::ios::ate);
     if (!f.is_open()) {
         r.chips.push_back("failed");
         r.errorBody = "Could not open file: " + resolved;
@@ -475,7 +475,7 @@ ReadResult ReadFileHead(const std::string& inputPath,
         }
     }
 
-    std::ifstream f(path_safety::Utf8ToWide(resolved), std::ios::binary | std::ios::ate);
+    std::ifstream f(std::filesystem::path(path_safety::Utf8ToWide(resolved)), std::ios::binary | std::ios::ate);
     if (!f.is_open()) {
         r.chips.push_back("failed");
         r.errorBody = "Could not open file: " + resolved;
@@ -631,7 +631,7 @@ ReadResult ReadFileRange(const std::string& inputPath,
         }
     }
 
-    std::ifstream f(path_safety::Utf8ToWide(resolved), std::ios::binary | std::ios::ate);
+    std::ifstream f(std::filesystem::path(path_safety::Utf8ToWide(resolved)), std::ios::binary | std::ios::ate);
     if (!f.is_open()) {
         r.chips.push_back("failed");
         r.errorBody = "Could not open file: " + resolved;
@@ -899,7 +899,7 @@ ReadResult ReadFileRanges(const std::string& inputPath,
         }
     }
 
-    std::ifstream f(path_safety::Utf8ToWide(resolved),
+    std::ifstream f(std::filesystem::path(path_safety::Utf8ToWide(resolved)),
                     std::ios::binary | std::ios::ate);
     if (!f.is_open()) {
         return fail("Could not open file: " + resolved);

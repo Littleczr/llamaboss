@@ -2478,7 +2478,7 @@ bool ChatHistory::WriteSaveSnapshot(const SaveSnapshot& snapshot,
         if (!snapshot.titleMarkerPath.empty()) {
             try {
                 std::ofstream marker(
-                    path_safety::Utf8ToWide(snapshot.titleMarkerPath),
+                    std::filesystem::path(path_safety::Utf8ToWide(snapshot.titleMarkerPath)),
                     std::ios::out | std::ios::trunc);
                 if (marker.is_open()) {
                     marker << snapshot.title << "\n\n"
@@ -2539,7 +2539,7 @@ bool ChatHistory::LoadFromFile(const std::string& filePath, std::vector<std::str
     outModels.clear();
 
     try {
-        std::ifstream file(path_safety::Utf8ToWide(filePath));
+        std::ifstream file(std::filesystem::path(path_safety::Utf8ToWide(filePath)));
         if (!file.is_open()) return false;
 
         std::string content((std::istreambuf_iterator<char>(file)),
@@ -3379,7 +3379,7 @@ void ReadLegacyChatFolderMeta(const std::string& folder,
     }
 
     if (titleOut.empty()) {
-        std::ifstream marker(path_safety::Utf8ToWide(JoinChatPath(folder, "_title.txt")));
+        std::ifstream marker(std::filesystem::path(path_safety::Utf8ToWide(JoinChatPath(folder, "_title.txt"))));
         if (marker.is_open()) std::getline(marker, titleOut);
         while (!titleOut.empty() && (titleOut.back() == '\r' || titleOut.back() == '\n'))
             titleOut.pop_back();

@@ -636,7 +636,7 @@ bool TryReadSmallTextFile(const std::string& path,
     sizeOut = 0;
 
 #ifdef _WIN32
-    std::ifstream file(path_safety::Utf8ToWide(path),
+    std::ifstream file(std::filesystem::path(path_safety::Utf8ToWide(path)),
                        std::ios::binary | std::ios::ate);
 #else
     std::ifstream file(path, std::ios::binary | std::ios::ate);
@@ -703,12 +703,17 @@ std::string AgentConversationScriptsDirForCwd(const std::string& cwd)
 
 bool AgentRegularFileExists(const std::string& path)
 {
+#ifdef _WIN32
     std::wstring wide = path_safety::Utf8ToWide(path);
     if (wide.empty()) return false;
 
     DWORD attrs = ::GetFileAttributesW(wide.c_str());
     return attrs != INVALID_FILE_ATTRIBUTES &&
            (attrs & FILE_ATTRIBUTE_DIRECTORY) == 0;
+#else
+    std::error_code ec;
+    return !path.empty() && std::filesystem::is_regular_file(path, ec);
+#endif
 }
 
 bool ProjectScriptRunBypassWouldBeShadowedByConversationScript(
