@@ -1,5 +1,3 @@
-#define _CRT_SECURE_NO_WARNINGS
-
 // python_session.cpp
 //
 // RLM step 2, phase S1 — persistent Python session.  See
@@ -18,29 +16,12 @@
 #include "lb_string_utils.h"   // LbUtf8SafeTruncate
 #include "python_resources.h"  // embedded lb_kernel.py (RCDATA)
 
-#include <Poco/Dynamic/Var.h>
-#include <Poco/JSON/Object.h>
-#include <Poco/JSON/Parser.h>
-
-#include <algorithm>
-#include <atomic>
-#include <chrono>
 #include <condition_variable>
-#include <cstdlib>
-#include <cstring>
 #include <cwctype>
 #include <iterator>
-#include <map>
-#include <mutex>
-#include <sstream>
-#include <string>
-#include <thread>
-#include <utility>
-#include <vector>
 #include "ui_event_post.h"
 
-#define NOMINMAX
-#include <windows.h>
+#include "lb_windows.h"
 
 wxDEFINE_EVENT(wxEVT_PY_SESSION_COMPLETE, wxCommandEvent);
 

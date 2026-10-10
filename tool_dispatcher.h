@@ -1,12 +1,12 @@
 // tool_dispatcher.h
 //
-// Phase 4: Agent harness — tool dispatcher.
+// Agent harness — tool dispatcher.
 //
-// Maps a parsed ToolInvocation onto one of the Phase 3 tool
-// functions and returns a unified result.  This is the SINGLE
-// place where the agent harness touches ReadFile / ListDirectory
-// / GrepExecutor — everything upstream (parser, loop control,
-// compaction) deals only in ToolInvocation + ToolInvocationResult.
+// Maps a parsed ToolInvocation onto the tool implementations and
+// returns a unified result.  This is the SINGLE place where the agent
+// harness touches ReadFile / ListDirectory / GrepExecutor — everything
+// upstream (parser, loop control, compaction) deals only in
+// ToolInvocation + ToolInvocationResult.
 //
 // ─── Sync vs async ───────────────────────────────────────────────
 // ToolSpec dispatch functions are either synchronous or start a
@@ -16,8 +16,8 @@
 // Specialized async tools post their own completion events and return Async.
 //
 // Note: this header deliberately does NOT include any agent-loop
-// types — it's usable from a future harness, a test harness, or a
-// REPL-style tool shell without pulling in loop state.
+// types — it's usable from a test harness or a REPL-style tool shell
+// without pulling in loop state.
 //
 #pragma once
 

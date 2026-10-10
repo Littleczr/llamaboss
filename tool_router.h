@@ -1,36 +1,17 @@
 // tool_router.h
 //
-// Phase 2 (architecture refactor): ToolSpec + ToolRouter.
+// ToolSpec + ToolRouter.
 //
 // A ToolSpec is the single, declarative description of a tool: its
 // name, its human-readable description, its argument shape (as a
-// JSON Schema for Phase 3 native function calling), its shape-level
-// validator, and its dispatcher.
+// JSON Schema for native function calling), its shape-level
+// validator, its safety profile, and its dispatcher.
 //
-// The router owns a map of name -> spec.  Phase 1 had three parallel
-// switches across ten tools (IsKnownToolName, ValidateToolArgs,
-// DispatchInvocation).  In Phase 2 those three switches collapse to
-// a single map lookup; adding a tool becomes one ToolSpec value
-// registered in tool_router.cpp's BuildSpecs().
-//
-// ─── Phase progression ───────────────────────────────────────────
-//
-//   P2 (this phase): Router used as the back-end behind the existing
-//                    public IsKnownToolName / ValidateToolArgs /
-//                    DispatchInvocation entry points.  No behaviour
-//                    changes; the model never sees a difference.
-//
-//   P3:              parameters_json_schema gets handed to llama-server
-//                    on /v1/chat/completions for models with native
-//                    tool-calling chat templates.
-//
-//   P4:              slash-command handlers in MyFrame route through
-//                    the router instead of calling tool functions
-//                    directly, unifying user-typed and agent-emitted
-//                    invocations behind one entry point.
-//
-//   P10:             MCP-discovered tools register through the same
-//                    router as built-ins — uniform dispatch.
+// The router owns a map of name -> spec, so IsKnownToolName,
+// ValidateToolArgs and DispatchInvocation are all single map lookups;
+// adding a tool is one ToolSpec value registered in tool_router.cpp's
+// BuildBuiltinSpecs().  User-typed slash commands and agent-emitted
+// invocations route through the same entry point.
 //
 // The router has no dependency on the agent loop, MyFrame, or the
 // chat UI.  It can be exercised from a test harness or a future CLI
@@ -82,18 +63,15 @@ struct ToolSpec {
     // router's map and the literal token the model emits in <n>.
     std::string name;
 
-    // Short human-readable summary, used by:
-    //   - Phase 3: handed to the model via the function-calling
-    //     `description` field on /v1/chat/completions.
-    //   - Future Settings UI / "what tools are available" surfaces.
+    // Short human-readable summary, handed to the model via the
+    // function-calling `description` field on /v1/chat/completions.
     // Keep these one-line and behaviour-focused, not implementation
     // detail.
     std::string description;
 
-    // JSON Schema for the tool's arguments.  Populated now so Phase 3
-    // is a flip-the-switch change rather than a writing-schemas
-    // change.  Currently unused at runtime (the XML protocol carries
-    // freeform text args); served to the model in Phase 3.
+    // JSON Schema for the tool's arguments, served to the model under
+    // native function calling (the XML protocol carries freeform text
+    // args instead).
     //
     // Stored as a string of JSON text, not a Poco::JSON::Object,
     // so this header doesn't pull Poco JSON into every TU that
@@ -174,9 +152,9 @@ public:
     // matches the older IsKnownToolName naming.
     bool Has(const std::string& name) const;
 
-    // Snapshot of all registered specs in registration order.  Used
-    // by Phase 3 to build the function-calling tool list to send to
-    // the model, and by Phase 4's unified slash-handler.
+    // Snapshot of all registered specs in registration order.  Used to
+    // build the function-calling tool list sent to the model, and by
+    // the slash-command handler.
     std::vector<const ToolSpec*> All() const;
 
 private:
@@ -190,7 +168,7 @@ private:
 // BuildBuiltinSpecs() in tool_router.cpp.
 ToolRouter& GetGlobalRouter();
 
-// ─── Phase 3c-i: native tool catalog ───────────────────────────
+// ─── Native tool catalog ───────────────────────────────────────
 // Render every registered tool as an entry in the OpenAI function-
 // calling shape and return the resulting JSON array as a string.
 // The output is suitable for splicing into a /v1/chat/completions
@@ -200,8 +178,8 @@ ToolRouter& GetGlobalRouter();
 //   { "type": "function",
 //     "function": { "name": ..., "description": ..., "parameters": ... } }
 // where "parameters" is the JSON schema string already stored on
-// the spec (see Phase 2's parameters_json_schema, parsed here as
-// a JSON value rather than re-stringified).
+// the spec (parameters_json_schema, parsed here as a JSON value
+// rather than re-stringified).
 //
 // Used by ChatHistory::BuildChatRequestJson when the active
 // protocol is ToolProtocol::Native.  XML-protocol requests do not

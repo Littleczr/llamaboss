@@ -1,5 +1,3 @@
-#define _CRT_SECURE_NO_WARNINGS
-
 // tool_protocol.cpp
 
 #include "tool_protocol.h"
@@ -7,21 +5,10 @@
 #include <wx/fileconf.h>
 #include <wx/string.h>
 
-#include <Poco/JSON/Parser.h>
-#include <Poco/JSON/Object.h>
-#include <Poco/JSON/Array.h>
-#include <Poco/JSON/Stringifier.h>
-#include <Poco/Net/HTTPClientSession.h>
-#include <Poco/Net/HTTPRequest.h>
-#include <Poco/Net/HTTPResponse.h>
-#include <Poco/StreamCopier.h>
-#include <Poco/URI.h>
 #include <Poco/SHA1Engine.h>
 #include <Poco/DigestStream.h>
 
-#include <chrono>
 #include <ostream>
-#include <sstream>
 #include "ui_event_post.h"
 
 wxDEFINE_EVENT(wxEVT_TOOL_PROTOCOL_DETECTED, wxThreadEvent);

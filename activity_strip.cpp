@@ -8,11 +8,6 @@
 #include <wx/taskbarbutton.h>
 #endif
 
-#include <algorithm>
-#include <cctype>
-#include <cstdlib>
-#include <sstream>
-
 namespace {
 
 std::string FormatClock(long long seconds)

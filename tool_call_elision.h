@@ -3,11 +3,10 @@
 //  tool_call_elision.h — shorten the arguments of OLD tool calls
 // ═══════════════════════════════════════════════════════════════════
 //
-// Build-time elision (ChatHistory::BuildChatRequestJson) used to shrink
-// only tool RESULTS.  In long agent chats most of the context is the
-// model's own tool-call ARGUMENTS: 2-4 KB PowerShell scripts, file
-// bodies for write_file, and so on.  Those were never touched, so the
-// request stayed over budget even with every eligible result elided.
+// In long agent chats most of the context is the model's own tool-call
+// ARGUMENTS: 2-4 KB PowerShell scripts, file bodies for write_file, and
+// so on.  Eliding only tool RESULTS leaves the request over budget even
+// with every eligible result elided.
 //
 // ShortenToolCallArguments() returns a shorter, still-valid JSON
 // object for one call's `function.arguments` string:
@@ -21,17 +20,12 @@
 // The input is returned unchanged when it is already small, so the
 // operation is idempotent across builds.
 //
-// Spool + guard (2026-10-01, from the first live run):  GPT-6 Luna
-// wanted to rerun an earlier build script, saw only the shortened copy,
-// and re-issued it verbatim three times -- marker included.  The policy
-// linter rejected all three only because each cut happened to fall
-// inside a quoted string; a cut between statements would have run half a
-// script, and a copied write_file body would have written a truncated
-// file.  Two defences:
+// Spool + guard: models DO copy an old call to rerun it, marker
+// included.  A cut between statements would run half a script, and a
+// copied write_file body would write a truncated file.  Two defences:
 //   * every cut value is spooled (when a spool callback is supplied) and
 //     the marker names the file, so the full text is one read away --
-//     the same pattern as tool-result elision, which the model already
-//     uses unprompted;
+//     the same pattern as tool-result elision;
 //   * ContainsArgElisionMarker() lets argument validation reject any new
 //     tool call that carries the marker, for every tool, before approval
 //     or execution (tool_invocation.cpp / agent_controller.cpp).

@@ -1,20 +1,16 @@
 // connections_dialog.cpp
-#define _CRT_SECURE_NO_WARNINGS
 
 #include "connections_dialog.h"
 #include "secrets_store.h"
 #include "theme.h"
 #include "widgets.h"   // ApplyDialogThemeRecursive, ApplyDarkTitleBar
 
-#include <wx/textdlg.h>
 #include <wx/sizer.h>
 #include <wx/radiobut.h>
 #include <wx/stattext.h>
 #include <wx/textctrl.h>
 #include <wx/msgdlg.h>
 #include <wx/panel.h>
-
-#include <string>
 
 // ─── Event table ────────────────────────────────────────────────
 
@@ -349,12 +345,12 @@ private:
             m_valueLabel->SetLabel("API key value:");
             if (m_allowEmptyDirectValue) {
                 m_valueHint->SetLabel(
-                    "Stored as plaintext in secrets.json. Leave blank "
-                    "to keep the existing secret.");
+                    "Stored encrypted in secrets.json (Windows DPAPI, "
+                    "this user only). Leave blank to keep the existing secret.");
             } else {
                 m_valueHint->SetLabel(
-                    "Stored as plaintext in secrets.json (user-only file "
-                    "ACL).");
+                    "Stored encrypted in secrets.json (Windows DPAPI, "
+                    "this user only).");
             }
         }
 
@@ -502,9 +498,8 @@ void ConnectionsDialog::ApplyTheme()
     if (!m_theme) return;
 
     // Use the dialog-surface colour for consistency with the rest of
-    // the dialog family (settings, model_manager, etc.). Was bgMain
-    // previously — the chat area shade — which made this modal read
-    // one tier darker than its parent Settings dialog.
+    // the dialog family (settings, model_manager, etc.), so this modal
+    // doesn't read one tier darker than its parent Settings dialog.
     SetBackgroundColour(m_theme->bgDialogSurface);
 
     // bgInputArea is the theme's slightly-lifted surface used for

@@ -3,8 +3,7 @@
 //   • ChatDisplay       — clicking a thumbnail in the transcript
 //   • AttachmentChip    — clicking a pending (not yet sent) image card
 //
-// Lifted out of ChatDisplay::ShowImageViewer so both surfaces get the
-// same viewer.  Header-only on purpose: no .vcxproj change needed.
+// Header-only on purpose: no .vcxproj change needed.
 //
 // Behavior:
 //   • Frame dims under the modal scrim; the image sits centred on the

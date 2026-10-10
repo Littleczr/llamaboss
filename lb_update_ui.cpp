@@ -1,10 +1,5 @@
 #include "lb_update_ui.h"
 
-#include <algorithm>
-#include <cctype>
-
-#include <Poco/URI.h>
-
 namespace {
 
 std::string LbUpdateLowerAscii(std::string s)

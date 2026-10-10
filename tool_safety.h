@@ -1,8 +1,8 @@
 // tool_safety.h
 //
 // Single home for the descriptive safety metadata attached to every
-// ToolSpec.  Promoted out of tool_router.h so tool_approval.h can
-// share these types without pulling in the full router header.
+// ToolSpec, kept out of tool_router.h so tool_approval.h can share
+// these types without pulling in the full router header.
 //
 // This is METADATA, not enforcement.  Enforcement still lives in
 // per-tool implementations (path_safety, command_policy, the staged-
@@ -10,40 +10,27 @@
 // those layers, the model-facing prompt summary, and any future
 // audit/telemetry surface read from one source of truth.
 //
-// ─── Migration note ──────────────────────────────────────────────
-// Before this header existed:
-//   - RiskTier               lived in tool_approval.h
-//   - ToolSafetyProfile      lived in tool_router.h
-//   - ClassifyTier()         was a hardcoded if/else ladder in
-//                            tool_approval.h that duplicated the
-//                            per-tool requiresApproval=true lines
-//                            in BuildBuiltinSpecs.
-//
-// After this header:
-//   - All safety types       live here.
-//   - ClassifyTier()         is a one-line lookup against the router.
-//   - safety.tier            is the only place a tool's classification
-//                            is declared; safety.requiresApproval()
-//                            is derived from it.
+// safety.tier is the only place a tool's classification is declared;
+// safety.requiresApproval() is derived from it, and ClassifyTier() in
+// tool_approval.h is a one-line lookup against the router.
 //
 #pragma once
 
 #include <string>
 
 // ─── Risk tier — drives the approval gate ───────────────────────
-// RequiresApproval used to walk a per-tool if/else ladder where each
-// branch hard-coded "needs approval" for tools that touched the
-// filesystem.  Once conversational consent matured (the model self-
-// asks "want me to do X?" and the user replies in prose), that
-// ladder produced double-prompts: model asks, user says yes, system
-// ALSO renders an approval card asking the same thing.
-//
-// The tier system replaces that ladder.  Each tool is classified
-// once on its ToolSpec.safety.tier; the approval gate renders a
-// card only for the Dangerous tier.  Safe and Moderate tools rely
-// on:
+// Each tool is classified once on its ToolSpec.safety.tier; the
+// approval gate renders a card only for the Dangerous tier.  Safe and
+// Moderate tools rely on:
 //   - in agent mode  : the model's natural-language ask + user "yes"
 //   - in slash mode  : the user having literally typed the command
+// so the user isn't asked twice (model asks, user says yes, card asks
+// again).
+//
+// Because Moderate tools run without a card, no combination of
+// approval-free tools may amount to running model-chosen code (e.g.
+// write a script, then run it).  Anything that executes code chosen by
+// the model belongs in Dangerous.
 //
 // PowerShell uses a hybrid safety path.  command_policy.cpp auto-allows
 // clearly read-only inspection commands, rejects malformed commands, and
@@ -133,10 +120,9 @@ enum class Reversibility {
 };
 
 // ─── ToolSafetyProfile ──────────────────────────────────────────
-// Attached to every ToolSpec.  Previously lived in tool_router.h;
-// promoted here so tool_approval.h's ClassifyTier() can read the
-// tier field without dragging the dispatcher headers into every
-// translation unit that needs the enum.
+// Attached to every ToolSpec.  Lives here so tool_approval.h's
+// ClassifyTier() can read the tier field without dragging the
+// dispatcher headers into every translation unit that needs the enum.
 struct ToolSafetyProfile {
     // ── Tier (single source of truth for the approval gate) ─────
     // ClassifyTier() in tool_approval.h reads this field via a
@@ -158,10 +144,11 @@ struct ToolSafetyProfile {
     // underlying tool/policy allows the path.
     bool mayInspectOutsideCwd = false;
 
-    // Legacy field name. True when writes/mutations are restricted to the
-    // trusted write-root set: conversation cwd, attached project, Skills,
-    // plus explicit chat-scoped folder grants. Kept to avoid a broad metadata
-    // rename; the runtime containment check remains authoritative.
+    // True when writes/mutations are restricted to the trusted
+    // write-root set: conversation cwd, attached project, Skills, plus
+    // explicit chat-scoped folder grants.  (The name predates the
+    // project/Skills roots.)  The runtime containment check remains
+    // authoritative.
     bool writesInsideCwdOnly = false;
 
     // ── Network + remote-side-effect footprint ──────────────────
@@ -201,7 +188,6 @@ struct ToolSafetyProfile {
 
     // ── Derived ─────────────────────────────────────────────────
     // Approval card requirement is fully derived from tier; tools
-    // no longer set this directly.  Existing call sites that read
-    // spec.safety.requiresApproval now invoke spec.safety.requiresApproval().
+    // never set it directly.
     bool requiresApproval() const { return tier == RiskTier::Dangerous; }
 };

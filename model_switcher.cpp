@@ -17,13 +17,6 @@
 #include "tool_protocol.h"     // ToolProtocol
 #include "endpoint_store.h"    // 2d: configured remote endpoints
 
-#include <algorithm>
-#include <cctype>
-#include <vector>
-#include <unordered_map>
-
-#include <wx/filename.h>
-
 namespace {
 
 // ── Remote selection key ─────────────────────────────────────────
@@ -295,8 +288,8 @@ InferenceTarget ModelSwitcher::ResolveTargetForConversation()
 
 void ModelSwitcher::MarkServerNotReady()
 {
-    // Shared readiness is service-owned.  This legacy helper now affects only
-    // the current frame's projection of that state.
+    // Shared readiness is service-owned.  This helper affects only the
+    // current frame's projection of that state.
     if (m_statusDot) m_statusDot->SetConnected(false);
 }
 
@@ -859,7 +852,7 @@ void ModelSwitcher::SwitchToModel(const std::string& newModel)
             return;
         }
 
-        // ── Multi-window courtesy check (Phase 3c) ───────────────
+        // ── Multi-window courtesy check ──────────────────────────
         // Going remote retires the local server, which kills any
         // LOCAL stream another window has in flight.  Remote-busy
         // windows are pinned to their own endpoint
@@ -921,7 +914,7 @@ void ModelSwitcher::SwitchToModel(const std::string& newModel)
         return;
     }
 
-    // ── Multi-window courtesy check (Phase 3c) ───────────────────
+    // ── Multi-window courtesy check ──────────────────────────────
     // Restarting the local server kills any LOCAL stream another
     // window has in flight.  Remote-busy windows are pinned to their
     // own endpoint (ResolveTargetForConversation) and unaffected —
@@ -1063,6 +1056,7 @@ void ModelSwitcher::UpdateModelLabel()
     };
 
     std::string display;
+    bool chatgptPlan = false;
     if (preferredRemote) {
         // Remote endpoint: show the endpoint's configured model display
         // name verbatim. The wire id (e.g. "anthropic/claude-sonnet-4.6")
@@ -1081,17 +1075,22 @@ void ModelSwitcher::UpdateModelLabel()
                             break;
                         }
                     }
+                    // Sign in with ChatGPT UI guideline: say when requests
+                    // use the ChatGPT plan, next to the model selector.
+                    if (ep->authScheme == EndpointStore::AuthScheme::ChatGpt)
+                        chatgptPlan = true;
                 }
             }
         }
         if (display.empty()) display = model;   // ad hoc / unknown id
+        if (chatgptPlan) display += " \xC2\xB7 Using ChatGPT plan";
     } else {
         // Take the friendly display ("gemma 4 e4b it f16") and reformat it
         // for the pill: "gemma-4-e4b-it · f16".  Hyphens replace the spaces
         // in the identity tokens, and any trailing quantization-like token
         // (f16, bf16, q4_K_M, iq4_NL, ...) gets peeled off as a " · <q>"
-        // suffix.  The ▾ caret is no longer appended -- the brackets that
-        // now wrap the pill (added in ui_builder.cpp) carry the affordance.
+        // suffix.  No ▾ caret: the brackets that wrap the pill (added in
+        // ui_builder.cpp) carry the affordance.
         display = FormatModelNameForPill(shortenModel(model));
     }
     const wxString displayWx = wxString::FromUTF8(display.c_str());

@@ -3,19 +3,9 @@
 #include "tool_grep.h"
 #include "tool_path.h"
 
-#include <algorithm>
-#include <chrono>
-#include <cstdint>
-#include <cstring>
 #include <deque>
-#include <fstream>
-#include <sstream>
-#include <string>
-#include <utility>
-#include <vector>
 
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
+#include "lb_windows.h"
 #include "ui_event_post.h"
 
 wxDEFINE_EVENT(wxEVT_GREP_COMPLETE, wxCommandEvent);
@@ -716,8 +706,8 @@ public:
         }
 
         // Nothing was actually read, so there is no negative to report --
-        // only a failure.  This is the case that used to render as a
-        // confident "(no matches)" for a file grep can't search at all.
+        // only a failure.  A confident "(no matches)" would be wrong for
+        // a file grep can't search at all.
         std::string skipError;
         if (skippedFiles > 0 && s.filesSearched == 0 && s.matches.empty() &&
             !s.cancelled && !s.timedOut) {

@@ -1,26 +1,12 @@
 // endpoint_store.cpp
-#define _CRT_SECURE_NO_WARNINGS
 
 #include "endpoint_store.h"
 #include "openai_responses.h"
 #include "secrets_store.h"
+#include "chatgpt_auth.h"
+#include "chatgpt_auth_core.h"
 
-#include <wx/wx.h>
-#include <wx/stdpaths.h>
-#include <wx/filename.h>
-#include <wx/log.h>
 #include <wx/datetime.h>
-#include <wx/filefn.h>
-
-#include <Poco/JSON/Parser.h>
-#include <Poco/JSON/Object.h>
-#include <Poco/JSON/Array.h>
-#include <Poco/JSON/Stringifier.h>
-#include <Poco/Dynamic/Var.h>
-
-#include <fstream>
-#include <sstream>
-#include <algorithm>
 
 namespace {
 
@@ -82,6 +68,7 @@ std::string AuthSchemeToString(EndpointStore::AuthScheme s)
     switch (s) {
         case EndpointStore::AuthScheme::XApiKey: return "x-api-key";
         case EndpointStore::AuthScheme::None:    return "none";
+        case EndpointStore::AuthScheme::ChatGpt: return "chatgpt";
         default:                                 return "bearer";
     }
 }
@@ -90,6 +77,7 @@ EndpointStore::AuthScheme AuthSchemeFromString(const std::string& s)
 {
     if (s == "x-api-key") return EndpointStore::AuthScheme::XApiKey;
     if (s == "none")      return EndpointStore::AuthScheme::None;
+    if (s == "chatgpt")   return EndpointStore::AuthScheme::ChatGpt;
     return EndpointStore::AuthScheme::Bearer;   // unknown values stay
                                                 // on the historical
                                                 // default
@@ -158,6 +146,13 @@ bool EndpointStore::Load()
     m_loadBackupPath.clear();
 
     wxString path = wxString::FromUTF8(GetEndpointsFilePath().c_str());
+
+    // ChatGPT sign-in credentials live beside endpoints.json.  Load()
+    // runs on the UI thread at startup, which is where the credential
+    // store must be initialized (worker threads only ever read it).
+    lb_chatgpt::Auth::Get().Init(std::string(
+        wxFileName(path).GetPath().ToUTF8().data()));
+
     if (!wxFileExists(path)) {
         // No file: seed a usable default so the picker isn't empty
         // before the user configures anything.
@@ -223,6 +218,7 @@ bool EndpointStore::Load()
             // Optional /think dialect override; empty means "sniff the
             // base URL at resolve time" (the backward-compatible path).
             ep.reasoningDialect = getStr("reasoning_dialect", "");
+            ep.chatgptAccount   = getStr("chatgpt_account", "");
 
             if (obj->has("extra_headers")) {
                 auto hdrs = obj->getObject("extra_headers");
@@ -312,6 +308,8 @@ bool EndpointStore::Save()
         // which is the common case, and keeps hand-edited files clean.
         if (!ep.reasoningDialect.empty())
             obj->set("reasoning_dialect", ep.reasoningDialect);
+        if (!ep.chatgptAccount.empty())
+            obj->set("chatgpt_account", ep.chatgptAccount);
 
         if (!ep.extraHeaders.empty()) {
             Poco::JSON::Object::Ptr hdrs = new Poco::JSON::Object(true);
@@ -392,6 +390,44 @@ bool EndpointStore::ResolveTarget(const std::string&  endpointId,
     if (wireModelId.empty()) {
         outReason = "No model id given for endpoint '" + ep->displayName + "'.";
         return false;
+    }
+
+    // ChatGPT plan: the transport is fixed and the credential is an OAuth
+    // token the chat worker fetches (and renews) itself -- see
+    // InferenceTarget::chatgptAccount.  Only cheap in-memory checks
+    // happen here, so the UI thread never waits on the network.
+    if (ep->authScheme == AuthScheme::ChatGpt) {
+        lb_chatgpt::AccountSummary account;
+        if (ep->chatgptAccount.empty() ||
+            !lb_chatgpt::Auth::Get().FindAccount(ep->chatgptAccount, account) ||
+            !account.signedIn) {
+            outReason = "'" + ep->displayName + "' isn't signed in to ChatGPT. Open Settings -> "
+                        "Connections, edit it, and choose Continue with ChatGPT.";
+            return false;
+        }
+        if (!account.planEnabled) {
+            outReason = "ChatGPT plan use wasn't allowed when '" + ep->displayName +
+                        "' was signed in. Edit it and choose Continue with ChatGPT again.";
+            return false;
+        }
+        InferenceTarget t;
+        t.baseUrl          = lb_chatgpt::kApiBaseUrl();
+        t.chatPath         = lb_chatgpt::kResponsesPath();
+        t.useTls           = true;
+        t.authHeaderName   = "Authorization";   // value filled by the worker
+        t.chatgptAccount   = ep->chatgptAccount;
+        t.managed          = false;
+        t.protocol         = ToolProtocol::Native;
+        t.modelId          = wireModelId;
+        t.responsesApi     = true;
+        t.reasoningDialect = ReasoningDialect::OpenAIStyle;
+        for (const auto& m : ep->models) {
+            if (m.id == wireModelId) { t.noTools = m.noTools; break; }
+        }
+        // Image generation is not available on the plan route.
+        t.imageOutput = false;
+        out = std::move(t);
+        return true;
     }
 
     // AuthScheme::None endpoints (local or SSH-tunneled servers such
@@ -491,9 +527,9 @@ bool EndpointStore::ResolveTarget(const std::string&  endpointId,
     t.responsesApi = lb_responses::IsResponsesPath(t.chatPath);
     if (t.responsesApi) {
         // Responses speaks the OpenAI reasoning vocabulary by definition.
-        // Phase 2: agent tools work on this lane (function tools +
-        // encrypted reasoning replay), so the model's own Allow agent
-        // tools flag is the only gate — no forced noTools any more.
+        // Agent tools work on this lane (function tools + encrypted
+        // reasoning replay), so the model's own Allow agent tools flag
+        // is the only gate.
         t.reasoningDialect = ReasoningDialect::OpenAIStyle;
     }
 

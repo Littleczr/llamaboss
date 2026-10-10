@@ -1,5 +1,3 @@
-#define _CRT_SECURE_NO_WARNINGS
-
 // chat_history.cpp
 #include "chat_history.h"
 #include "reasoning_policy.h"
@@ -12,38 +10,16 @@
 #include "tool_call_elision.h"   // old tool-call argument elision
 
 // Poco headers for JSON
-#include <Poco/JSON/Parser.h>
-#include <Poco/JSON/Array.h>
-#include <Poco/JSON/Stringifier.h>
 #include <Poco/Timestamp.h>
 #include <Poco/DateTimeFormatter.h>
 #include <Poco/DateTimeFormat.h>
 #include <Poco/UUIDGenerator.h>
 #include <Poco/Types.h>
-#include <Poco/Base64Encoder.h>   // image attachment wire projection
 #include <Poco/FileStream.h>      // UTF-8-safe binary reads on Windows
-#include <Poco/StreamCopier.h>    // file → base64 encoder pump
 #include <Poco/File.h>            // stat (size/mtime) for the data-URI cache
 
 // wxWidgets for paths and file system
-#include <wx/stdpaths.h>
-#include <wx/filename.h>
-#include <wx/utils.h>
-#include <wx/dir.h>        // chat folder index / legacy migration
 #include <wx/datetime.h>   // chat folder date prefix
-
-#include <sstream>
-#include <fstream>
-#include <algorithm>
-#include <cctype>
-#include <cstring>
-#include <utility>
-#include <unordered_map>   // data-URI cache
-#include <mutex>           // data-URI cache + chat folder index guards
-#include <vector>
-#include <filesystem>     // elision spool
-#include <cstdint>
-#include <cstdio>
 
 // File format version: 9 (last bump added fields for the since-retired
 // Goals feature; v9 files are still read, their "goal" block ignored).
@@ -451,20 +427,20 @@ std::vector<std::string> ExtractToolCallIds(const Poco::JSON::Array::Ptr& toolCa
     return ids;
 }
 
-// ── Elision spool (2026-10-01) ───────────────────────────────────
-// Build-time elision used to DROP old tool-result bodies, leaving the
-// model a marker and nothing to fall back on: it re-ran the tool (or
-// guessed a Vars\ filename that never existed).  The full result is now
-// saved to the conversation's Vars\ lane and the marker names that
-// file, so an elided result becomes a variable, the same as RLM
-// demotion: grep or read_range the slice that is needed.
+// ── Elision spool ────────────────────────────────────────────────
+// Build-time elision saves the full tool result to the conversation's
+// Vars\ lane and the marker names that file, so an elided result
+// becomes a variable, the same as var-store demotion: grep or
+// read_range the slice that is needed.  A marker with nothing behind
+// it makes the model re-run the tool (or guess a Vars\ filename that
+// never existed).
 //
 // Idempotent by construction: the filename is a hash of the content,
 // so every build (and every session) maps the same result to the same
 // file, and the marker text is byte-stable across builds.  Results
 // that were already demoted at append time point at their existing
 // spool instead of being copied.  Any failure falls back to the plain
-// marker, i.e. the previous behaviour.
+// marker.
 
 constexpr size_t kMinElisionSpoolBytes = 2048;   // tiny results: marker only
 
@@ -767,7 +743,7 @@ void ChatHistory::AddAssistantMessage(const std::string& content, const std::str
     MarkDirty(/*contentActivity=*/true);
 }
 
-// ── Phase 3c-ii: native sidecar fields ─────────────────────────
+// ── Native sidecar fields ──────────────────────────────────────
 
 void ChatHistory::SetLastAssistantToolCalls(const std::string& toolCallsJson)
 {
@@ -942,12 +918,11 @@ bool ChatHistory::IsEmpty() const
 
 bool ChatHistory::HasPersistableContent() const
 {
-    // Historically LlamaBoss only persisted chats once they had at
-    // least one message.  Projects Phase 1 adds durable metadata that
-    // the user can set before typing a message, so allow metadata-only
-    // conversations to be saved as well.  If an empty metadata-only
-    // conversation has already been saved, HasFilePath() lets later
-    // metadata clears persist too.
+    // Projects add durable metadata that the user can set before
+    // typing a message, so metadata-only conversations are saved too,
+    // not just chats with at least one message.  If an empty
+    // metadata-only conversation has already been saved, HasFilePath()
+    // lets later metadata clears persist too.
     return !m_messages.empty()
         || HasProject()
         || m_pinned
@@ -966,10 +941,10 @@ bool ChatHistory::HasPersistableContent() const
 size_t ChatHistory::EstimateTokensFromBytes(size_t bytes)
 {
     // Fixed, conservative estimate for the meter's fallback (before an
-    // exact usage report).  Since 2026-10-01 the ELISION budget no longer
-    // uses this constant once a usage report has calibrated it
-    // (elision_budget.h); over-estimating here only makes the meter
-    // read high, while over-estimating in elision wasted the window.
+    // exact usage report).  The ELISION budget does not use this
+    // constant once a usage report has calibrated it (elision_budget.h);
+    // over-estimating here only makes the meter read high, while
+    // over-estimating in elision would waste the window.
     return (size_t)((double)bytes / kBytesPerToken);
 }
 
@@ -1057,7 +1032,7 @@ std::string ChatHistory::BuildChatRequestJson(const std::string& model, bool str
     // amortizes the sync; this is the read-side counterpart.
     FlushStreamBuffer();
 
-    // ── Phase 3c-i: pre-parse the tools array once ──────────────
+    // ── Pre-parse the tools array once ──────────────────────────
     // The caller passes an already-stringified JSON array (from
     // BuildToolsArrayJson).  We parse it here so it nests under
     // "tools" as a real JSON value rather than an embedded string.
@@ -1075,7 +1050,7 @@ std::string ChatHistory::BuildChatRequestJson(const std::string& model, bool str
         }
     }
 
-    // ── Phase 1: gather wire messages in original form ──────────
+    // ── Step 1: gather wire messages in original form ───────────
     // Build a parallel vector of message records so we can mutate
     // tool-result content in place during compaction and project
     // sidecar fields (tool_calls / tool_call_id) onto the wire JSON
@@ -1086,13 +1061,13 @@ std::string ChatHistory::BuildChatRequestJson(const std::string& model, bool str
         std::string role;
         std::string content;
         bool        isToolResult;     // cached — XML-formatted "[tool: NAME]" body
-        // Phase 3c-ii sidecars; only consulted when nativeProtocol
-        // is true.  Both empty for messages that didn't carry the
-        // matching field on disk.
+        // Native sidecars; only consulted when nativeProtocol is true.
+        // Both empty for messages that didn't carry the matching field
+        // on disk.
         std::string             toolCallId;     // user message answering an assistant call
         Poco::JSON::Array::Ptr  toolCalls;      // assistant message that emitted calls
-        // OpenAI Responses sidecar (Phase 2): the verbatim output array of
-        // the turn that emitted toolCalls.  Projected only when the send
+        // OpenAI Responses sidecar: the verbatim output array of the
+        // turn that emitted toolCalls.  Projected only when the send
         // target is a Responses endpoint AND toolCalls survives the
         // sanitizer — it is meaningless (and rejected by the provider)
         // without the function calls it belongs to.
@@ -1146,14 +1121,13 @@ std::string ChatHistory::BuildChatRequestJson(const std::string& model, bool str
         //
         // A blank USER message is a different case: attachments live in a
         // sidecar array, not in content, so a message can be blank here and
-        // still carry a persisted image that the carrier pass below is
-        // supposed to project.  Dropping it was doubly wrong -- the image
-        // never reached the model, AND the carrier loop (which scans `wire`
-        // backwards for the newest real user message) then selected the
-        // PREVIOUS turn instead, re-sending stale images.  The UI injects
-        // default text ("What is in this image?") on the normal send path,
-        // so this only bites imported conversations and any future caller
-        // that skips that injection -- but it fails silently when it does.
+        // still carry a persisted image that the carrier pass below must
+        // project.  Dropping it would lose the image AND make the carrier
+        // loop (which scans `wire` backwards for the newest real user
+        // message) select the PREVIOUS turn instead, re-sending stale
+        // images.  The UI injects default text ("What is in this image?")
+        // on the normal send path, so this matters for imported
+        // conversations and any caller that skips that injection.
         const bool hasToolCalls = msg->has("tool_calls");
         const bool blankContent =
             content.find_first_not_of(" \t\r\n") == std::string::npos;
@@ -1199,7 +1173,7 @@ std::string ChatHistory::BuildChatRequestJson(const std::string& model, bool str
         wire.push_back(std::move(w));
     }
 
-    // ── Phase 1b: strip stale live-loop budget trailers ─────────
+    // ── Step 1b: strip stale live-loop budget trailers ──────────
     // AgentController appends a model-facing "[agent tool step N of 12]"
     // trailer to the newest counted tool result while a loop is actively
     // iterating.  That trailer is useful for the immediate follow-up request,
@@ -1220,15 +1194,11 @@ std::string ChatHistory::BuildChatRequestJson(const std::string& model, bool str
         wire[i].content = StripAgentStepTrailer(wire[i].content);
     }
 
-    // ── Phase 1c: image carrier selection ────────────────────────
+    // ── Step 1c: image carrier selection ─────────────────────────
     // User-attached images are persisted to the conversation's
-    // attachments sidecar folder, but historically rode the wire only
-    // in the single request built right after attach (via
-    // AttachmentManager::InjectImagesIntoRequest).  Any rebuild —
-    // every agent-loop iteration, or a follow-up turn — silently
-    // dropped them, so vision models (Grok, Gemini, local mmproj
-    // pairs) went blind after one tool call and truthfully claimed
-    // they could not see the image.
+    // attachments sidecar folder.  Every request rebuild (each
+    // agent-loop iteration, or a follow-up turn) must re-project them,
+    // or vision models go blind after one tool call.
     //
     // Policy: project images from the NEWEST real user message (not a
     // tool result under either protocol), and only that one.  This
@@ -1236,8 +1206,7 @@ std::string ChatHistory::BuildChatRequestJson(const std::string& model, bool str
     // turn and for immediate re-asks, while bounding per-request
     // upload cost to one message's images.  Once the user sends a
     // newer message, older images age off the wire — which also means
-    // switching to a text-only model afterwards keeps working exactly
-    // as before.
+    // switching to a text-only model afterwards keeps working.
     for (size_t i = wire.size(); i-- > 0;) {
         WireMsg& w = wire[i];
         if (w.role != "user" || w.isToolResult || !w.toolCallId.empty())
@@ -1260,7 +1229,7 @@ std::string ChatHistory::BuildChatRequestJson(const std::string& model, bool str
         break;
     }
 
-    // ── Phase 1d: tool-image carrier (view_image) ────────────────
+    // ── Step 1d: tool-image carrier (view_image) ─────────────────
     // Images the model pulled in with view_image (photos extracted from
     // a .zip, downloaded files, script output, any local image) live in
     // a "tool_images" sidecar on the tool-result message.  They follow
@@ -1312,11 +1281,11 @@ std::string ChatHistory::BuildChatRequestJson(const std::string& model, bool str
     const std::string imageChatDir =
         m_filePath.empty() ? std::string() : GetChatFolder(m_filePath);
 
-    // ── Phase 2: optional compaction ────────────────────────────
+    // ── Step 2: optional compaction ─────────────────────────────
     // Only runs when the caller provided a context-window hint.
     // Measure the stringified body, and if it exceeds the budget,
-    // first shorten the arguments of old tool calls (Phase 2a, native
-    // protocol), then elide tool-result bodies (Phase 2b), oldest-first
+    // first shorten the arguments of old tool calls (step 2a, native
+    // protocol), then elide tool-result bodies (step 2b), oldest-first
     // in both, until we're under.
     // The last `kMinPreservedResults` tool results are exempt —
     // that's the recent context the model needs to keep reasoning
@@ -1336,11 +1305,10 @@ std::string ChatHistory::BuildChatRequestJson(const std::string& model, bool str
         // tokens plus an optional prompt_cache_key.  Every LlamaBoss chat
         // shares the same system prompt and tool catalog, so without a key
         // all chats compete for one cache slot and a fast agent loop spills
-        // across machines: turn_stats.tsv showed the cache stuck at the
-        // shared ~16.3k-token prefix on every chat (2026-10-02).  A stable
-        // per-conversation key keeps one chat on one cache.  Responses
-        // endpoints only: lb_responses::BuildChatRequest copies it and
-        // every other endpoint keeps its request bytes unchanged.
+        // across machines, leaving the cache stuck at the shared prefix.
+        // A stable per-conversation key keeps one chat on one cache.
+        // Responses endpoints only: lb_responses::BuildChatRequest copies
+        // it and every other endpoint keeps its request bytes unchanged.
         if (m_responsesApi) {
             if (m_createdAt.empty()) m_createdAt = CurrentTimestamp();
             char key[24];
@@ -1365,8 +1333,7 @@ std::string ChatHistory::BuildChatRequestJson(const std::string& model, bool str
         ApplyLocalLlamaSampling(root, model, agentSamplingProfile);
 
         // ── Reasoning override (/think off|low|medium|high|on) ───
-        // Auto sends nothing, keeping the historical request shape
-        // byte-for-byte.  Local llama-server targets (.gguf model
+        // Auto sends nothing.  Local llama-server targets (.gguf model
         // value) get chat_template_kwargs.enable_thinking, which
         // hybrid-reasoning chat templates (Qwen3 family and similar)
         // honor when the server runs with --jinja; templates that
@@ -1376,9 +1343,9 @@ std::string ChatHistory::BuildChatRequestJson(const std::string& model, bool str
         //
         // Remote targets branch on the dialect the frame resolved
         // from the endpoint (SetActiveReasoningDialect):
-        //   * OpenRouter style — a "reasoning" object.  On/Off keep
-        //     the historical {"enabled": bool} byte-for-byte;
-        //     Low/Medium/High use the documented {"effort": "..."}.
+        //   * OpenRouter style — a "reasoning" object.  On/Off send
+        //     {"enabled": bool}; Low/Medium/High use the documented
+        //     {"effort": "..."}.
         //   * OpenAI style (direct api.openai.com, which rejects
         //     unknown body fields — the reasoning object 400s
         //     there) — the "reasoning_effort" string.  Off maps to
@@ -1619,13 +1586,12 @@ std::string ChatHistory::BuildChatRequestJson(const std::string& model, bool str
                         ++imageCount;
                     }
                     if (imageCount > 0) {
-                        // Text part only when there is text.  Before the
-                        // blank-content fix in the wire-build loop this
-                        // could not be empty (blank messages never reached
-                        // here); now it can, and an empty {"type":"text",
-                        // "text":""} part is rejected outright by some
-                        // OpenAI-compatible providers.  Images alone are a
-                        // valid content array.
+                        // Text part only when there is text: blank user
+                        // messages carrying only images reach this point,
+                        // and an empty {"type":"text","text":""} part is
+                        // rejected outright by some OpenAI-compatible
+                        // providers.  Images alone are a valid content
+                        // array.
                         if (!w.content.empty()) {
                             Poco::JSON::Object::Ptr textPart =
                                 new Poco::JSON::Object;
@@ -1667,16 +1633,15 @@ std::string ChatHistory::BuildChatRequestJson(const std::string& model, bool str
         flushPendingToolImages();
         root->set("messages", arr);
 
-        // Phase 3c-i: tools field (Native protocol only).  Sits at
-        // the root level alongside messages; the model sees the tool
-        // catalog and may emit structured tool_calls in its
-        // response.  3c-ii consumes those tool_calls.
+        // tools field (Native protocol only).  Sits at the root level
+        // alongside messages; the model sees the tool catalog and may
+        // emit structured tool_calls in its response.
         if (toolsArr) {
             root->set("tools", toolsArr);
 
-            // Phase 10 supports native multi-call responses.  The request may
-            // therefore advertise parallel tool calling; AgentController is
-            // still the enforcement layer.  It accepts a batch only when every
+            // Native multi-call responses are supported, so the request
+            // advertises parallel tool calling; AgentController is still
+            // the enforcement layer.  It accepts a batch only when every
             // invocation carries a usable unique id and every ToolSpec has
             // explicitly opted in via batchSafe.  Mutating, approval-gated,
             // policy-enforced, or otherwise non-batchable tools fall back to
@@ -1711,7 +1676,14 @@ std::string ChatHistory::BuildChatRequestJson(const std::string& model, bool str
         const size_t budget = (size_t)((double)contextTokens
                                        * elisionBpt * kBudgetFraction);
 
-        if (body.size() > budget) {
+        // Image data URIs are compared at an estimated token cost, not
+        // their base64 bytes (elision_budget.h, BudgetedBodyBytes).  A
+        // couple of screenshots otherwise exceeded the budget on their
+        // own and every elidable text result was elided for nothing.
+        const size_t budgetedBodySize =
+            lb_elision::BudgetedBodyBytes(body, elisionBpt);
+
+        if (budgetedBodySize > budget) {
             // Count tool results so we know which ones to preserve.
             size_t totalToolResults = 0;
             for (const auto& w : wire) if (w.isToolResult) ++totalToolResults;
@@ -1736,7 +1708,7 @@ std::string ChatHistory::BuildChatRequestJson(const std::string& model, bool str
             // and stopping when estimated <= budget guarantees the real
             // body is also <= budget.  We may elide one extra candidate
             // versus the old per-iteration measurement, never under.
-            size_t estimatedBodySize = body.size();
+            size_t estimatedBodySize = budgetedBodySize;
 
             // Wire index of the first PRESERVED tool result (the newest
             // kMinPreservedResults stay intact).  wire.size() when every
@@ -1750,11 +1722,11 @@ std::string ChatHistory::BuildChatRequestJson(const std::string& model, bool str
                 }
             }
 
-            // ── Phase 2a: shorten arguments of old tool calls ────
-            // (2026-10-01.)  Runs BEFORE result elision: the arguments
-            // of a call that already ran (2-4 KB PowerShell scripts,
-            // write_file bodies) are the least valuable bytes in a long
-            // agent chat, and the result echo still names the call.
+            // ── Step 2a: shorten arguments of old tool calls ─────
+            // Runs BEFORE result elision: the arguments of a call that
+            // already ran (2-4 KB PowerShell scripts, write_file bodies)
+            // are the least valuable bytes in a long agent chat, and the
+            // result echo still names the call.
             //
             // Eligible: an assistant tool_calls turn (native protocol;
             // XML-protocol calls live in content and are untouched)
@@ -1823,7 +1795,7 @@ std::string ChatHistory::BuildChatRequestJson(const std::string& model, bool str
                 }
             }
 
-            // ── Phase 2b: elide old tool-result bodies ───────────
+            // ── Step 2b: elide old tool-result bodies ────────────
             size_t toolResultsSeen   = 0;
 
             for (size_t i = 0; i < wire.size() && estimatedBodySize > budget; ++i) {
@@ -1861,14 +1833,14 @@ std::string ChatHistory::BuildChatRequestJson(const std::string& model, bool str
         }
     }
 
-    // ── Phase 3 bugfix #4: native transcript sanitizer ───────
+    // ── Native transcript sanitizer ──────────────────────────────
     // OpenAI/llama-server tool-call history is strict:
     //   assistant + tool_calls[id=A]
     //   role:"tool" + tool_call_id=A
-    // must stay paired.  Save/reload, cancel, older Phase 3 bugs, or
-    // partial multi-call execution can leave one side without the other.
-    // Before returning a native request body, sanitize the projected
-    // history so it never emits:
+    // must stay paired.  Save/reload, cancel, or partial multi-call
+    // execution can leave one side without the other.  Before
+    // returning a native request body, sanitize the projected history
+    // so it never emits:
     //   * assistant.tool_calls with missing replies
     //   * role:"tool" replies with no valid preceding assistant call
     //   * empty assistant messages left behind after stripping tool_calls
@@ -1890,8 +1862,8 @@ std::string ChatHistory::BuildChatRequestJson(const std::string& model, bool str
             }
 
             // Native tool replies must appear immediately after the
-            // assistant tool-call turn.  For Phase 3 we keep this strict
-            // instead of searching arbitrarily far forward; if a normal
+            // assistant tool-call turn.  This stays strict instead of
+            // searching arbitrarily far forward; if a normal
             // user/assistant message appears before the matching tool
             // replies, the old sidecar is no longer safe to project as
             // role:"tool".
@@ -1999,6 +1971,23 @@ std::string ChatHistory::BuildChatRequestJson(const std::string& model, bool str
                         std::ostringstream tc;
                         Poco::JSON::Stringifier::stringify(w.toolCalls, tc);
                         b.assistantBytes += static_cast<size_t>(tc.tellp());
+                    } catch (...) { /* size is best-effort */ }
+                }
+                // Responses replay: only the reasoning items are extra
+                // (the sidecar's function_call items stand in for the
+                // tool_calls already counted above).  Logged to
+                // ctx_calibration.tsv for the metrics export.
+                if (w.responsesOutput) {
+                    try {
+                        for (size_t k = 0; k < w.responsesOutput->size(); ++k) {
+                            const auto item = w.responsesOutput->getObject(k);
+                            if (!item || !item->has("type") ||
+                                item->getValue<std::string>("type") != "reasoning")
+                                continue;
+                            std::ostringstream rs;
+                            Poco::JSON::Stringifier::stringify(item, rs);
+                            b.replayBytes += static_cast<size_t>(rs.tellp());
+                        }
                     } catch (...) { /* size is best-effort */ }
                 }
             } else if (w.isToolResult || !w.toolCallId.empty()) {
@@ -2567,17 +2556,16 @@ bool ChatHistory::LoadFromFile(const std::string& filePath, std::vector<std::str
         // Everything below parses into *locals* and commits to members
         // only in the noexcept block at the very end.  A throw (bad field
         // type, missing "role", non-convertible model) or a structurally
-        // malformed array now leaves this ChatHistory exactly as it was —
+        // malformed array leaves this ChatHistory exactly as it was —
         // the previously loaded conversation stays intact, and the `false`
         // return is truthful.  This matters because m_filePath is left
         // pointing at the prior conversation on failure, so a half-mutated
         // state could otherwise be autosaved over a perfectly good file.
         //
-        // Title and creation time retain the original absent-field behavior.
-        // Activity time is resolved from this file below, never another chat.
-        // Fields the
-        // original cleared-then-maybe-set (tool/project) start empty so the
-        // "absent => cleared" behaviour is preserved.
+        // Title and creation time keep their absent-field behavior.
+        // Activity time is resolved from this file below, never another
+        // chat.  Fields that are "absent => cleared" (tool/project) start
+        // empty.
         std::string   newTitle      = m_title;
         std::string   newCreatedAt  = m_createdAt;
         std::string   newUpdatedAt; // Never inherit another chat's activity time.
@@ -2615,7 +2603,7 @@ bool ChatHistory::LoadFromFile(const std::string& filePath, std::vector<std::str
             }
         }
 
-        // Tool execution context (Phase 3) — locals default to empty/0,
+        // Tool execution context — locals default to empty/0,
         // overwritten only if the key is present in the file.
         if (root->has("tool_cwd")) {
             // Chats saved before the Workflows -> Chats rename may pin a
@@ -2638,7 +2626,7 @@ bool ChatHistory::LoadFromFile(const std::string& filePath, std::vector<std::str
             // anything else (including future values) loads as Auto
         }
 
-        // Optional long-lived project association (Projects Phase 1).
+        // Optional long-lived project association.
         if (root->has("project_id")) {
             newProjectId = root->getValue<std::string>("project_id");
         }
@@ -2707,18 +2695,18 @@ bool ChatHistory::LoadFromFile(const std::string& filePath, std::vector<std::str
                     loadedMsg->set("attachments", msgObj->getArray("attachments"));
                 }
 
-                // Phase 3c-ii: restore native function-calling
-                // sidecars.  Absent in pre-3c-ii files, harmless on
-                // restored XML conversations (BuildChatRequestJson
-                // ignores them when nativeProtocol=false).
+                // Restore native function-calling sidecars.  Absent in
+                // older files, harmless on XML conversations
+                // (BuildChatRequestJson ignores them when
+                // nativeProtocol=false).
                 if (msgObj->has("tool_call_id")) {
                     loadedMsg->set("tool_call_id",
                                    msgObj->getValue<std::string>("tool_call_id"));
                 }
                 if (msgObj->has("tool_calls")) {
                     loadedMsg->set("tool_calls", msgObj->getArray("tool_calls"));
-                    // Responses reasoning-replay sidecar (Phase 2); only
-                    // ever written next to tool_calls.
+                    // Responses reasoning-replay sidecar; only ever
+                    // written next to tool_calls.
                     if (msgObj->has(lb_responses::kOutputSidecarKey())) {
                         try {
                             loadedMsg->set(lb_responses::kOutputSidecarKey(),
@@ -2789,10 +2777,10 @@ bool ChatHistory::LoadFromFile(const std::string& filePath, std::vector<std::str
 
         // Self-calibrating elision budget: replay this chat's
         // ctx_calibration.tsv so the first request after reopening uses
-        // the learned bytes-per-token, not the 3.0 floor (observed: the
-        // first post-restart request elided 13 results at 542 KB, the
-        // next went to 865 KB).  No log / no usable rows: keep the
-        // current value.  Best-effort; never fails the load.
+        // the learned bytes-per-token, not the 3.0 default (which elides
+        // far too early on the first request and then jumps).  No log /
+        // no usable rows: keep the current value.  Best-effort; never
+        // fails the load.
         SeedElisionCalibrationFromChatFolder();
         return true;
     }
@@ -3518,9 +3506,9 @@ std::string ChatHistory::CurrentTimestamp()
     return Poco::DateTimeFormatter::format(now, Poco::DateTimeFormat::ISO8601_FORMAT);
 }
 
-// ── Tool-result formatting (Phase 3) ─────────────────────────────
+// ── Tool-result formatting ───────────────────────────────────────
 
-// ─── Unified tool-block formatter (Phase 3) ────────────────────
+// ─── Unified tool-block formatter ──────────────────────────────
 //
 // Produces the canonical history-round-trip form for any tool
 // invocation.  Dynamic-length backtick fences keep body and errorBody

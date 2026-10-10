@@ -10,9 +10,6 @@
 #include <wx/stattext.h>
 #include <wx/textctrl.h>
 
-#include <algorithm>
-#include <utility>
-
 namespace {
 
 wxButton* LbMakeThemedAccentButton(wxWindow* parent, wxWindowID id,

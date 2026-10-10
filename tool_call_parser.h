@@ -1,6 +1,6 @@
 // tool_call_parser.h
 //
-// Phase 4: Agent harness — tool call parser.
+// Agent harness — tool call parser (XML protocol).
 //
 // ─── Protocol ────────────────────────────────────────────────────
 // The agent-mode system prompt instructs the model to emit tool
@@ -11,10 +11,10 @@
 //    <args>chat_display.h</args>
 //    </tool_call>
 //
-// Some local models prepend/replace the opener with the observed
-// sentinel "<|tool_call>call". The parser accepts that narrow
-// compatibility form too, so raw tool-call markup does not leak into
-// the chat and the requested tool still executes.
+// Some local models prepend/replace the opener with the sentinel
+// "<|tool_call>call". The parser accepts that narrow compatibility
+// form too, so raw tool-call markup does not leak into the chat and
+// the requested tool still executes.
 //
 // Qwen models drift into their trained Qwen3-Coder tool format. When a
 // block has no <name> tag but opens with <function>NAME</name>,
@@ -26,25 +26,23 @@
 // IsKnownToolName / ValidateToolArgs gates. Looser shapes stay malformed,
 // with an error that quotes the <function> tag the model actually wrote.
 //
-// Only one block per assistant turn is honored.  If the model
-// emits more, additional blocks are left in the prose for the user
-// to see but do not trigger execution — simpler loop, and it
-// preempts parallel-call ambiguity until we add real tool
-// parallelism.
+// Only one block per assistant turn is honored on the XML protocol.
+// If the model emits more, additional blocks are left in the prose for
+// the user to see but do not trigger execution.  (Native function
+// calling supports multi-call batches; see AgentController.)
 //
 // Important limitation: this is an in-band protocol. A model that emits
 // a well-formed literal example of the protocol can be indistinguishable
 // from an intentional tool call. Approval gates and tool risk tiers are
 // the safety layer above this parser.
 //
-// ─── Reasoning is never a tool call (2026-09-30) ─────────────────
+// ─── Reasoning is never a tool call ──────────────────────────────
 // ChatClient re-wraps delta.reasoning_content as inline
 // <think>…</think>, so the text both parse modes see includes the
 // model's reasoning.  Models routinely quote the protocol while
 // thinking ("I need to use the exact format: <tool_call><name>
-// powershell</name><args>...</args></tool_call>"), and before this
-// rule that example was dispatched as a real call (observed with a
-// Qwen 27B: PowerShell executed the literal "...").
+// powershell</name><args>...</args></tool_call>"), and that example
+// must not be dispatched as a real call.
 //
 // Openers are ignored when they sit in reasoning, in any of the three
 // shapes it arrives in (details at FindFirstOpenMarkerOutsideReasoning):

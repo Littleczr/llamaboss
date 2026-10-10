@@ -1,24 +1,24 @@
 // lb_hover_tile.h
 // Shared "hover tile" highlight for flat icon/text buttons.
 //
-// The sidebar conversation cards lift their background slightly on hover.
-// Icon buttons elsewhere (toolbar hamburger, +, settings cogwheel, about,
-// attach, agent toggle) used to change only their glyph colour, which made
-// the cogwheel in particular feel inert.  This helper gives them the same
-// kind of feedback: the whole button surface lifts a few shades toward the
-// theme's foreground colour while the mouse is over it.
+// Bind()/Surface()/Highlight() lift the whole button surface a few
+// shades toward the theme's foreground colour while the mouse is over
+// it.  Used by the sidebar cards, archive strip and the sidebar's New
+// Window button.  Toolbar / input icon buttons use glyph-only hover
+// (BindGlyph below), matching the text-only hover of the ctx meter and
+// [ Skills ].
 //
 // Why "lift toward textPrimary" rather than reusing theme.sidebarHover
 // verbatim: several themes (Nord, Dracula, One Dark) define sidebarHover as
 // the exact toolbar colour, so a literal copy would be invisible on the top
-// bar.  Mixing toward the foreground works on every dark and light theme and
-// produces a lift of similar strength to the sidebar card hover.
+// bar.  Mixing toward the foreground works on every dark and light theme.
 #pragma once
 
 #include <wx/button.h>
 #include <wx/utils.h>
 #include <algorithm>
 #include <functional>
+#include <memory>
 #include "theme.h"
 
 namespace LbHoverTile {
@@ -82,6 +82,47 @@ inline void Bind(wxButton* button,
             if (glyph) glyph(hovered);
             button->Refresh();
         }
+    };
+
+    button->Bind(wxEVT_ENTER_WINDOW, [setHover](wxMouseEvent& e) {
+        setHover(true);
+        e.Skip();
+    });
+    button->Bind(wxEVT_MOTION, [setHover](wxMouseEvent& e) {
+        setHover(true);
+        e.Skip();
+    });
+    button->Bind(wxEVT_LEAVE_WINDOW, [setHover](wxMouseEvent& e) {
+        setHover(false);
+        e.Skip();
+    });
+    button->Bind(wxEVT_BUTTON, [setHover](wxCommandEvent& e) {
+        setHover(false);
+        e.Skip();
+    });
+}
+
+// Glyph-only hover for flat toolbar / input icon buttons (☰ + ⚙ ⓘ, the
+// paperclip, the agent toggle).  The background never changes, so no
+// square tile appears behind the icon; only the glyph colour reacts,
+// matching the ctx meter, model pill and [ Skills ] / [ Project ] labels.
+//   glyph  called with true/false on enter/leave.  For text glyphs it sets
+//          the foreground colour; for SVG bitmap buttons it can be empty,
+//          since SetBitmapCurrent() supplies the hover tint and this helper
+//          just forces the owner-drawn button to repaint.
+// The click hook clears the hover state for the same reason as Bind():
+// a modal dialog swallows the LEAVE event, so the glyph would stay lit.
+inline void BindGlyph(wxButton* button, std::function<void(bool)> glyph = {})
+{
+    if (!button) return;
+
+    auto hoveredFlag = std::make_shared<bool>(false);
+    auto setHover = [button, glyph, hoveredFlag](bool hovered) {
+        if (hovered && !button->IsEnabled()) hovered = false;
+        if (*hoveredFlag == hovered) return;
+        *hoveredFlag = hovered;
+        if (glyph) glyph(hovered);
+        button->Refresh();
     };
 
     button->Bind(wxEVT_ENTER_WINDOW, [setHover](wxMouseEvent& e) {

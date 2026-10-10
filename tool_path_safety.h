@@ -3,24 +3,20 @@
 // Shared workspace-containment helpers for the file-mutation tools
 // (tool_write, tool_edit, tool_delete, tool_mkdir).
 //
-// Before this header existed, each of those four .cpp files carried
-// its own byte-identical copy of LowerAscii / NormalizeForCompare /
-// IsUnderCwd.  IsUnderCwd is the workspace sandbox boundary -- a
-// silent drift between the four copies is a security hole.  Lifting
-// the helpers here makes that class of regression impossible.
+// IsUnderCwd is the workspace sandbox boundary, so it must exist in
+// exactly one place: a silent drift between per-tool copies would be a
+// security hole.
 //
 // Note that this is the *tool-side* path safety: it operates on
 // canonical absolute Windows paths produced by GetFullPathNameW
 // (i.e. paths already resolved through tool_path::ResolveToolPath)
-// and decides whether they fall inside the conversation cwd.
+// and decides whether they fall inside the allowed write roots.
 //
 // Filename sanitization (path_safety::SanitizeFilename) and UTF-8 <->
-// wide conversion (path_safety::Utf8ToWide / WideToUtf8) live in the
-// existing path_safety.h -- this header layers on top of them.
+// wide conversion (path_safety::Utf8ToWide / WideToUtf8) live in
+// path_safety.h -- this header layers on top of them.
 //
-// All functions are inline and live in the tool_path_safety namespace
-// so the symbols don't collide with the anonymous-namespace versions
-// they replace.
+// All functions are inline and live in the tool_path_safety namespace.
 
 #pragma once
 
@@ -145,12 +141,12 @@ inline bool IsKnownProjectRelativePath(const std::string& input)
     }
     if (s.empty()) return false;
 
-    // Reject traversal components anywhere in the relative path.  The old
-    // prefix-only check caught "..\\Inputs" but still classified
-    // "Inputs\\..\\..\\outside.txt" as a known project-lane path.  Final
-    // write containment remained a second line of defense, but classification
-    // itself must fail closed and leave traversal-shaped inputs on the legacy
-    // cwd resolver path.
+    // Reject traversal components anywhere in the relative path, not
+    // just as a prefix: "Inputs\\..\\..\\outside.txt" must not be
+    // classified as a known project-lane path.  Final write containment
+    // is a second line of defense, but classification itself must fail
+    // closed and leave traversal-shaped inputs on the plain cwd resolver
+    // path.
     {
         size_t segmentStart = 0;
         while (segmentStart <= s.size()) {
@@ -210,8 +206,7 @@ inline bool IsKnownProjectRelativePath(const std::string& input)
 // project-relative paths such as `Inputs\\x.txt`, `Outputs\\report.md`,
 // `Workflows\\helper.py`, `Notes\\NOTES.md`, `Sources\\policy.pdf`,
 // `Templates\\form.docx`, `PROJECT.md`, `project.json`, and `requirements.txt` resolve under
-// activeProjectRoot.  All other paths preserve legacy behavior and resolve
-// against cwd.
+// activeProjectRoot.  All other paths resolve against cwd.
 inline std::string ResolveProjectAwareToolPath(const std::string& input,
                                                const std::string& cwd,
                                                const std::string& activeProjectRoot)

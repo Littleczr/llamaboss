@@ -2,12 +2,14 @@
 // Slim, theme-coloured scroll rail that replaces a native vertical scrollbar.
 //
 // How it works:
-//   * The real wxScrolledWindow lives inside a plain "clip" panel.  When the
+//   * The real scrolling window (a wxScrolledWindow, or the chat transcript's
+//     wxRichTextCtrl -- anything driven by wxScrollHelper) lives inside a
+//     plain "clip" panel.  When the
 //     content is taller than the viewport, the list is made wider than the
 //     clip by exactly the native scrollbar width, so the native bar is pushed
 //     outside the visible area (child windows are clipped to their parent).
 //     Native scrolling, the mouse wheel, keyboard navigation and every
-//     existing Scroll()/GetViewStart() call keep working unchanged.
+//     Scroll()/GetViewStart() call keep working unchanged.
 //   * This rail sits beside the clip and draws a thin rounded thumb that
 //     mirrors the list's scroll position.  It can be dragged, clicked above or
 //     below the thumb to page, and wheel events over it go to the list.
@@ -16,13 +18,26 @@
 //
 // State is re-synced on idle (cheap getters and a rect compare), so the rail
 // follows programmatic scrolls and list rebuilds without call-site hooks.
+//
+// Native text mode (the composer): a multiline wxTextCtrl is a native EDIT
+// control that keeps its scroll state in Win32, not in wxScrollHelper.  The
+// wxTextCtrl constructor below reads the position from
+// GetScrollInfo(SB_VERT) and scrolls with EM_LINESCROLL; the clip trick is
+// the same, using the control's non-client width as the bar width.
+// LbFollowClip is the clip for that case: it reports the child's min height
+// to the sizer, so the composer's SetMinSize() auto-grow and drag resize
+// keep working unchanged.
 #pragma once
 
 #include <wx/wx.h>
 #include <wx/dcbuffer.h>
 #include <wx/scrolwin.h>
 #include <wx/settings.h>
+#include <wx/textctrl.h>
 #include <wx/timer.h>
+#ifdef __WXMSW__
+#include <wx/msw/wrapwin.h>
+#endif
 #include <algorithm>
 #include <functional>
 #include "theme.h"
@@ -30,11 +45,26 @@
 class LbScrollRail : public wxPanel
 {
 public:
+    // `list` is any window that scrolls through wxScrollHelper: the
+    // sidebar's wxScrolledWindow, or the chat transcript (wxRichTextCtrl).
     LbScrollRail(wxWindow* parent, wxWindow* clip, wxScrolledWindow* list,
+                 std::function<const ThemeData&()> theme)
+        : LbScrollRail(parent, clip, list, list, std::move(theme)) {}
+
+    // Native multiline text control (the composer).  See header comment.
+    LbScrollRail(wxWindow* parent, wxWindow* clip, wxTextCtrl* text,
+                 std::function<const ThemeData&()> theme)
+        : LbScrollRail(parent, clip, text, nullptr, std::move(theme))
+    {
+        m_text = text;
+    }
+
+    LbScrollRail(wxWindow* parent, wxWindow* clip, wxWindow* list,
+                 wxScrollHelper* scroller,
                  std::function<const ThemeData&()> theme)
         : wxPanel(parent, wxID_ANY, wxDefaultPosition, wxDefaultSize,
                   wxBORDER_NONE | wxFULL_REPAINT_ON_RESIZE)
-        , m_clip(clip), m_list(list), m_theme(std::move(theme))
+        , m_clip(clip), m_list(list), m_scroller(scroller), m_theme(std::move(theme))
         , m_timer(this)
     {
         SetMinSize(wxSize(FromDIP(kRailWidth), -1));
@@ -72,9 +102,24 @@ public:
     // Call after a theme change.
     void ApplyTheme()
     {
-        if (m_clip) m_clip->SetBackgroundColour(m_theme().bgSidebar);
+        if (m_clip) m_clip->SetBackgroundColour(Background(m_theme()));
         Refresh();
     }
+
+    // Which ThemeData colour the rail and clip sit on (default: sidebar).
+    void SetBackgroundSlot(wxColour ThemeData::* slot)
+    {
+        m_bgSlot = slot;
+        ApplyTheme();
+    }
+
+    // Forward wheel events over the rail to this window instead of applying
+    // the rail's own step (the chat view has its own faster wheel handling).
+    void SetWheelTarget(wxWindow* target) { m_wheelTarget = target; }
+
+    // Called after the rail itself scrolls the list (drag, track click,
+    // own wheel step), so the owner can update follow-the-output state.
+    void SetScrolledCallback(std::function<void()> cb) { m_onScrolled = std::move(cb); }
 
 private:
     static constexpr int kRailWidth   = 8;    // DIP, total column width
@@ -94,7 +139,14 @@ private:
     };
 
     wxWindow*         m_clip;
-    wxScrolledWindow* m_list;
+    wxWindow*         m_list;
+    wxScrollHelper*   m_scroller;
+    wxTextCtrl*       m_text = nullptr;   // native text mode when set
+    wxColour ThemeData::* m_bgSlot = &ThemeData::bgSidebar;
+    wxWindow*         m_wheelTarget = nullptr;
+    std::function<void()> m_onScrolled;
+
+    wxColour Background(const ThemeData& t) const { return t.*m_bgSlot; }
     std::function<const ThemeData&()> m_theme;
     wxTimer           m_timer;
 
@@ -111,16 +163,52 @@ private:
     Metrics Measure() const
     {
         Metrics m;
-        if (!m_list) return m;
+        if (m_text) return MeasureText();
+        if (!m_list || !m_scroller) return m;
         int ux = 0, uy = 0;
-        m_list->GetScrollPixelsPerUnit(&ux, &uy);
+        m_scroller->GetScrollPixelsPerUnit(&ux, &uy);
         m.unitY = std::max(1, uy);
         int vx = 0, vy = 0;
-        m_list->GetViewStart(&vx, &vy);
+        m_scroller->GetViewStart(&vx, &vy);
         m.scrollY  = vy * m.unitY;
         m.contentH = m_list->GetVirtualSize().GetHeight();
         m.clientH  = m_list->GetClientSize().GetHeight();
         return m;
+    }
+
+    // Native EDIT control: Win32 scroll info is in lines; convert to pixels
+    // with the line height so the shared thumb maths stays unchanged.
+    Metrics MeasureText() const
+    {
+        Metrics m;
+        if (!m_text) return m;
+        m.unitY = std::max(1, m_text->GetCharHeight());
+#ifdef __WXMSW__
+        SCROLLINFO si{};
+        si.cbSize = sizeof(si);
+        si.fMask  = SIF_ALL;
+        if (!::GetScrollInfo(static_cast<HWND>(m_text->GetHWND()),
+                             SB_VERT, &si))
+            return m;
+        const int lines = si.nMax - si.nMin + 1;
+        const int page  = static_cast<int>(si.nPage);
+        if (page <= 0 || lines <= page) return m;   // nothing to scroll
+        m.contentH = lines * m.unitY;
+        m.clientH  = page  * m.unitY;
+        m.scrollY  = (si.nPos - si.nMin) * m.unitY;
+#endif
+        return m;
+    }
+
+    void ScrollTextLines(int delta)
+    {
+        if (!m_text || delta == 0) return;
+#ifdef __WXMSW__
+        ::SendMessage(static_cast<HWND>(m_text->GetHWND()),
+                      EM_LINESCROLL, 0, static_cast<LPARAM>(delta));
+#else
+        m_text->ScrollLines(delta);
+#endif
     }
 
     wxRect ThumbRect(const Metrics& m) const
@@ -145,6 +233,16 @@ private:
     {
         if (!m_clip || !m_list) return;
         const wxSize clip = m_clip->GetClientSize();
+        if (m_text) {
+            // The EDIT control shows its own bar in the non-client area;
+            // push exactly that width outside the clip, bar or no bar.
+            const int ncw = std::max(0,
+                m_list->GetSize().x - m_list->GetClientSize().x);
+            const wxRect want(0, 0, clip.x + ncw, clip.y);
+            if (m_list->GetRect() != want)
+                m_list->SetSize(want);
+            return;
+        }
         const bool needsBar = m_list->GetVirtualSize().GetHeight() > clip.y;
         const int sbw = needsBar
             ? wxSystemSettings::GetMetric(wxSYS_VSCROLL_X, m_list) : 0;
@@ -200,7 +298,14 @@ private:
     {
         const Metrics m = Measure();
         px = std::clamp(px, 0, m.maxScroll());
-        m_list->Scroll(-1, (px + m.unitY / 2) / m.unitY);
+        if (m_text) {
+            ScrollTextLines((px + m.unitY / 2) / m.unitY - m.scrollY / m.unitY);
+            if (m_onScrolled) m_onScrolled();
+            Sync();
+            return;
+        }
+        m_scroller->Scroll(-1, (px + m.unitY / 2) / m.unitY);
+        if (m_onScrolled) m_onScrolled();
         Sync();
     }
 
@@ -210,7 +315,7 @@ private:
     {
         wxAutoBufferedPaintDC dc(this);
         const ThemeData& t = m_theme();
-        dc.SetBackground(wxBrush(t.bgSidebar));
+        dc.SetBackground(wxBrush(Background(t)));
         dc.Clear();
         if (!m_visible) return;
 
@@ -227,7 +332,7 @@ private:
         };
         const wxColour fill = m_dragging
             ? LbInteractiveAccent(t)
-            : mix(t.bgSidebar, t.textMuted, m_hot ? 80 : 50);
+            : mix(Background(t), t.textMuted, m_hot ? 80 : 50);
 
         const wxRect r = ThumbRect(m);
         dc.SetPen(*wxTRANSPARENT_PEN);
@@ -300,12 +405,57 @@ private:
             e.Skip();
             return;
         }
+        if (m_wheelTarget) {
+            // Let the target's own wheel handler (speed, follow logic) run.
+            wxMouseEvent copy(e);
+            copy.SetEventObject(m_wheelTarget);
+            copy.SetId(m_wheelTarget->GetId());
+            m_wheelTarget->GetEventHandler()->ProcessEvent(copy);
+            Sync();
+            return;
+        }
         const int delta = std::max(1, e.GetWheelDelta());
         m_wheelAccum += e.GetWheelRotation();
         const int notches = m_wheelAccum / delta;
         if (notches == 0) return;
         m_wheelAccum -= notches * delta;
+        if (m_text) {
+            ScrollTextLines(-notches * e.GetLinesPerAction());
+            Sync();
+            return;
+        }
         const Metrics m = Measure();
         ScrollToPixel(m.scrollY - notches * e.GetLinesPerAction() * m.unitY);
     }
+};
+
+// Clip panel for LbScrollRail's native text mode.  The child is positioned
+// by the rail (not a sizer), so this panel reports the child's min height to
+// its own sizer: SetMinSize() on the child still drives the row height.  The
+// width is deliberately small and fixed, so the child's pushed-out width
+// never feeds back into the clip's best size.
+class LbFollowClip : public wxPanel
+{
+public:
+    explicit LbFollowClip(wxWindow* parent)
+        : wxPanel(parent, wxID_ANY, wxDefaultPosition, wxDefaultSize,
+                  wxBORDER_NONE | wxTAB_TRAVERSAL) {}
+
+    void SetFollowed(wxWindow* child) { m_child = child; }
+
+    wxSize GetMinSize() const override
+    {
+        int h = -1;
+        if (m_child) {
+            h = m_child->GetMinSize().y;
+            if (h <= 0) h = m_child->GetBestSize().y;
+        }
+        return wxSize(FromDIP(40), h);
+    }
+
+protected:
+    wxSize DoGetBestSize() const override { return GetMinSize(); }
+
+private:
+    wxWindow* m_child = nullptr;
 };

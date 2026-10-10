@@ -3,18 +3,14 @@
 // Native dependency-free webpage inspector for LlamaBoss.
 // Uses WinHTTP from the Windows SDK; no third-party HTTP/HTML libraries.
 
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-
 #include "tool_web_fetch.h"
 #include "ui_event_post.h"
 #include "var_store.h"      // demotion threshold — see kInlineBodyBudget below
 #include "chat_folders.h"   // chat folder recognizer
 
+#include "lb_windows.h"
 #include <winsock2.h>
 #include <ws2tcpip.h>
-#include <windows.h>
 #include <winhttp.h>
 #pragma comment(lib, "winhttp.lib")
 #pragma comment(lib, "ws2_32.lib")
@@ -42,23 +38,7 @@ wxDEFINE_EVENT(wxEVT_WEB_FETCH_ERROR,    wxCommandEvent);
 #define WINHTTP_DECOMPRESSION_FLAG_DEFLATE 0x00000002
 #endif
 
-#include <algorithm>
 #include <array>
-#include <chrono>
-#include <cctype>
-#include <cstdint>
-#include <cstdlib>
-#include <cstdio>
-#include <cstring>
-#include <filesystem>
-#include <fstream>
-#include <iomanip>
-#include <mutex>
-#include <sstream>
-#include <string>
-#include <unordered_map>
-#include <vector>
-#include <utility>
 
 namespace {
 
@@ -401,8 +381,7 @@ std::string SafeFileStem(const std::string& host, const std::string& path, const
         bool ok = std::isalnum(uc) || c == '-' || c == '_' || c == '.';
         if (!ok) c = '_';
     }
-    // Collapse runs of '_' in one linear pass. (Previously a std::regex was
-    // constructed inside a loop here — the file's only regex use.)
+    // Collapse runs of '_' in one linear pass (no std::regex).
     {
         std::string collapsed;
         collapsed.reserve(s.size());
@@ -2166,7 +2145,7 @@ std::string BinaryKindForExtension(const std::string& ext)
 //     runs, so indentation is gone and line numbers no longer match the
 //     source (a grep/read_range hazard once the text is on disk).
 //
-// So the pipeline now runs only when the response really is HTML.  Every
+// So the pipeline runs only when the response really is HTML.  Every
 // other textual response is saved VERBATIM under an honest extension and
 // no derived _text.md copy is produced: one canonical artifact the model
 // can grep, slice with read_range, or parse with py.
@@ -2201,10 +2180,10 @@ bool ResponseIsHtml(const std::string& contentType, const std::string& data)
     return SniffLooksLikeHtml(data);
 }
 
-// Honest on-disk extension for a non-HTML textual response.  The old code
-// named every text artifact "_raw.html", which both mislabeled the file
-// and nudged the model toward HTML-shaped tooling (grep for tags) instead
-// of parsing it as the structured data it is.
+// Honest on-disk extension for a non-HTML textual response.  Naming every
+// text artifact "_raw.html" would mislabel the file and nudge the model
+// toward HTML-shaped tooling (grep for tags) instead of parsing it as
+// the structured data it is.
 std::string TextExtensionForResponse(const std::string& contentType,
                                      const std::string& data)
 {
@@ -2308,9 +2287,8 @@ WebFetchResult FetchWebPageUrlImpl(const std::string& urlArg,
         return r;
     }
     // Order matters here: an error status must be reported even when its
-    // body is empty. Previously the empty-body check ran first, so a bare
-    // 403/429 with no payload (e.g. httpbin.org/status/403) reported only
-    // "empty" and the status code never reached the model.
+    // body is empty, so this runs before the empty-body check (a bare
+    // 403/429 with no payload must still report its status code).
     if (statusCode >= 400) {
         r.chips = { "http " + std::to_string(statusCode), HumanBytes(html.size()), ElapsedChip(t0) };
 
@@ -2513,8 +2491,8 @@ WebFetchResult FetchWebPageUrlImpl(const std::string& urlArg,
     // Strip once, then both the title extraction and the markdown conversion
     // work from the stripped HTML. Extracting the title afterwards means a
     // <title> inside a comment, a script string, or an inline SVG icon
-    // (SVG accessibility <title> elements are common) can no longer shadow
-    // the document title when <head> lacks one.
+    // (SVG accessibility <title> elements are common) can't shadow the
+    // document title when <head> lacks one.
     std::string strippedHtml = StripUnsafeHtmlBlocks(StripBom(htmlText));
     const std::string title = ExtractTitle(strippedHtml);
     std::string text = HtmlToTextStripped(strippedHtml, url);

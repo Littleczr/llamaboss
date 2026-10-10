@@ -6,42 +6,42 @@
 // ChatHistory::BuildChatRequestJson elides old tool results/arguments
 // once the request body exceeds
 //     contextTokens * bytesPerToken * kBudgetFraction   (bytes).
-// bytesPerToken used to be the constant 3.0.  Measured on GPT-6 Luna
-// (ctx_calibration.tsv, 2026-10-01, 67 rows): 4.8-6.3 real bytes per
-// token, so the 550 KB budget for a 262k window held the conversation
-// at ~89-107k real tokens -- about 40% of the window -- and elision ran
-// for most of a long agent session with ~150k tokens unused.
+// A constant bytesPerToken is wrong for most models: measured values run
+// from ~1.3 (token-dense models) to ~6.3 bytes per token.  Too high a
+// constant elides far too early (a 262k window held at ~40%); too low
+// lets requests exceed the window.
 //
 // AdaptiveBytesPerToken learns the ratio from exact usage reports:
 //   * Observe() takes the wire bytes of the last built request and the
 //     server's prompt_tokens for it.  Requests under kMinCalibrationBytes
 //     are ignored (fixed overhead dominates), as are implausible ratios
 //     above kMaxPlausibleBpt (a server reporting only UNCACHED prompt
-//     tokens would otherwise inflate the budget).
+//     tokens would otherwise inflate the budget) or below
+//     kMinPlausibleBpt.
 //   * The applied value is clamp(measured * kMargin, kFloorBpt, kCapBpt).
-//     Largest consecutive swing in the Luna log was 6.9%; kMargin=0.90
-//     covers that, and kBudgetFraction's 30% headroom remains on top.
+//     kMargin=0.90 covers the observed request-to-request swing (~7%),
+//     and kBudgetFraction's 30% headroom remains on top.
+//   * Default vs floor are separate: before any measurement the value is
+//     kDefaultBpt (3.0); a measured candidate may go down to kFloorBpt
+//     (1.0).  Clamping a dense model UP to the default would enlarge its
+//     budget and let requests through past the window.  Lowering only
+//     shrinks the budget, which is the safe direction.
 //   * Hysteresis: lowering (the safety direction) applies when the new
 //     candidate is >5% below the applied value; raising needs >10%.
 //     A budget that moved every request would move the elision cut
 //     every request -- un-eliding content, then eliding it again -- and
 //     break the provider's prompt cache each turn.
-//   * Elided bodies may LOWER, never RAISE (2026-10-01, second Luna log,
-//     109 rows): heavily elided requests measure HIGHER bytes/token
-//     (median 6.20 vs 5.83 unelided -- spool markers and shortened
-//     arguments tokenize cheaply).  Raising on them un-elided 30-50
-//     results in one request (to 1.08 MB / 184.8k tokens), which then
-//     measured lower and re-elided: 11 such sawtooth cycles in 16
-//     minutes, each breaking the prompt cache twice.  A raise must come
+//   * Elided bodies may LOWER, never RAISE: heavily elided requests
+//     measure HIGHER bytes/token (spool markers and shortened arguments
+//     tokenize cheaply).  Raising on them un-elides dozens of results in
+//     one request, which then measures lower and re-elides -- a sawtooth
+//     that breaks the prompt cache twice per cycle.  A raise must come
 //     from a body that elided nothing, i.e. one that represents the
 //     content a higher budget would restore.
-//   * Keyed to the model string: a different model starts at the floor.
+//   * Keyed to the model string: a different model starts at the default.
 //   * SeedFromCalibrationTsv() replays the chat folder's
 //     ctx_calibration.tsv on load, so a reopened chat does not spend its
-//     first request at the 3.0 floor (observed: 542 KB, 13 results
-//     elided, then 865 KB one report later).
-//   * Before the first usable measurement: kFloorBpt (the old 3.0),
-//     i.e. exactly the previous behaviour.
+//     first request at the default.
 //
 // Pure arithmetic, no dependencies: tested in elision_budget_tests.cpp.
 
@@ -52,10 +52,12 @@
 
 namespace lb_elision {
 
-constexpr double      kFloorBpt            = 3.0;
+constexpr double      kDefaultBpt          = 3.0;   // before any measurement
+constexpr double      kFloorBpt            = 1.0;   // lowest applied value from a measurement
 constexpr double      kCapBpt              = 6.0;
 constexpr double      kMargin              = 0.90;
 constexpr double      kMaxPlausibleBpt     = 8.0;
+constexpr double      kMinPlausibleBpt     = 0.5;   // below: treat the report as bogus
 constexpr std::size_t kMinCalibrationBytes = 32 * 1024;
 constexpr double      kLowerThreshold      = 0.95;   // apply if candidate < applied*0.95
 constexpr double      kRaiseThreshold      = 1.10;   // apply if candidate > applied*1.10
@@ -70,7 +72,7 @@ public:
     // Bytes-per-token to use for a request to `model`.
     double Current(const std::string& model) const
     {
-        return (m_applied > 0.0 && model == m_model) ? m_applied : kFloorBpt;
+        return (m_applied > 0.0 && model == m_model) ? m_applied : kDefaultBpt;
     }
 
     // Feed one exact usage report.  `bodyWasElided`: the measured request
@@ -84,7 +86,7 @@ public:
             requestBytes < kMinCalibrationBytes)
             return false;
         const double measured = (double)requestBytes / (double)promptTokens;
-        if (!(measured > 0.0) || measured > kMaxPlausibleBpt) return false;
+        if (!(measured >= kMinPlausibleBpt) || measured > kMaxPlausibleBpt) return false;
 
         m_lastMeasured = measured;
         const double candidate = CandidateFromMeasured(measured);
@@ -191,6 +193,68 @@ inline int SeedFromCalibrationTsv(AdaptiveBytesPerToken& a, const std::string& t
     } catch (...) {
         return 0;
     }
+}
+
+// ── Image attachments vs. the byte budget ──────────────────────────
+// The budget is BYTES (contextTokens * bpt * kBudgetFraction), but an
+// attached image travels as a base64 data URI: hundreds of KB on the
+// wire for a few thousand tokens.  Two screenshots can be ~90% of a
+// request body at a small fraction of the window; counting their raw
+// bytes would make the body never fit, so every elidable text tool
+// result gets elided on every request and the model loses the very
+// reads that verified its claims.
+//
+// BudgetedBodyBytes() is the size compared against the budget: the body
+// with each image data URI's bytes replaced by kImageTokenEstimate
+// tokens' worth of bytes at the current bpt.  Eliding text cannot shrink
+// an image anyway, so counting its raw bytes only ever cost text.
+//
+// Only real JSON image values are discounted: the scan requires the
+// opening quote of "data:image... to directly follow ':' (a JSON value
+// position).  The same text inside a tool result or file body is
+// JSON-escaped (\"data:image...), so it is preceded by a backslash and
+// keeps counting at full size -- it IS text tokens there.
+//
+// kImageTokenEstimate is deliberately high (typical provider cost is
+// ~1-2k tokens per screenshot); over-estimating only elides a little
+// more text, which is the safe direction.
+constexpr std::size_t kImageTokenEstimate = 3000;
+
+struct ImageUriScan {
+    std::size_t bytes = 0;   // raw bytes of the data-URI values (without quotes)
+    std::size_t count = 0;   // number of image data URIs found
+};
+
+inline ImageUriScan ScanImageDataUris(const std::string& body)
+{
+    ImageUriScan out;
+    static const std::string kNeedle = "\"data:image";
+    std::size_t pos = 0;
+    while ((pos = body.find(kNeedle, pos)) != std::string::npos) {
+        // Must be a JSON value: `":"data:image` with nothing escaped.
+        if (pos == 0 || body[pos - 1] != ':') { pos += kNeedle.size(); continue; }
+        const std::size_t valueStart = pos + 1;
+        // Base64, the MIME type and ";base64," contain no '"'; a '/' may
+        // be emitted as "\/", which is fine.  Stop at the closing quote.
+        const std::size_t close = body.find('"', valueStart);
+        if (close == std::string::npos) break;   // truncated body: ignore the tail
+        out.bytes += close - valueStart;
+        ++out.count;
+        pos = close + 1;
+    }
+    return out;
+}
+
+// Size to compare against the byte budget.  bytesPerToken is the same
+// value the budget was built with, so an image costs exactly
+// kImageTokenEstimate tokens of budget.
+inline std::size_t BudgetedBodyBytes(const std::string& body, double bytesPerToken)
+{
+    const ImageUriScan s = ScanImageDataUris(body);
+    if (s.count == 0) return body.size();
+    const std::size_t text = body.size() - s.bytes;
+    const double perImage = (double)kImageTokenEstimate * (bytesPerToken > 0.0 ? bytesPerToken : kDefaultBpt);
+    return text + (std::size_t)((double)s.count * perImage);
 }
 
 } // namespace lb_elision

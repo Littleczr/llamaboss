@@ -64,28 +64,28 @@ size_t ComputeReadCap(int ctxTokens)
 // it is both the output cap enforced below and the history-inline budget
 // reported to the var store.
 //
-// Previously these were two different numbers — output was capped at
-// ComputeReadCap (512 KiB at 262K ctx) while history demoted above
-// 48 KiB.  Anything landing in that 464 KiB gap got neither the lines
-// nor an actionable error: the var store spooled the slice to a fresh
-// Vars\ file and handed back a handle card, so the model had to issue a
-// SECOND read_range against a copy of the thing it just asked for, with
-// line numbers that no longer matched the source file.
+// They must be the same number.  If output were capped higher than the
+// history-demotion threshold, anything landing in the gap would get
+// neither the lines nor an actionable error: the var store would spool
+// the slice to a fresh Vars\ file and hand back a handle card, so the
+// model would have to issue a SECOND read_range against a copy of the
+// thing it just asked for, with line numbers that no longer match the
+// source file.
 //
-// Collapsing the two makes the body provably <= the budget, so a ranged
-// read can never demote, and an over-large request comes back as
-// "narrow the range or split the call" — one round trip either way, but
-// the error says what to do.  ComputeRangedReadHistoryBudget therefore
-// degrades from a policy knob into an assertion; the field name stays
-// (tool_dispatcher.h, the JSON case runner) so the diff stays local.
+// One limit makes the body provably <= the budget, so a ranged read can
+// never demote, and an over-large request comes back as "narrow the
+// range or split the call" — one round trip either way, but the error
+// says what to do.  ComputeRangedReadHistoryBudget is therefore an
+// assertion more than a policy knob; the field name is kept
+// (tool_dispatcher.h, the JSON case runner).
 //
 // The fixed ceiling keeps a 262K model from retaining 512 KiB per slice
 // permanently; the context-aware half keeps small-context endpoints safe.
 //
 // Boundary note: the combined multi-range span caps at 1000 lines, which
 // at ~50 bytes/line lands right around 48 KiB.  A 1000-line request over
-// long-line content (minified JS, wide CSV rows, log lines) will now be
-// rejected rather than demoted.  If that shows up in practice, raise
+// long-line content (minified JS, wide CSV rows, log lines) is rejected
+// rather than demoted.  If that shows up in practice, raise
 // kRangedReadInlineCeiling here — it is the single place that decides.
 size_t ComputeRangedReadHistoryBudget(int ctxTokens)
 {
@@ -243,20 +243,20 @@ std::string ElapsedChip(
 
 namespace {
 
-// Conversation Scripts-lane fallback for read (2026-06-12 transcript):
-// python_create_script puts runnable .py artifacts in the conversation
-// Scripts folder — a SIBLING of the default Workspace cwd — and models
-// routinely try to read their own script back with `read name.py` right
-// after creating or running it.  The cwd-resolved path then misses,
-// costing one failed tool step plus a full-path retry.  Reading is
-// side-effect free, so resolve the miss instead of coaching it — under
-// strict conditions so /cd'ed workspaces and projects are unaffected:
+// Conversation Scripts-lane fallback for read: python_create_script puts
+// runnable .py artifacts in the conversation Scripts folder — a SIBLING
+// of the default Workspace cwd — and models routinely try to read their
+// own script back with `read name.py` right after creating or running
+// it.  The cwd-resolved path then misses, costing one failed tool step
+// plus a full-path retry.  Reading is side-effect free, so resolve the
+// miss instead of coaching it — under strict conditions so /cd'ed
+// workspaces and projects are unaffected:
 //   * the requested path is a bare filename or the explicit lane form
 //     Scripts\name / Scripts/name (no other separators, no "..");
 //   * the cwd basename is "Workspace" (the conversation default; a
 //     /cd'ed cwd has no meaningful Scripts sibling);
 //   * the cwd-resolved path does not exist, so the Workspace always
-//     wins on a name collision and existing behavior never changes;
+//     wins on a name collision;
 //   * the sibling Scripts file actually exists.
 // Returns the resolved Scripts-lane path, or empty when any condition
 // fails.
@@ -822,10 +822,10 @@ ReadResult ReadFileRanges(const std::string& inputPath,
     }
 
     // Out-of-order or overlapping ranges are sorted and merged instead of
-    // rejected (2026-10-01: "195:260,1:25" failed and cost a tool step;
-    // the intent is unambiguous).  Each range was validated above; the
-    // merged result is re-checked against the same caps, and a chip
-    // records the normalization so it is never silent.
+    // rejected ("195:260,1:25" has an unambiguous intent).  Each range
+    // was validated above; the merged result is re-checked against the
+    // same caps, and a chip records the normalization so it is never
+    // silent.
     bool reordered = false, merged = false;
     for (size_t i = 1; i < normalized.size(); ++i) {
         if (normalized[i].startLine < normalized[i - 1].startLine) {

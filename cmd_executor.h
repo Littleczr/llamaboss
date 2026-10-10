@@ -1,10 +1,10 @@
 // cmd_executor.h
 //
-// Phase 1 of the LlamaBoss Pro tool-executor harness.
+// PowerShell tool executor.
 //
-// Runs a single user-issued PowerShell command on a worker thread,
-// captures stdout + stderr, enforces a timeout and an output cap,
-// and reports completion back to the UI via a wxCommandEvent.
+// Runs a single PowerShell command on a worker thread, captures stdout
+// + stderr, enforces a timeout and an output cap, and reports
+// completion back to the UI via a wxCommandEvent.
 //
 // Lifetime model mirrors ChatClient:
 //   - CmdExecutor is owned by MyFrame.
@@ -127,8 +127,8 @@ public:
     bool Start(const std::string& command);
 
     // Full overload.  `cwd` is a UTF-8 absolute path; pass empty to fall
-    // back to %USERPROFILE% (legacy behaviour).  `timeoutMs` of 0 falls
-    // back to kDefaultTimeoutMs.
+    // back to %USERPROFILE%.  `timeoutMs` of 0 falls back to
+    // kDefaultTimeoutMs.
     //
     // Used by the agent path to honour the per-conversation tool CWD set
     // by /cd, which the model expects PowerShell calls to respect.

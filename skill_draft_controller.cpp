@@ -1,9 +1,6 @@
 #include "skill_draft_controller.h"
 
-#include <algorithm>
 #include <cassert>
-#include <sstream>
-#include <utility>
 
 #include "app_state.h"
 #include "chat_client.h"

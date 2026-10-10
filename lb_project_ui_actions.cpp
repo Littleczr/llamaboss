@@ -1,11 +1,7 @@
 #include "lb_project_ui_actions.h"
 
-#include <wx/dir.h>
-#include <wx/filefn.h>
-#include <wx/filename.h>
 #include <wx/msgdlg.h>
 #include <wx/string.h>
-#include <wx/utils.h>
 #include <wx/window.h>
 
 #include "project_manager.h"

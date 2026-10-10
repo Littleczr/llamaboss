@@ -1,10 +1,10 @@
 // skill_draft_controller.h — hidden Skill draft builder orchestration.
 //
-// Owns the transient Skill authoring/design session state that previously
-// lived inline in MyFrame, plus the hidden Skill Draft Builder control turn.
-// The frame still owns wx UI widgets and input clearing; this controller owns
-// the state, prompt handoff, hidden streaming lifecycle, save-to-disk result,
-// and stop/error handling for the builder turn.
+// Owns the transient Skill authoring/design session state plus the
+// hidden Skill Draft Builder control turn.  The frame owns wx UI widgets
+// and input clearing; this controller owns the state, prompt handoff,
+// hidden streaming lifecycle, save-to-disk result, and stop/error
+// handling for the builder turn.
 
 #pragma once
 

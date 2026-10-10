@@ -1,14 +1,13 @@
 // var_store.h
 //
-// RLM Phase A — the external-context "variable store".
+// The external-context "variable store".
 //
-// Design (agreed 20260810): the substrate is the filesystem, not a
-// bespoke object registry.  A "variable" is a plain file in the
-// conversation workspace's Vars\ lane, which means the model's query
-// surface is the EXISTING tool suite (read / grep / ls / open /
-// python_run_script) — no new tool names, no new parser contracts, no
-// new vocabulary for small models to learn.  This subsystem's only
-// jobs are:
+// Design: the substrate is the filesystem, not a bespoke object
+// registry.  A "variable" is a plain file in the conversation
+// workspace's Vars\ lane, which means the model's query surface is the
+// EXISTING tool suite (read / grep / ls / open / python_run_script) —
+// no new tool names, no new parser contracts, no new vocabulary for
+// small models to learn.  This subsystem's only jobs are:
 //
 //   1. Spool a large tool-result body to Vars\<tag>_<NNNN>[_<hint>].txt
 //      instead of letting it flow whole into the model context.

@@ -17,14 +17,14 @@
 // created, and is never renamed afterwards (renaming a chat in the sidebar
 // does not touch the folder; see the _title.txt marker for the live title).
 //
-// Legacy layout (pre-rename builds), still recognized so that folders the
-// one-time migration could not move keep working:
+// Legacy layout, still recognized so that folders the one-time migration
+// could not move keep working:
 //
 //   %USERPROFILE%\LlamaBoss\Workflows\chat_1ed3d3c2\Workspace
 //
-// "Workflows" now means ONLY the project Workflows lane
+// "Workflows" means ONLY the project Workflows lane
 // (<project>\Workflows, see ProjectManager::ProjectWorkflowsPath).  Nothing
-// chat-related should use that word any more.
+// chat-related should use that word.
 //
 // Everything in this header is pure string logic with no wx / Win32
 // dependency, so any translation unit (tools, path safety, tests) can use it.
@@ -170,7 +170,7 @@ inline bool IsChatFolderName(const std::string& name)
 }
 
 // True for the folder that holds chat folders: "Chats", or the legacy
-// "Workflows" root that pre-rename builds used.
+// "Workflows" root.
 inline bool IsChatsRootName(const std::string& name)
 {
     const std::string lower = detail::LowerAscii(name);
@@ -250,8 +250,8 @@ inline std::string BuildChatFolderName(const std::string& dateYmd,
 // %USERPROFILE%\LlamaBoss\Shared\Workspace).
 //
 // Every "which chat does this cwd belong to" check in the codebase must go
-// through here.  Several tools used to carry private copies; a copy that
-// drifts silently changes which lanes tools and approvals trust.
+// through here: a private copy that drifts silently changes which lanes
+// tools and approvals trust.
 inline std::string ChatFolderFromWorkspaceCwd(const std::string& cwd)
 {
     const std::string clean = detail::TrimTrailingSeparators(cwd);

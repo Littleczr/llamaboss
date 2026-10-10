@@ -1,5 +1,3 @@
-#define _CRT_SECURE_NO_WARNINGS
-
 // python_runner.cpp
 //
 // Controlled Python backend foundation.  See python_runner.h for the
@@ -17,30 +15,14 @@
 #include "tool_path.h"
 #include "tool_path_safety.h"
 
-#include <wx/filename.h>
-
-#include <algorithm>
-#include <atomic>
-#include <chrono>
-#include <cctype>
-#include <cstring>
 #include <cwchar>
-#include <fstream>
 #include <iterator>
-#include <mutex>
-#include <set>
-#include <sstream>
 #include "ui_event_post.h"
-#include <string>
-#include <thread>
-#include <utility>
-#include <vector>
 
 #include "progress_output_fold.h" // collapse \r progress bars (tqdm, pip)
 #include "python_resources.h"     // built-in helper scripts (RCDATA)
 
-#define NOMINMAX
-#include <windows.h>
+#include "lb_windows.h"
 
 wxDEFINE_EVENT(wxEVT_PYTHON_COMPLETE, wxCommandEvent);
 wxDEFINE_EVENT(wxEVT_PYTHON_ERROR,    wxCommandEvent);
@@ -281,7 +263,7 @@ std::string SharedLanesRootDir()
 {
     // Delegates to the shared layout owner.  agent_controller.cpp's
     // one-shot-bypass shadow check resolves the SAME lanes through the
-    // SAME ServerManager functions, so the two can no longer diverge.
+    // SAME ServerManager functions, so the two cannot diverge.
     return ServerManager::GetSharedLanesRootDir();
 }
 
@@ -298,9 +280,6 @@ std::string PathBaseNameLocal(const std::string& path)
     return (pos == std::string::npos) ? s : s.substr(pos + 1);
 }
 
-// (StartsWithLocal was removed: its only consumer, the local
-// chat-folder recognizer body, now delegates to
-// ServerManager::ChatFolderFromCwd.)
 
 std::string ChatFolderFromCwd(const std::string& cwd)
 {
@@ -586,12 +565,12 @@ std::string BaseNameOf(const std::string& path);
 
 std::string NormalizePathForCompare(std::string path)
 {
-    // Compare canonical Windows paths, not raw strings.  The previous
-    // implementation only normalized slashes/case, which meant a path such
-    // as C:\Users\Cesar\LlamaBoss\Workspace\..\..\outside.txt could
-    // still appear to be under the LlamaBoss root during prefix checks.
-    // GetFullPathNameW collapses . and .. segments before we do the
-    // case-insensitive boundary comparison.
+    // Compare canonical Windows paths, not raw strings.  Normalizing
+    // only slashes/case would let a path such as
+    // C:\Users\Cesar\LlamaBoss\Workspace\..\..\outside.txt appear to be
+    // under the LlamaBoss root during prefix checks.  GetFullPathNameW
+    // collapses . and .. segments before we do the case-insensitive
+    // boundary comparison.
     if (!path.empty()) {
         std::wstring w = Utf8ToWide(path);
         DWORD needed = GetFullPathNameW(w.c_str(), 0, nullptr, nullptr);
@@ -661,12 +640,12 @@ std::vector<std::string> PythonArtifactRoots(const std::string& cwd,
 std::vector<std::string> PythonAutoArtifactScanRoots(const std::string& cwd,
                                                      const std::string& activeProjectRoot)
 {
-    // python_run_script used to snapshot the entire LlamaBoss root plus the
-    // active project before and after every run.  That is convenient, but it
-    // gets expensive once Projects, Sources, Templates, or cache folders grow.
-    // Keep explicit ARTIFACT: paths fully flexible via IsAllowedPythonArtifactPath();
-    // for automatic discovery, scan only the places scripts are expected to
-    // create user-facing files.
+    // Snapshotting the entire LlamaBoss root plus the active project
+    // before and after every run gets expensive once Projects, Sources,
+    // Templates, or cache folders grow.  Keep explicit ARTIFACT: paths
+    // fully flexible via IsAllowedPythonArtifactPath(); for automatic
+    // discovery, scan only the places scripts are expected to create
+    // user-facing files.
     std::vector<std::string> roots;
 
     auto addRoot = [&](const std::string& root) {
@@ -1511,14 +1490,12 @@ bool ResolveRunnableScriptPath(const std::string& requested,
 
             // Nested skill paths are the natural on-disk form
             // (Skills\runPod\scripts\runpod_ops.py) and the form models
-            // copy out of SKILL.md files.  Observed 2026-08-03: GPT-5
-            // emitted exactly that, got "accepts a single .py filename
-            // only", and had to fall back to an absolute path.  Accept
-            // the nested form: remember the FIRST component as the
-            // pinned skill folder, resolve the LAST component through
-            // the normal skill-script search, then verify the resolved
-            // script actually lives under the pinned folder — keeping
-            // the lane selector's explicit-pinning promise intact.
+            // copy out of SKILL.md files, so accept it: remember the
+            // FIRST component as the pinned skill folder, resolve the
+            // LAST component through the normal skill-script search,
+            // then verify the resolved script actually lives under the
+            // pinned folder — keeping the lane selector's
+            // explicit-pinning promise intact.
             if (skillName.find(':') != std::string::npos) {
                 errorOut = "python_run_script Skills\\... does not accept "
                            "drive-letter paths. Use Skills\\<skill>\\<script>.py, "
@@ -1596,12 +1573,11 @@ bool ResolveRunnableScriptPath(const std::string& requested,
 
     // Friendly conversation-lane form: Scripts\helper.py pins the
     // conversation Scripts lane.  This is the lane python_create_script
-    // writes to and the one models most naturally name — observed
-    // 2026-06-11: gemma-4-e4b emitted Scripts\cli_downloader.py, which
-    // passed shape validation, then died in the path-shaped branch below
-    // because relative paths resolve against the cwd (the Workspace
-    // folder) while the Scripts lane is the Workspace's SIBLING.  The
-    // selector mirrors Workflows\ and Skills\ exactly.
+    // writes to and the one models most naturally name.  Without this
+    // selector the path-shaped branch below would resolve it against
+    // the cwd (the Workspace folder), while the Scripts lane is the
+    // Workspace's SIBLING.  The selector mirrors the Workflows\ and
+    // Skills\ selectors exactly.
     {
         std::string pathish = name;
         std::replace(pathish.begin(), pathish.end(), '/', '\\');
@@ -2068,9 +2044,7 @@ std::vector<PythonCandidate> BuildCandidates(const std::string& scriptPath,
     // realistic threat is PYTHONPATH redirection by an attacker who already
     // has write access to the user's environment, which is a strictly
     // bigger compromise than what -I would have prevented.
-    //
-    // python_run_script (user/model-authored scripts) was already running
-    // without -I prior to this change; this only relaxes the helper path.
+    // python_run_script (user/model-authored scripts) also runs without -I.
     // -X utf8 : force Python stdio/text handling to use UTF-8 even on
     //           Windows systems whose inherited process code page is still
     //           legacy ANSI.  This prevents smart punctuation copied from
@@ -2388,9 +2362,9 @@ private:
                     // a single argv element ("--format-index 1").  argparse
                     // then rejects the call with a usage error the model
                     // cannot diagnose, and small models retry the identical
-                    // call until the loop guard stops the agent (observed
-                    // 2026-06-11 with gemma-4-e4b).  Name the exact bad token
-                    // and both accepted fixes so one retry can succeed.
+                    // call until the loop guard stops the agent.  Name the
+                    // exact bad token and both accepted fixes so one retry
+                    // can succeed.
                     if (!completedSuccessfully &&
                         !attempt.cancelled && !attempt.timedOut) {
                         std::string suspicious;

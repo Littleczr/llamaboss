@@ -25,7 +25,7 @@ struct AttachmentInfo {
     std::string mimeType;     // "text/x-c++src", "image/png"
     size_t      byteSize = 0; // original file size in bytes
 
-    // ── Persistence (Phase 3) ────────────────────────────────
+    // ── Persistence ──────────────────────────────────────────
     std::string storagePath;   // Sidecar path relative to conversations dir
                                // e.g. "attachments/chat_abc12345/0_photo.png"
                                // Empty if not persisted to disk.
@@ -182,7 +182,7 @@ public:
     // string to an image_url/text multimodal array.
     std::string InjectImagesIntoRequest(const std::string& requestJson) const;
 
-    // ── Image persistence (Phase 3) ──────────────────────────────
+    // ── Image persistence ────────────────────────────────────────
 
     // Save all pending images to sidecar files on disk.
     // attachDir:       absolute path to the target directory (created if needed)
@@ -204,7 +204,7 @@ public:
     static bool IsSpreadsheetFile(const std::string& path);
     // NOTE: callers must test IsCsvFile BEFORE IsTextFile when
     // classifying a dropped/picked file — CSV gets workspace routing,
-    // and IsTextFile no longer claims the extension.
+    // and IsTextFile does not claim the extension.
     static bool IsCsvFile(const std::string& path);
     static bool IsZipFile(const std::string& path);
     static std::string GuessMimeType(const std::string& filename);

@@ -1,16 +1,11 @@
-#define _CRT_SECURE_NO_WARNINGS
-
 // tool_dispatcher.cpp
 //
-// Phase 2: this file used to host the per-tool DispatchXxx functions
-// (DispatchRead, DispatchLs, ..., DispatchDelete) plus the if-chain
-// inside DispatchInvocation that selected among them.  All built-in
-// dispatch bodies now live inside the router as ToolSpec.dispatch
+// Built-in dispatch bodies live inside the router as ToolSpec.dispatch
 // closures (see tool_router.cpp -- DoRead through DoDelete).
 //
-// DispatchInvocation stays as the one public shim for callers; it
-// validates, looks up the spec in the router, fills the dependency
-// bundle, calls dispatch, and returns.
+// DispatchInvocation is the one public shim for callers; it validates,
+// looks up the spec in the router, fills the dependency bundle, calls
+// dispatch, and returns.
 
 #include "tool_dispatcher.h"
 #include "tool_router.h"
@@ -18,9 +13,6 @@
 
 #include <cassert>
 #include <exception>
-#include <string>
-#include <thread>
-#include <utility>
 
 wxDEFINE_EVENT(wxEVT_TOOL_WORKER_COMPLETE, wxCommandEvent);
 
@@ -200,8 +192,7 @@ DispatchOutcome DispatchInvocation(const ToolInvocation& inv,
     if (!spec || !spec->dispatch) {
         // Shouldn't reach here under normal flow -- the parser rejects
         // unknown names via IsKnownToolName.  Belt-and-braces fallback
-        // for any future path that bypasses the parser (e.g. a Phase 4
-        // slash-command shim that wires straight into the dispatcher).
+        // for any path that bypasses the parser.
         return MakeInvalidOutcome(inv, "Unknown tool: " + inv.name);
     }
 

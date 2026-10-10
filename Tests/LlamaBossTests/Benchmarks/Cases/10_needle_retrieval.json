@@ -1,0 +1,48 @@
+{
+    "schema_version":  1,
+    "benchmarks":  [
+                       {
+                           "name":  "RLM_Needle_6000_Lines",
+                           "task":  "Find the unique retrieval marker in the source. Report the marker exactly and state its physical line number. Do not report any other candidate.",
+                           "modes":  [
+                                         "direct",
+                                         "rlm"
+                                     ],
+                           "source":  {
+                                          "type":  "generated_lines",
+                                          "line_count":  6000,
+                                          "template":  "record {line}: routine telemetry alpha beta gamma",
+                                          "patches":  [
+                                                          {
+                                                              "line":  5000,
+                                                              "text":  "record 5000: unique retrieval marker NEEDLE_XYZZY"
+                                                          }
+                                                      ]
+                                      },
+                           "expect":  {
+                                          "required":  [
+                                                           {
+                                                               "id":  "exact_marker",
+                                                               "all_of":  [
+                                                                              "NEEDLE_XYZZY"
+                                                                          ]
+                                                           },
+                                                           {
+                                                               "id":  "physical_line",
+                                                               "any_of":  [
+                                                                              "5000"
+                                                                          ]
+                                                           }
+                                                       ],
+                                          "forbidden":  [
+                                                            "NEEDLE_XYZZY_2"
+                                                        ],
+                                          "required_tools":  [
+                                                                 "grep",
+                                                                 "read_range"
+                                                             ],
+                                          "min_score":  1.0
+                                      }
+                       }
+                   ]
+}

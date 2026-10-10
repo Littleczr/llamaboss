@@ -15,29 +15,13 @@
 
 #include "chat_client.h"
 #include "openai_responses.h"
+#include "chatgpt_auth.h"       // ChatGPT plan lane: worker-side token
+#include "chatgpt_auth_core.h"  // plan error vocabulary
 
 // Poco headers for HTTP communication
-#include <Poco/URI.h>
-#include <Poco/Net/HTTPClientSession.h>
-#include <Poco/Net/HTTPSClientSession.h>
-#include <Poco/Net/HTTPRequest.h>
-#include <Poco/Net/HTTPResponse.h>
 #include <Poco/Net/NetException.h>
-#include <Poco/StreamCopier.h>
-#include <Poco/Timespan.h>
-#include <Poco/JSON/Object.h>
-#include <Poco/JSON/Array.h>
-#include <Poco/JSON/Parser.h>
-#include <Poco/JSON/Stringifier.h>
 #include <Poco/JSON/JSONException.h>
-#include <Poco/Exception.h>
 
-#include <memory>
-#include <sstream>
-#include <chrono>
-#include <cstddef>
-#include <string>
-#include <algorithm>
 #include <istream>
 #include "ui_event_post.h"
 #include "lb_ssl.h"
@@ -47,11 +31,11 @@
 //  Stream limits
 // ═══════════════════════════════════════════════════════════════════
 // Everything below arrives from a remote endpoint we do not control.
-// A malfunctioning or hostile server could previously hand us an
-// unterminated SSE line, an endless tool-argument fragment, or a
-// multi-gigabyte error body, all of which grew a std::string until
-// the process died. These are deliberately generous - the point is
-// that a ceiling EXISTS, not that it is tight.
+// A malfunctioning or hostile server could hand us an unterminated SSE
+// line, an endless tool-argument fragment, or a multi-gigabyte error
+// body; without ceilings each would grow a std::string until the
+// process died. These are deliberately generous - the point is that a
+// ceiling EXISTS, not that it is tight.
 namespace {
 
 // One SSE line. Generous because a whole generated image arrives on
@@ -301,9 +285,9 @@ wxThread::ExitCode ChatWorkerThread::Entry()
     const bool responsesApi = m_target.responsesApi ||
         lb_responses::IsResponsesPath(m_target.chatPath);
     lb_responses::ChatStream responsesStream;
-    // Phase 2: function calls come back on the completion event in the
-    // Chat Completions shape the rest of the pipeline already consumes,
-    // plus the verbatim output array for reasoning replay.
+    // Responses API: function calls come back on the completion event
+    // in the Chat Completions shape the rest of the pipeline already
+    // consumes, plus the verbatim output array for reasoning replay.
     std::string responsesToolCallsJson;
     std::string responsesOutputJson;
 
@@ -320,7 +304,7 @@ wxThread::ExitCode ChatWorkerThread::Entry()
     // an open tag has been emitted without its close.
     bool inReasoningBlock = false;
 
-    // ── Phase 3c-ii: structured tool_calls accumulator ──────────
+    // ── Structured tool_calls accumulator ───────────────────────
     // OpenAI streaming format delivers tool_calls in fragments
     // across many SSE events.  Each delta.tool_calls entry carries
     // an `index` — fragments accumulate per-index until the stream
@@ -427,11 +411,10 @@ wxThread::ExitCode ChatWorkerThread::Entry()
     auto isCancelled = [this]() { return m_control->IsCancelled(); };
 
     // ── Delta coalescing ─────────────────────────────────────────
-    // The UI already batches on a 16 ms timer, but the worker used to
-    // allocate one wxCommandEvent and run one UTF-8 -> UTF-16
-    // conversion PER TOKEN, then the UI converted each one straight
-    // back. A fast local model turns that into thousands of
-    // allocations and conversions for a single answer.
+    // The UI already batches on a 16 ms timer.  Posting one
+    // wxCommandEvent and running one UTF-8 -> UTF-16 conversion PER
+    // TOKEN (which the UI then converts straight back) turns a fast
+    // local model's answer into thousands of allocations.
     //
     // Buffer here instead and flush on 4 KiB or 12 ms, whichever
     // comes first - below the UI's 16 ms tick, so perceived streaming
@@ -559,11 +542,31 @@ wxThread::ExitCode ChatWorkerThread::Entry()
     std::size_t streamBytes = 0;
 
     try {
+        // ChatGPT plan lane: the OAuth access token is fetched HERE, on
+        // the worker, because renewing it is a network call and it
+        // expires hourly -- a token resolved on the UI thread at send
+        // time could be stale by the time a long agent loop reaches its
+        // tenth request.  Refreshes are serialized inside Auth, so two
+        // windows sending at once cannot race the rotating refresh token.
+        const bool chatgptPlan = !m_target.chatgptAccount.empty();
+        if (chatgptPlan) {
+            std::string token, tokenError;
+            const bool haveToken = lb_chatgpt::Auth::Get().GetAccessToken(
+                m_target.chatgptAccount, token, tokenError);
+            if (isCancelled()) return (ExitCode)0;
+            if (!haveToken) {
+                postError(tokenError);
+                return (ExitCode)0;
+            }
+            m_target.authHeaderName  = "Authorization";
+            m_target.authHeaderValue = "Bearer " + token;
+        }
+
         // Convert after the UI has finished message/attachment projection.
         // The original conversation remains unchanged. Other endpoints keep
         // their request bytes exactly as built by ChatHistory.
         if (responsesApi)
-            m_requestBody = lb_responses::BuildChatRequest(m_requestBody);
+            m_requestBody = lb_responses::BuildChatRequest(m_requestBody, chatgptPlan);
 
         // ── Connect to the target's OpenAI-compatible endpoint ──
         // The path comes from the target so an Anthropic-native
@@ -619,8 +622,7 @@ wxThread::ExitCode ChatWorkerThread::Entry()
         req.setContentLength((long)m_requestBody.size());
 
         // Auth + provider-fixed headers. Both are empty for local
-        // lanes, so this is a no-op there and the request is
-        // byte-for-byte what it was before the target refactor.
+        // lanes, so this is a no-op there.
         if (!m_target.authHeaderName.empty() &&
             !m_target.authHeaderValue.empty()) {
             req.set(m_target.authHeaderName, m_target.authHeaderValue);
@@ -649,17 +651,49 @@ wxThread::ExitCode ChatWorkerThread::Entry()
             const std::string err = ReadBodyBounded(in, kMaxErrorBodyBytes);
 
             wxCommandEvent* event = new wxCommandEvent(wxEVT_ASSISTANT_ERROR);
-            event->SetString(wxString::FromUTF8(
-                "API Error (" + std::to_string(resp.getStatus()) + "): "
-                + resp.getReason() + " - " + err
-            ));
+            if (chatgptPlan) {
+                // A rejected token must not be reused by the next send:
+                // force a refresh (a revoked grant then surfaces as the
+                // clear "sign-in expired" message from GetAccessToken).
+                if (resp.getStatus() == Poco::Net::HTTPResponse::HTTP_UNAUTHORIZED)
+                    lb_chatgpt::Auth::Get().InvalidateAccessToken(m_target.chatgptAccount);
+                event->SetString(wxString::FromUTF8(
+                    lb_chatgpt::DescribePlanHttpError(
+                        static_cast<int>(resp.getStatus()), err)));
+            } else {
+                event->SetString(wxString::FromUTF8(
+                    "API Error (" + std::to_string(resp.getStatus()) + "): "
+                    + resp.getReason() + " - " + err
+                ));
+            }
             SafeQueueEvent(event);
             return (ExitCode)0;
         }
 
-        if (responsesApi && resp.getContentType().find("text/event-stream") != 0) {
-            postError("The Responses endpoint did not return a streaming response.");
-            return (ExitCode)0;
+        // A streaming reply may omit Content-Type entirely: the ChatGPT
+        // plan route (api.openai.com via Sign in with ChatGPT) sends a
+        // chunked SSE body with no Content-Type header at all.  Reject
+        // only a reply that positively declares something else, and say
+        // what it was -- the SSE parser below still refuses a body that
+        // isn't a valid Responses stream.
+        if (responsesApi) {
+            std::string contentType = resp.getContentType();
+            for (char& c : contentType)
+                if (c >= 'A' && c <= 'Z') c = static_cast<char>(c + ('a' - 'A'));
+            const bool declared = !contentType.empty();
+            if (declared && contentType.find("text/event-stream") != 0) {
+                const std::string bodyHead = ReadBodyBounded(in, kMaxErrorBodyBytes);
+                if (chatgptPlan && contentType.find("json") != std::string::npos) {
+                    // A JSON body on a 200 is an error envelope; describe it.
+                    postError(lb_chatgpt::DescribePlanHttpError(200, bodyHead));
+                } else {
+                    std::string head = bodyHead.substr(0, 300);
+                    postError("The Responses endpoint returned " + contentType +
+                              " instead of a stream." +
+                              (head.empty() ? std::string() : " Start of reply: " + head));
+                }
+                return (ExitCode)0;
+            }
         }
 
         // ── Parse SSE stream ─────────────────────────────────────
@@ -1045,9 +1079,9 @@ wxThread::ExitCode ChatWorkerThread::Entry()
                         }
                     }
 
-                    // Phase 3c-ii: tool_calls fragments.  OpenAI
-                    // streaming format — each entry has an index
-                    // and partial field updates that we accumulate.
+                    // tool_calls fragments.  OpenAI streaming format —
+                    // each entry has an index and partial field updates
+                    // that we accumulate.
                     if (delta->has("tool_calls") && !delta->isNull("tool_calls")) {
                         markToken(true);
                         try {
@@ -1216,7 +1250,7 @@ wxThread::ExitCode ChatWorkerThread::Entry()
                     return (ExitCode)0;
             }
 
-            // ── Phase 3c-ii: serialize the tool_calls accumulator ──
+            // ── Serialize the tool_calls accumulator ───────────────
             // Render the per-index slots into an OpenAI-shape JSON
             // array.  Empty slots (no id AND no name AND no
             // arguments — happens if a fragment carried just an
@@ -1225,10 +1259,10 @@ wxThread::ExitCode ChatWorkerThread::Entry()
             // synthesize "call_<idx>" so downstream threading has
             // something stable).
             // An interrupted (repetition-stopped) reply carries no tool
-            // calls: they are unfinished at best, and dispatching one
-            // after telling the user the reply stopped is the bug this
-            // guards against.  The frame also refuses them (belt and
-            // braces for XML-protocol calls embedded in fullReply).
+            // calls: they are unfinished at best, and must not be
+            // dispatched after telling the user the reply stopped.  The
+            // frame also refuses them (belt and braces for XML-protocol
+            // calls embedded in fullReply).
             if (stats.stoppedForRepetition) {
                 toolCalls.clear();
                 responsesToolCallsJson.clear();

@@ -1,20 +1,18 @@
 // lb_modal_scrim.cpp
 // Implementation of the Telegram-style modal scrim.  See lb_modal_scrim.h.
 //
-// The first version used a translucent wxFrame.  On wxMSW that can be
-// capability-dependent and, in practice here, it did not reliably appear above
-// the owning frame before the modal dialog opened.  We use a small native
-// layered popup instead: it is owned by the LlamaBoss frame, paints solid
-// black, applies per-window alpha, and is shown before the dialog enters its
-// modal loop.  The dialog is created/shown afterward, so it remains above the
-// scrim.
+// A translucent wxFrame is capability-dependent on wxMSW and does not
+// reliably appear above the owning frame before the modal dialog opens.
+// We use a small native layered popup instead: it is owned by the
+// LlamaBoss frame, paints solid black, applies per-window alpha, and is
+// shown before the dialog enters its modal loop.  The dialog is
+// created/shown afterward, so it remains above the scrim.
 #include "lb_modal_scrim.h"
 
-#include <wx/wx.h>
 #include <wx/dialog.h>
 
 #ifdef __WXMSW__
-#include <windows.h>
+#include "lb_windows.h"
 #include <memory>
 #endif
 

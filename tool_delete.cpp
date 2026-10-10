@@ -7,11 +7,7 @@
 #include "path_safety.h"
 #include "tool_mutation_guard.h"
 
-#include <chrono>
-#include <sstream>
-
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
+#include "lb_windows.h"
 
 namespace {
 

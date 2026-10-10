@@ -2,8 +2,7 @@
 //
 // lb_about_dialog.h — themed About dialog with in-place update flow.
 //
-// Replaces the old wxMessageDialog + chat-transcript status lines.  All
-// update feedback (checking / up to date / available / downloading /
+// All update feedback (checking / up to date / available / downloading /
 // errors) stays inside this dialog; nothing is written to the chat.
 //
 // The dialog checks and downloads.  It does NOT launch the installer:

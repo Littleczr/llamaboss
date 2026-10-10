@@ -1,7 +1,6 @@
 // tool_call_elision_tests.cpp
 //
-// Regression harness for tool_call_elision.h (2026-10-01, open item A).
-// Poco::JSON only, no wx:
+// Regression harness for tool_call_elision.h.  Poco::JSON only, no wx:
 //   g++ -std=c++17 -I . tool_call_elision_tests.cpp -lPocoJSON -lPocoFoundation && ./a.out
 // (Windows: link PocoJSON/PocoFoundation the same way the app does.)
 //
@@ -12,9 +11,9 @@
 //     "does not match the executed tool call" (why the sidecar must go);
 //   * shortened arguments + no sidecar -> legacy replay succeeds and
 //     carries the shortened arguments.
-// And the copy guard (2026-10-01 live run: the model re-issued shortened
-// calls verbatim): cut values are spooled and the marker names the file;
-// ContainsArgElisionMarker matches real markers (new and first-shipped
+// And the copy guard (models re-issue shortened calls verbatim): cut
+// values are spooled and the marker names the file;
+// ContainsArgElisionMarker matches real markers (current and older
 // shapes, raw JSON or decoded) but not a bare grep for the phrase.
 #include "tool_call_elision.h"
 #include "openai_responses.h"
@@ -258,7 +257,7 @@ utf8done:
         check(out2.find("full text") == std::string::npos && ContainsArgElisionMarker(out2), "throwing spool -> marker only");
     }
 
-    // 11. Guard: exactly the transcript's copied shape, first-shipped marker.
+    // 11. Guard: a verbatim copied shape with the older marker.
     {
         const std::string copied =
             "$ErrorActionPreference='Continue'; $ms='C:\\Program Files\\Microsoft Visual Studio\\18\\Communit"

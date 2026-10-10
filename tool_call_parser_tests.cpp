@@ -1,4 +1,4 @@
-// Regression harness for tool_call_parser changes (2026-06-11).
+// Regression harness for tool_call_parser.
 // Compiles against the real tool_call_parser.cpp with stubbed
 // validators (the real ones delegate to the tool router / wx app).
 
@@ -36,8 +36,8 @@ static int g_failures = 0;
 
 int main()
 {
-    // ── 1. The exact transcript failure: colon-less opener, valid XML
-    //       body, stray </name> closer, EOS. Must now recover. ──
+    // ── 1. Colon-less opener, valid XML body, stray </name> closer,
+    //       EOS. Must recover. ──
     {
         std::string filler;
         for (int i = 0; i < 130; ++i)
@@ -123,7 +123,7 @@ int main()
               "unknown tool via recovery: specific reason surfaced");
     }
 
-    // ── 8. Regressions: previously working shapes still work. ──
+    // ── 8. Baseline shapes still work. ──
     {
         std::string text =
             "Sure.\n<tool_call>\n<name>ls</name>\n<args>D:\\Music</args>\n</tool_call>\nDone.";
@@ -184,7 +184,7 @@ int main()
               "preview: small blocks pass through");
     }
 
-    // ── 10. Streaming detector regression: normal closed block. ──
+    // ── 10. Streaming detector: normal closed block. ──
     {
         ToolCallStreamDetector det;
         bool fired = false;
@@ -196,12 +196,11 @@ int main()
               "regression: streaming detector across split deltas");
     }
 
-    // ── 11. Sixth gemma drift shape (2026-06-11 transcript): colon
-    //        opener carrying the name, XML <args> body, NO <name> tag,
-    //        proper </tool_call> closer.  Previously the brace parser
-    //        found no '{' and silently cleared args, so the call
-    //        dispatched empty and validation produced a misleading
-    //        "requires a filename" error. ──
+    // ── 11. Gemma drift: colon opener carrying the name, XML <args>
+    //        body, NO <name> tag, proper </tool_call> closer.  The brace
+    //        parser would find no '{' and silently clear args, so the
+    //        call would dispatch empty with a misleading "requires a
+    //        filename" error. ──
     {
         std::string text =
             "<|tool_call>call:python_run_script\n"
@@ -250,10 +249,10 @@ int main()
     }
 
 
-    // ── 12. Seventh gemma drift shape (2026-06-12 transcript): colon
-    //        opener carrying the name, then a mistaken XML-ish argument tag
-    //        (<name> or <path>) and only </args> at EOS.  This is terminal
-    //        and unambiguous, so recover instead of burning malformed strikes. ──
+    // ── 12. Gemma drift: colon opener carrying the name, then a
+    //        mistaken XML-ish argument tag (<name> or <path>) and only
+    //        </args> at EOS.  This is terminal and unambiguous, so
+    //        recover instead of burning malformed strikes. ──
     {
         std::string text =
             "<|tool_call>call:python_install_package<name>yt-dlp</args>";
@@ -292,8 +291,8 @@ int main()
               "tagged args with trailing prose: NOT recovered");
     }
 
-    // ── Eighth drift shape: name on call line, newline-separated args,
-    //    bare final </args> (2026-06-12 yt-dlp transcripts) ──────────
+    // ── Gemma drift: name on call line, newline-separated args, bare
+    //    final </args> ─────────────────────────────────────────────
     {
         std::string text =
             "<|tool_call>call:write\n"
@@ -410,9 +409,9 @@ int main()
               "newline args: unknown-tool reason");
     }
 
-    // ── Reasoning spans are never tool calls (2026-09-30). ──────────
-    // Qwen 27B quoted the protocol inside its reasoning and the batch
-    // parser dispatched the quote: PowerShell executed "...".
+    // ── Reasoning spans are never tool calls. ───────────────────────
+    // A model quoting the protocol inside its reasoning must not have
+    // the quote dispatched (PowerShell would execute "...").
     const std::string kThinkExample =
         "<think>The tool call format keeps failing. I need to use the exact "
         "XML format: <tool_call><name>pwd</name><args>...</args></tool_call> "
@@ -517,7 +516,7 @@ int main()
               "think stream: open reasoning never fires; held tail is safe to flush");
     }
 
-    // ── Leaked reasoning (2026-09-30, second transcript). ───────────
+    // ── Leaked reasoning. ───────────────────────────────────────────
     // llama-server ends reasoning_content at the first "<tool_call>" the
     // model writes, even inside its thinking.  ChatClient closes the
     // wrapped block there; the rest of the thought arrives as content,
@@ -526,7 +525,7 @@ int main()
         "<tool_call>\n<function>read</name>\n<args>@timeout=300\n"
         "a.txt\n</args>\n</tool_call>";
     {
-        // Transcript lines 43-57: a MENTION of <tool_call> in reasoning.
+        // A MENTION of <tool_call> in reasoning.
         std::string text =
             "<think>I need to fix the format of the tool call - I used "
             "`<function>` instead of `</think>\n"
@@ -539,8 +538,8 @@ int main()
               "leak: mention before stray </think> skipped; real block parsed");
     }
     {
-        // Transcript lines 63-76: a complete quoted example, more
-        // reasoning, stray </think>, then the real (broken) attempt.
+        // A complete quoted example, more reasoning, stray </think>,
+        // then the real (broken) attempt.
         std::string text =
             "<think>I need to fix the tool call format. The correct format "
             "is as follows:\n</think>\n"
@@ -605,8 +604,8 @@ int main()
               "placeholder: args merely containing ... still valid");
     }
     {
-        // Streaming, byte by byte, transcript lines 43-57: the mention
-        // must not swallow the display; the real block fires.
+        // Streaming, byte by byte: the mention must not swallow the
+        // display; the real block fires.
         std::string text =
             "<think>I used `<function>` instead of `</think>\n"
             "<tool_call>`. Let me retry.\n</think>\n\n"
@@ -630,10 +629,10 @@ int main()
               "args stream: </think> inside write args still fires");
     }
 
-    // ── Qwen function-tag drift (2026-09-30 transcripts). ───────────
+    // ── Qwen function-tag drift. ────────────────────────────────────
     auto parse = [](const std::string& t) { return ParseAssistantResponse(t); };
     {
-        // Transcript 3, verbatim shape (tool swapped to a stubbed one).
+        // Real-world shape (tool swapped to a stubbed one).
         ParsedAssistantResponse p = parse(
             "I'll search your D: drive first.\n\n"
             "<tool_call>\n<function>read</name>\n"
@@ -754,7 +753,7 @@ int main()
     }
 
     {
-        // Fourth transcript, verbatim shape: <function>NAME> (no slash).
+        // <function>NAME> (no slash).
         ParsedAssistantResponse p = ParseAssistantResponse(
             "<tool_call>\n<function>read>\n"
             "<args>Get-ChildItem -Path 'D:\\' -Recurse -File -Filter '*child*'</args>\n"

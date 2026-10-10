@@ -1,6 +1,6 @@
 // tool_path.h
 //
-// Path-resolution helpers for Phase 3 slash commands.
+// Path-resolution helpers for tools.
 //
 // ResolveToolPath takes a user-supplied path (possibly relative,
 // possibly containing %VAR% env-vars, possibly with mixed separators)
@@ -8,7 +8,7 @@
 // on any failure.  It does NOT check whether the path exists —
 // callers layer IsDirectory() / IsFile() on top.
 //
-// The helpers are Windows-only, matching the rest of LlamaBoss Pro's
+// The helpers are Windows-only, matching the rest of LlamaBoss's
 // target platform (CreateProcessW, Job Objects, wxRegKey, etc.).
 //
 #pragma once

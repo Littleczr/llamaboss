@@ -6,14 +6,7 @@
 #include "tool_python_syntax.h"
 #include "path_safety.h"   // Utf8ToWide
 
-#include <string>
-#include <thread>
-#include <vector>
-
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#include <windows.h>
+#include "lb_windows.h"
 
 namespace {
 

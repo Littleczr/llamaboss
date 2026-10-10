@@ -15,16 +15,9 @@
 
 #include "project_controller.h"
 
-#include <wx/wx.h>
-#include <wx/filedlg.h>
-#include <wx/textdlg.h>
 #include <wx/choicdlg.h>
-#include <wx/utils.h>
 
-#include <algorithm>
-#include <cstddef>
-#include <sstream>
-
+#include "app.h"                   // wxGetApp().GetConversationRegistry()
 #include "app_state.h"
 #include "chat_display.h"
 #include "chat_history.h"
@@ -290,6 +283,17 @@ void ProjectController::MoveChatsToProject(const std::vector<std::string>& paths
             ++moved;
         }
         else {
+            // Another window owns this chat and autosaves its in-memory
+            // copy: a load-mutate-save here would either be silently
+            // reverted by that window's next autosave or, racing its
+            // background save, overwrite newer messages on disk.  Same
+            // guard as rename / pin / archive.
+            if (wxGetApp().GetConversationRegistry().OwnerOf(
+                    path, dynamic_cast<const wxFrame*>(m_frame))) {
+                ++skipped;
+                continue;
+            }
+
             // Throwaway ChatHistory — load, mutate, save.  Models
             // are round-tripped through LoadFromFile/SaveToFile so
             // we don't accidentally rewrite the file with no model
@@ -346,8 +350,8 @@ void ProjectController::MoveChatsToProject(const std::vector<std::string>& paths
         }
         message += std::to_string(skipped) +
                    (skipped == 1
-                       ? " chat was already at the destination or unreadable."
-                       : " chats were already at the destination or unreadable.");
+                       ? " chat was already at the destination, unreadable, or open in another window."
+                       : " chats were already at the destination, unreadable, or open in another window.");
         wxMessageBox(
             wxString::FromUTF8(message.c_str()),
             "Move to Project",

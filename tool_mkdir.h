@@ -1,7 +1,7 @@
 // tool_mkdir.h
 //
-// Phase 6 sibling to tool_write: create a directory under
-// the per-conversation tool CWD or active project root.
+// Sibling to tool_write: create a directory under the per-conversation
+// tool CWD or another allowed write root.
 //
 // MakeDirectory is idempotent on directories: if the leaf already
 // exists AS a directory, the call succeeds and is reported as
@@ -10,7 +10,7 @@
 // won't silently substitute one inode shape for the other.
 //
 // Same containment story as tool_write: the resolved path must
-// land inside ctx.cwd, the leaf basename must survive
+// land inside the allowed write roots, the leaf basename must survive
 // path_safety::SanitizeFilename intact. Missing intermediate
 // directories are created safely (mkdir -p style), but every new
 // segment is sanitized and the final resolved path must remain inside

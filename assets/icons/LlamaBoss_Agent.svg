@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none">
+  <title>LlamaBoss Agent robot</title>
+  <desc>A rounded robot head with two eyes, side ears and a short antenna.</desc>
+  <g stroke="#D0D5DC" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+    <circle cx="12" cy="3.5" r="1.5"/>
+    <path d="M12 5v3M4.5 11.5H3a1 1 0 0 0-1 1v3a1 1 0 0 0 1 1h1.5M19.5 11.5H21a1 1 0 0 1 1 1v3a1 1 0 0 1-1 1h-1.5"/>
+    <rect x="4.5" y="8" width="15" height="12" rx="3"/>
+    <circle cx="9" cy="14" r="0.9" fill="#D0D5DC" stroke="none"/>
+    <circle cx="15" cy="14" r="0.9" fill="#D0D5DC" stroke="none"/>
+  </g>
+</svg>

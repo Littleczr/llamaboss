@@ -1,22 +1,19 @@
 // agent_event.h
 //
-// Phase 9: typed AgentEvents — a small structured event envelope
-// layered on top of the Phase 5 sink callbacks.
+// Typed AgentEvents — a small structured event envelope layered on top
+// of the sink callbacks.
 //
 // ─── Why a typed event envelope, not a full bus? ────────────────
-// Phase 5 intentionally kept the controller simple: AgentController
-// reports progress to an AgentEventSink with direct typed methods
-// such as OnAgentToolBlock() and OnAgentLoopEnd().  That is still the
-// right architecture for the current app.  Phase 9 adds a lightweight
-// AgentEvent value type so future code can forward, test, inspect, or
-// record events without inventing a wx event hierarchy or rewriting
-// the saved-history format.
+// AgentController reports progress to an AgentEventSink with direct
+// typed methods such as OnAgentToolBlock() and OnAgentLoopEnd().  The
+// AgentEvent value type lets code forward, test, inspect, or record
+// events without inventing a wx event hierarchy or changing the
+// saved-history format.
 //
-// Existing sinks remain source-compatible.  AgentEventSink::OnAgentEvent()
-// is the new central entry point, but its default implementation simply
-// dispatches to the existing Phase 5/6 methods.  MyFrame can keep its
-// current overrides.  A future sub-agent, logger, or test harness can
-// override OnAgentEvent() directly and forward a single object.
+// AgentEventSink::OnAgentEvent() is the central entry point; its
+// default implementation dispatches to the typed methods, which MyFrame
+// overrides.  A logger or test harness can override OnAgentEvent()
+// directly and forward a single object.
 //
 // ─── Event taxonomy ─────────────────────────────────────────────
 // The enum is deliberately a little richer than today's UI needs:
@@ -31,13 +28,9 @@
 //   TurnComplete       : reserved for future explicit final-answer events.
 //   AgentStatus        : replayable non-tool status cards, e.g. tool cap.
 //
-// These specific event names give Phase 10+ room to add approval cards,
-// status displays, sub-agent forwarding, and test assertions without
-// changing the stable rendering code.
-//
-// All sink calls are still synchronous and occur on the UI thread today.
-// When a future worker-thread producer appears, wrap the sink in a wx
-// QueueEvent adapter; do not make AgentController depend on wx.
+// All sink calls are synchronous and occur on the UI thread.  If a
+// worker-thread producer ever appears, wrap the sink in a wx QueueEvent
+// adapter; do not make AgentController depend on wx.
 //
 // ─── End-reason taxonomy ─────────────────────────────────────────
 // Every loop ends for exactly one reason.  MyFrame uses the reason
@@ -65,7 +58,7 @@ enum class AgentEndReason {
 
     // Hit AgentController::kMaxIterations.  Tool calls ran but the
     // model never converged; loop bails to prevent runaway cost.
-    // Phase 8 also emits a replayable Agent Status card for this.
+    // Also emits a replayable Agent Status card.
     IterationCap,
 
     // Hit AgentController::kMaxMalformedPerTurn back-to-back.  The
@@ -82,9 +75,9 @@ enum class AgentEndReason {
     // a defensive code path.
     SendFailed,
 
-    // Phase 7 guardrail: the same normalized tool call repeated
-    // too many times inside a small rolling window.  The loop stops
-    // before dispatching the repeated call.
+    // Loop guard: the same normalized tool call repeated too many
+    // times inside a small rolling window.  The loop stops before
+    // dispatching the repeated call.
     LoopGuard,
 
     // A tool result was terminal for this turn and intentionally stopped
@@ -113,8 +106,8 @@ struct AgentEvent {
     AgentEventType type = AgentEventType::ToolOutput;
 
     // Rendering payload for ToolOutput/ApprovalRequired/AgentStatus/
-    // Error/specialized file events.  Uses the existing ToolBlock
-    // shape so Phase 9 does not touch chat rendering or saved history.
+    // Error/specialized file events.  Uses the ToolBlock shape so
+    // events don't touch chat rendering or saved history.
     ToolBlock toolBlock;
     bool      startExpanded = false;
 
@@ -126,8 +119,7 @@ struct AgentEvent {
     std::string toolCallId;
 
     // Normalized loop-guard signature for trace/log consumers.
-    // Empty for legacy observers or events that are not tied to a
-    // concrete tool dispatch.
+    // Empty for events that are not tied to a concrete tool dispatch.
     std::string toolSignature;
 
     // LoopEnd payload.
@@ -202,8 +194,8 @@ struct AgentEvent {
 };
 
 // Implemented by MyFrame.  AgentController calls OnAgentEvent(); the
-// default bridge below fans the typed event back out to the existing
-// Phase 5/6 virtual methods so current UI code remains unchanged.
+// default bridge below fans the typed event back out to the typed
+// virtual methods.
 class AgentEventSink {
 public:
     virtual ~AgentEventSink() = default;
@@ -220,8 +212,8 @@ public:
             break;
 
         case AgentEventType::ToolCall:
-            // ToolCall is informational for Phase 9.  It is not rendered
-            // by default, otherwise every model request would add noise.
+            // ToolCall is informational.  It is not rendered by default,
+            // otherwise every model request would add noise.
             break;
 
         case AgentEventType::ApprovalRequired:
@@ -261,8 +253,8 @@ public:
     virtual void OnAgentToolBlock(const ToolBlock& block,
                                   bool startExpanded) = 0;
 
-    // Phase 6: a risky tool invocation is paused before execution
-    // and represented as an approval card.
+    // A risky tool invocation is paused before execution and
+    // represented as an approval card.
     virtual void OnAgentApprovalRequired(const ToolBlock& block)
     {
         OnAgentToolBlock(block, true);

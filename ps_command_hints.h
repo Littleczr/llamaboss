@@ -4,27 +4,25 @@
 // produce a SILENT no-op (exit 0, no output, no error), which local
 // models then misread as success.
 //
-// First detector (2026-06-11): `Get-ChildItem -Include` selects
-// nothing unless -Recurse is used or the -Path value ends with a
-// wildcard.  Observed in the wild as:
+// 1. `Get-ChildItem -Include` selects nothing unless -Recurse is used
+//    or the -Path value ends with a wildcard:
 //
-//   Get-ChildItem -Path "C:\dir" -Include "*.h","*.cpp" -File |
-//       Compress-Archive -DestinationPath out.zip
+//      Get-ChildItem -Path "C:\dir" -Include "*.h","*.cpp" -File |
+//          Compress-Archive -DestinationPath out.zip
 //
-// -> zero files matched, Compress-Archive's process block never ran,
-//    exit 0, no zip, and the model claimed the file was "attached".
+//    -> zero files matched, Compress-Archive's process block never ran,
+//       exit 0, no zip, and the model claims the file was "attached".
 //
-// Second detector (2026-09-30): a wildcard -Path combined with
-// -Recurse -File.  Measured on Windows PowerShell 5.1 against a drive
-// with 62,392 files:
+// 2. A wildcard -Path combined with -Recurse -File.  Measured on
+//    Windows PowerShell 5.1 against a drive with 62,392 files:
 //
-//   gci 'D:\*' -Recurse -File              -> 0        (silent)
-//   gci 'D:\*' -Recurse -File -Filter *.txt -> 0        (silent)
-//   gci 'D:\'  -Recurse -File              -> 62,392
-//   gci 'D:\*' -Recurse          (no -File) -> 62,392
+//      gci 'D:\*' -Recurse -File              -> 0        (silent)
+//      gci 'D:\*' -Recurse -File -Filter *.txt -> 0        (silent)
+//      gci 'D:\'  -Recurse -File              -> 62,392
+//      gci 'D:\*' -Recurse          (no -File) -> 62,392
 //
-// A local model searched "all of D:" this way four times, reported
-// "no documents found", and was never told the search covered nothing.
+//    A model searching "all of D:" this way reports "no documents
+//    found" and is never told the search covered nothing.
 //
 // The caller decides WHEN to surface a hint (typically: command
 // succeeded but produced no output and no workspace changes); this

@@ -36,18 +36,18 @@ public:
     AppState&     GetAppState()     { return *m_appState; }
     ModelService& GetModelService() { return *m_modelService; }
 
-    // Which window has which conversation open (Phase 3b guard
-    // against the same conversation being edited in two windows).
+    // Which window has which conversation open (guards against the
+    // same conversation being edited in two windows).
     ConversationRegistry& GetConversationRegistry()
     {
         return m_conversationRegistry;
     }
 
-    // ── Single-instance handoff (Phase 3d) ───────────────────────
+    // ── Single-instance handoff ──────────────────────────────────
     // A second desktop-shortcut launch detects this process via
     // wxSingleInstanceChecker, signals the named new-window event,
     // and exits.  The listener thread marshals that signal here on
-    // the main thread; the result is byte-for-byte the Ctrl+Shift+N
+    // the main thread; the result is exactly the Ctrl+Shift+N
     // behavior — a full MyFrame borrowing the app-owned singletons,
     // joining whatever server/target is already active.
     void OpenNewWindowFromSecondLaunch();

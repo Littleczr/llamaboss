@@ -1,11 +1,8 @@
 // agent_controller.h
 //
-// Phase 9: Agent harness — typed event envelope.
-//
-// Phase 7 added the small multi-step loop and repeated-tool guard.
-// Phase 8 added replayable status cards for safety stops.
-// Phase 9 routes loop notifications through a typed AgentEvent object
-// while preserving the existing sink callbacks and UI behavior.
+// Agent harness: a small multi-step tool loop with repeated-tool and
+// cycle guards, replayable status cards for safety stops, and typed
+// AgentEvent notifications.
 //
 // Drives the agent's inner loop: parse assistant response → dispatch
 // tool → append result to history → send next request → repeat until
@@ -26,26 +23,17 @@
 // and route through us first; we decide whether to swallow the
 // event (loop continues) or let normal flow proceed (loop ended).
 //
-// ─── Phase 5: AgentEvents ────────────────────────────────────────
-// Phase 4 mixed two concerns inside Callbacks: the *logic* of
-// driving a chat (sendRequest, buildSystemPrompt, bumpGenerationId,
-// getActiveProtocol, buildToolContext) and the *UI side-effects* of
-// running a loop (begin a new iteration's prefix + dots, finalize
-// streaming on loop end).  Phase 4 also reached into ChatDisplay
-// directly to render tool blocks and system messages.
-//
-// Phase 5 splits those:
-//   - Logic callbacks stay in `Callbacks`.  These are pure functions
-//     with no UI semantics.
-//   - UI-shaped concerns move to AgentEventSink.  The controller no
-//     longer holds a ChatDisplay pointer; it posts structured events
-//     (loop begin, iteration begin, tool block ready, loop end) to
-//     the sink, which MyFrame implements.
-//
-// This unblocks P6 (approval cards intercept ToolBlock events before
-// rendering), P9 (sub-agents implement AgentEventSink to forward
-// events to the parent loop), and any future test harness that
-// wants to drive the controller without a wx UI in the loop.
+// ─── Logic vs UI ─────────────────────────────────────────────────
+//   - Logic callbacks live in `Callbacks` (sendRequest,
+//     buildSystemPrompt, bumpGenerationId, getActiveProtocol,
+//     buildToolContext).  These are pure functions with no UI
+//     semantics.
+//   - UI-shaped concerns go through AgentEventSink.  The controller
+//     holds no ChatDisplay pointer; it posts structured events (loop
+//     begin, iteration begin, tool block ready, loop end) to the sink,
+//     which MyFrame implements.  Approval cards intercept ToolBlock
+//     events at this seam, and a test harness can drive the controller
+//     without a wx UI.
 //
 // ─── Loop control ────────────────────────────────────────────────
 //   kMaxIterations      : hard cap on tool calls per user turn.
@@ -64,8 +52,7 @@
 // ConversationController, which destroys the OLD ChatHistory and
 // binds a new one.  A raw ChatHistory* captured at construction
 // would dangle after that swap; the next agent iteration would
-// write into freed heap and crash inside vector::push_back's
-// iterator-debug walk.  Going through the unique_ptr reference
+// write into freed heap.  Going through the unique_ptr reference
 // always reaches the current ChatHistory.  Mirrors what
 // ModelSwitcher and ConversationController already do.
 //
@@ -121,24 +108,24 @@ public:
     static constexpr int kMaxWaitSecondsPerCall     = 600;
     static constexpr int kDefaultWaitBudgetSeconds  = 1800;   // 30 min/turn
 
-    // Phase 7: repeated-tool guard.  If the same normalized
-    // tool signature would appear this many times inside the
-    // most recent window, stop the loop before dispatch.
+    // Repeated-tool guard.  If the same normalized tool signature
+    // would appear this many times inside the most recent window,
+    // stop the loop before dispatch.
     static constexpr int kLoopGuardWindow          = 5;
     static constexpr int kLoopGuardRepeatThreshold = 3;
 
-    // Phase 7c: cycle guard for A/B/C/A/B/C-style loops that never
-    // repeat one exact signature enough times to trip the exact-repeat
-    // guard but are still visibly stuck.
+    // Cycle guard for A/B/C/A/B/C-style loops that never repeat one
+    // exact signature enough times to trip the exact-repeat guard but
+    // are still visibly stuck.
     static constexpr int kCycleGuardWindow      = 6;
     static constexpr int kCycleGuardMaxDistinct = 3;
     static constexpr int kCycleGuardMinRepeats  = 2;
 
-    // Phase 10: multi-tool dispatch.  Hard ceiling on how many native
-    // tool calls from one assistant turn are queued for sequential
-    // execution.  Anything past the ceiling is dropped from the
-    // persisted tool_calls sidecar and reported to the model via a
-    // soft-hint notice so it can re-issue the remainder next turn.
+    // Multi-tool dispatch.  Hard ceiling on how many native tool calls
+    // from one assistant turn are queued for sequential execution.
+    // Anything past the ceiling is dropped from the persisted
+    // tool_calls sidecar and reported to the model via a soft-hint
+    // notice so it can re-issue the remainder next turn.
     static constexpr int kMaxNativeCallsPerTurn = 8;
 
     // Bounds for the user-configurable tool-step cap (see
@@ -146,8 +133,7 @@ public:
     static constexpr int kMinConfigurableToolSteps = 4;
     static constexpr int kMaxConfigurableToolSteps = 60;
 
-    // Logic-only callbacks.  Phase 5 stripped the UI-shaped entries
-    // (beginNextIteration, onLoopEnd) — those moved to
+    // Logic-only callbacks.  UI-shaped work goes through
     // AgentEventSink::OnAgentIterationBegin / OnAgentLoopEnd.
     struct Callbacks {
         // Kick off the next chat request.  Body is the full JSON
@@ -173,12 +159,11 @@ public:
         // request can't land on a later loop step.
         std::function<unsigned long()> bumpGenerationId;
 
-        // Phase 3c-i: returns the active model's tool protocol so
-        // the request builder can decide whether to attach a
-        // function-calling "tools" array.  Returning ToolProtocol::
-        // Native enables the tool catalog; Xml/Unknown disable it.
-        // Optional — when unset (or returning Unknown) the agent
-        // uses XML-protocol behaviour.
+        // Returns the active model's tool protocol so the request
+        // builder can decide whether to attach a function-calling
+        // "tools" array.  Returning ToolProtocol::Native enables the
+        // tool catalog; Xml/Unknown disable it.  Optional — when unset
+        // (or returning Unknown) the agent uses XML-protocol behaviour.
         std::function<ToolProtocol()> getActiveProtocol;
 
         // The wire "model" field for this conversation's requests.
@@ -202,8 +187,7 @@ public:
         std::function<std::string()> resolveWireModel;
     };
 
-    // Phase 5: takes an AgentEventSink* in the slot Phase 4 used for
-    // ChatDisplay*.  MyFrame implements the sink and passes `this`.
+    // MyFrame implements the sink and passes `this`.
     AgentController(std::unique_ptr<ChatHistory>& history,
                     AgentEventSink* sink,
                     AppState*       appState,
@@ -223,8 +207,8 @@ public:
     // mode.  The user's message must already be added to history
     // and a generation request must be about to fire — Begin()
     // simply arms the controller to treat the upcoming streaming
-    // reply as iteration 1.  Phase 5: also fires
-    // OnAgentLoopBegin() so the frame can hook loop-scoped UI.
+    // reply as iteration 1, and fires OnAgentLoopBegin() so the
+    // frame can hook loop-scoped UI.
     void Begin();
 
     // Tool-protocol snapshot for the request currently in flight.
@@ -243,7 +227,7 @@ public:
     // Call before Begin(); used by every request this turn builds.
     void SetConversationContextTokens(int tokens) { m_conversationContextTokens = tokens; }
 
-    // Phase 10: user-configurable tool-step cap.  Clamped to
+    // User-configurable tool-step cap.  Clamped to
     // [kMinConfigurableToolSteps, kMaxConfigurableToolSteps]; takes
     // effect on the NEXT cap comparison, so raising it mid-loop
     // extends the current loop and lowering it can stop the loop at
@@ -260,23 +244,23 @@ public:
     // agent is actually waiting on grep or PowerShell.
     bool IsAwaitingAsyncResult() const { return m_awaitingAsyncResult; }
 
-    // Phase 6: true while the loop is paused on an approval card.
-    // MyFrame keeps the input enabled in this state so /approve or
-    // /deny can resolve the pending tool invocation.
+    // True while the loop is paused on an approval card.  MyFrame
+    // keeps the input enabled in this state so /approve or /deny can
+    // resolve the pending tool invocation.
     bool IsAwaitingApproval() const { return m_awaitingApproval; }
     bool IsAwaitingWriteRootGrant() const {
         return m_awaitingApproval && !m_pendingWriteRootGrant.empty();
     }
 
-    // Phase 6: resolve a pending approval.  Approve executes the
-    // stored invocation; Deny records a denied tool result and lets
-    // the model continue; Cancel records a cancelled result and ends
-    // the loop without another model request.
+    // Resolve a pending approval.  Approve executes the stored
+    // invocation; Deny records a denied tool result and lets the model
+    // continue; Cancel records a cancelled result and ends the loop
+    // without another model request.
     //
     // rememberForChat: when true, enables one-approval mode for the
     // rest of the conversation so subsequent approval-required tools
-    // dispatch without re-prompting.  In the polished UI, plain
-    // approve maps here; approve once passes false.
+    // dispatch without re-prompting.  Plain approve maps here;
+    // approve once passes false.
     bool ApprovePendingTool(bool rememberForChat = false);
     bool DenyPendingTool();
     bool CancelPendingApproval();
@@ -304,12 +288,12 @@ public:
     //   - HandleAssistantError always returns false (errors always
     //     end the loop).
     //
-    // Phase 3c-ii: toolCallsJson is the structured tool_calls
-    // payload from the streaming response (empty when the model
-    // emitted no native tool calls — typical XML-protocol case).
-    // When present and non-empty AND the active protocol is Native,
-    // the controller bypasses the XML stream-detector path and
-    // synthesizes invocations directly from the structured calls.
+    // toolCallsJson is the structured tool_calls payload from the
+    // streaming response (empty when the model emitted no native tool
+    // calls — typical XML-protocol case).  When present and non-empty
+    // AND the active protocol is Native, the controller bypasses the
+    // XML stream-detector path and synthesizes invocations directly
+    // from the structured calls.
     bool HandleAssistantComplete(const std::string& fullResponse,
                                  const std::string& toolCallsJson = "");
     bool HandleGrepComplete(const struct GrepResult& grepResult);
@@ -339,9 +323,9 @@ private:
     // that ends the loop.
     bool DispatchAndContinue(const ToolInvocation& inv);
 
-    // Phase 6: same dispatch body after the user has approved the
-    // paused invocation.  This deliberately skips the approval check
-    // so /approve does not re-open the same card forever.
+    // Same dispatch body after the user has approved the paused
+    // invocation.  This deliberately skips the approval check so
+    // /approve does not re-open the same card forever.
     bool DispatchApprovedAndContinue(const ToolInvocation& inv,
                                      const ToolContext&    ctx);
 
@@ -354,9 +338,9 @@ private:
 
     // Render result + append to history, then continue the loop
     // (next queued batch call, or next model request).  Shared
-    // between sync dispatch and async completion.  Phase 10 split
-    // the body into FeedResultOnly + ContinueLoop so the deny path
-    // can interleave a batch drain between the two halves.
+    // between sync dispatch and async completion.  Split into
+    // FeedResultOnly + ContinueLoop so the deny path can interleave a
+    // batch drain between the two halves.
     void FeedResultAndIterate(const ToolInvocationResult& r,
                               bool countTowardIterationCap = true);
 
@@ -371,7 +355,7 @@ private:
     // invocation or fire the next model request.
     void ContinueLoop();
 
-    // ─── Phase 10: native multi-call batch queue ─────────────────
+    // ─── Native multi-call batch queue ───────────────────────────
     // Pops and dispatches the next queued invocation from the current
     // assistant turn.  Returns the DispatchAndContinue result.
     bool DispatchNextQueuedInvocation();
@@ -382,18 +366,16 @@ private:
     // run BEFORE any EndLoop that abandons a partially-executed batch.
     void DrainQueuedInvocationsWithSkippedResults(const std::string& reason);
 
-    // Shared tail for every async tool completion.  The four
-    // HandleXxxComplete handlers used to each repeat the same
-    // cancel-vs-continue epilogue (render partial result, round-trip
-    // to history, EndLoop(Cancelled) — or FeedResultAndIterate).
-    // They now build their tool-specific ToolInvocationResult and
-    // delegate here, so the next async tool cannot add a fifth copy
-    // of the epilogue.  `cancelled` is (m_cancelled || worker reported
-    // cancelled); `inv` supplies the tool_call_id for the cancel-path
-    // history record.
+    // Shared tail for every async tool completion: render partial
+    // result on cancel, round-trip to history, then EndLoop(Cancelled)
+    // or FeedResultAndIterate.  Each HandleXxxComplete builds its
+    // tool-specific ToolInvocationResult and delegates here, so the
+    // epilogue exists once.  `cancelled` is (m_cancelled || worker
+    // reported cancelled); `inv` supplies the tool_call_id for the
+    // cancel-path history record.
     // countTowardIterationCap: waits are exempt (they consume the
     // wait-time budget instead of tool steps); every other async
-    // tool counts as before.
+    // tool counts.
     bool FinishAsyncToolResult(const ToolInvocation&       inv,
                                const ToolInvocationResult& r,
                                bool                        cancelled,
@@ -409,8 +391,8 @@ private:
                               int&               secondsOut,
                               std::string&       reasonOut);
 
-    // Phase 7: build and track recent tool signatures so a small
-    // model cannot spin forever on the same exact call.
+    // Build and track recent tool signatures so a small model cannot
+    // spin forever on the same exact call.
     std::string BuildToolSignature(const ToolInvocation& inv) const;
     bool WouldTripLoopGuard(const ToolInvocation& inv,
                             std::string&          signatureOut,
@@ -420,26 +402,25 @@ private:
                              int&                  distinctCountOut) const;
     void RecordToolSignature(const std::string& signature);
 
-    // Phase 7d: called when a dispatched invocation's result lands.
-    // Marks the most recent matching record's outcome; on success,
-    // purges earlier FAILED records of the same signature (see the
-    // ToolSignatureRecord comment for the rationale).
+    // Called when a dispatched invocation's result lands.  Marks the
+    // most recent matching record's outcome; on success, purges earlier
+    // FAILED records of the same signature (see the ToolSignatureRecord
+    // comment for the rationale).
     //
-    // Phase 7e: outputText is the success body of the result.  Its
-    // hash is stored on the record and drives the progress purge (see
+    // outputText is the success body of the result.  Its hash is stored
+    // on the record and drives the progress purge (see
     // ToolSignatureRecord).  Callers on failure paths may omit it.
     void ResolveToolSignatureOutcome(const ToolInvocation& inv,
                                      bool                  failed,
                                      const std::string&    outputText
                                          = std::string());
 
-    // Phase 7e: FNV-1a 64-bit hash of a tool result body with
-    // whitespace runs collapsed.  Static so tests can call it.
+    // FNV-1a 64-bit hash of a tool result body with whitespace runs
+    // collapsed.  Static so tests can call it.
     static uint64_t HashToolOutputForLoopGuard(const std::string& text);
 
-    // Phase 9/Phase 3 trace: emit a non-rendered ToolCall AgentEvent
-    // at the approved dispatch point.  Useful for sub-agent forwarders,
-    // logging, and tests.
+    // Emit a non-rendered ToolCall AgentEvent at the approved dispatch
+    // point.  Useful for forwarders, logging, and tests.
     void EmitToolCallEvent(const ToolInvocation& inv,
                            const std::string&   signature);
 
@@ -450,33 +431,31 @@ private:
     void EmitAndStoreTerminalToolResult(const ToolInvocationResult& r,
                                         bool startExpanded = true);
 
-    // Phase 8: helper for loop-ending status cards that are not
-    // associated with a real tool invocation.  These cards are
-    // intentionally persisted using the existing tool-block history
-    // format rather than introducing a new saved-history record type.
+    // Helper for loop-ending status cards that are not associated with
+    // a real tool invocation.  These cards are intentionally persisted
+    // using the existing tool-block history format rather than
+    // introducing a new saved-history record type.
     void EmitAndStoreAgentStatusCard(const std::string& title,
                                      const std::vector<std::string>& chips,
                                      const std::string& message,
                                      bool startExpanded = true);
 
-    // Phase 3c-ii: parse the OpenAI-shape tool_calls array (as
-    // emitted by ChatClient's accumulator) into our internal
-    // ToolInvocation form.  Each invocation carries the call id
-    // for downstream tool_call_id threading.  Empty result on
-    // parse failure or empty input.
+    // Parse the OpenAI-shape tool_calls array (as emitted by
+    // ChatClient's accumulator) into our internal ToolInvocation form.
+    // Each invocation carries the call id for downstream tool_call_id
+    // threading.  Empty result on parse failure or empty input.
     std::vector<ToolInvocation> ParseStructuredToolCalls(
         const std::string& toolCallsJson);
 
-    // Phase 3c-ii: convert an OpenAI-style structured arguments
-    // JSON payload to LlamaBoss's legacy single-string args form
-    // expected by the dispatchers.  Schema-aware: pulls the right
-    // field(s) from the JSON object based on the tool name.
+    // Convert an OpenAI-style structured arguments JSON payload to
+    // LlamaBoss's legacy single-string args form expected by the
+    // dispatchers.  Schema-aware: pulls the right field(s) from the
+    // JSON object based on the tool name.
     std::string ProjectStructuredArgs(const std::string& toolName,
                                       const std::string& argsJson);
 
-    // Phase 5: post a tool-block event to the sink.  Centralizes
-    // the (otherwise four-times-repeated) ToolInvocationResult →
-    // ToolBlock packing.
+    // Post a tool-block event to the sink.  Centralizes the
+    // ToolInvocationResult → ToolBlock packing.
     void EmitToolBlock(const ToolInvocationResult& r,
                        bool startExpanded = false);
 
@@ -534,23 +513,21 @@ private:
     // conversation history or replays after restart.
     std::string   m_nextRequestSystemNudge;
 
-    // Phase 7/7d: rolling window of recently DISPATCHED tool signatures,
-    // used by the exact-repeat and cycle guards.  Phase 7d added the
-    // outcome flag: when a previously-failing call later SUCCEEDS, its
-    // earlier failed records are purged, because the success proves the
-    // blocking state changed (e.g. run(missing) -> create_script ->
-    // run(ok)) and the past failures no longer indicate a stuck loop.
-    // Successful repeats still accumulate, so identical-successful-call
-    // doom loops (the original Phase 7 motivation) remain guarded.
-    // Phase 7e added output-hash progress detection: when a call
-    // SUCCEEDS with output that differs from an earlier success of the
-    // same signature, the earlier records are purged -- same question,
-    // different answer means the call is doing real work (scroll ->
-    // snapshot paging is the canonical transcript), so it must not
-    // accumulate toward the repeat guard.  Successful repeats whose
-    // output MATCHES still accumulate, so identical-successful-call
-    // doom loops (same question, same answer, repeated) remain guarded
-    // at the unchanged threshold.
+    // Rolling window of recently DISPATCHED tool signatures, used by
+    // the exact-repeat and cycle guards.
+    //   * Outcome flag: when a previously-failing call later SUCCEEDS,
+    //     its earlier failed records are purged, because the success
+    //     proves the blocking state changed (e.g. run(missing) ->
+    //     create_script -> run(ok)) and the past failures no longer
+    //     indicate a stuck loop.
+    //   * Output-hash progress detection: when a call SUCCEEDS with
+    //     output that differs from an earlier success of the same
+    //     signature, the earlier records are purged -- same question,
+    //     different answer means the call is doing real work (scroll
+    //     -> snapshot paging is the canonical transcript).
+    // Successful repeats whose output MATCHES still accumulate, so
+    // identical-successful-call doom loops (same question, same answer,
+    // repeated) remain guarded.
     struct ToolSignatureRecord {
         std::string signature;
         bool        failed        = false;  // set when the call's result lands
@@ -565,30 +542,30 @@ private:
     // fall back to the Settings value.
     int m_conversationContextTokens = 0;
 
-    // Standalone write-and-stop (2026-10-01): lowercased disk paths that
-    // write / overwrite_file succeeded on during THIS turn.  The turn
-    // stops only when the same artifact is written a second time — the
-    // small-model re-write loop the heuristic exists for — so a capable
-    // model's single state-file overwrite no longer ends a multi-step
-    // plan.  Cleared in Begin().
+    // Standalone write-and-stop: lowercased disk paths that write /
+    // overwrite_file succeeded on during THIS turn.  The turn stops only
+    // when the same artifact is written a second time — the small-model
+    // re-write loop the heuristic exists for — so a capable model's
+    // single state-file overwrite doesn't end a multi-step plan.
+    // Cleared in Begin().
     std::vector<std::string> m_standaloneWritePathsThisTurn;
 
-    // Phase 10: user-configurable tool-step cap.  Defaults to the
-    // historical constant; AppState persists the user's value and
-    // MyFrame pushes it here at startup and on /agent_steps.
+    // User-configurable tool-step cap.  Defaults to kMaxIterations;
+    // AppState persists the user's value and MyFrame pushes it here at
+    // startup.
     int           m_maxToolSteps = kMaxIterations;
 
     // wait tool per-turn accounting.  m_waitSecondsUsed accumulates
     // GRANTED wait time (reset by Begin); m_waitBudgetSeconds is the
-    // fixed per-turn cap (the /wait_budget command was removed 2026-09-28).
+    // fixed per-turn cap.
     int           m_waitSecondsUsed   = 0;
     int           m_waitBudgetSeconds = kDefaultWaitBudgetSeconds;
 
-    // Phase 10: remaining native tool calls from the current assistant
-    // turn, executed sequentially after the first.  Non-empty only
-    // between HandleAssistantComplete and the moment the last batched
-    // result has been fed back; always empty while a model request is
-    // in flight.  Begin() and EndLoop() clear it defensively.
+    // Remaining native tool calls from the current assistant turn,
+    // executed sequentially after the first.  Non-empty only between
+    // HandleAssistantComplete and the moment the last batched result
+    // has been fed back; always empty while a model request is in
+    // flight.  Begin() and EndLoop() clear it defensively.
     std::vector<ToolInvocation> m_queuedInvocations;
 
     // Pending model-facing notice appended to the next real tool result.
@@ -597,15 +574,15 @@ private:
     // EndLoop() so it cannot leak onto unrelated results.
     std::string   m_pendingSoftHint;
 
-    // Phase 7e: loop-guard checkpoint (soft block before hard block).
-    // The FIRST time a signature trips the exact-repeat guard, the
-    // agent gets a model-facing challenge result instead of a hard
-    // stop; the signature is remembered here, and a SECOND trip of the
-    // same signature hard-blocks as before.  The cycle guard gets one
-    // checkpoint per agent turn via the bool.  Both cleared on Begin()
-    // and EndLoop().  Challenged calls are never dispatched and never
-    // recorded, so the guard window is unchanged when the model simply
-    // re-issues the identical call.
+    // Loop-guard checkpoint (soft block before hard block).  The FIRST
+    // time a signature trips the exact-repeat guard, the agent gets a
+    // model-facing challenge result instead of a hard stop; the
+    // signature is remembered here, and a SECOND trip of the same
+    // signature hard-blocks.  The cycle guard gets one checkpoint per
+    // agent turn via the bool.  Both cleared on Begin() and EndLoop().
+    // Challenged calls are never dispatched and never recorded, so the
+    // guard window is unchanged when the model simply re-issues the
+    // identical call.
     std::string   m_challengedLoopGuardSignature;
     bool          m_cycleGuardChallenged = false;
 
@@ -616,10 +593,10 @@ private:
     ToolContext    m_pendingAsyncContext;
     bool           m_awaitingAsyncResult = false;
 
-    // Phase 6: single pending approval slot for the agent path.
-    // The invocation and context are captured at the moment the
-    // model requested the tool so /approve executes exactly what was
-    // previewed, even if later UI state changes.
+    // Single pending approval slot for the agent path.  The invocation
+    // and context are captured at the moment the model requested the
+    // tool so /approve executes exactly what was previewed, even if
+    // later UI state changes.
     ToolInvocation m_pendingApprovalInvocation;
     ToolContext    m_pendingApprovalContext;
     std::string    m_pendingWriteRootGrant;
@@ -640,10 +617,9 @@ private:
     std::vector<std::string> m_oneShotApprovedScriptRun;
     int m_oneShotApprovedScriptRunBeginCredits = 0;
 
-    // Phase 3c-ii: tool_call_id of the currently-dispatching
-    // invocation, threaded into AddToolResultMessage so the next
-    // request can emit a properly-tagged role:"tool" reply.  Empty
-    // for XML-protocol invocations (no ids exist there) and
-    // between iterations.
+    // tool_call_id of the currently-dispatching invocation, threaded
+    // into AddToolResultMessage so the next request can emit a
+    // properly-tagged role:"tool" reply.  Empty for XML-protocol
+    // invocations (no ids exist there) and between iterations.
     std::string    m_currentToolCallId;
 };

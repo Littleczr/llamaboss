@@ -177,8 +177,8 @@ private:
         // and never lets filesystem mtime drive the date section.
         bool        hasActivityTime = false;
 
-        // Project/date metadata drives the Phase 3 color coding, project
-        // tag, and time-section visibility without reparsing JSON during
+        // Project/date metadata drives the color coding, project tag,
+        // and time-section visibility without reparsing JSON during
         // hover/search/repaint paths.
         std::string projectId;
         std::string projectName;
@@ -248,7 +248,8 @@ private:
     Callbacks    m_callbacks;
     const ThemeData* m_theme;             // Current theme (not owned)
     std::string  m_activeFilePath;        // Currently loaded conversation
-    std::string  m_searchFilter;          // Current search text (lowercase)
+    std::string  m_menuHoverPath;         // Row whose "..." is under the mouse
+    std::string  m_searchFilter;         // Current search text (lowercase)
     bool         m_showArchived = false;   // Archive browser mode
     size_t       m_archivedCount = 0;
 
@@ -288,10 +289,10 @@ private:
     std::set<std::string> m_overrideExpandedGroups;
 
     // ── Metadata cache keyed by file path ─────────────────────────
-    // ScanConversations() used to read the first ~2KB of every JSON on
-    // every refresh to pluck out the "title" field. With a few hundred
-    // conversations that's a visible UI hitch every time a message
-    // completes (AutoSaveConversation → sidebar Refresh).
+    // Reading the first ~2KB of every JSON on every refresh to pluck
+    // out the "title" field would be a visible UI hitch every time a
+    // message completes (AutoSaveConversation → sidebar Refresh) with
+    // a few hundred conversations.
     //
     // Title and project association only change when the file is
     // rewritten, which bumps mtime.  So we cache them per path and skip

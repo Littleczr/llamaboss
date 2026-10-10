@@ -1,7 +1,7 @@
 // tool_delete.h
 //
-// Phase 8: delete a single file or empty directory under the
-// per-conversation tool CWD.
+// Delete a single file or empty directory inside the allowed write
+// roots.
 //
 // DeleteEntry removes one filesystem entry at a time.  Files are
 // deleted unconditionally (subject to the usual safety floor).
@@ -22,11 +22,12 @@
 // block in chat history.  A multi-file cleanup walks naturally
 // through ls + per-entry delete iterations.  PowerShell remains
 // more flexible for developer/system workflows, but Remove-Item and
-// other non-read-only shell commands now pause for explicit approval
+// other non-read-only shell commands pause for explicit approval
 // before they execute, keeping that broader path visible to the user.
 //
 // ─── Safety floor (same shape as write/edit/mkdir) ───────────────
-// 1. Containment: the resolved path must be inside ctx.cwd.
+// 1. Containment: the resolved path must be inside the allowed write
+//    roots (cwd, active project, Skills, chat folder grants).
 // 2. Sanitization: the basename must survive SanitizeFilename
 //    intact (defends against weird models emitting names with
 //    Windows-invalid characters).

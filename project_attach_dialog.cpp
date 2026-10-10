@@ -9,11 +9,7 @@
 #include <wx/panel.h>
 #include <wx/sizer.h>
 #include <wx/stattext.h>
-#include <wx/utils.h>    // wxLaunchDefaultApplication
 #include <wx/window.h>
-
-#include <algorithm>
-#include <utility>
 
 // Local menu/button IDs for the dialog.
 enum {

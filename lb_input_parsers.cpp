@@ -1,7 +1,5 @@
 #include "lb_input_parsers.h"
 
-#include <string_view>
-
 #include "tool_invocation.h"
 
 namespace lb_input_parsers {
@@ -55,7 +53,6 @@ struct SlashEntry {
 // Typed tool commands kept for the user.  The model still has every
 // tool; these are the only ones a person can run by typing, because
 // reminders have no other screen for listing or cancelling them.
-// (The other 32 typed tool mirrors were removed 2026-09-28.)
 static const SlashEntry kToolSlashTable[] = {
     { "/reminder_create",        tool_names::kReminderCreate },
     { "/reminder_list",          tool_names::kReminderList },

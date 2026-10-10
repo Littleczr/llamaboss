@@ -38,14 +38,8 @@
 
 #include <wx/fileconf.h>
 #include <wx/msgdlg.h>
-#include <wx/filename.h>
-#include <wx/statline.h>
 #include <wx/dirdlg.h>
 #include <wx/display.h>
-
-#include <algorithm>
-#include <sstream>
-#include <iomanip>
 
 // ── Helper: human-readable file size ─────────────────────────────
 static std::string FormatFileSize(const std::string& path)
@@ -584,10 +578,10 @@ void SettingsDialog::CreateControls()
                                     .GetClientArea();
         maxWinH = workArea.GetHeight() * 9 / 10;
 
-        // Old 600px width was barely enough before the KV-cache and
-        // remote-endpoint sections; with a vertical scrollbar visible,
-        // right-edge buttons could look cut off. Prefer 720px, but keep
-        // the dialog inside small monitors.
+        // 600px is barely enough for the KV-cache and remote-endpoint
+        // sections; with a vertical scrollbar visible, right-edge buttons
+        // could look cut off. Prefer 720px, but keep the dialog inside
+        // small monitors.
         winW = std::min(720, std::max(600, workArea.GetWidth() * 9 / 10));
     }
 

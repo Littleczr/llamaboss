@@ -1,18 +1,16 @@
 // tool_ls.h
 //
-// Implementation of the /ls slash command — Phase 3.
+// Implementation of the ls tool.
 //
 // Mirrors tool_read.h: takes a path and a resolved ToolContext,
 // returns an LsResult ready to be packed into a ChatDisplay::ToolBlock
 // and passed to ChatHistory::FormatToolBlockAsUserMessage.  No wx
-// includes so the Phase 4 agent harness can drive this identically
-// to how the user does.
+// includes so the agent harness can drive this identically to how the
+// user does.
 //
-// Synchronous: directory enumeration on a local SSD completes in
-// sub-millisecond time for normal dev dirs.  Network shares or
-// very-deep trees will block the UI thread briefly; acceptable
-// given the 500-entry cap.  Can be threaded later if it ever
-// actually matters.
+// Synchronous: the router dispatches ls on a worker thread
+// (ToolWorkerExecutor), so slow network shares or deep trees don't
+// block the UI; the 500-entry cap bounds the work.
 //
 #pragma once
 

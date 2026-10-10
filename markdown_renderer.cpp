@@ -11,9 +11,6 @@
 
 #include "markdown_renderer.h"
 #include "chat_display_ctrl.h"
-#include <algorithm>
-#include <cctype>
-#include <vector>
 
 // ═══════════════════════════════════════════════════════════════════
 //  Construction / Reset
@@ -179,12 +176,12 @@ void MarkdownRenderer::ProcessDelta(const std::string& delta, const wxColour& ba
     // means the permanent part of the document is untouched and the
     // ONLY change is that the preview at the end got longer.
     //
-    // The old code still did RemovePartialLine() + a full
-    // RenderPartialLine(m_lineBuffer) every single time.  For a line of
-    // final length L arriving over N deltas that is O(N*L) rich-text
-    // insert+remove, and every one of those invalidates wxRichTextBuffer
-    // layout.  Models routinely emit a 1000-2000 char paragraph as one
-    // unbroken line, so streaming visibly slowed down as the line grew.
+    // A RemovePartialLine() + full RenderPartialLine(m_lineBuffer) on
+    // every delta is O(N*L) rich-text insert+remove for a line of final
+    // length L arriving over N deltas, and every one invalidates
+    // wxRichTextBuffer layout.  Models routinely emit a 1000-2000 char
+    // paragraph as one unbroken line, so streaming would visibly slow
+    // down as the line grew.
     //
     // m_lineBuffer only ever grows until a newline consumes a prefix, so
     // the text already on screen is a strict prefix of the new text:
@@ -192,11 +189,10 @@ void MarkdownRenderer::ProcessDelta(const std::string& delta, const wxColour& ba
     // WriteStyled builds a self-contained attr and appends at the end,
     // so the result is byte-identical to the full rewrite.
     //
-    // The UTF-8 guard matters: the old full-rewrite path self-healed a
-    // delta split mid-codepoint on the next call (wxString::FromUTF8
-    // returns EMPTY for invalid UTF-8 on wxMSW).  Appending cannot
-    // self-heal, so anything not standalone-valid falls through to the
-    // rewrite and behaves exactly as it always did.
+    // The UTF-8 guard matters: the full-rewrite path self-heals a delta
+    // split mid-codepoint on the next call (wxString::FromUTF8 returns
+    // EMPTY for invalid UTF-8 on wxMSW).  Appending cannot self-heal, so
+    // anything not standalone-valid falls through to the rewrite.
     if (!m_bulkMode &&
         m_partialLineStart >= 0 &&
         m_partialLineRenderedLen == m_lineBuffer.size() &&
@@ -361,13 +357,11 @@ void MarkdownRenderer::RenderCompleteLine(const std::string& line, const wxColou
                 m_codeBlockFilename = info.filename;
             }
 
-            // Plain fences (``` with no language tag) must receive the
-            // same framed header and Copy affordance as typed fences.
-            // The renderer historically used an empty language as the
-            // signal to suppress all code-block chrome, which made these
-            // very common blocks look like amber text with no way to copy
-            // them.  Normalize only the presentation label here; the
-            // captured clipboard payload remains the exact original text.
+            // Plain fences (``` with no language tag) get the same
+            // framed header and Copy affordance as typed fences; an
+            // empty language must not suppress code-block chrome.
+            // Normalize only the presentation label here; the captured
+            // clipboard payload remains the exact original text.
             if (m_codeBlockLang.empty()) {
                 m_codeBlockLang = "text";
             }

@@ -45,13 +45,14 @@ public:
     }
 
     // ── Session-scoped approval trust ────────────────────────────
-    // "Approve" (one-approval mode) used to die on every conversation
-    // reload because ChatHistory's trust flag is in-memory only and
-    // LoadFromFile always builds a fresh history.  These two methods
-    // give trust app-session lifetime instead: granting trust records
-    // the conversation's normalized path here, and the load path in
-    // ConversationController re-arms the ChatHistory flag when the
-    // same file is opened again in this run of LlamaBoss.
+    // ChatHistory's trust flag is in-memory only and LoadFromFile
+    // always builds a fresh history, so on its own "Approve"
+    // (one-approval mode) would die on every conversation reload.
+    // These two methods give trust app-session lifetime instead:
+    // granting trust records the conversation's normalized path here,
+    // and the load path in ConversationController re-arms the
+    // ChatHistory flag when the same file is opened again in this run
+    // of LlamaBoss.
     //
     // Deliberately NOT persisted to disk: a chat reopened weeks later
     // should not silently carry pre-approved delete/script-create.

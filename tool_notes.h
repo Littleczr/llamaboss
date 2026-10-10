@@ -1,12 +1,13 @@
 // tool_notes.h
 //
-// NOTES.md — append-only personal notes file.
+// NOTES.md — append-only personal notes file (cross-conversation
+// memory).
 //
-// Phase 1 of the cross-conversation memory layer. The user has a single
-// markdown file at %USERPROFILE%\LlamaBoss\NOTES.md (created on first
-// append) that holds facts, paths, preferences, and small workflows the
-// agent should remember across conversations. Two global tools touch it, and two project tools use the active
-// project context:
+// The user has a single markdown file at %USERPROFILE%\LlamaBoss\NOTES.md
+// (created on first append) that holds facts, paths, preferences, and
+// small workflows the agent should remember across conversations. Two
+// global tools touch it, and two project tools use the active project
+// context:
 //
 //   notes_read   — return the global NOTES.md contents inline.
 //   notes_append — when no project is active, append one full entry to global
@@ -19,20 +20,20 @@
 //
 // Notes are NOT injected into the system prompt, ever.  This keeps the
 // llama-server prefix cache stable (a key win for local models) and lets
-// NOTES.md grow much larger than Hermes' MEMORY.md cap of ~2,200 chars.
-// The cost is paid only on turns where the model decides to read.
+// NOTES.md grow large.  The cost is paid only on turns where the model
+// decides to read.
 //
 // Threading: synchronous on the caller's thread.  File ops are fast
-// (a few KB at most for the foreseeable future), and both call sites
-// (slash handler — none in v1 — and the agent dispatcher in
-// tool_router.cpp) are already on the GUI thread when invoking, matching
-// every other sync tool here.
+// (a few KB at most for the foreseeable future), and the agent
+// dispatcher in tool_router.cpp is already on the GUI thread when
+// invoking, matching every other sync tool here.
 //
 // Path safety: the tool ignores its `ctx.cwd`.  The target path is fixed
-// at %USERPROFILE%\LlamaBoss\NOTES.md and is the only path either entry
-// point will ever read or write.  The append body is treated as opaque
-// markdown text — newlines and special characters are preserved verbatim
-// after a single trailing-whitespace trim.
+// at %USERPROFILE%\LlamaBoss\NOTES.md (or the active project's
+// Notes\NOTES.md) and is the only path either entry point will ever read
+// or write.  The append body is treated as opaque markdown text —
+// newlines and special characters are preserved verbatim after a single
+// trailing-whitespace trim.
 //
 #pragma once
 

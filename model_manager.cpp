@@ -15,18 +15,7 @@
 #include "model_url.h"          // pasted-link parsing (pure, unit-tested)
 #include "ui_event_post.h"
 
-#include <wx/filename.h>
-#include <wx/filefn.h>          // wxGetDiskSpace
-#include <wx/dir.h>
-#include <wx/log.h>             // wxLogNull
 #include <wx/msgdlg.h>
-
-#include <algorithm>
-#include <thread>
-
-#include <sstream>
-#include <iomanip>
-#include <utility>
 
 // ─────────────────────────────────────────────────────────────────
 //  Button helpers (file-local)
@@ -368,8 +357,8 @@ void ModelManagerDialog::RefreshModelList()
 }
 
 // ── Name column: fill the width, full name on hover ──────────────
-// The Model column used to be a fixed 380 px, so long names were cut
-// ("...Aggressive-Q4_...") while an empty third column sat to the right.
+// A fixed-width Model column cuts long names ("...Aggressive-Q4_...")
+// while an empty third column sits to the right.
 
 void ModelManagerDialog::FitNameColumn()
 {
@@ -589,12 +578,12 @@ bool ModelManagerDialog::ConfirmLeaveDuringDownload()
 //  (DownloadThread) --> Idle.  Each stage is generation-stamped so a
 //  late event from a cancelled stage is ignored.
 //
-//  Where the file lands (2026-10-02):
+//  Where the file lands:
 //    casual mode, model weights  -> models\<stem>\<file>.gguf (a bundle,
 //                                   same layout as the catalog downloader)
-//    casual mode, mmproj / draft -> models\<file>.gguf (unchanged; see
+//    casual mode, mmproj / draft -> models\<file>.gguf (see
 //                                   model_url::IsCompanionFilename)
-//    power mode (custom folder)  -> <folder>\<file>.gguf (flat, unchanged)
+//    power mode (custom folder)  -> <folder>\<file>.gguf (flat)
 //  Before downloading, the root AND every bundle folder are checked for
 //  the same file name, so a model already filed in a folder is selected
 //  instead of being downloaded a second time.

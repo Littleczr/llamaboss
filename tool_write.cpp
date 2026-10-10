@@ -9,16 +9,7 @@
 #include "path_safety.h"
 #include "tool_mutation_guard.h"
 
-#include <algorithm>
-#include <chrono>
-#include <cstdint>
-#include <cctype>
-#include <sstream>
-#include <utility>
-#include <vector>
-
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
+#include "lb_windows.h"
 
 namespace {
 
@@ -132,8 +123,7 @@ enum class WriteRiskMode {
 // Shared implementation behind WriteNewFile / OverwriteFileContent.
 // Lives in the anonymous namespace (internal linkage): only the two
 // public wrappers below call it, and it is not declared in
-// tool_write.h.  Previously it sat just outside the namespace and so
-// leaked an undeclared external symbol.
+// tool_write.h.
 WriteResult WriteFileContent(const std::string& argsBlob,
                              const ToolContext& ctx,
                              bool overwriteExisting,
@@ -285,6 +275,27 @@ WriteResult WriteFileContent(const std::string& argsBlob,
         return r;
     }
 
+    // Never truncate a non-empty file to zero bytes.  Empty content here
+    // is almost always a malformed call (path line only, a misnamed
+    // content field) rather than a request to blank the file.
+    if (overwriteExisting && targetIsFile && content.empty()) {
+        std::wstring wTarget = path_safety::Utf8ToWide(resolved);
+        WIN32_FILE_ATTRIBUTE_DATA fad{};
+        if (!wTarget.empty() &&
+            ::GetFileAttributesExW(wTarget.c_str(), GetFileExInfoStandard, &fad) &&
+            (fad.nFileSizeHigh != 0 || fad.nFileSizeLow != 0)) {
+            r.chips.push_back("blocked");
+            r.errorBody = "overwrite_file received EMPTY content for an existing "
+                          "non-empty file, so nothing was changed: " + resolved +
+                          "\nSend the full new file contents (native calls: the "
+                          "\"content\" string parameter; text calls: content on "
+                          "the lines after the path). To make the file empty on "
+                          "purpose, delete it and write it again.";
+            r.chips.push_back(ElapsedChip(t0));
+            return r;
+        }
+    }
+
     // ── Atomic-ish write: unique sibling temp then rename ─────────
     // Step 1: create a fresh temp file with CREATE_NEW so we never
     // overwrite a real user-owned "<path>.tmp" file.  Step 2: write
@@ -420,9 +431,8 @@ WriteResult WriteFileContent(const std::string& argsBlob,
     const size_t bytes = content.size();
     const size_t lines = CountLines(content);
 
-    // Structured success metadata for the UI.  The tool card no longer
-    // has to scrape the human confirmation text to know which file was
-    // created; it can render a PresentedFile chip from these fields.
+    // Structured success metadata for the UI, so the tool card can render
+    // a PresentedFile chip without scraping the confirmation text.
     r.createdPath = resolved;
     r.displayName = tool_path_safety::Basename(resolved);
     r.sizeBytes   = bytes;

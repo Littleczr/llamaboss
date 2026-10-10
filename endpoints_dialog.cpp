@@ -1,5 +1,4 @@
 // endpoints_dialog.cpp
-#define _CRT_SECURE_NO_WARNINGS
 
 #include "endpoints_dialog.h"
 #include "reasoning_policy.h"
@@ -9,13 +8,12 @@
 #include "theme.h"
 #include "widgets.h"   // ApplyDialogThemeRecursive, ApplyDarkTitleBar
 #include "connections_dialog.h"
+#include "chatgpt_auth.h"        // Sign in with ChatGPT (plan usage)
+#include "chatgpt_auth_core.h"
+#include "lb_ssl.h"
 #include <wx/simplebook.h>
-#include <wx/scrolwin.h>
 #include <wx/checkbox.h>
-#include <wx/utils.h>
-#ifdef __WXMSW__
-#include <windows.h>
-#endif
+#include "lb_windows.h"
 #include "ui_event_post.h"   // LbQueueEventIfAlive (fetch-models worker)
 
 #include <wx/checklst.h>
@@ -30,28 +28,9 @@
 #include <wx/panel.h>
 #include <wx/display.h>
 
-#include <Poco/Net/HTTPClientSession.h>
-#include <Poco/Net/HTTPSClientSession.h>
-#include <Poco/Net/HTTPRequest.h>
-#include <Poco/Net/HTTPResponse.h>
 #include <Poco/Net/HTTPMessage.h>
-#include <Poco/JSON/Parser.h>
-#include <Poco/JSON/Object.h>
-#include <Poco/JSON/Array.h>
-#include <Poco/URI.h>
-#include <Poco/Exception.h>
 
-#include <algorithm>   // std::transform (model tags, case-insensitive)
-#include <atomic>      // fetch-worker alive token
-#include <cctype>      // std::tolower
-#include <memory>
-#include <sstream>
-#include <iomanip>      // quoted display names in the advanced model editor
-#include <set>
-#include <string>
-#include <thread>      // detached fetch-models / test-connection workers
 #include <stdexcept>
-#include <chrono>      // probe timing
 
 // ─── Event table ────────────────────────────────────────────────
 
@@ -201,10 +180,25 @@ EndpointStore::Endpoint MakeProviderPreset(int selection)
             { "X-Title",      "LlamaBoss" },
         };
     }
+    else if (selection == 3) {
+        // ChatGPT plan: no API key.  The transport is fixed by the Sign
+        // in with ChatGPT contract; the account is chosen by signing in.
+        ep.id             = "chatgpt";
+        ep.displayName    = "ChatGPT plan";
+        ep.baseUrl        = lb_chatgpt::kApiBaseUrl();
+        ep.chatPath       = lb_chatgpt::kResponsesPath();
+        ep.authScheme     = EndpointStore::AuthScheme::ChatGpt;
+        ep.secretProvider = "chatgpt";
+        ep.secretKey      = "account";
+    }
     // selection 2 is Custom: retain the safe struct defaults and let the
     // user fill only the values that genuinely vary by provider.
     return ep;
 }
+
+// Provider combo index for an endpoint.  ChatGPT shares api.openai.com
+// with the OpenAI API-key preset, so the auth scheme decides first.
+constexpr int kPresetChatGpt = 3;
 
 // ── Model-list text <-> vector ───────────────────────────────────
 // The edit dialog presents the model list as one line per model:
@@ -446,13 +440,12 @@ void SetModelPickerVisibility(std::vector<EndpointStore::Model>& records,
 
 // ─── Composite Add/Edit dialog ──────────────────────────────────
 //
-// Redesigned around the two personas that actually use it:
+// Designed around the two personas that actually use it:
 //
 //   * Provider preset (OpenAI / OpenRouter) — the overwhelmingly
 //     common case.  Every transport constant is known for these, so
 //     the visible dialog is just: Provider, Saved connection, and a
-//     fetched model checklist.  The old separate "Add Remote
-//     Endpoint" chooser modal is gone — the Provider combo IS that
+//     fetched model checklist.  The Provider combo is the preset
 //     choice, and switching it re-seeds the constants live.
 //   * Custom OpenAI-compatible service — Base URL sits in the
 //     Connection group; chat path, auth scheme and tool protocol are
@@ -465,14 +458,17 @@ void SetModelPickerVisibility(std::vector<EndpointStore::Model>& records,
 // on a detached worker thread, feeding a filterable checklist.
 // Checking/unchecking changes membership on structured model records.
 // The advanced text editor projects selected records and imports its final
-// draft on save or return to the checklist. A 401 on the fetch doubles as the auth test
-// that previously required a failed first chat message.
+// draft on save or return to the checklist. A 401 on the fetch doubles as
+// the auth test, so a bad key shows up before the first chat message.
 
 struct FetchModelsResult {
     bool        ok = false;
     int         status = 0;             // HTTP status (0 = transport error)
     std::string error;
     std::vector<std::string> ids;       // sorted, deduplicated
+    // Display names parallel to `ids` when the catalog provides them
+    // (the ChatGPT plan catalog does); empty otherwise.
+    std::vector<std::string> names;
     bool credentialsVerified = false;
 };
 
@@ -572,6 +568,31 @@ FetchModelsResult FetchModelIds(
             out.ok = true;
             return out;
         }
+        // ChatGPT plan catalog shape: {"models":[{slug,display_name,visibility}]}.
+        // Keep the server's order and its display names.
+        if (Poco::JSON::Array::Ptr models = rootObj->getArray("models")) {
+            std::set<std::string> seen;
+            bool anyVisibility = false;
+            for (size_t i = 0; i < models->size(); ++i) {
+                auto o = models->getObject(i);
+                if (o && o->has("visibility")) anyVisibility = true;
+            }
+            for (size_t i = 0; i < models->size(); ++i) {
+                auto o = models->getObject(i);
+                if (!o) continue;
+                try {
+                    if (anyVisibility && o->optValue<std::string>("visibility", "") != "list") continue;
+                    std::string slug = o->optValue<std::string>("slug", "");
+                    if (slug.empty()) slug = o->optValue<std::string>("id", "");
+                    if (slug.empty() || !seen.insert(slug).second) continue;
+                    std::string name = o->optValue<std::string>("display_name", "");
+                    out.ids.push_back(slug);
+                    out.names.push_back(name.empty() ? PrettyNameFromId(slug) : name);
+                } catch (...) { /* non-string fields: skip the entry */ }
+            }
+            out.ok = true;
+            return out;
+        }
         Poco::JSON::Array::Ptr data = rootObj->getArray("data");
         if (!data) {
             out.error = "Response has no \"data\" array - not an "
@@ -596,7 +617,30 @@ FetchModelsResult FetchModelIds(
     return out;
 }
 
-// Catalog access alone is not credential verification on a public endpoint.
+// ChatGPT plan catalog -- worker thread only (GetAccessToken may refresh
+// the sign-in over the network).  The plan route answers
+//   {"models":[{"slug":...,"display_name":...,"visibility":"list"},...]}
+// in the account's own order; only visibility "list" entries are meant
+// for a picker.  A plain {"data":[{"id":...}]} body is accepted too, in
+// case the route ever returns the standard shape.
+void RedactProbeError(std::string& message, const std::string& key);   // defined below
+
+FetchModelsResult FetchChatGptCatalog(const std::string& account)
+{
+    FetchModelsResult out;
+    std::string token, tokenError;
+    if (!lb_chatgpt::Auth::Get().GetAccessToken(account, token, tokenError)) {
+        out.status = 401;
+        out.error = tokenError;
+        return out;
+    }
+    lb::EnsureSSLInitialized();   // normally done at startup; cheap no-op then
+    out = FetchModelIds(lb_chatgpt::kModelsUrl(), "Authorization", "Bearer " + token, {});
+    RedactProbeError(out.error, token);
+    if (out.status == 401) lb_chatgpt::Auth::Get().InvalidateAccessToken(account);
+    out.credentialsVerified = out.ok;
+    return out;
+}
 // OpenRouter has a dedicated authenticated key check; OpenAI's models route
 // requires authentication. Custom servers may expose their catalog publicly.
 FetchModelsResult FetchConnectionCatalog(const std::string& base, const std::string& url,
@@ -642,6 +686,8 @@ struct TestConnectionResult {
 };
 
 wxDEFINE_EVENT(wxEVT_EP_CONNECTION_TESTED, wxThreadEvent);
+// Sign in with ChatGPT: CompleteSignIn finished (payload SignInResult).
+wxDEFINE_EVENT(wxEVT_EP_CHATGPT_SIGNED_IN, wxThreadEvent);
 
 ProbeOutcome PostChatProbe(
     const std::string& url,
@@ -899,18 +945,49 @@ public:
         label(credentials, first, "Provider");
         wxArrayString providers; providers.Add("OpenAI"); providers.Add("OpenRouter");
         providers.Add("Custom compatible service");
+        providers.Add("ChatGPT plan (Plus or Pro - sign in, no API key)");   // kPresetChatGpt
         m_providerChoice = new wxChoice(credentials, wxID_ANY,
             wxDefaultPosition, wxDefaultSize, providers);
         first->Add(m_providerChoice, 0, wxEXPAND);
-        label(credentials, first, "API key");
+
+        // ── ChatGPT plan sign-in (shown only for that provider) ──────
+        m_chatgptPanel = new wxPanel(credentials, wxID_ANY);
+        {
+            auto* cg = new wxBoxSizer(wxVERTICAL);
+            auto* intro = new wxStaticText(m_chatgptPanel, wxID_ANY,
+                "Use your ChatGPT Plus or Pro plan in LlamaBoss instead of an API key. "
+                "Requests count toward your plan's usage (the same allowance as Codex); "
+                "you can cap LlamaBoss under ChatGPT Settings > Usage.");
+            intro->Wrap(FromDIP(560));
+            m_hints.push_back(intro);
+            cg->Add(intro, 0, wxEXPAND | wxTOP | wxBOTTOM, FromDIP(8));
+            auto* row = new wxBoxSizer(wxHORIZONTAL);
+            m_chatgptSignInBtn = MakeAccentButton(m_chatgptPanel, wxID_ANY,
+                "Continue with ChatGPT", theme, FromDIP(34));
+            m_chatgptSignInBtn->SetToolTip("Opens ChatGPT in your browser to sign in and allow LlamaBoss to use your plan.");
+            m_chatgptSignOutBtn = MakeFlatButton(m_chatgptPanel, wxID_ANY, "Sign out", theme);
+            m_chatgptSignOutBtn->SetToolTip("Forget this ChatGPT sign-in on this computer and revoke it.");
+            row->Add(m_chatgptSignInBtn, 0, wxRIGHT, FromDIP(10));
+            row->Add(m_chatgptSignOutBtn, 0);
+            cg->Add(row, 0, wxTOP, FromDIP(4));
+            m_chatgptStatus = new wxStaticText(m_chatgptPanel, wxID_ANY, wxEmptyString);
+            m_chatgptStatus->SetMinSize(wxSize(FromDIP(40), -1));
+            cg->Add(m_chatgptStatus, 0, wxEXPAND | wxTOP, FromDIP(10));
+            m_chatgptPanel->SetSizer(cg);
+        }
+        first->Add(m_chatgptPanel, 0, wxEXPAND);
+
+        m_apiKeyLabel = label(credentials, first, "API key");
         m_apiKeyField = new wxTextCtrl(credentials, wxID_ANY, wxEmptyString,
             wxDefaultPosition, wxDefaultSize, wxTE_PASSWORD);
         m_apiKeyField->SetHint("Paste your API key, or leave blank to use your saved key");
         first->Add(m_apiKeyField, 0, wxEXPAND);
         auto* showKey = new wxCheckBox(credentials, wxID_ANY, "Show key");
         first->Add(showKey, 0, wxTOP, FromDIP(6));
+        m_showKeyBox = showKey;
         auto* getKey = MakeFlatButton(credentials, wxID_ANY, "Get an API key in your browser", theme);
         first->Add(getKey, 0, wxTOP, FromDIP(6));
+        m_getKeyBtn = getKey;
         getKey->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) {
             const int preset = m_providerChoice->GetSelection();
             if (preset == 2) {
@@ -935,6 +1012,7 @@ public:
             "Your key stays out of chat and is saved when you finish setup.");
         keyHelp->Wrap(FromDIP(600));
         m_hints.push_back(keyHelp);
+        m_keyHelp = keyHelp;
 
         m_advancedPane = new wxCollapsiblePane(credentials, wxID_ANY, "Advanced",
             wxDefaultPosition, wxDefaultSize, wxCP_DEFAULT_STYLE | wxCP_NO_TLW_RESIZE);
@@ -1166,6 +1244,12 @@ public:
         }
         m_providerChoice->Bind(wxEVT_CHOICE,
             [this](wxCommandEvent& e) { SeedFromPreset(e.GetSelection()); });
+        m_chatgptSignInBtn->Bind(wxEVT_BUTTON,
+            &EndpointEditDialog::OnChatGptSignIn, this);
+        m_chatgptSignOutBtn->Bind(wxEVT_BUTTON,
+            &EndpointEditDialog::OnChatGptSignOut, this);
+        Bind(wxEVT_EP_CHATGPT_SIGNED_IN,
+             &EndpointEditDialog::OnChatGptSignedIn, this);
         m_fetchBtn->Bind(wxEVT_BUTTON,
             &EndpointEditDialog::OnFetchModels, this);
         Bind(wxEVT_EP_MODELS_FETCHED,
@@ -1198,8 +1282,12 @@ public:
 
         // Provider selection from the seed's base URL; Add passes an
         // OpenAI preset, Edit whatever the endpoint actually is.
-        m_providerChoice->SetSelection(DetectPreset(seed.baseUrl));
+        m_providerChoice->SetSelection(
+            seed.authScheme == EndpointStore::AuthScheme::ChatGpt
+                ? kPresetChatGpt : DetectPreset(seed.baseUrl));
         m_providerChoice->Enable(isNew);
+        m_chatgptAccount = seed.chatgptAccount;
+        ApplyProviderMode(/*relayout*/ false);
 
         UpdateResolvedUrl();
         UpdateAuthFieldEnables();
@@ -1237,7 +1325,21 @@ public:
             // "Connection..." is one click away.
             ShowStep(1);
             const bool noAuth = m_noAuthRadio->GetValue();
-            if (noAuth || !EffectiveApiKey().empty()) {
+            if (IsChatGpt()) {
+                if (ChatGptSignedIn()) {
+                    m_modelConnectionStatus->SetLabel("Loading your ChatGPT models...");
+                    CallAfter([this]() {
+                        if (m_fetchInFlight) return;
+                        wxCommandEvent e;
+                        OnFetchModels(e);
+                    });
+                } else {
+                    m_modelConnectionStatus->SetLabel(
+                        wxString::FromUTF8(kCross.c_str()) +
+                        "Not signed in to ChatGPT. Click Connection... to sign in.");
+                    SetFetchStatus("Your checked models are shown. Refreshing them needs a ChatGPT sign-in.");
+                }
+            } else if (noAuth || !EffectiveApiKey().empty()) {
                 m_modelConnectionStatus->SetLabel("Loading the model catalog...");
                 CallAfter([this]() {
                     if (m_fetchInFlight) return;
@@ -1275,6 +1377,11 @@ public:
         m_connectionBtn->SetForegroundColour(theme.textMuted);
         m_testBtn->SetBackgroundColour(theme.bgDialogSurface);
         m_testBtn->SetForegroundColour(theme.textMuted);
+        m_chatgptPanel->SetBackgroundColour(theme.bgDialogSurface);
+        m_chatgptSignInBtn->SetBackgroundColour(theme.accentButton);
+        m_chatgptSignInBtn->SetForegroundColour(theme.accentButtonText);
+        m_chatgptSignOutBtn->SetBackgroundColour(theme.bgDialogSurface);
+        m_chatgptSignOutBtn->SetForegroundColour(theme.textMuted);
 
         m_modelList->SetBackgroundColour(theme.bgInputField);
         m_modelList->SetForegroundColour(theme.textPrimary);
@@ -1304,6 +1411,10 @@ public:
         // (about-to-be-destroyed) handler.  A bare store(false) would
         // reintroduce exactly the race ui_event_post.h exists to stop.
         LbMarkUiEventTargetDead(m_alive);
+        // A browser sign-in still waiting: stop its loopback listener.
+        // The worker sees the flag within ~250 ms and its result post is
+        // dropped by the alive gate above.
+        if (m_signInAttempt) lb_chatgpt::Auth::CancelSignIn(m_signInAttempt);
     }
 
 private:
@@ -1405,8 +1516,175 @@ private:
             RefreshLayout();
         }
         if (preset == 2) ExpandAdvanced();
+        m_chatgptAccount = p.chatgptAccount;
+        ApplyProviderMode();
         UpdateResolvedUrl();
         UpdateConnectionStatus();
+    }
+
+    // ── ChatGPT plan (Sign in with ChatGPT) ─────────────────────
+    bool IsChatGpt() const
+    {
+        return m_providerChoice && m_providerChoice->GetSelection() == kPresetChatGpt;
+    }
+
+    bool ChatGptSignedIn(lb_chatgpt::AccountSummary* out = nullptr) const
+    {
+        lb_chatgpt::AccountSummary a;
+        const bool ok = !m_chatgptAccount.empty() &&
+            lb_chatgpt::Auth::Get().FindAccount(m_chatgptAccount, a) &&
+            a.signedIn && a.planEnabled;
+        if (out) *out = a;
+        return ok;
+    }
+
+    // ChatGPT has no key, URL or auth choices: swap the key widgets and
+    // the Advanced pane for the sign-in panel.
+    void ApplyProviderMode(bool relayout = true)
+    {
+        const bool chatgpt = IsChatGpt();
+        for (wxWindow* w : { static_cast<wxWindow*>(m_apiKeyLabel),
+                             static_cast<wxWindow*>(m_apiKeyField),
+                             static_cast<wxWindow*>(m_showKeyBox),
+                             static_cast<wxWindow*>(m_getKeyBtn),
+                             static_cast<wxWindow*>(m_connectionStatus),
+                             static_cast<wxWindow*>(m_keyHelp),
+                             static_cast<wxWindow*>(m_advancedPane) }) {
+            if (w) w->Show(!chatgpt);
+        }
+        if (m_chatgptPanel) m_chatgptPanel->Show(chatgpt);
+        if (m_connectionBtn)
+            m_connectionBtn->SetToolTip(chatgpt ? "Sign in to or out of ChatGPT"
+                                                : "Change the API key or advanced connection settings");
+        UpdateChatGptStatus();
+        if (relayout) RefreshLayout();
+    }
+
+    void UpdateChatGptStatus()
+    {
+        if (!m_chatgptStatus) return;
+        lb_chatgpt::AccountSummary a;
+        const bool known = !m_chatgptAccount.empty() &&
+            lb_chatgpt::Auth::Get().FindAccount(m_chatgptAccount, a);
+        const std::string who = !a.email.empty() ? a.email
+                              : !a.name.empty() ? a.name : std::string("your ChatGPT account");
+        std::string text;
+        if (m_signInAttempt)
+            text = "Waiting for you to finish in your browser... (sign in, then allow LlamaBoss to use your plan)";
+        else if (known && a.signedIn && a.planEnabled)
+            text = kCheck + "Signed in as " + who + ". Requests on this connection use your ChatGPT plan.";
+        else if (known && a.signedIn)
+            text = kCross + "Signed in as " + who + ", but ChatGPT plan use wasn't allowed. "
+                   "Choose Continue with ChatGPT and allow it.";
+        else if (known)
+            text = "Signed out (" + who + "). Choose Continue with ChatGPT to sign in again.";
+        else
+            text = "Not signed in. Continue with ChatGPT opens your browser to sign in.";
+        m_chatgptStatus->SetLabel(wxString::FromUTF8(text));
+        m_chatgptStatus->Wrap(FromDIP(560));
+        m_chatgptStatus->SetToolTip(wxString::FromUTF8(text));
+        if (m_chatgptSignInBtn)
+            m_chatgptSignInBtn->SetLabel(m_signInAttempt ? "Cancel sign-in" : "Continue with ChatGPT");
+        if (m_chatgptSignOutBtn)
+            m_chatgptSignOutBtn->Show(known && a.signedIn && !m_signInAttempt);
+        if (m_chatgptPanel) m_chatgptPanel->Layout();
+    }
+
+    void OnChatGptSignIn(wxCommandEvent&)
+    {
+        // The same button cancels a sign-in that is waiting on the browser.
+        if (m_signInAttempt) {
+            lb_chatgpt::Auth::CancelSignIn(m_signInAttempt);
+            return;
+        }
+        // A known account re-authorizes in place (same registration, no
+        // consent screen).  After Sign out the connection has no account,
+        // so this registers fresh and the browser offers an account picker.
+        std::string reauth;
+        lb_chatgpt::AccountSummary existing;
+        if (!m_chatgptAccount.empty() &&
+            lb_chatgpt::Auth::Get().FindAccount(m_chatgptAccount, existing))
+            reauth = m_chatgptAccount;
+
+        std::string url, error;
+        auto attempt = lb_chatgpt::Auth::Get().BeginSignIn(reauth, url, error);
+        if (!attempt) {
+            SetFetchStatus(kCross + error);
+            return;
+        }
+        m_signInAttempt = attempt;
+        const unsigned gen = ++m_signInGeneration;
+
+        if (wxLaunchDefaultBrowser(wxString::FromUTF8(url))) {
+            SetFetchStatus("ChatGPT opened in your browser. Sign in, allow LlamaBoss to use your plan, "
+                           "then come back here.");
+        } else {
+            if (wxTheClipboard->Open()) {
+                wxTheClipboard->SetData(new wxTextDataObject(wxString::FromUTF8(url)));
+                wxTheClipboard->Close();
+            }
+            SetFetchStatus("Couldn't open your browser. The sign-in link is on the clipboard: paste it "
+                           "into a browser on this computer.");
+        }
+        UpdateChatGptStatus();
+        UpdateSaveButtons();
+
+        wxEvtHandler* target = this;
+        std::weak_ptr<std::atomic<bool>> alive = m_alive;
+        std::thread([target, alive, attempt, gen]() {
+            lb_chatgpt::SignInResult r = lb_chatgpt::Auth::Get().CompleteSignIn(attempt);
+            auto* ev = new wxThreadEvent(wxEVT_EP_CHATGPT_SIGNED_IN);
+            ev->SetPayload(r);
+            ev->SetInt(static_cast<int>(gen));
+            LbQueueEventIfAlive(target, alive, ev);
+        }).detach();
+    }
+
+    void OnChatGptSignedIn(wxThreadEvent& event)
+    {
+        if (static_cast<unsigned>(event.GetInt()) != m_signInGeneration) return;
+        m_signInAttempt.reset();
+        const auto r = event.GetPayload<lb_chatgpt::SignInResult>();
+        UpdateSaveButtons();
+        if (r.cancelled) {
+            UpdateChatGptStatus();
+            SetFetchStatus("Sign-in cancelled.");
+            return;
+        }
+        if (!r.ok) {
+            UpdateChatGptStatus();
+            SetFetchStatus(kCross + r.error);
+            return;
+        }
+        m_chatgptAccount = r.account.clientId;
+        InvalidateFetch();          // a different credential = a different catalog
+        UpdateChatGptStatus();
+        Raise();
+        if (!r.account.planEnabled) {
+            SetFetchStatus(kCross + "Signed in, but ChatGPT plan use wasn't allowed, so LlamaBoss can't "
+                           "use your plan. Choose Continue with ChatGPT again and allow it.");
+            return;
+        }
+        // Same path as Connect: load the account's models, then (on the
+        // first page) move on to choosing one.
+        m_connectPending = m_pages && m_pages->GetSelection() == 0;
+        wxCommandEvent e;
+        OnFetchModels(e);
+    }
+
+    void OnChatGptSignOut(wxCommandEvent&)
+    {
+        if (m_chatgptAccount.empty()) return;
+        if (wxMessageBox("Sign LlamaBoss out of ChatGPT on this computer?\n\n"
+                         "Chats using this connection will stop until you sign in again.",
+                         "Sign out of ChatGPT", wxYES_NO | wxNO_DEFAULT | wxICON_QUESTION, this) != wxYES)
+            return;
+        lb_chatgpt::Auth::Get().SignOut(m_chatgptAccount);
+        m_chatgptAccount.clear();
+        InvalidateFetch();
+        UpdateChatGptStatus();
+        SetFetchStatus("Signed out of ChatGPT. Choose Continue with ChatGPT to sign in again.");
+        RefreshLayout();
     }
 
     void ExpandAdvanced()
@@ -1604,6 +1882,33 @@ private:
     {
         if (m_fetchInFlight) return;
 
+        if (IsChatGpt()) {
+            if (!ChatGptSignedIn()) {
+                m_connectPending = false;
+                UpdateSaveButtons();
+                SetFetchStatus("Choose Continue with ChatGPT to sign in first.");
+                return;
+            }
+            const std::string account = m_chatgptAccount;
+            m_fetchInFlight = true;
+            m_fetchBtn->Enable(false);
+            UpdateSaveButtons();
+            const unsigned gen = m_fetchGeneration;
+            m_inFlightGeneration = gen;
+            if (!m_testInFlight && !m_hasTestResult)
+                SetFetchStatus(m_connectPending ? "Loading your ChatGPT models..." : "Refreshing models...");
+            wxEvtHandler* target = this;
+            std::weak_ptr<std::atomic<bool>> alive = m_alive;
+            std::thread([target, alive, account, gen]() {
+                FetchModelsResult r = FetchChatGptCatalog(account);
+                auto* ev = new wxThreadEvent(wxEVT_EP_MODELS_FETCHED);
+                ev->SetPayload(r);
+                ev->SetInt((int)gen);
+                LbQueueEventIfAlive(target, alive, ev);
+            }).detach();
+            return;
+        }
+
         const std::string base =
             NormalizeBaseUrl(TrimUtf8(m_baseUrlField->GetValue()));
         if (base.rfind("http://", 0) != 0 &&
@@ -1686,13 +1991,18 @@ private:
                 // still editable from the configured list.
                 const wxString text = wxString::FromUTF8(kCross.c_str()) +
                     ((r.status == 401 || r.status == 403)
-                        ? "The saved key was rejected. Click Connection... to paste a new one."
+                        ? (IsChatGpt() ? "ChatGPT sign-in needs attention. Click Connection... to sign in again."
+                                       : "The saved key was rejected. Click Connection... to paste a new one.")
                         : "Could not load the catalog. Your checked models are still shown.");
                 m_modelConnectionStatus->SetLabel(text);
                 m_modelConnectionStatus->SetToolTip(text);
                 if (m_modelConnectionStatus->GetParent()) m_modelConnectionStatus->GetParent()->Layout();
             }
-            if (r.status == 401 || r.status == 403) {
+            if (IsChatGpt()) {
+                if (!m_testInFlight && !m_hasTestResult)
+                    SetFetchStatus(kCross + (r.error.empty() ? std::string("Could not load your ChatGPT models.")
+                                                             : r.error));
+            } else if (r.status == 401 || r.status == 403) {
                 if (!m_testInFlight && !m_hasTestResult)
                     SetFetchStatus(kCross + "Authentication or access check failed (" + r.error +
                                    "). Chat requests use this same key.");
@@ -1703,10 +2013,16 @@ private:
             return;
         }
 
+        m_fetchedNames.clear();
+        for (size_t i = 0; i < r.ids.size() && i < r.names.size(); ++i)
+            m_fetchedNames[r.ids[i]] = r.names[i];
         m_fetchedIds = std::move(r.ids);
         RefreshModelChecklist();
         wxString connectionText;
-        if (r.credentialsVerified && m_editMode)
+        if (IsChatGpt())
+            connectionText = wxString::FromUTF8(kCheck.c_str()) +
+                "Signed in to ChatGPT. Check the models you want in your picker.";
+        else if (r.credentialsVerified && m_editMode)
             connectionText = wxString::FromUTF8(kCheck.c_str()) + "Connected. Check the models you want in your picker.";
         else if (r.credentialsVerified)
             connectionText = "Credentials accepted. Choose a model to start chatting.";
@@ -1920,9 +2236,14 @@ private:
 
         for (const auto& id : m_fetchedIds) {
             if (configuredIds.count(id)) continue;
-            if (!matches(id, PrettyNameFromId(id))) continue;
+            const auto named = m_fetchedNames.find(id);
+            const std::string fetchedName = named != m_fetchedNames.end()
+                ? named->second : PrettyNameFromId(id);
+            if (!matches(id, fetchedName)) continue;
+            std::string rowLabel = id;
+            if (fetchedName != PrettyNameFromId(id)) rowLabel += " = " + fetchedName;
             const int idx = (int)m_modelList->Append(
-                wxString::FromUTF8(id.c_str()));
+                wxString::FromUTF8(rowLabel.c_str()));
             m_modelList->Check(idx, false);
             m_rowModelIds.push_back(id);
         }
@@ -1946,6 +2267,14 @@ private:
         const bool        nowChecked = m_modelList->IsChecked((unsigned)idx);
 
         SetModelPickerVisibility(m_models, id, nowChecked);
+        if (nowChecked) {
+            const auto named = m_fetchedNames.find(id);
+            if (named != m_fetchedNames.end() && !named->second.empty()) {
+                for (auto& model : m_models)
+                    if (model.id == id && model.displayName == PrettyNameFromId(id))
+                        model.displayName = named->second;
+            }
+        }
         m_modelsField->ChangeValue(ModelsToText(m_models));
 
         // Keep the toggled model selected after the checked block reorders.
@@ -2113,6 +2442,20 @@ public:
         if (m_rawModelsDirty)
             MergePickerModels(ep.models, ParseModelsText(m_modelsField->GetValue()));
         ep.extraHeaders = m_extraHeaders;
+        if (IsChatGpt()) {
+            // Fixed by the Sign in with ChatGPT contract; nothing here is
+            // user-editable, so stale field values can never leak in.
+            ep.authScheme       = EndpointStore::AuthScheme::ChatGpt;
+            ep.baseUrl          = lb_chatgpt::kApiBaseUrl();
+            ep.chatPath         = lb_chatgpt::kResponsesPath();
+            ep.secretProvider   = "chatgpt";
+            ep.secretKey        = "account";
+            ep.protocol         = ToolProtocol::Native;
+            ep.reasoningDialect.clear();
+            ep.extraHeaders.clear();
+            ep.chatgptAccount   = m_chatgptAccount;
+            for (auto& model : ep.models) model.imageOutput = false;
+        }
         return ep;
     }
 
@@ -2131,6 +2474,20 @@ private:
         };
         if (!IsSafeIdentifier(wxString::FromUTF8(ep.id))) {
             connectionError("Choose a connection id using lowercase letters, digits or underscores in Advanced."); return false;
+        }
+        if (IsChatGpt()) {
+            // No key to check or save: the credential is the sign-in.
+            noAuth = true;
+            if (!ChatGptSignedIn()) {
+                ShowStep(0);
+                SetFetchStatus("Choose Continue with ChatGPT to sign in first.");
+                if (m_chatgptSignInBtn) m_chatgptSignInBtn->SetFocus();
+                return false;
+            }
+            if (!m_endpointStore) {
+                SetFetchStatus("Connection storage is unavailable. Restart LlamaBoss and try again."); return false;
+            }
+            return true;
         }
         try {
             Poco::URI uri(ep.baseUrl);
@@ -2213,6 +2570,12 @@ private:
     // model" on the Models page.
     void OnOK(wxCommandEvent&)
     {
+        if (m_signInAttempt) return;   // finish (or cancel) the browser sign-in first
+        if (IsChatGpt() && m_pages->GetSelection() == 0 && !ChatGptSignedIn()) {
+            wxCommandEvent e;
+            OnChatGptSignIn(e);
+            return;
+        }
         EndpointStore::Endpoint ep; bool noAuth = false;
         if (!ValidateConnectionFields(ep, noAuth)) return;
         if (m_pages->GetSelection() == 0) {
@@ -2299,7 +2662,7 @@ private:
             ? (connecting ? "Connecting..." : "Connect") : "Save and use model");
         if (m_saveBtn) m_saveBtn->Enable(!connecting);
         if (connectionPage) {
-            m_finishBtn->Enable(!m_fetchInFlight);
+            m_finishBtn->Enable(!m_fetchInFlight && !m_signInAttempt);
             m_finishBtn->SetToolTip(wxString());
             return;
         }
@@ -2345,7 +2708,10 @@ private:
             lb_responses::IsResponsesPath(lb_responses::ResolveChatPath(
                 TrimUtf8(m_baseUrlField->GetValue()),
                 TrimUtf8(m_chatPathField->GetValue()), m_rowModelIds[row]));
-        m_compatibilityHint->SetLabel(viaResponses
+        if (IsChatGpt()) m_imageOutput->Enable(false);
+        m_compatibilityHint->SetLabel(IsChatGpt()
+            ? "Runs on your ChatGPT plan through OpenAI Responses: agent tools and reasoning work together. Image generation isn't available on this connection."
+            : viaResponses
             ? "This model is routed through OpenAI Responses: tools and reasoning work together at any /think level. Leave Allow agent tools on."
             : "Allow agent tools makes tools available when Agent mode is on. Image generation uses a separate, tools-free request.");
         m_compatibilityHint->Wrap(FromDIP(560));
@@ -2456,6 +2822,22 @@ private:
     std::vector<std::pair<std::string, std::string>> m_extraHeaders;
     bool m_rebuildingKeys = false;
     std::vector<wxStaticText*> m_hints;
+
+    // API-key widgets hidden for the ChatGPT plan provider.
+    wxStaticText* m_apiKeyLabel = nullptr;
+    wxCheckBox*   m_showKeyBox  = nullptr;
+    wxButton*     m_getKeyBtn   = nullptr;
+    wxStaticText* m_keyHelp     = nullptr;
+    // ChatGPT plan sign-in.
+    wxPanel*      m_chatgptPanel      = nullptr;
+    wxButton*     m_chatgptSignInBtn  = nullptr;
+    wxButton*     m_chatgptSignOutBtn = nullptr;
+    wxStaticText* m_chatgptStatus     = nullptr;
+    std::string   m_chatgptAccount;              // issued client id, "" = none
+    std::shared_ptr<lb_chatgpt::SignInAttempt> m_signInAttempt;
+    unsigned      m_signInGeneration = 0;
+    // Catalog display names (ChatGPT plan catalog provides them).
+    std::map<std::string, std::string> m_fetchedNames;
 };
 
 }  // anonymous namespace
@@ -2598,8 +2980,20 @@ void EndpointsDialog::RebuildList(const wxString& selectId)
         const wxString name = wxString::FromUTF8(ep.displayName.c_str());
         long item = m_list->InsertItem(idx, name);
         const bool noAuth = ep.authScheme == EndpointStore::AuthScheme::None;
-        const bool hasKey = m_secretsStore && !m_secretsStore->GetSecret(ep.secretProvider, ep.secretKey).empty();
-        m_list->SetItem(item, 1, noAuth ? "Not required" : hasKey ? "Saved" : "Needs API key");
+        if (ep.authScheme == EndpointStore::AuthScheme::ChatGpt) {
+            lb_chatgpt::AccountSummary account;
+            const bool known = !ep.chatgptAccount.empty() &&
+                lb_chatgpt::Auth::Get().FindAccount(ep.chatgptAccount, account);
+            std::string label = "ChatGPT: sign in needed";
+            if (known && account.signedIn && account.planEnabled)
+                label = "ChatGPT: " + (account.email.empty() ? std::string("signed in") : account.email);
+            else if (known && account.signedIn)
+                label = "ChatGPT: plan use not allowed";
+            m_list->SetItem(item, 1, wxString::FromUTF8(label));
+        } else {
+            const bool hasKey = m_secretsStore && !m_secretsStore->GetSecret(ep.secretProvider, ep.secretKey).empty();
+            m_list->SetItem(item, 1, noAuth ? "Not required" : hasKey ? "Saved" : "Needs API key");
+        }
 
         std::string modelsCol;
         for (const auto& model : ep.models) {
@@ -2691,8 +3085,10 @@ bool LbShowAIConnectionSetup(wxWindow* parent, EndpointStore* store, SecretsStor
     if (modelToUse) modelToUse->clear();
     if (!store) return false;
     if (!LbEnsureConnectionStoresWritable(parent, store, secrets)) return false;
-    if (provider != "openrouter" && provider != "openai" && provider != "custom") return false;
-    auto seed = MakeProviderPreset(provider == "openai" ? 0 : provider == "openrouter" ? 1 : 2);
+    if (provider != "openrouter" && provider != "openai" && provider != "custom" &&
+        provider != "chatgpt") return false;
+    auto seed = MakeProviderPreset(provider == "openai" ? 0 : provider == "openrouter" ? 1 :
+                                   provider == "chatgpt" ? kPresetChatGpt : 2);
     if (provider == "custom") { seed.id = "custom"; seed.displayName = "Custom provider"; seed.secretProvider = "custom"; }
     const auto* existing = store->FindEndpoint(seed.id);
     const bool isNew = existing == nullptr;
@@ -2746,10 +3142,12 @@ void EndpointsDialog::OnDelete(wxCommandEvent&)
     if (sel < 0 || sel >= (long)m_rowIds.size()) return;
 
     const std::string id = m_rowIds[sel];
-    int ans = wxMessageBox(
-        wxString::Format("Delete endpoint '%s'?",
-                         wxString::FromUTF8(id.c_str())),
-        "Confirm", wxYES_NO | wxICON_WARNING, this);
+    const auto* target = m_store->FindEndpoint(id);
+    const bool chatgpt = target && target->authScheme == EndpointStore::AuthScheme::ChatGpt &&
+                         !target->chatgptAccount.empty();
+    wxString question = wxString::Format("Delete endpoint '%s'?", wxString::FromUTF8(id.c_str()));
+    if (chatgpt) question += "\n\nThis also signs LlamaBoss out of ChatGPT on this computer.";
+    int ans = wxMessageBox(question, "Confirm", wxYES_NO | wxICON_WARNING, this);
     if (ans != wxYES) return;
 
     const auto* existing = m_store->FindEndpoint(id);
@@ -2759,6 +3157,13 @@ void EndpointsDialog::OnDelete(wxCommandEvent&)
     if (!m_store->Save()) {
         m_store->UpsertEndpoint(previous);
         wxMessageBox("Could not save the deletion. The connection was restored.", "Save failed", wxOK | wxICON_ERROR, this);
+    } else if (chatgpt) {
+        // Only when no other connection still uses the same sign-in.
+        bool shared = false;
+        for (const auto& other : m_store->Endpoints())
+            if (other.authScheme == EndpointStore::AuthScheme::ChatGpt &&
+                other.chatgptAccount == previous.chatgptAccount) shared = true;
+        if (!shared) lb_chatgpt::Auth::Get().SignOut(previous.chatgptAccount);
     }
     RebuildList();
     UpdateButtonState();

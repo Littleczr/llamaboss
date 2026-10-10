@@ -7,18 +7,9 @@
 #include "tool_read.h"
 #include "chat_history.h"
 
-#include <Poco/JSON/Object.h>
-
-#include <algorithm>
-#include <cctype>
-#include <chrono>
-#include <set>
-#include <sstream>
 #include <regex>
-#include <functional>
 
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
+#include "lb_windows.h"
 #include <shellapi.h>
 
 namespace {
@@ -272,14 +263,15 @@ std::string BasenameLower(const std::string& path)
 
 // ─── Risky / text-like extension lists ───────────────────────────
 // The risky list is the security floor: anything here is blocked from
-// ShellExecute even if the user explicitly asked for it.  Phase 2b
-// will add a click-confirm affordance to override; for now, blocked
-// means blocked.
+// ShellExecute even if the user explicitly asked for it.  Blocked means
+// blocked.  It is also used by write/edit/delete, so scriptable files
+// can't be created, edited, or deleted by tools.
 //
 // Keep this synced with the user's threat model.  When in doubt,
 // add it -- false positives just mean the user opens it manually
 // in File Explorer; false negatives mean the agent runs code on
-// the user's behalf without consent.
+// the user's behalf without consent.  Launching is separately
+// restricted to LaunchableExtensions() below.
 const std::set<std::string>& RiskyExtensions()
 {
     static const std::set<std::string> kSet = {
@@ -306,6 +298,42 @@ const std::set<std::string>& RiskyExtensions()
         "url",
         // Macro Office documents
         "docm", "dotm", "xlsm", "xltm", "pptm", "potm",
+        // Text-writable formats whose default shell verb runs code or
+        // reaches out.  write/overwrite_file could create these and
+        // open would ShellExecute them, all without an approval card.
+        "pyw", "pyz", "pyzw",             // pythonw / zipapp launchers
+        "rdp",                            // RDP to attacker host, drives shared
+        "msc",                            // MMC console (script-capable XML)
+        "iqy", "slk", "xll", "xlam", "ppam",  // Excel/Office code paths
+        "library-ms", "search-ms", "searchconnector-ms",
+        "settingcontent-ms", "website", "scf",
+        "wsc", "sct", "inf", "chm",
+        "appinstaller", "appx", "appxbundle", "msix", "msixbundle",
+        "jnlp",
+    };
+    return kSet;
+}
+
+// Extensions the open tool may hand to ShellExecuteW.  This is an
+// ALLOWLIST: an extension that is neither text-like nor listed here is
+// refused, so a new or obscure launchable type fails closed instead of
+// executing.  Keep it to viewers/players for passive content.
+const std::set<std::string>& LaunchableExtensions()
+{
+    static const std::set<std::string> kSet = {
+        // Images
+        "png", "jpg", "jpeg", "gif", "bmp", "webp", "tif", "tiff",
+        "ico", "heic", "heif", "avif",
+        // Audio
+        "mp3", "wav", "flac", "m4a", "aac", "ogg", "oga", "opus", "wma",
+        "mid", "midi",
+        // Video
+        "mp4", "m4v", "mkv", "mov", "avi", "webm", "wmv", "mpg", "mpeg",
+        "3gp",
+        // Documents (macro-free formats only)
+        "pdf", "docx", "xlsx", "pptx", "odt", "ods", "odp", "epub",
+        // Archives (open in Explorer / archive viewer, nothing runs)
+        "zip", "7z",
     };
     return kSet;
 }
@@ -362,7 +390,7 @@ const std::set<std::string>& TextLikeFilenames()
 // ─── Language hint by extension ──────────────────────────────────
 // Used to populate OpenResult::bodyLang so the rendered tool block
 // gets syntax highlighting for the inlined content, matching how
-// /read presents code files.
+// read presents code files.
 std::string LangForExtImpl(const std::string& ext)
 {
     static const std::set<std::string> kCpp     = { "c","h","cpp","hpp","cc","cxx","hh" };
@@ -1282,7 +1310,27 @@ OpenResult OpenFile(const std::string&                  inputPath,
         return r;
     }
 
-    // ── Safe branch: ShellExecuteW ───────────────────────────────
+    // ── Safe branch: ShellExecuteW (allowlisted types only) ──────
+    // "Not on the kill list" is not the same as "safe to launch": the
+    // shell will happily run any registered handler (.pyw, .rdp, .msc,
+    // ...).  Only passive viewer/player types are launched; everything
+    // else is refused and left for the user to open by hand.
+    if (!LaunchableExtensions().count(LowerExt(resolved))) {
+        r.chips.push_back("blocked");
+        const std::string ext = LowerExt(resolved);
+        std::ostringstream ss;
+        ss << "Refused to open \"" << resolved << "\".\n"
+           << "Tools only launch images, audio, video, PDFs, macro-free "
+           << "Office documents and archives"
+           << (ext.empty() ? std::string(" (this file has no extension).")
+                           : " (extension: ." + ext + ").") << "\n"
+           << "Ask the user to open it manually from File Explorer if "
+           << "they want to.";
+        r.errorBody = ss.str();
+        r.chips.push_back(elapsedChip());
+        return r;
+    }
+
     std::string shellErr = ShellOpenFile(resolved);
     if (!shellErr.empty()) {
         r.chips.push_back("failed");

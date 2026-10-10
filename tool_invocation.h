@@ -1,17 +1,15 @@
 // tool_invocation.h
 //
-// Phase 4: Agent harness — tool invocation types.
+// Agent harness — tool invocation types.
 //
 // A ToolInvocation is the protocol-neutral internal representation
 // of a single tool call, regardless of whether it arrived as a
-// text-mode <tool_call>...</tool_call> block (primary) or a
-// JSON function-call payload (future provider-native adapter).
+// text-mode <tool_call>...</tool_call> block or a native JSON
+// function-call payload.
 //
-// The Phase 3 slash-command handlers on MyFrame already do the
-// right thing for user-typed "/read foo.cpp" etc.  The dispatcher
-// (see tool_dispatcher.h) maps a ToolInvocation onto the same
-// underlying tool functions so user-typed and agent-emitted
-// invocations produce byte-identical results.
+// The dispatcher (see tool_dispatcher.h) maps a ToolInvocation onto
+// the tool implementations, so user-typed and agent-emitted
+// invocations produce identical results.
 //
 #pragma once
 
@@ -100,12 +98,12 @@ struct ToolInvocation {
     // an error chip so it can self-correct.
     std::string invalidReason;
 
-    // Phase 3c-ii: id of the model-emitted tool call this
-    // invocation was synthesized from.  Empty for XML-protocol
-    // invocations (no ids exist in that protocol).  When non-empty,
-    // the dispatched result is stored as a tool-result message
-    // tagged with this id so subsequent requests can thread
-    // role:"tool" replies via tool_call_id.
+    // Id of the model-emitted tool call this invocation was
+    // synthesized from.  Empty for XML-protocol invocations (no ids
+    // exist in that protocol).  When non-empty, the dispatched result
+    // is stored as a tool-result message tagged with this id so
+    // subsequent requests can thread role:"tool" replies via
+    // tool_call_id.
     std::string toolCallId;
 };
 

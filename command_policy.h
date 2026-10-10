@@ -1,6 +1,6 @@
 // command_policy.h
 //
-// Phase 5+: Agent harness — PowerShell command policy.
+// Agent harness — PowerShell command policy.
 //
 // EvaluatePowerShellCommand is the single classifier between the
 // agent dispatcher, the approval gate, and CmdExecutor.  Given a
@@ -17,25 +17,23 @@
 // 1. Reject empty / whitespace-only commands.
 // 2. Reject only malformed quote drift that this lightweight scanner
 //    can identify reliably (unterminated single/double-quoted strings).
-// 3. Preserve the existing quote-aware pipeline split so clearly
-//    read-only commands can still be auto-classified stage by stage.
+// 3. Split pipelines quote-aware so clearly read-only commands can be
+//    auto-classified stage by stage.
 // 4. Auto-run when every pipeline stage has a simple head on the
 //    read-only allowlist and the command contains none of the shell
-//    constructs that historically made allowlist-only classification
-//    unsafe.
+//    constructs that make allowlist-only classification unsafe.
 // 5. Require approval instead of hard-blocking when a command falls
 //    outside that narrow auto-run profile, including:
 //      - non-allowlisted command heads such as powershell, Compress-Archive,
 //        Remove-Item, git, etc.
 //      - script blocks, grouping/subexpressions, redirection, separators,
 //        backticks, call/background operators, or double-quoted `$` expansion
-//      - newlines or other syntax that is valid PowerShell but no longer
-//        eligible for silent read-only auto-run
+//      - newlines, non-ASCII characters, or other syntax that is valid
+//        PowerShell but not eligible for silent read-only auto-run
 //
-// This keeps the old low-friction inspection path intact while allowing
-// developers to perform broader PowerShell workflows through explicit
-// user approval rather than forcing LlamaBoss to grow one bespoke tool
-// per shell task.
+// This keeps a low-friction inspection path while allowing broader
+// PowerShell workflows through explicit user approval rather than
+// forcing LlamaBoss to grow one bespoke tool per shell task.
 #pragma once
 
 #include <string>
@@ -64,8 +62,8 @@ PolicyDecision EvaluatePowerShellCommand(const std::string& command);
 // ─── Advisory lint: hazardous-but-legal string constructs ───────
 //
 // Returns zero or more human/model-readable warnings for constructs
-// that are valid PowerShell but historically caused silent breakage
-// when generated or relayed by a model:
+// that are valid PowerShell but commonly cause silent breakage when
+// generated or relayed by a model:
 //
 //   1. Backtick-escaped double quotes (`") — legal, but the most
 //      fragile construct to regenerate through any re-quoting layer.

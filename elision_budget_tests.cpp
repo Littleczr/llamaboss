@@ -1,13 +1,13 @@
 // elision_budget_tests.cpp
 //
-// Regression harness for elision_budget.h (2026-10-01).  No dependencies:
+// Regression harness for elision_budget.h.  No dependencies:
 //   g++ -std=c++17 -I . elision_budget_tests.cpp && ./a.out
 //
-// Includes a replay of the 67-row GPT-6 Luna ctx_calibration.tsv from
-// the r16c2 session (req_bytes, prompt_tokens): the adaptive budget must
-// never let a filled request exceed the intended window fraction by more
-// than the margin allows, must settle (few changes), and must raise the
-// usable window well above the old 3.0 constant's ~40%.
+// Includes a replay of a real 67-row ctx_calibration.tsv (req_bytes,
+// prompt_tokens): the adaptive budget must never let a filled request
+// exceed the intended window fraction by more than the margin allows,
+// must settle (few changes), and must raise the usable window well
+// above a fixed 3.0 constant's ~40%.
 #include "elision_budget.h"
 #include <cmath>
 #include <cstdio>
@@ -204,29 +204,47 @@ static const Row kLuna[] = {
     {533152, 101463}
 };
 
+// A token-dense model (the 10 largest rows of a real
+// ctx_calibration.tsv, oldest first).  Measures 1.27-1.97 B/token.
+// Clamped up to 3.0, the 550 KB budget would let the
+// 389,520-byte / 308,018-token request through unelided (117% of window).
+static const ERow kLunaPro[] = {
+    {373548, 231945, false}, {375921, 234697, false}, {548552, 278514, true},
+    {549254, 279936, true},  {389520, 308018, false},
+    {237344, 170297, false}, {261047, 183806, false}, {263080, 184591, false},
+    {274192, 191956, false}, {285473, 197732, false}
+};
+
 int main()
 {
     // Defaults and guards.
     {
         AdaptiveBytesPerToken a;
-        check(a.Current("m") == kFloorBpt, "no measurement -> floor 3.0 (old behaviour)");
+        check(a.Current("m") == kDefaultBpt, "no measurement -> default 3.0 (old behaviour)");
         check(!a.Observe("m", 20000, 4000), "tiny request ignored");
         check(!a.Observe("m", 600000, 50000), "implausible ratio (12/token, uncached-only report) ignored");
         check(!a.Observe("m", 600000, 0), "zero prompt tokens ignored");
         check(!a.Observe("", 600000, 100000), "empty model ignored");
-        check(a.Current("m") == kFloorBpt, "still floor after rejected reports");
+        check(a.Current("m") == kDefaultBpt, "still default after rejected reports");
         check(a.Observe("m", 500000, 100000), "first valid report applies");
         check(std::abs(a.Current("m") - 4.5) < 1e-9, "5.0 measured -> 4.5 applied");
-        check(a.Current("other") == kFloorBpt, "different model -> floor");
+        check(a.Current("other") == kDefaultBpt, "different model -> default");
         check(!a.Observe("m", 520000, 100000), "+4% swing: no change (hysteresis)");
         check(!a.Observe("m", 480000, 100000), "-4% measured (candidate 4.32 > 4.5*0.95=4.275): no change");
         check(a.Observe("m", 460000, 100000), "-8% measured (candidate 4.14): lowers");
-        check(a.Observe("m2", 400000, 100000) && std::abs(a.Current("m2") - 3.6) < 1e-9 && a.Current("m") == kFloorBpt,
+        check(a.Observe("m2", 400000, 100000) && std::abs(a.Current("m2") - 3.6) < 1e-9 && a.Current("m") == kDefaultBpt,
               "model switch re-keys");
         AdaptiveBytesPerToken b; b.Observe("m", 700000, 100000);
         check(b.Current("m") == kCapBpt, "7.0 measured -> capped 6.0");
+        // A dense model must not be clamped UP to the 3.0 default, which
+        // would enlarge its budget.
         AdaptiveBytesPerToken c; c.Observe("m", 250000, 100000);
-        check(c.Current("m") == kFloorBpt, "2.5 measured -> floor 3.0");
+        check(std::abs(c.Current("m") - 2.25) < 1e-9, "2.5 measured -> 2.25 applied (no longer clamped up to 3.0)");
+        AdaptiveBytesPerToken f; f.Observe("m", 100000, 100000);
+        check(f.Current("m") == kFloorBpt, "1.0 measured -> floor 1.0");
+        AdaptiveBytesPerToken g;
+        check(!g.Observe("m", 40000, 100000) && g.Current("m") == kDefaultBpt,
+              "implausible ratio (0.4/token) ignored");
     }
 
     // Replay the Luna session.
@@ -259,6 +277,37 @@ int main()
     }
 
 
+    // Luna-pro replay: with the floor fixed, a body filled to the budget
+    // stays within the intended fraction once calibrated, where the old
+    // clamp admitted more than the whole window.
+    {
+        const double window = 262144, fraction = 0.70;
+        AdaptiveBytesPerToken a;
+        double worstAfterFirst = 0;
+        bool first = true;
+        for (const ERow& r : kLunaPro) {
+            const double realBpt = (double)r.bytes / (double)r.tokens;
+            if (!first) {
+                const double fill = window * a.Current("lp") * fraction / realBpt / window;
+                if (fill > worstAfterFirst) worstAfterFirst = fill;
+            }
+            a.Observe("lp", (size_t)r.bytes, r.tokens, r.elided);
+            first = false;
+        }
+        const double oldFill = window * 3.0 * fraction / (389520.0 / 308018.0) / window;
+        char buf[200];
+        std::snprintf(buf, sizeof buf, "luna-pro: old 3.0 clamp filled %.0f%% of window at the 308k row", oldFill * 100);
+        check(oldFill > 1.0, buf);
+        // The 308k row (pasted screenshot) dropped from 1.6 to 1.27 B/tok in
+        // one request -- a 21% swing, beyond kMargin's 10% -- so the 70%
+        // target can be overshot on such a turn; the window itself holds.
+        std::snprintf(buf, sizeof buf, "luna-pro: worst filled-budget share after calibration %.1f%% (< 100%%)",
+                      worstAfterFirst * 100);
+        check(worstAfterFirst < 1.0, buf);
+        std::snprintf(buf, sizeof buf, "luna-pro: applied %.2f B/tok (below the old 3.0)", a.Current("lp"));
+        check(a.Current("lp") < 2.0 && a.Current("lp") >= kFloorBpt, buf);
+    }
+
     // Elided bodies may lower, never raise.
     {
         AdaptiveBytesPerToken a;
@@ -278,7 +327,7 @@ int main()
             const double before = a.Current("gpt-6-luna");
             if (a.Observe("gpt-6-luna", (size_t)r.bytes, r.tokens, r.elided)) ++changes;
             const double after = a.Current("gpt-6-luna");
-            if (after > before && before != kFloorBpt) { ++raises; if (r.elided) ++raisesFromElided; }
+            if (after > before && before != kDefaultBpt) { ++raises; if (r.elided) ++raisesFromElided; }
         }
         check(raisesFromElided == 0, "log 2 replay: 0 raises from elided bodies (old rule: 11 sawtooth spikes)");
         char buf[160];
@@ -296,7 +345,7 @@ int main()
         check(fed == 2 && std::abs(a.Current("gpt-6-luna") - 4.5) < 1e-9 && a.Model() == "gpt-6-luna",
               "seed uses only the last row's model; elided row cannot raise");
         AdaptiveBytesPerToken b;
-        check(SeedFromCalibrationTsv(b, "") == 0 && b.Current("x") == kFloorBpt, "empty file -> floor");
+        check(SeedFromCalibrationTsv(b, "") == 0 && b.Current("x") == kDefaultBpt, "empty file -> default");
         check(SeedFromCalibrationTsv(b, "garbage\nno\theader\n") == 0, "no header -> nothing");
         check(SeedFromCalibrationTsv(b, hdr + "t\tm\tabc\t100\t1\t1\t1\t0\nt\tm\t500000\n") == 0,
               "malformed rows skipped");
@@ -308,6 +357,42 @@ int main()
         AdaptiveBytesPerToken d;
         check(SeedFromCalibrationTsv(d, many) == 64, "seeding capped to last 64 rows");
         check(d.MeasuredFor("m") > 5.9 && d.MeasuredFor("other") == 0.0, "MeasuredFor reports last measurement per model");
+    }
+
+    // Image data URIs vs. the byte budget.
+    {
+        const std::string b64(400000, 'A');
+        const std::string img = "{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64," + b64 + "\"}}";
+        const std::string text(100000, 'x');
+        check(ScanImageDataUris("{\"content\":\"" + text + "\"}").count == 0 &&
+              BudgetedBodyBytes("{\"content\":\"" + text + "\"}", 2.5) == text.size() + 14,
+              "no images -> budgeted size is the raw size");
+        const std::string one = "{\"messages\":[{\"content\":[" + img + "]}]}";
+        const ImageUriScan s1 = ScanImageDataUris(one);
+        check(s1.count == 1 && s1.bytes == std::string("data:image/png;base64,").size() + b64.size(),
+              "one image_url data URI is found and measured without quotes");
+        check(BudgetedBodyBytes(one, 2.5) == one.size() - s1.bytes + (size_t)(kImageTokenEstimate * 2.5),
+              "image counted as kImageTokenEstimate tokens at the given bpt");
+        const std::string escaped = "{\"role\":\"tool\",\"content\":\"html: {\\\"url\\\":\\\"data:image/png;base64,AAAA\\\"}\"}";
+        check(ScanImageDataUris(escaped).count == 0,
+              "escaped data:image inside tool-result text keeps counting as text");
+        const std::string slashed = "{\"url\":\"data:image\\/jpeg;base64,AB\\/CD\"}";
+        const ImageUriScan s2 = ScanImageDataUris(slashed);
+        check(s2.count == 1 && s2.bytes == std::string("data:image\\/jpeg;base64,AB\\/CD").size(),
+              "escaped slashes in the URI are measured to the closing quote");
+        check(ScanImageDataUris("{\"url\":\"data:image/png;base64,AAAA").count == 0,
+              "truncated URI with no closing quote is ignored");
+        // Replay: two screenshots (~1.1 MB) + ~100 KB of text, 262.1k window,
+        // Haiku measured ~2.79 B/tok -> applied 2.51.  Old: elided everything.
+        const double bpt = CandidateFromMeasured(2.79);
+        const size_t budget = (size_t)(262100.0 * bpt * 0.70);
+        const std::string two = "{\"messages\":[{\"content\":[" + img + "," + img + "]},{\"content\":\"" + text + "\"}]}";
+        std::string big = two;
+        big.insert(big.size() - 3, std::string(450000, 'y'));
+        check(two.size() > budget && BudgetedBodyBytes(two, bpt) < budget,
+              "Haiku replay: screenshots alone no longer push the body over budget");
+        check(BudgetedBodyBytes(big, bpt) > budget,
+              "real text growth past the budget still triggers elision with images present");
     }
 
     std::cout << "\n" << passes << "/" << (passes + fails) << " passed\n";

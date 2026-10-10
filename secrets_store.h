@@ -1,13 +1,13 @@
 // secrets_store.h
 //
-// Phase 1 secrets layer for service-tool API keys.
+// Secrets layer for service-tool and endpoint API keys.
 //
 // SecretsStore owns one JSON file at:
 //     %LOCALAPPDATA%\LlamaBoss\secrets.json
 //
-// The file shape mirrors OpenClaw's openclaw.json — a flat mapping
-// from provider name to a small {key: value} map.  Values may be
-// raw strings or env-var indirections of the form {"$env": "NAME"}.
+// The logical document is a flat mapping from provider name to a small
+// {key: value} map.  Values may be raw strings or env-var indirections
+// of the form {"$env": "NAME"}.
 //
 //     {
 //       "version": 1,
@@ -17,12 +17,13 @@
 //       }
 //     }
 //
-// Storage policy for Phase 1 follows OpenClaw's threat model:
-// plaintext on disk, file ACL inherited from the user-only
-// %LOCALAPPDATA%\LlamaBoss directory, no OS-keychain encryption.
-// SecretRef ($env) lets users keep keys out of the JSON when they
-// prefer.  DPAPI encryption is a deliberate Phase 2 option, not a
-// Phase 1 requirement.
+// At rest, the document above is written DPAPI-encrypted (current-user
+// scope) as
+//     { "version": 2, "protection": "dpapi-current-user", "data": "<b64url>" }
+// Plaintext v1 files still load and are re-saved encrypted on first
+// load.  Plaintext would be readable by approval-free agent tools (read,
+// grep, auto-run Get-Content) and exfiltratable via web_fetch_url.
+// SecretRef ($env) still lets users keep keys out of the file.
 //
 // Lifetime:
 //   * Owned by AppState (one per process).
@@ -142,8 +143,8 @@ public:
     // at a missing env var won't shadow whatever the user has set
     // in their shell).
     //
-    // Phase 2 will narrow this to "only providers declared in the
-    // running skill's `## Connections` section."
+    // TODO: narrow this to "only providers declared in the running
+    // skill's `## Connections` section."
     std::vector<std::pair<std::string, std::string>>
         BuildEnvInjections() const;
 

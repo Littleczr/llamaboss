@@ -1,15 +1,6 @@
-#define _CRT_SECURE_NO_WARNINGS
-
 // ─── drop_import_controller.cpp ────────────────────────────────────
 
 #include "drop_import_controller.h"
-
-#include <wx/wx.h>
-#include <wx/dir.h>
-#include <wx/filefn.h>
-#include <wx/filename.h>
-
-#include <utility>
 
 namespace {
 

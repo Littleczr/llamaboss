@@ -26,7 +26,7 @@ wxDECLARE_EVENT(wxEVT_ASSISTANT_DELTA, wxCommandEvent);
 wxDECLARE_EVENT(wxEVT_ASSISTANT_COMPLETE, wxCommandEvent);
 wxDECLARE_EVENT(wxEVT_ASSISTANT_ERROR, wxCommandEvent);
 
-// ── Phase 3c-ii: extra payload on assistant-complete events ────
+// ── Extra payload on assistant-complete events ─────────────────
 // wxCommandEvent::SetString already carries the model's prose
 // content for the completed turn.  When the model is on the
 // native tool-calling protocol it may also have emitted a
@@ -40,7 +40,7 @@ wxDECLARE_EVENT(wxEVT_ASSISTANT_ERROR, wxCommandEvent);
 // MyFrame::OnAssistantComplete wraps it in a std::unique_ptr as its
 // very first action, before any early return.  Recipients
 // that don't know about tool_calls can ignore the payload entirely
-// — the existing SetString-based contract is unchanged.
+// — the SetString-based contract is unchanged.
 //
 // toolCallsJson is a JSON array string in OpenAI shape:
 //   [{"id":"call_0","type":"function",
@@ -62,10 +62,10 @@ public:
 
     const std::string& ToolCallsJson() const { return m_toolCallsJson; }
 
-    // OpenAI Responses (Phase 2): the verbatim `output` array of the
-    // completed response when it contained at least one function_call.
-    // Carries the model's encrypted reasoning items, which the next
-    // request in the tool loop must replay (store:false).  Persisted by
+    // OpenAI Responses: the verbatim `output` array of the completed
+    // response when it contained at least one function_call.  Carries
+    // the model's encrypted reasoning items, which the next request in
+    // the tool loop must replay (store:false).  Persisted by
     // ChatHistory::SetLastAssistantResponsesOutput; empty on every other
     // lane and on tool-free Responses turns.
     const std::string& ResponsesOutputJson() const
@@ -83,11 +83,11 @@ public:
 
     // Destructive read for the one consumer that persists them.
     // A generated image arrives as a base64 data URL, so a 4 MB PNG
-    // is ~5.5 MB of std::string per entry; the UI handler used to
-    // copy the whole vector out of the payload purely to read it
-    // once.  Call this instead when you are about to consume them.
-    // The payload is left empty afterwards, which is fine: the
-    // handler owns it via unique_ptr and drops it at end of scope.
+    // is ~5.5 MB of std::string per entry; copying the whole vector
+    // out of the payload just to read it once is wasteful.  Call this
+    // instead when you are about to consume them.  The payload is
+    // left empty afterwards, which is fine: the handler owns it via
+    // unique_ptr and drops it at end of scope.
     std::vector<std::string> TakeImageDataUrls()
     { return std::move(m_imageDataUrls); }
 
@@ -181,11 +181,10 @@ private:
 
 // Thread class for handling HTTP requests
 //
-// The worker no longer takes a bare (model, apiUrl) pair. It takes a
-// fully-resolved InferenceTarget describing the endpoint URL, path,
-// TLS requirement, and auth/extra headers. The request body still
-// carries the wire "model" field, so the target's modelId is purely
-// informational at the transport layer.
+// The worker takes a fully-resolved InferenceTarget describing the
+// endpoint URL, path, TLS requirement, and auth/extra headers. The
+// request body still carries the wire "model" field, so the target's
+// modelId is purely informational at the transport layer.
 class ChatWorkerThread : public wxThread
 {
 public:

@@ -3,7 +3,6 @@
 #include "theme.h"
 
 #include <wx/sizer.h>
-#include <algorithm>
 
 namespace {
 
@@ -80,9 +79,8 @@ ProjectStatusStrip::ProjectStatusStrip(wxWindow* parent,
     m_bgColor     = theme.bgToolbar;
     m_textColor   = theme.textPrimary;
     m_mutedColor  = theme.textMuted;
-    // Hover colour: the shared toolbar accent (theme.h).  This used to be
-    // chatAssistant, which in every theme except "dark" is plain foreground
-    // text -- in Nord the hover went from #D8DEE9 to #ECEFF4 and was
+    // Hover colour: the shared toolbar accent (theme.h).  chatAssistant
+    // would be plain foreground text in most themes, making the hover
     // effectively invisible.
     m_actionColor = LbInteractiveAccent(theme);
     m_borderColor = theme.borderSubtle;

@@ -2,20 +2,21 @@
 
 // Stateless OpenAI Responses adapter.
 //
-// Phase 1: chat, streaming, reasoning effort, errors, token usage.
-// Phase 2: agent tools.  Function tools are converted from the Chat
-// Completions catalog, native tool_calls history is replayed as
-// function_call / function_call_output items, and the model's own
-// reasoning items (encrypted, because store:false) are replayed in front
-// of the function calls they produced, preserving the original output
-// items required for stateless reasoning continuation.
+// Covers chat, streaming, reasoning effort, errors, token usage, and
+// agent tools.  Function tools are converted from the Chat Completions
+// catalog, native tool_calls history is replayed as function_call /
+// function_call_output items, and the model's own reasoning items
+// (encrypted, because store:false) are replayed in front of the function
+// calls they produced, preserving the original output items required
+// for stateless reasoning continuation.
 //
-// The application still builds its existing Chat Completions projection;
+// The application still builds its Chat Completions projection;
 // conversion happens once, after attachments, immediately before
 // transport.  Header-only so existing Visual Studio builds need no new
 // compiled item.
 #include "reasoning_policy.h"
 #include "repetition_guard.h"
+#include "chatgpt_auth_core.h"   // plan-route namespace + error vocabulary
 #include <Poco/JSON/Array.h>
 #include <Poco/JSON/Object.h>
 #include <Poco/JSON/Parser.h>
@@ -52,14 +53,13 @@ public:
 // Chat Completions target ever sees it.
 inline const char* kOutputSidecarKey() { return "lb_responses_output"; }
 
-// Direct-OpenAI routing is family-based, not an allowlist.  The allowlist
-// ("gpt-6-astra", "gpt-5.6-luna") broke the moment a new id shipped:
-// gpt-6-luna fell through to /v1/chat/completions and 400'd on
-// tools + reasoning at every /think level, including Auto (server-side
-// default effort).  Responses is OpenAI's primary text API and accepts
-// every current text model, so route everything EXCEPT the families
-// that exist only on Chat Completions.  Callers still gate on host ==
-// api.openai.com, a default chat path, and non-image turns.
+// Direct-OpenAI routing is family-based, not an allowlist: an allowlist
+// of model ids breaks the moment a new id ships (it falls through to
+// /v1/chat/completions and 400s on tools + reasoning).  Responses is
+// OpenAI's primary text API and accepts every current text model, so
+// route everything EXCEPT the families that exist only on Chat
+// Completions.  Callers still gate on host == api.openai.com, a default
+// chat path, and non-image turns.
 inline bool IsChatCompletionsOnlyModel(std::string model)
 {
     for (char& c : model)
@@ -127,6 +127,12 @@ inline std::string Stringify(const Poco::Dynamic::Var& value)
 // ── Tool catalog ─────────────────────────────────────────────────
 // Chat Completions:  {"type":"function","function":{name,description,parameters}}
 // Responses:         {"type":"function",name,description,parameters,strict}
+// ChatGPT plan route: the same function tools, but grouped in ONE
+// namespace -- {"type":"namespace","name":"llamaboss","tools":[...]} --
+// because that route does not accept bare top-level function tools.
+// The model's function_call items then carry "namespace":"llamaboss",
+// and every replayed function_call must carry it back (the server
+// rejects a namespaced call that arrives without it).
 inline Array::Ptr ConvertTools(const Array::Ptr& chatTools)
 {
     Array::Ptr tools = new Array;
@@ -153,6 +159,37 @@ inline Array::Ptr ConvertTools(const Array::Ptr& chatTools)
     return tools;
 }
 
+inline Array::Ptr WrapToolsInNamespace(const Array::Ptr& functionTools)
+{
+    Object::Ptr ns = new Object;
+    ns->set("type", "namespace");
+    ns->set("name", std::string(lb_chatgpt::kToolNamespace()));
+    ns->set("description", std::string(
+        "LlamaBoss tools that act on the user's own computer: files, shell, Python, web fetch."));
+    ns->set("tools", functionTools);
+    Array::Ptr wrapped = new Array;
+    wrapped->add(ns);
+    return wrapped;
+}
+
+// Function-call items replayed into `input` must match how the tools
+// are declared on THIS request: namespaced on the plan route, bare on
+// API-key routes.  A conversation can move between the two (same chat,
+// different connection), so the stored items are normalized per send.
+inline Object::Ptr NormalizeFunctionCallNamespace(Object::Ptr item, bool chatgptPlan)
+{
+    if (!item || !item->has("type") || !item->get("type").isString() ||
+        item->getValue<std::string>("type") != "function_call")
+        return item;
+    if (chatgptPlan) {
+        if (!item->has("namespace") || item->isNull("namespace"))
+            item->set("namespace", std::string(lb_chatgpt::kToolNamespace()));
+    } else if (item->has("namespace")) {
+        item->remove("namespace");
+    }
+    return item;
+}
+
 // ── Assistant tool-call turn ─────────────────────────────────────
 // Replay the complete original output when available. The agent may have
 // executed only a subset (batch limit, or a tool that must run alone).
@@ -161,7 +198,7 @@ inline Array::Ptr ConvertTools(const Array::Ptr& chatTools)
 // ChatHistory supplies the actual results for every surviving tool call.
 // Legacy turns have no raw output and are reconstructed from chat history.
 inline void AppendAssistantToolTurn(Array::Ptr input,
-    const Object::Ptr& old, const std::string& visibleText)
+    const Object::Ptr& old, const std::string& visibleText, bool chatgptPlan = false)
 {
     const auto toolCalls = old->getArray("tool_calls");
     if (!toolCalls) throw std::runtime_error("Assistant tool_calls is not an array.");
@@ -209,7 +246,7 @@ inline void AppendAssistantToolTurn(Array::Ptr input,
             if (originalCalls.count(id) == 0)
                 throw std::runtime_error("Saved Responses output is missing an executed tool call.");
         for (std::size_t i = 0; i < sidecar->size(); ++i)
-            input->add(sidecar->getObject(i));
+            input->add(NormalizeFunctionCallNamespace(sidecar->getObject(i), chatgptPlan));
         for (const auto& id : skipped) {
             Object::Ptr result = new Object;
             result->set("type", "function_call_output");
@@ -235,11 +272,21 @@ inline void AppendAssistantToolTurn(Array::Ptr input,
         fc->set("name", RequiredString(fn, "name"));
         fc->set("arguments", fn->has("arguments") && !fn->isNull("arguments")
             ? RequiredString(fn, "arguments") : std::string("{}"));
-        input->add(fc);
+        input->add(NormalizeFunctionCallNamespace(fc, chatgptPlan));
     }
 }
 
-inline std::string BuildChatRequest(const std::string& chatJson)
+// chatgptPlan: the request rides a ChatGPT Plus/Pro plan through Sign in
+// with ChatGPT.  That route (siwc "Preview limitations") additionally:
+//   * rejects explicit system-role items -> the leading system prompt
+//     becomes top-level `instructions`, any later system message a
+//     developer message;
+//   * rejects max_output_tokens (and other fields this converter never
+//     emits: temperature, top_p, metadata, truncation, user, ...);
+//   * requires function tools to be grouped in a namespace.
+// store:false and stream:true are required there and are already the
+// converter's behavior for every Responses target.
+inline std::string BuildChatRequest(const std::string& chatJson, bool chatgptPlan = false)
 {
     Poco::JSON::Parser parser;
     const auto chat = parser.parse(chatJson).extract<Object::Ptr>();
@@ -266,15 +313,18 @@ inline std::string BuildChatRequest(const std::string& chatJson)
     }
     // Auto omits the override. Do not request reasoning summaries: availability
     // can depend on account verification. Consume summaries if provided.
-    if (chat->has("max_completion_tokens"))
-        request->set("max_output_tokens", chat->get("max_completion_tokens"));
-    else if (chat->has("max_tokens"))
-        request->set("max_output_tokens", chat->get("max_tokens"));
+    if (!chatgptPlan) {
+        if (chat->has("max_completion_tokens"))
+            request->set("max_output_tokens", chat->get("max_completion_tokens"));
+        else if (chat->has("max_tokens"))
+            request->set("max_output_tokens", chat->get("max_tokens"));
+    }
 
     if (chat->has("tools") && !chat->isNull("tools")) {
         const auto tools = chat->getArray("tools");
         if (tools && tools->size() > 0) {
-            request->set("tools", ConvertTools(tools));
+            request->set("tools", chatgptPlan ? WrapToolsInNamespace(ConvertTools(tools))
+                                              : ConvertTools(tools));
             if (chat->has("parallel_tool_calls") && !chat->isNull("parallel_tool_calls"))
                 request->set("parallel_tool_calls", chat->get("parallel_tool_calls"));
             // store:false means the provider keeps nothing between calls;
@@ -316,12 +366,24 @@ inline std::string BuildChatRequest(const std::string& chatJson)
             std::string visible;
             if (old->has("content") && !old->isNull("content") && old->get("content").isString())
                 visible = old->getValue<std::string>("content");
-            AppendAssistantToolTurn(input, old, visible);
+            AppendAssistantToolTurn(input, old, visible, chatgptPlan);
             continue;
         }
 
+        // Plan route: no system-role items.  The leading system prompt
+        // (ChatHistory always puts it first) becomes `instructions`;
+        // any later system message keeps its position as a developer
+        // message, which that route accepts.
+        if (chatgptPlan && role == "system") {
+            if (i == 0 && old->has("content") && !old->isNull("content") &&
+                old->get("content").isString()) {
+                request->set("instructions", old->getValue<std::string>("content"));
+                continue;
+            }
+        }
+
         Object::Ptr msg = new Object;
-        msg->set("role", role);
+        msg->set("role", (chatgptPlan && role == "system") ? std::string("developer") : role);
         if (!old->has("content") || old->isNull("content"))
             throw std::runtime_error("Chat message has no content.");
         if (old->get("content").isString()) {
@@ -367,8 +429,8 @@ struct StreamUpdate {
     long outputTokens = -1;
     long cachedInputTokens = -1;   // usage.input_tokens_details.cached_tokens
     long reasoningTokens = -1;     // usage.output_tokens_details.reasoning_tokens
-    // Phase 2, set on completion only.  toolCallsJson is the Chat
-    // Completions shape the rest of LlamaBoss already consumes
+    // Set on completion only.  toolCallsJson is the Chat Completions
+    // shape the rest of LlamaBoss already consumes
     // ([{"id":call_id,"type":"function","function":{name,arguments}}]);
     // outputJson is the verbatim `output` array of the completed
     // response, populated only when it contains at least one
@@ -399,6 +461,13 @@ public:
                 const auto details = response->getObject("incomplete_details");
                 if (error) update.error += " " + error->optValue<std::string>("message", "");
                 if (details) update.error += " Reason: " + details->optValue<std::string>("reason", "unknown");
+                // ChatGPT plan codes (usage limit, eligibility, ...) can
+                // arrive mid-stream as response.failed; say what to do.
+                if (error) {
+                    const std::string code = error->optValue<std::string>("code", "");
+                    const std::string plain = lb_chatgpt::DescribePlanErrorCode(code);
+                    if (!plain.empty()) update.error = plain + " [" + code + "]";
+                }
             }
             m_terminal = true;
             return update;
@@ -436,12 +505,35 @@ public:
                 auto& call = CallSlot(Index(event, "output_index"));
                 RecordCall(call, item, /*snapshot*/ type == "response.output_item.done");
             }
+            // Keep every finished item.  The ChatGPT plan route ends with a
+            // response.completed whose `output` is EMPTY (the Codex backend
+            // streams items only), so these are the only complete copy of
+            // the reply -- including the encrypted reasoning items a tool
+            // loop must replay.
+            if (type == "response.output_item.done") {
+                const int index = Index(event, "output_index");
+                if (m_doneItems.count(index) == 0 && m_doneItems.size() >= 1024)
+                    throw std::runtime_error("Responses stream contains too many output items.");
+                m_doneItems[index] = item;
+            }
         } else if (type == "response.completed") {
             const auto response = event->getObject("response");
             if (!response || RequiredString(response, "status") != "completed")
                 throw std::runtime_error("Responses completion has no completed response.");
             const auto output = response->getArray("output");
-            if (!output) throw std::runtime_error("Responses completion has no output array.");
+            if (!output && m_doneItems.empty())
+                throw std::runtime_error("Responses completion has no output array.");
+            // Final items by output index: the streamed output_item.done
+            // copies, overridden by the completion's own output array when
+            // the server repeats it (api.openai.com with an API key does;
+            // the ChatGPT plan route sends an empty array).
+            std::map<int, Object::Ptr> finalItems = m_doneItems;
+            const bool outputRepeated = output && output->size() > 0;
+            if (outputRepeated)
+                for (std::size_t i = 0; i < output->size(); ++i)
+                    finalItems[static_cast<int>(i)] = output->getObject(i);
+            Array::Ptr finalOutput = new Array;
+            for (const auto& entry : finalItems) finalOutput->add(entry.second);
             std::set<PartKey> finalParts;
             std::set<int> finalCalls;
             std::set<std::string> finalCallIds, finalItemIds;
@@ -449,17 +541,18 @@ public:
             // Completion repeats the final text. Verify/fill any missing suffix
             // by content part instead of rendering it twice. Also supports an
             // endpoint sending only the final completed snapshot.
-            for (std::size_t i = 0; i < output->size(); ++i) {
-                const auto item = output->getObject(i);
+            for (const auto& finalEntry : finalItems) {
+                const int i = finalEntry.first;
+                const auto item = finalEntry.second;
                 CheckItem(item);
                 const std::string itemType = RequiredString(item, "type");
                 if (itemType == "function_call") {
-                    auto& call = CallSlot(static_cast<int>(i));
+                    auto& call = CallSlot(i);
                     RecordCall(call, item, /*snapshot*/ true);
                     if (!finalCallIds.insert(call.callId).second ||
                         (!call.itemId.empty() && !finalItemIds.insert(call.itemId).second))
                         throw std::runtime_error("Responses completion contains duplicate function call ids.");
-                    finalCalls.insert(static_cast<int>(i));
+                    finalCalls.insert(i);
                     Object::Ptr entry = new Object;
                     entry->set("id", call.callId);
                     entry->set("type", "function");
@@ -481,15 +574,20 @@ public:
                     const auto partType = RequiredString(part, "type");
                     if (partType != "output_text" && partType != "refusal" && partType != "summary_text")
                         throw std::runtime_error("Unsupported Responses output content.");
-                    finalParts.emplace(static_cast<int>(i), isSummary, static_cast<int>(j));
-                    const auto addition = AddPart(static_cast<int>(i), isSummary,
+                    finalParts.emplace(i, isSummary, static_cast<int>(j));
+                    const auto addition = AddPart(i, isSummary,
                         static_cast<int>(j), RequiredString(part, partType == "refusal" ? "refusal" : "text"), true);
                     if (isSummary) update.summary += addition;
                     else update.text += addition;
                 }
             }
+            // Text already streamed (and shown) that no final item covers is
+            // only an error when the server claimed to repeat the whole
+            // output.  Without that repeat, the deltas ARE the record.
+            // Function calls are still strict below: one is never run
+            // without its finished item.
             for (const auto& part : m_parts) {
-                if (!part.second.text.empty() && finalParts.count(part.first) == 0)
+                if (outputRepeated && !part.second.text.empty() && finalParts.count(part.first) == 0)
                     throw std::runtime_error("Responses completion omitted streamed content.");
             }
             for (const auto& call : m_calls) {
@@ -516,7 +614,7 @@ public:
             }
             if (toolCalls->size() > 0) {
                 update.toolCallsJson = Stringify(toolCalls);
-                update.outputJson = Stringify(output);
+                update.outputJson = Stringify(finalOutput);
             } else if (!m_visibleText) {
                 throw std::runtime_error("Responses completed without an answer. Try Low or resend the message.");
             }
@@ -548,6 +646,7 @@ private:
     };
     std::map<PartKey, Part> m_parts;
     std::map<int, Call> m_calls;    // keyed by output_index
+    std::map<int, Object::Ptr> m_doneItems;   // output_item.done, by output_index
     std::size_t m_bytes = 0;
     bool m_visibleText = false;
     bool m_terminal = false;

@@ -58,7 +58,7 @@ enum class ModelServiceChange : int
     Stopped
 };
 
-// ── Frame busy classification (Phase 3c refinement) ──────────────
+// ── Frame busy classification ────────────────────────────────────
 // What an attached frame's in-flight work depends on.  BusyLocal:
 // the session runs against the shared llama-server, so stopping or
 // restarting the process breaks it.  BusyRemote: the session is
@@ -117,11 +117,11 @@ public:
     void QueueCurrentStateTo(wxEvtHandler* handler,
                              std::weak_ptr<std::atomic<bool>> aliveToken) const;
 
-    // ── One-shot initial-server bootstrap (Chunk D) ──────────────
+    // ── One-shot initial-server bootstrap ────────────────────────
     // StartInitialServer must run once per application, not once per
     // window: the first frame consumes this and boots the model the
-    // user last had loaded; every later frame (Phase 3's New Window)
-    // sees false and simply joins the already-running server.
+    // user last had loaded; every later frame (New Window) sees false
+    // and simply joins the already-running server.
     bool ConsumeInitialBootstrap()
     {
         const bool first = !m_initialBootstrapDone;
@@ -154,13 +154,13 @@ public:
     void DetachFrameSink(wxEvtHandler* handler);
 
     // True if any attached window other than |self| is currently
-    // generating.  Powers two Phase 3c behaviors: the "your request
-    // will queue behind another window" notice at send time (llama-
-    // server runs a single slot, so a second request waits silently
-    // inside the server otherwise), and the "switching models will
-    // interrupt window X's stream" confirmation.  Pull-based on
-    // purpose: every frame already knows its own IsBusy(), so there
-    // is no generation-lifecycle bookkeeping to get wrong.
+    // generating.  Powers the "your request will queue behind another
+    // window" notice at send time (llama-server runs a single slot, so
+    // a second request waits silently inside the server otherwise), and
+    // the "switching models will interrupt window X's stream"
+    // confirmation.  Pull-based on purpose: every frame already knows
+    // its own IsBusy(), so there is no generation-lifecycle bookkeeping
+    // to get wrong.
     bool AnyOtherWindowBusy(const wxEvtHandler* self) const;
 
     // Like AnyOtherWindowBusy, but true only when the busy window's
@@ -172,15 +172,14 @@ public:
     // trigger those.
     bool AnyOtherWindowBusyOnLocalServer(const wxEvtHandler* self) const;
 
-    // ── KV slot actions, multi-window adjudicated (Phase 3c) ─────
-    // The KV fast path was designed single-window: ownership is
-    // stamped at send time, and save/restore fire /slots actions
-    // against the single server slot.  With another window mid-
-    // generation, a stamp can claim KV the slot doesn't hold yet
-    // (this request queues behind the other stream inside llama-
-    // server), a save can serialize the wrong conversation's KV
-    // under this one's cache name, and a restore can clobber the
-    // slot that stream is actively using.  These wrappers consult
+    // ── KV slot actions, multi-window adjudicated ────────────────
+    // KV slot ownership is stamped at send time, and save/restore fire
+    // /slots actions against the single server slot.  With another
+    // window mid-generation, a stamp can claim KV the slot doesn't hold
+    // yet (this request queues behind the other stream inside llama-
+    // server), a save can serialize the wrong conversation's KV under
+    // this one's cache name, and a restore can clobber the slot that
+    // stream is actively using.  These wrappers consult
     // AnyOtherWindowBusy and degrade to "no KV fast path" under
     // contention — correct by omission, the same philosophy as
     // ServerManager's own ownership guard.  |self| is the calling

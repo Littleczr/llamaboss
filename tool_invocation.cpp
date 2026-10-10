@@ -1,13 +1,10 @@
-#define _CRT_SECURE_NO_WARNINGS
-
 // tool_invocation.cpp
 //
-// Phase 2: this file used to host the IsKnownToolName / ValidateToolArgs
-// switches across all ten tools.  Both now live as ToolSpec fields
-// inside the router (see tool_router.cpp -- BuildBuiltinSpecs and the
-// per-tool ValXxx validators).  The two free-function entry points
-// declared in tool_invocation.h are kept for parser compatibility and
-// delegate to GetGlobalRouter().
+// IsKnownToolName / ValidateToolArgs live as ToolSpec fields inside the
+// router (see tool_router.cpp -- BuildBuiltinSpecs and the per-tool
+// ValXxx validators).  The two free-function entry points declared in
+// tool_invocation.h are kept for parser compatibility and delegate to
+// GetGlobalRouter().
 
 #include "tool_invocation.h"
 #include "tool_router.h"
@@ -27,10 +24,10 @@ bool ValidateToolArgs(const std::string& name,
         reasonOut = "unknown tool: " + name;
         return false;
     }
-    // A shortened old tool call copied into a new one (2026-10-01).
-    // Every protocol funnels through here (XML, slash, native after
-    // projection; native raw JSON is also checked in agent_controller),
-    // so no tool can run or write a truncated copy.
+    // A shortened old tool call copied into a new one.  Every protocol
+    // funnels through here (XML, slash, native after projection; native
+    // raw JSON is also checked in agent_controller), so no tool can run
+    // or write a truncated copy.
     if (lb_toolcall_elision::ContainsArgElisionMarker(args)) {
         reasonOut = lb_toolcall_elision::CopiedElisionRejection(args);
         return false;
@@ -38,8 +35,7 @@ bool ValidateToolArgs(const std::string& name,
     if (!spec->validate) {
         // Belt-and-braces: a registered spec without a validator is
         // treated as accept-anything-shape-wise.  All built-in specs
-        // set this; the branch exists so a future MCP-discovered
-        // tool (Phase 10) without its own validator still works.
+        // set one.
         return true;
     }
     return spec->validate(args, reasonOut);

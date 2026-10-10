@@ -2,10 +2,8 @@
 //
 // Shared Python syntax pre-check, used by both tool_write.cpp (the
 // write / overwrite_file tools) and tool_router.cpp (the
-// python_create_script tool).  Previously each TU carried its own
-// near-identical copy of this logic; a deadlock + verdict fix landed
-// in one copy but not the other, which is exactly the kind of drift a
-// single shared implementation prevents.
+// python_create_script tool).  One implementation so deadlock and
+// verdict fixes can't land in one copy but not another.
 //
 // ─── Behavior ─────────────────────────────────────────────────────
 // CheckFile compiles the file at `filePath` in memory (compile(), via

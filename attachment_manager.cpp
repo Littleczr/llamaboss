@@ -1,5 +1,3 @@
-#define _CRT_SECURE_NO_WARNINGS
-
 // attachment_manager.cpp
 // Manages pending file and image attachments for chat messages.
 // Supports multiple simultaneous attachments.
@@ -8,25 +6,14 @@
 #include "var_store.h"
 #include "path_safety.h"
 
-#include <fstream>
-#include <sstream>
-#include <algorithm>
 #include <cassert>
-#include <cctype>
 #include <initializer_list>
 
-#include <Poco/Base64Encoder.h>
 #include <Poco/Base64Decoder.h>
-#include <Poco/JSON/Object.h>
-#include <Poco/JSON/Parser.h>
-#include <Poco/JSON/Array.h>
-#include <Poco/JSON/Stringifier.h>
 #include <Poco/Logger.h>
 
 // Use wxFileName only for lightweight path queries (extension, existence, size).
 // No other wx UI dependency.
-#include <wx/filename.h>
-#include <wx/filefn.h>
 #include <wx/strconv.h>   // wxMBConvUTF16LE/BE — text attachment normalization
 
 
@@ -926,12 +913,12 @@ std::string AttachmentManager::InjectImagesIntoRequest(const std::string& reques
             }
             auto contentVar = msg->get("content");
             if (!contentVar.isString()) {
-                // Expected path since ChatHistory::BuildChatRequestJson
-                // learned to project persisted images itself (Phase 1c
-                // image carrier): the last user message already carries
-                // the multimodal content array.  Nothing to do here —
-                // this injector remains as the fallback for callers
-                // that build request bodies without the carrier pass.
+                // Expected path: ChatHistory::BuildChatRequestJson
+                // projects persisted images itself (image carrier), so
+                // the last user message already carries the multimodal
+                // content array.  Nothing to do here — this injector
+                // remains as the fallback for callers that build
+                // request bodies without the carrier pass.
                 if (m_logger)
                     m_logger->debug("InjectImagesIntoRequest: content already structured (carrier projection); skipping");
                 return requestJson;
@@ -983,7 +970,7 @@ std::string AttachmentManager::InjectImagesIntoRequest(const std::string& reques
 }
 
 // ═══════════════════════════════════════════════════════════════════
-//  Image Persistence (Phase 3)
+//  Image Persistence
 // ═══════════════════════════════════════════════════════════════════
 
 bool AttachmentManager::SaveImagesToDisk(const std::string& attachDir,

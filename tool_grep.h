@@ -1,8 +1,8 @@
 // tool_grep.h
 //
-// Implementation of the /grep slash command — Phase 3.
+// Implementation of the grep tool.
 //
-// Unlike /read and /ls, this one is THREADED: recursive search
+// Unlike read and ls, this one is THREADED: recursive search
 // across a source tree can take seconds, and we don't want to pin
 // the UI thread.  The executor lifetime follows CmdExecutor's
 // pattern exactly:

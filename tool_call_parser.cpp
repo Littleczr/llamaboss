@@ -82,8 +82,7 @@ constexpr size_t kMaxToolCallBlockBytes = 64 * 1024;
 // failed command. Re-feeding a small model (gemma-4-e4b class) a
 // multi-KB verbatim copy of its own broken block makes the broken
 // pattern the strongest signal in recent context, and the model
-// repeats it verbatim until the malformed cap trips (observed
-// 2026-06-11, three identical broken `write` calls in a row).
+// repeats it verbatim until the malformed cap trips.
 //
 // Both cut points are nudged to UTF-8 sequence boundaries so the
 // preview never contains a split multi-byte character (Poco's JSON
@@ -173,9 +172,6 @@ size_t MaxOpenMarkerBytes()
                      kOpenGemmaNative.size()});
 }
 
-// (A CloseForOpenerLen() lookup used to live here; it was superseded
-// by FindCloseMarker below, which also handles the hybrid-closer case,
-// and has been removed as dead code.)
 
 // Find the closer that pairs with a matched opener.  Most
 // <|tool_call>call:... blocks use Gemma's native <tool_call|> closer,
@@ -287,13 +283,13 @@ bool FindFirstOpenMarkerRaw(const std::string& text,
 //   </function>
 //   </tool_call>
 //
-// blend it with ours.  Observed 2026-09-30 (Qwen 27B), repeated
-// verbatim through every malformed-call coaching attempt:
+// blend it with ours, and repeat the blend verbatim through
+// malformed-call coaching:
 //
 //   <function>powershell</name>   <args>…</args>
 //   <function=powershell</name>   <args>…</args>
 //   <function>powershell</function>             (no args)
-//   <function>powershell>        <args>…</args>  (2026-09-30, later run)
+//   <function>powershell>        <args>…</args>
 //
 // The intent is unambiguous when the tag is the FIRST thing in the
 // block, carries an identifier-only name, and is followed only by a
@@ -441,8 +437,7 @@ std::string MissingNameReason(const std::string& inner)
 // so fullResponse carries the model's reasoning.  Models quote the
 // protocol while thinking ("I need to use the exact format:
 // <tool_call><name>powershell</name><args>...</args></tool_call>"),
-// and a raw search dispatched that quote as a real call (observed
-// 2026-09-30, Qwen 27B: PowerShell executed the literal "...").
+// and a raw search would dispatch that quote as a real call.
 //
 // Reasoning reaches this parser in three shapes:
 //
@@ -452,8 +447,7 @@ std::string MissingNameReason(const std::string& inner)
 //      llama-server's reasoning splitter ends reasoning_content at the
 //      first "<tool_call>" the model writes, even a mention inside its
 //      thinking.  The rest of the thought arrives as CONTENT, terminated
-//      by the model's own stray </think>.  Observed 2026-09-30 (Qwen
-//      27B): both a "..." execution and a burned malformed strike.
+//      by the model's own stray </think>.
 //
 // Shapes 2 and 3 are both "an unmatched </think> closes reasoning that
 // started somewhere before it".  The complication is legitimate calls
@@ -740,8 +734,8 @@ bool ParseInnerBlockGemmaNative(const std::string& inner,
 // Defense in depth for quoted protocol examples that no structural
 // rule can catch: a well-formed call whose whole argument is the
 // template placeholder ("..." / "ARGS") was copied from a format
-// example, never meant (observed 2026-09-30: PowerShell ran "...").
-// Reject it with coaching instead of executing it.
+// example, never meant.  Reject it with coaching instead of executing
+// it.
 void RejectPlaceholderArgs(ToolInvocation& inv)
 {
     if (!inv.valid) return;
@@ -774,21 +768,19 @@ bool ParseInnerByVariantImpl(size_t             openerLen,
             return ParseInnerBlock(inner, rawBlock, out);
         }
 
-        // Sixth observed gemma-4-e4b drift shape (2026-06-11): colon opener
-        // carrying the name, then an XML <args> body with NO <name> tag, and
-        // a proper closer:
+        // Gemma drift: colon opener carrying the name, then an XML
+        // <args> body with NO <name> tag, and a proper closer:
         //
         //   <|tool_call>call:python_run_script
         //   <args>cli_downloader.py
         //   https://example.com/...</args>
         //   </tool_call>
         //
-        // Before this branch existed, that shape fell through to the brace
-        // parser, which found no '{' and SILENTLY CLEARED ARGS — so a
-        // perfectly intelligible call dispatched with empty args and the
-        // model received a misleading "requires a filename" validation
-        // error, burning malformed-counter strikes on retries of the same
-        // form (observed: three consecutive strikes in one turn).
+        // Without this branch the shape falls through to the brace
+        // parser, which finds no '{' and SILENTLY CLEARS ARGS — so an
+        // intelligible call dispatches with empty args and the model
+        // gets a misleading "requires a filename" validation error,
+        // burning malformed-counter strikes on retries of the same form.
         size_t hybridArgsA = t.find(kArgsOpen);
         if (hybridArgsA != std::string::npos) {
             out.rawBlock = rawBlock;
@@ -943,18 +935,16 @@ bool TryRecoverTerminalGemmaHybridWithoutCloser(
 // only Gemma's colon opener, only at end-of-response, only identifier-like
 // known tool names, and only the exact stray </args> boundary shape.
 
-// Eighth observed gemma-4-e4b drift shape (2026-06-12, yt-dlp downloader
-// agent transcripts): colon-native opener, tool name ALONE on the call
-// line, multi-line argument payload laid out exactly as the XML protocol
-// teaches, but closed with a bare </args> instead of a recognized closer:
+// Gemma drift: colon-native opener, tool name ALONE on the call line,
+// multi-line argument payload laid out exactly as the XML protocol
+// teaches, but closed with a bare </args> instead of a recognized
+// closer:
 //
 //   <|tool_call>call:write\nmain.py\n<file content...>\n</args>
 //   <|tool_call>call:python_run_script\nmain.py\nhttps://youtube...\n</args>
 //
-// This was the dominant drift in the 2026-06-12 sessions: the model
-// repeated it verbatim through every malformed-call coaching attempt,
-// burning the malformed cap on write AND python_run_script turns.  The
-// intent is unambiguous when all of these hold:
+// Models repeat this shape verbatim through malformed-call coaching,
+// so it must recover.  The intent is unambiguous when all of these hold:
 //   * Gemma colon-native opener only,
 //   * terminal tail only (no recognized closer; enforced by the caller),
 //   * the call line after `call:` holds ONLY an identifier-like name
@@ -1031,9 +1021,9 @@ bool TryRecoverTerminalGemmaNewlineArgsWithArgsCloser(
     return true;
 }
 
-// Seventh observed gemma-4-e4b drift shape (2026-06-12): colon-native
-// opener with the tool name inline, then a WRONG XML-ish tag used as the
-// argument opener, and only </args> at EOS:
+// Gemma drift: colon-native opener with the tool name inline, then a
+// WRONG XML-ish tag used as the argument opener, and only </args> at
+// EOS:
 //
 //   <|tool_call>call:python_install_package<name>yt-dlp</args>
 //   <|tool_call>call:overwrite_file<path>main.py\n...content...</args>
@@ -1225,9 +1215,9 @@ bool IsWhitespaceAndStrayClosingTags(const std::string& s)
     return true;
 }
 
-// Fifth observed gemma-4-e4b drift shape (2026-06-11): colon-LESS
-// opener, perfectly well-formed XML <name>/<args> body, then a stray
-// closing tag in place of </tool_call> before EOS:
+// Gemma drift: colon-LESS opener, perfectly well-formed XML
+// <name>/<args> body, then a stray closing tag in place of
+// </tool_call> before EOS:
 //
 //   <|tool_call>call
 //   <name>write</name>
@@ -1237,10 +1227,10 @@ bool IsWhitespaceAndStrayClosingTags(const std::string& s)
 //   </name>          <-- mirror of the last tag family, not a closer
 //
 // FindCloseMarker correctly finds no closer, and the two recovery
-// shims above are gated to the colon-native opener, so this shape
-// previously surfaced as an unterminated-call error — which the model
-// then repeated verbatim until the malformed cap stopped the loop,
-// even though the payload was unambiguous.
+// shims above are gated to the colon-native opener, so without this
+// shim the shape surfaces as an unterminated-call error — which the
+// model then repeats verbatim until the malformed cap stops the loop,
+// even though the payload is unambiguous.
 //
 // Recovery scope is deliberately narrow, mirroring the shims above:
 //   * only the XML opener or the colon-less Gemma opener (the colon
@@ -1469,7 +1459,7 @@ bool ToolCallStreamDetector::Feed(const std::string& delta)
 
     m_buffer += delta;
 
-    // ── Phase 1: searching for a tool-call opener ────────────────
+    // ── Stage 1: searching for a tool-call opener ────────────────
     // Anything before the opening marker is prose. We can safely
     // publish everything up to (buffer.size - maxOpenLen + 1) as
     // prose — the trailing window is held back in case a marker is
@@ -1533,7 +1523,7 @@ bool ToolCallStreamDetector::Feed(const std::string& delta)
             m_insideBlock  = true;
             m_blockStart   = 0;
             m_openMarkerLen = openLen;
-            // fall through to Phase 2 (maybe closer already in buffer)
+            // fall through to stage 2 (maybe closer already in buffer)
         } else {
             // Hold back the last bytes in case a split opener lands
             // here (tool-call opener OR <think>); publish everything
@@ -1549,11 +1539,11 @@ bool ToolCallStreamDetector::Feed(const std::string& delta)
         }
     }
 
-    // ── Phase 2: inside a tool call, searching for the closer ────
+    // ── Stage 2: inside a tool call, searching for the closer ────
     // m_buffer is guaranteed to start with a recognized opener here.
     // The closer to look for depends on which opener was matched
     // (XML opener -> </tool_call>, gemma-native opener with colon
-    // -> <tool_call|>).  m_openMarkerLen, set in Phase 1, is the
+    // -> <tool_call|>).  m_openMarkerLen, set in stage 1, is the
     // disambiguator.
     size_t contentStart = m_openMarkerLen;
     size_t closePos = std::string::npos;

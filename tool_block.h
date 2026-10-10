@@ -1,14 +1,13 @@
 // tool_block.h
 //
-// Phase 5: Lifted out of ChatDisplay so non-UI components — the agent
-// loop, the tool dispatcher, future P6 approval cards, future P9
-// sub-agent forwarders — can construct and pass tool-block payloads
-// without depending on chat_display.h (and transitively on wx).
+// Tool-block payload, kept out of ChatDisplay so non-UI components —
+// the agent loop, the tool dispatcher, approval cards — can construct
+// and pass tool-block payloads without depending on chat_display.h
+// (and transitively on wx).
 //
-// ChatDisplay still defines `using ToolBlock = ::ToolBlock;` for
-// backward compatibility, so existing call sites that say
-// `ChatDisplay::ToolBlock` keep compiling.  New code should use the
-// global `ToolBlock` directly.
+// ChatDisplay defines `using ToolBlock = ::ToolBlock;` so call sites
+// that say `ChatDisplay::ToolBlock` keep compiling.  New code should
+// use the global `ToolBlock` directly.
 //
 // Rendering is four-part (header, echo, body, optional errorBody);
 // see chat_display.h's DisplayToolBlock comment for the semantic
@@ -33,7 +32,7 @@ struct ToolBlock {
     std::string              commandEcho;   // shown after "> " prefix
     std::string              body;          // stdout / file contents / listing
     std::string              errorBody;     // stderr / failure detail
-    std::string              bodyLang;      // reserved — Phase 3.x highlighting
+    std::string              bodyLang;      // reserved for syntax highlighting
 
     // Optional clickable file chips to render with the tool result.
     // Used for files that already exist on disk after a tool succeeds

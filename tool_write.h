@@ -1,18 +1,21 @@
 // tool_write.h
 //
-// Phase 6: file creation -- write a brand-new file under the
-// per-conversation tool CWD.
+// File creation and whole-file replacement under the allowed write
+// roots (per-conversation tool CWD, active project, Skills, chat
+// folder grants).
 //
 // WriteNewFile creates a NEW file at a path resolved against ctx.cwd.
-// It refuses every overwrite, every escape from ctx.cwd, every risky
-// executable / scriptable extension (use write_powershell_script for
-// approved .ps1 project scripts), and every input whose basename
-// does not survive path_safety::SanitizeFilename intact.  The model
-// never gets to bypass these checks via prompt -- they live in this
-// file, not in the system prompt.
+// It refuses every overwrite, every escape from the allowed write
+// roots, every risky executable / scriptable extension (use
+// write_powershell_script for approved .ps1 project scripts), and every
+// input whose basename does not survive path_safety::SanitizeFilename
+// intact.  The model never gets to bypass these checks via prompt --
+// they live in this file, not in the system prompt.
 //
 // OverwriteFileContent shares every gate above, but atomically
-// replaces an existing regular file instead of refusing it.
+// replaces an existing regular file instead of refusing it.  It
+// refuses EMPTY content for an existing non-empty file (a malformed
+// call must never truncate a file to zero bytes).
 //
 // ─── Args shape ──────────────────────────────────────────────────
 // The tool is invoked with a single <args> blob whose first line
@@ -32,14 +35,14 @@
 // newline if the content doesn't already have one. Lossless for any
 // file that already ended in a newline (the conventional case).
 //
-// Empty content (path-only args) is allowed and creates a zero-byte
-// file -- useful for marker / sentinel files.
+// For write (create-new), empty content (path-only args) is allowed
+// and creates a zero-byte file -- useful for marker / sentinel files.
 //
 // ─── Threading ───────────────────────────────────────────────────
 // Synchronous on the caller's thread.  The local SSD write itself is
 // sub-ms at our 1 MiB cap, so the bytes-to-disk path needs no
 // threading.  The one non-trivial latency is the optional Python
-// syntax pre-check (see below): for a .py/.pyw target it spawns a
+// syntax pre-check (see below): for a .py target it spawns a
 // short-lived interpreter process, which dominates the call's wall
 // time (interpreter startup, not I/O).  That subprocess is bounded by
 // a 10s timeout and its output is drained on a helper thread so a
@@ -67,15 +70,16 @@
 // user-owned .tmp file is never overwritten.
 //
 // ─── Python syntax pre-check ──────────────────────────────────────
-// When the target is a .py/.pyw file, the staged content is run
-// through an in-memory compile() syntax check before the rename.  The gate is deliberately
-// narrow: only a recognized SyntaxError / IndentationError / TabError
-// blocks the write (the staging file is deleted and the model gets the
-// compiler message back to retry).  Anything else -- no interpreter on
-// PATH, a py launcher with no usable 3.x runtime, a check that times
-// out -- is treated as "unverified" and does NOT block the write; the
-// later python_health / python_run_script step surfaces a genuine
-// runtime problem instead of this tool conflating it with bad syntax.
+// When the target is a .py file, the staged content is run through an
+// in-memory compile() syntax check before the rename.  The gate is
+// deliberately narrow: only a recognized SyntaxError / IndentationError
+// / TabError blocks the write (the staging file is deleted and the
+// model gets the compiler message back to retry).  Anything else -- no
+// interpreter on PATH, a py launcher with no usable 3.x runtime, a
+// check that times out -- is treated as "unverified" and does NOT
+// block the write; the later python_health / python_run_script step
+// surfaces a genuine runtime problem instead of this tool conflating
+// it with bad syntax.
 //
 #pragma once
 

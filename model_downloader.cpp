@@ -1,5 +1,3 @@
-#define _CRT_SECURE_NO_WARNINGS
-
 // model_downloader.cpp
 // Curated model catalog + HTTPS download dialog for LlamaBoss.
 // Models are sourced from bartowski on HuggingFace — no account required.
@@ -10,40 +8,13 @@
 #include "path_safety.h"
 #include "lb_ssl.h"
 
-#include <wx/filename.h>
-#include <wx/log.h>
-#include <wx/utils.h>   // wxGetProcessId
-
 // Poco HTTPS
-#include <Poco/Net/HTTPClientSession.h>
-#include <Poco/Net/HTTPSClientSession.h>
-#include <Poco/Net/HTTPRequest.h>
-#include <Poco/Net/HTTPResponse.h>
 #include <Poco/Net/HTTPMessage.h>
 #include <Poco/Net/NetSSL.h>
-#include <Poco/URI.h>
-#include <Poco/Exception.h>
 
-#include <fstream>
-#include <mutex>
-#include <sstream>
 #include "ui_event_post.h"
-#include <iomanip>
-#include <algorithm>
-#include <cctype>
 
-#ifdef __WXMSW__
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
-#ifdef min
-#undef min
-#endif
-#ifdef max
-#undef max
-#endif
-#endif
+#include "lb_windows.h"
 
 // ── Events ──────────────────────────────────────────────────────
 wxDEFINE_EVENT(wxEVT_DOWNLOAD_PROGRESS, wxCommandEvent);
@@ -249,19 +220,17 @@ const std::vector<DownloadableModel> ModelDownloaderDialog::kModels =
 // ═══════════════════════════════════════════════════════════════════
 //  SSL
 // ═══════════════════════════════════════════════════════════════════
-// Deliberately NOT initialized here any more. Poco's SSLManager is a
-// process singleton: this file used to call initializeClient() with
-// its own AcceptCertificateHandler, which both disabled certificate
-// verification for model downloads AND raced lb_ssl.cpp for control
-// of the same singleton (whichever ran first won, and both claimed to
-// be authoritative). DownloadThread::Entry() now calls
-// lb::EnsureSSLInitialized() like every other HTTPS path.
+// Deliberately NOT initialized here.  Poco's SSLManager is a process
+// singleton; initializing it here with a custom certificate handler
+// would race lb_ssl.cpp for control of it (and an
+// AcceptCertificateHandler would disable verification).
+// DownloadThread::Entry() calls lb::EnsureSSLInitialized() like every
+// other HTTPS path.
 //
-// Remaining hardening for downloads specifically: publish SHA-256
-// hashes alongside the curated catalog entries and verify the
-// completed file before renaming it off .download. Transport
-// authenticity now holds; content authenticity would be the second
-// layer.
+// Possible further hardening for downloads: publish SHA-256 hashes
+// alongside the curated catalog entries and verify the completed file
+// before renaming it off .download.  Transport authenticity holds;
+// content authenticity would be the second layer.
 
 static bool QuietRemoveFileUtf8(const std::string& path)
 {
@@ -340,8 +309,8 @@ static bool PromoteDownloadUtf8(const std::string& tempPath,
     wxLogNull noLog;
 
     // Non-Windows fallback: wxRenameFile(..., true) requests overwrite without
-    // pre-deleting the destination. This keeps the old behavior portable while
-    // avoiding the destructive remove-first sequence.
+    // pre-deleting the destination, avoiding a destructive remove-first
+    // sequence.
     if (wxRenameFile(wxString::FromUTF8(tempPath),
                      wxString::FromUTF8(destPath),
                      true)) {
@@ -1273,8 +1242,7 @@ void ModelDownloaderDialog::OnDownloadClicked(size_t idx)
 
     // Weights already on disk and only the projector missing (a failed
     // or cancelled vision stage, now or in an earlier session): resume
-    // at the projector.  Retry used to re-download the multi-GB weights
-    // first.
+    // at the projector instead of re-downloading the multi-GB weights.
     if (!model.mmprojFilename.empty() &&
         IsWeightsDownloaded(model) && !IsProjectorDownloaded(model)) {
         wxFileName mmFn = wxFileName::FileName(
@@ -1358,9 +1326,8 @@ bool ModelDownloaderDialog::StartMmprojStage(size_t idx)
         m_cancelFlag.reset();
         m_downloadingMmproj = false;
         m_activeRow = -1;
-        // Not complete: the old code marked the row "✓ Downloaded" here
-        // and told the user to "retry later", with no retry path.  The
-        // weights stay on disk, so Retry fetches only the projector.
+        // Not complete: don't mark the row "✓ Downloaded".  The weights
+        // stay on disk, so Retry fetches only the projector.
         SetRowError(idx, "vision component could not start. The model "
                          "works for text; Retry fetches only the vision part.");
         return false;
@@ -1463,8 +1430,8 @@ void ModelDownloaderDialog::OnDownloadComplete(wxCommandEvent& ev)
     // weights, not what gets loaded by name). Then start a 1-second
     // timer so the user has a beat to register the "✓ Downloaded
     // successfully" state before the dialog closes itself and the
-    // caller kicks off model load. Non-first-run mode is unaffected —
-    // those users dismiss the dialog manually as before.
+    // caller kicks off model load. Outside first-run mode the user
+    // dismisses the dialog manually.
     if (m_firstRunMode) {
         m_downloadedPath = BuildDestPath(kModels[idx]);
         m_autoCloseTimer.StartOnce(1000);

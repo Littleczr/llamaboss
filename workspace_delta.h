@@ -4,28 +4,27 @@
 // run-style tool executes (PowerShell command, script run), diff it
 // afterwards, and format a model-facing "[workspace changes]" manifest.
 //
-// Why this exists (2026-06-11): a PowerShell Compress-Archive command
-// silently matched zero files (the Get-ChildItem -Include footgun),
-// exited 0 with no output, and a small local model then told the user
-// "the file is attached above" — patterned on the write tool's artifact
-// cards — when no file existed at all. The harness gave the model no
-// ground truth about file-system effects, so it confabulated one.
-// Detected changes are named and created files can be attached as
-// PresentedFile cards. Complete scans with no detected changes stay
-// quiet; expected output files must still be verified before claiming
-// success. Incomplete scans retain an explicit cap notice.
+// Why: without ground truth about file-system effects, a model whose
+// command silently matched zero files (the Get-ChildItem -Include
+// footgun) and exited 0 will tell the user "the file is attached
+// above" — patterned on the write tool's artifact cards — when no file
+// exists at all.  Detected changes are named and created files can be
+// attached as PresentedFile cards. Complete scans with no detected
+// changes stay quiet; expected output files must still be verified
+// before claiming success. Incomplete scans retain an explicit cap
+// notice.
 //
 // Scope is deliberately the conversation workspace folder only:
 // cheap, bounded, and where run-style tools are expected to place
 // their outputs. Callers must not pass broad roots like %USERPROFILE%.
 //
 // The python_run_script auto-artifact scanner in python_runner.cpp
-// predates this header and keeps its own multi-root snapshot; this
-// header is the equivalent for tools that had nothing (PowerShell).
+// keeps its own multi-root snapshot; this header is the equivalent for
+// PowerShell.
 //
-// Windows implementation mirrors the proven FindFirstFileW pattern
-// from python_runner.cpp. A POSIX branch exists solely so the logic
-// can be unit-tested off-Windows; it is not used by the app.
+// Windows implementation mirrors the FindFirstFileW pattern from
+// python_runner.cpp. A POSIX branch exists solely so the logic can be
+// unit-tested off-Windows; it is not used by the app.
 //
 #pragma once
 
@@ -35,10 +34,7 @@
 #include <vector>
 
 #ifdef _WIN32
-    #ifndef WIN32_LEAN_AND_MEAN
-        #define WIN32_LEAN_AND_MEAN
-    #endif
-    #include <windows.h>
+    #include "lb_windows.h"
 #else
     #include <dirent.h>
     #include <sys/stat.h>
@@ -103,6 +99,11 @@ inline bool ShouldSkipScanDir(const std::string& name)
            key == ".pytest_cache" ||
            key == "__pycache__" ||
            key == "node_modules" ||
+           // vcpkg manifest-mode dependency trees (sources, build trees,
+           // packages): tens of thousands of files, enough to hit the
+           // 2000-entry cap on every PowerShell call when a project is
+           // built inside a chat Workspace.
+           key == "vcpkg_installed" ||
            key == ".venv" ||
            key == "venv" ||
            key == "env" ||

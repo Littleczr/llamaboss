@@ -5,14 +5,6 @@
 // ChatHistory through the held unique_ptr reference.
 #include "project_context_builder.h"
 
-#include <wx/wx.h>
-
-#include <algorithm>
-#include <filesystem>
-#include <functional>
-#include <system_error>
-#include <vector>
-
 #include "chat_history.h"
 #include "lb_string_utils.h"   // ProjectSource_HumanBytes
 #include "skill_authoring_support.h"   // LbReadSkillFrontmatterDescription
@@ -206,14 +198,15 @@ void ProjectContextBuilder::AppendSkillsBlock(std::ostringstream& p) const
             // frontmatter description so the model can pick the right
             // skill from the list without reading every contract.  The
             // full SKILL.md is still read on use (grounding rule above).
-            // Legacy skills without frontmatter return empty and print
-            // nothing.  Cache safety: this runs only on context-cache
-            // rebuilds, and FingerprintItems already mixes each SKILL.md
-            // mtime into the signature, so an edited description
-            // invalidates the cached prompt.
-            // 500 matches the authoring contract (skill_prompt_builder.cpp asks
-            // for descriptions "under 500 characters").  The old 300 default cut
-            // the trailing "Do not use for..." clauses that disambiguate skills.
+            // Skills without frontmatter return empty and print nothing.
+            // Cache safety: this runs only on context-cache rebuilds, and
+            // FingerprintItems already mixes each SKILL.md mtime into the
+            // signature, so an edited description invalidates the cached
+            // prompt.
+            // 500 matches the authoring contract (skill_prompt_builder.cpp
+            // asks for descriptions "under 500 characters"); a shorter cap
+            // would cut the trailing "Do not use for..." clauses that
+            // disambiguate skills.
             const std::string description =
                 LbReadSkillFrontmatterDescription(skill.path, 500);
             if (!description.empty()) {

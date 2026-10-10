@@ -9,24 +9,13 @@
 #include "lb_scroll_rail.h"
 #include "path_safety.h"
 
-#include <wx/dir.h>
-#include <wx/filename.h>
-#include <wx/dnd.h>
 #include <wx/dataobj.h>
-#include <wx/dcbuffer.h>
 #include <wx/dcclient.h>
 
-#include <fstream>
-#include <algorithm>
-#include <cctype>
 #include <array>
-#include <cstdint>
 #include <ctime>
-#include <cstdlib>
 
-#ifdef __WXMSW__
-#include <windows.h>   // GetFileAttributesExW — cheap stat in ScanConversations
-#endif
+#include "lb_windows.h"   // GetFileAttributesExW — cheap stat in ScanConversations
 
 namespace {
 
@@ -35,8 +24,7 @@ namespace {
 //   \"  \\  \/  \b  \f  \n  \r  \t
 // Whitespace-control escapes (\b \f \n \r \t) collapse to a single
 // space because the sidebar shows titles on one line -- letting a real
-// newline through would make wxStaticText render a multi-line label,
-// which is uglier than the literal-`\n` artifact we are fixing.
+// newline through would make wxStaticText render a multi-line label.
 // Unknown escapes drop the backslash and keep the following character,
 // matching the lenient behaviour of most JSON readers.
 //
@@ -269,9 +257,7 @@ wxColour MixSidebarColour(const wxColour& first,
 // ── Monospace type: the sidebar's half of the LlamaBoss terminal idiom ──
 // The rest of the app (project status strip, context meter, model pill,
 // chat body) is teletype-faced via AppState::CreateMonospaceFont / explicit
-// wxFONTFAMILY_TELETYPE "Consolas" fonts.  The sidebar previously used the
-// stock proportional GetFont(), which is what made the redesigned cards read
-// as generic rather than as part of this app.  We can't reach AppState from
+// wxFONTFAMILY_TELETYPE "Consolas" fonts.  We can't reach AppState from
 // here (the sidebar only holds a ThemeData*), so mirror the same idiom
 // locally: wxFONTFAMILY_TELETYPE guarantees a monospace fallback even when the
 // named face is absent, and "Cascadia Mono" / "Consolas" both ship on modern
@@ -330,7 +316,7 @@ wxColour SidebarCardBackground(const ThemeData& theme)
 std::uint32_t SidebarStableHash(const std::string& value)
 {
     // FNV-1a gives project colors that remain stable across launches and
-    // machines without introducing a new persisted color field in Phase 3.
+    // machines without a persisted color field.
     std::uint32_t hash = 2166136261u;
     for (unsigned char ch : value) {
         hash ^= static_cast<std::uint32_t>(ch);
@@ -972,11 +958,9 @@ void ConversationSidebar::Refresh(const std::string& activeFilePath)
     UpdateArchiveButton();
 
     // ── Primary grouping: project / Unassigned ───────────
-    // Phase 3 deliberately keeps project headers as the primary containers.
-    // They own collapse state, context menus, and drag/drop destinations.
-    // Time sections are nested beneath them, which adds the mockup's useful
-    // Today/Yesterday hierarchy without regressing any existing project
-    // workflow.
+    // Project headers are the primary containers.  They own collapse
+    // state, context menus, and drag/drop destinations.  Time sections
+    // (Today/Yesterday/...) are nested beneath them.
     struct Group {
         std::string id;
         std::string displayName;
@@ -1093,9 +1077,7 @@ void ConversationSidebar::Refresh(const std::string& activeFilePath)
         ++sizerIdx;
     };
 
-    // The unused Pinned bucket is intentionally first.  Phase 4 only needs
-    // to persist/toggle ConversationEntry::pinned; the layout and search
-    // plumbing are already prepared here.
+    // The Pinned bucket is intentionally first.
     static const std::array<std::string, 5> kDateBucketOrder = {
         "pinned", "today", "yesterday", "previous7", "older"
     };
@@ -1557,11 +1539,18 @@ void ConversationSidebar::ApplyRowAppearance(RowWidgets& row, bool hovered)
         ? ((active || selected) ? 34 : (hovered ? 22 : 15))
         : ((active || selected) ? 50 : (hovered ? 34 : 26));
     const wxColour iconBg = MixSidebarColour(cardBg, projectAccent, iconWeight);
-    const wxColour iconFg = (active || selected)
-        ? wxColour(255, 255, 255)
-        : (neutral
-            ? m_theme->textMuted
-            : MixSidebarColour(projectAccent, m_theme->textPrimary, 16));
+    // Hovered chevron: unassigned rows light up in the shared interactive
+    // accent (same as [ Skills ], the ctx meter and the toolbar icons);
+    // project rows brighten their own project colour so the hue still
+    // identifies the project.  Active/selected keeps white on the accent.
+    wxColour iconFg;
+    if (active || selected)
+        iconFg = wxColour(255, 255, 255);
+    else if (neutral)
+        iconFg = hovered ? LbInteractiveAccent(*m_theme) : m_theme->textMuted;
+    else
+        iconFg = MixSidebarColour(projectAccent, m_theme->textPrimary,
+                                  hovered ? 45 : 16);
 
     if (row.iconPanel)
         row.iconPanel->SetBackgroundColour(iconBg);
@@ -1597,10 +1586,16 @@ void ConversationSidebar::ApplyRowAppearance(RowWidgets& row, bool hovered)
         // dots only for the active/selected/hovered row.  This avoids visual
         // clutter without reintroducing the Windows Show()/Hide() layout and
         // repaint problems that originally made the dots unreliable.
+        // The dots themselves turn the interactive accent only while the
+        // pointer is directly over them (like [ Skills ] and the toolbar
+        // icons); merely hovering the row keeps them textPrimary.
         const bool showActions = hovered || active || selected;
+        const bool menuHot = showActions && !m_menuHoverPath.empty() &&
+                             m_menuHoverPath == row.filePath;
         row.menuBtn->SetBackgroundColour(cardBg);
         row.menuBtn->SetForegroundColour(
-            showActions ? m_theme->textPrimary : cardBg);
+            menuHot     ? LbInteractiveAccent(*m_theme)
+            : showActions ? m_theme->textPrimary : cardBg);
         if (!row.menuBtn->IsShown())
             row.menuBtn->Show();
     }
@@ -1877,20 +1872,19 @@ ConversationSidebar::ScanConversations()
 
         // ── Cheap stat ───────────────────────────────────────────
         // Cache key uses millisecond-resolution mtime (NTFS file times are
-        // sub-second) plus the file size.  GetTicks() was seconds-only, so a
-        // second save inside the same wall-clock second produced an identical
-        // key and the sidebar reused stale title/project metadata.  The size
-        // is a belt-and-suspenders change check that holds even where the
+        // sub-second) plus the file size.  Seconds-only resolution would let
+        // a second save inside the same wall-clock second produce an
+        // identical key and reuse stale title/project metadata.  The size is
+        // a belt-and-suspenders change check that holds even where the
         // filesystem mtime can't resolve sub-second.
         //
-        // On MSW this used to be wxFileName::GetTimes() + GetSize() — each
-        // opens a file handle (CreateFile), so every sidebar refresh paid
-        // TWO handle opens per conversation, and Refresh runs once per
-        // completed turn (AutoSaveConversation → Refresh).  With hundreds
-        // of conversations plus Defender in the open path, that stacked a
-        // few ms onto the same end-of-turn moment as the autosave itself.
         // GetFileAttributesExW returns size + last-write time in a single
-        // metadata query with no handle open.
+        // metadata query with no handle open.  wxFileName::GetTimes() +
+        // GetSize() would open TWO handles per conversation on every
+        // refresh, and Refresh runs once per completed turn
+        // (AutoSaveConversation → Refresh); with hundreds of conversations
+        // plus Defender in the open path, that stacks a few ms onto the
+        // end-of-turn moment.
         long long          thisMtimeMs = 0;
         unsigned long long thisSize    = 0;
 #ifdef __WXMSW__
@@ -2083,9 +2077,9 @@ ConversationSidebar::ScanConversations()
                     while (std::getline(file, line)) {
                         if (!scanningMessagesForLegacyTitle &&
                             line.find("\"messages\"") != std::string::npos) {
-                            // Normal files stop at the message array exactly as
-                            // before.  Legacy session-context titles get one
-                            // narrow fallback scan for the first user message.
+                            // Normal files stop at the message array.
+                            // Legacy session-context titles get one narrow
+                            // fallback scan for the first user message.
                             if (!IsLegacySessionContextTitle(entry.title)) break;
                             scanningMessagesForLegacyTitle = true;
                             continue;
@@ -2167,8 +2161,7 @@ ConversationSidebar::ScanConversations()
             // ONLY when updated_at actually parsed — otherwise entry.modTime
             // still holds the filesystem mtime, and writing that here would
             // make the field's ">0 means real activity clock" contract lie,
-            // re-seeding mtime into date bucketing on the next cache hit
-            // (the exact bug this fix closes).
+            // re-seeding mtime into date bucketing on the next cache hit.
             m_metaCache[entry.filePath] = {
                 entry.title, entry.projectId, entry.projectName,
                 entry.pinned, entry.archived,
@@ -2723,7 +2716,7 @@ ConversationSidebar::CreateRow(const ConversationEntry& entry)
     // A zero horizontal minimum lets the title surrender space to the fixed
     // action slot instead of pushing the dots beyond the clipped card edge.
     // Native clipping is intentional here: the full title remains available
-    // through the tooltip, and the row no longer displays a second "..."
+    // through the tooltip, and the row doesn't display a second "..."
     // beside the conversation-actions control.
     row.titleLabel->SetMinSize(wxSize(0, -1));
     // Title in the app's teletype face, bold for hierarchy against the muted
@@ -2936,8 +2929,33 @@ ConversationSidebar::CreateRow(const ConversationEntry& entry)
         target->Bind(wxEVT_ENTER_WINDOW, enterHandler);
         target->Bind(wxEVT_LEAVE_WINDOW, leaveHandler);
     }
-    row.menuBtn->Bind(wxEVT_ENTER_WINDOW, enterHandler);
-    row.menuBtn->Bind(wxEVT_LEAVE_WINDOW, leaveHandler);
+    // The "..." control tracks its own hover so the dots can light up in the
+    // accent while the pointer is directly on them.  Leaving the dots but
+    // staying on the card repaints the row as hovered (dots back to
+    // textPrimary); leaving the card entirely clears the row hover.
+    row.menuBtn->Bind(wxEVT_ENTER_WINDOW,
+        [panel = row.panel, this](wxMouseEvent&) {
+            const std::string path = panel->GetName().ToUTF8().data();
+            m_menuHoverPath = path;
+            auto it = m_rows.find(path);
+            if (it != m_rows.end())
+                ApplyRowAppearance(it->second, true);
+        });
+    row.menuBtn->Bind(wxEVT_LEAVE_WINDOW,
+        [panel = row.panel, this](wxMouseEvent&) {
+            const std::string path = panel->GetName().ToUTF8().data();
+            if (m_menuHoverPath == path)
+                m_menuHoverPath.clear();
+            panel->CallAfter([panel, this]() {
+                if (!panel) return;
+                const std::string p = panel->GetName().ToUTF8().data();
+                auto it = m_rows.find(p);
+                if (it == m_rows.end()) return;
+                const bool stillOnCard =
+                    panel->GetScreenRect().Contains(wxGetMousePosition());
+                ApplyRowAppearance(it->second, stillOnCard);
+            });
+        });
 
     return row;
 }
@@ -3000,9 +3018,9 @@ void ConversationSidebar::UpdateRow(RowWidgets& row,
 //  Internal — context menu for selected conversation(s)
 // ═══════════════════════════════════════════════════════════════════
 //
-// The sidebar no longer builds the menu itself.  It just hands the
-// selection (and an anchor window) up to the frame, which has the
-// project metadata it needs to build a Move-to-project submenu.
+// The sidebar doesn't build the menu itself.  It hands the selection
+// (and an anchor window) up to the frame, which has the project
+// metadata it needs to build a Move-to-project submenu.
 
 void ConversationSidebar::ShowContextMenu(const std::string& filePath)
 {

@@ -1,10 +1,10 @@
 // tool_approval.h
 //
-// Phase 6: Approval Cards -- small, header-only gate shared by
-// the slash path (MyFrame) and the agent path (AgentController).
+// Approval Cards -- small, header-only gate shared by the slash path
+// (MyFrame) and the agent path (AgentController).
 //
 // This layer deliberately sits BEFORE DispatchInvocation.  The
-// actual tools keep their existing sandbox / policy checks; approval
+// actual tools keep their own sandbox / policy checks; approval
 // only pauses risky intent so the user can explicitly allow or deny
 // it.  Approval cards are UI-only and are not written to chat history.
 //
@@ -39,34 +39,31 @@ namespace tool_approval {
 using RiskTier = ::RiskTier;
 
 // ═══════════════════════════════════════════════════════════════════
-//  Risk tiering — Phase 3 (consolidated via ToolSpec.safety.tier)
+//  Risk tiering (ToolSpec.safety.tier)
 // ═══════════════════════════════════════════════════════════════════
 //
-// RequiresApproval used to walk a per-tool if/else ladder where each
-// branch hard-coded "needs approval" for tools that touched the
-// filesystem.  That worked when /approve was the trust mechanism.
-// Once conversational consent matured (the model self-asks "want me
-// to do X?" and the user replies in prose), that ladder produced
-// double-prompts: model asks, user says yes, system ALSO renders an
-// approval card asking the same thing.
-//
-// The tier system replaces that ladder.  Each tool is classified
-// ONCE on its ToolSpec.safety.tier (see tool_safety.h and the
-// BuildBuiltinSpecs registrations in tool_router.cpp).  ClassifyTier
-// is now a one-line lookup against the global router; it exists
-// purely to keep older call sites compiling.  New code should read
+// Each tool is classified ONCE on its ToolSpec.safety.tier (see
+// tool_safety.h and the BuildBuiltinSpecs registrations in
+// tool_router.cpp).  ClassifyTier is a one-line lookup against the
+// global router kept for older call sites; new code should read
 // spec.safety.tier directly.  RequiresApproval renders an approval
-// card only for the Dangerous tier.  Safe and Moderate tools rely
-// on:
+// card only for the Dangerous tier.  Safe and Moderate tools rely on:
 //   - in agent mode  : the model's natural-language ask + user "yes"
 //   - in slash mode  : the user having literally typed the command
+// so the user isn't asked twice (model asks, user says yes, card asks
+// again).
+//
+// Because Moderate tools run without a card, a Moderate tool must never
+// be able to combine with another approval-free tool into arbitrary
+// code execution (e.g. write a script, then run it).  Anything that
+// executes code chosen by the model belongs in Dangerous.
 //
 // PowerShell is conditional: clearly read-only commands stay outside
 // the approval-card path, while broader syntactically usable commands
 // are routed here by command_policy.cpp for explicit review.
 //
-// The RiskTier enum itself now lives in tool_safety.h so the
-// ToolSafetyProfile struct can carry it as a field.
+// The RiskTier enum lives in tool_safety.h so the ToolSafetyProfile
+// struct can carry it as a field.
 
 inline RiskTier ClassifyTier(const std::string& toolName)
 {
@@ -158,11 +155,8 @@ inline std::string CommandEcho(const ToolInvocation& inv)
 inline std::string ToolDisplayName(const std::string& name)
 {
     // Single source of truth: ToolSpec.displayName, populated by the
-    // kPresentation table in tool_router.cpp.  The per-tool if-ladder
-    // that used to live here was one of three hand-maintained copies
-    // of the same mapping (with HandlePythonComplete's ternary ladder
-    // and the dispatch bodies' PreFill literals) and could silently
-    // drift.  Fallback mirrors the old ladder's default.
+    // kPresentation table in tool_router.cpp, so the mapping can't
+    // drift between call sites.
     const ToolSpec* spec = GetGlobalRouter().Find(name);
     if (spec && !spec->displayName.empty()) return spec->displayName;
     return name.empty() ? std::string("Tool") : name;
@@ -450,8 +444,10 @@ inline std::string PreviewForInvocation(const ToolInvocation& inv,
         p << "Target Python script: " << targetOut << "\n"
           << "Conversation Scripts fallback: " << ScriptPreviewPath(inv.args, ctx.cwd) << "\n"
           << "Working directory: " << ctx.cwd << "\n"
-          << "Runs one existing .py script from the fixed conversation Scripts folder, or an optional .py helper script from the active project's Workflows folder. "
-          << "Captures stdout, stderr, exit code, runtime, and attaches newly created files under the LlamaBoss root as artifact cards. No command-line arguments, package installs, or automatic sends in this phase.";
+          << "Runs one existing .py script from the conversation Scripts folder, the active project's Workflows folder, or the LlamaBoss Skills folder (bare names are looked up in that order). "
+          << "Configured Connection API keys are injected as environment variables. "
+          << "Captures stdout, stderr, exit code, runtime, and attaches newly created files under the LlamaBoss root as artifact cards.\n\n"
+          << "Request:\n" << LimitText(Trim(inv.args), 600);
         return p.str();
     }
 
@@ -647,6 +643,10 @@ inline bool RequiresApproval(const ToolInvocation& inv,
     else if (inv.name == tool_names::kWritePowerShellScript) {
         out.required = true;
         out.reason = "Creates or replaces a PowerShell .ps1 script. The script is written but not executed; review the source before approving.";
+    }
+    else if (inv.name == tool_names::kPythonRunScript) {
+        out.required = true;
+        out.reason = "Runs a Python script with full local file and network access. Every configured Connection API key is injected into its environment. Scripts in the project Workflows and Skills folders can be changed by write/overwrite_file/edit without approval, so review the script before approving.";
     }
     else if (inv.name == tool_names::kPy) {
         out.required = true;

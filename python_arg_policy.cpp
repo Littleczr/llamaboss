@@ -2,10 +2,6 @@
 
 #include "python_arg_policy.h"
 
-#include <algorithm>
-#include <cctype>
-#include <string>
-
 namespace {
 
 std::string LowerAscii(std::string s)

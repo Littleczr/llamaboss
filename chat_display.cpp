@@ -5,29 +5,15 @@
 #include "ascii_animation.h"
 #include "theme.h"
 #include "path_safety.h"
-#include <wx/clipbrd.h>
 #include <wx/caret.h>
-#include <wx/filedlg.h>
 #include <wx/file.h>
-#include <wx/filefn.h>
-#include <wx/filename.h>
 #include <wx/msgdlg.h>
 #include <wx/menu.h>       // image thumbnail context menu
 #include <wx/statbmp.h>    // image viewer lightbox
 #include <wx/dialog.h>     // image viewer lightbox
 #include "image_lightbox.h" // shared full-size image viewer
-#include <wx/utils.h>
-#include <wx/stdpaths.h>   // thumbnail cache location
-#include <wx/log.h>        // wxLogNull around cache reads
-#include <algorithm>
-#include <cctype>
-#include <cstdio>
-#include <sstream>
-#include <vector>
 
-#ifdef __WXMSW__
-#include <windows.h>       // thumbnail cache prune enumeration
-#endif
+#include "lb_windows.h"       // thumbnail cache prune enumeration
 
 namespace {
 
@@ -52,13 +38,12 @@ void HideRichTextCaret(wxRichTextCtrl* ctrl)
 // ═══════════════════════════════════════════════════════════════════
 //  Thumbnail cache
 // ═══════════════════════════════════════════════════════════════════
-// Opening a conversation containing images used to decode every original
-// file at full resolution and box-filter it down to the display cap, on
-// the UI thread, inside the frozen replay batch — tens of ms per image
-// for the 1–2K px files image models emit, paid on EVERY open.  The
-// first render still pays that cost once; the scaled result is then
-// saved as a small PNG under %LOCALAPPDATA%\LlamaBoss\thumbcache and
-// every later replay loads the thumbnail instead.
+// Decoding every original image at full resolution and box-filtering it
+// down to the display cap costs tens of ms per image on the UI thread
+// for the 1–2K px files image models emit.  The first render pays that
+// cost once; the scaled result is then saved as a small PNG under
+// %LOCALAPPDATA%\LlamaBoss\thumbcache and every later replay loads the
+// thumbnail instead.
 //
 // Cache key: FNV-1a hash of (absolute path | mtime ms | size | target
 // box).  Any change to the original file or to the display cap yields a
@@ -1235,13 +1220,12 @@ void ChatDisplay::HandleToolBlockAffordanceClick(size_t idx)
     if (idx >= m_toolBlocks.size()) return;
     ToolBlockRegion& r = m_toolBlocks[idx];
 
-    // NOTE: We previously wrapped the toggle in Freeze()/Thaw() to
-    // batch redraws on long bodies, but that caused stray characters
-    // to leak from the old affordance label into the doc — a known
-    // wxRichTextCtrl quirk with mutations across paragraph boundaries
-    // inside a frozen control.  Letting the control redraw normally
-    // between operations sidesteps it.  The flicker cost on long
-    // bodies is acceptable for a click-driven (not auto) operation.
+    // Don't wrap the toggle in Freeze()/Thaw(): wxRichTextCtrl leaks
+    // stray characters from the old affordance label into the doc when
+    // mutations cross paragraph boundaries inside a frozen control.
+    // Letting the control redraw normally between operations sidesteps
+    // it.  The flicker cost on long bodies is acceptable for a
+    // click-driven (not auto) operation.
 
     if (r.expanded) {
         // ── Collapse ──
@@ -1694,10 +1678,10 @@ void ChatDisplay::DisplaySystemNotice(const std::string& text)
 }
 
 // ─── Generic tool-result block ──────────────────────────────────
-// One rendering path for /cmd today and /read, /ls, /grep, and the
-// Phase 4 agent harness tomorrow.  Header + echo + body + errorBody
-// are all independently optional; e.g. /ls has no errorBody on
-// success, /read may have no echo on a repeat invocation, etc.
+// One rendering path for every tool result, slash or agent.  Header +
+// echo + body + errorBody are all independently optional; e.g. ls has
+// no errorBody on success, read may have no echo on a repeat
+// invocation, etc.
 bool ChatDisplay::IsToolBlockFailure(const ToolBlock& block)
 {
     // Any stderr output is treated as failure — covers PowerShell

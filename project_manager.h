@@ -3,8 +3,8 @@
 //
 // Projects foundation.  A Project is a long-lived user folder
 // under %USERPROFILE%\LlamaBoss\Projects that can be attached to one or
-// more conversations.  Phase 2 loads PROJECT.md as the trusted project
-// contract; workflows and skills still come later.
+// more conversations.  PROJECT.md is the trusted project contract;
+// Sources, Workflows, and the global Skills lane are managed here too.
 
 #include <string>
 #include <vector>
@@ -66,7 +66,7 @@ public:
                               std::string& outError);
 
     // List projects that have project.json metadata.  Folders without
-    // project.json are ignored in Phase 1 to avoid guessing user intent.
+    // project.json are ignored to avoid guessing user intent.
     static std::vector<ProjectInfo> ListProjects();
 
     static bool LoadProjectByRoot(const std::string& rootPath,
@@ -85,8 +85,8 @@ public:
     static std::string ProjectSourcesPath(const std::string& rootPath);
     static std::string ProjectWorkflowsPath(const std::string& rootPath);
 
-    // Projects Phase 3: copy user-selected long-lived source files into
-    // Sources/ and expose a lightweight file listing to the prompt.
+    // Copy user-selected long-lived source files into Sources/ and
+    // expose a lightweight file listing to the prompt.
     static bool CopyFilesToProjectSources(const std::string& rootPath,
                                           const std::vector<std::string>& sourcePaths,
                                           std::vector<ProjectSourceInfo>& outCopied,
@@ -96,25 +96,25 @@ public:
     static std::vector<ProjectSourceInfo> ListProjectSources(const std::string& rootPath,
                                                              std::size_t maxItems = 50);
 
-    // Projects Phase 4: resolve a user/model-supplied source reference
-    // against Sources/.  Supports exact filename, Sources/<name>, stem-only,
-    // and unique case-insensitive partial matches. Returns false when there
-    // is no match or the reference is ambiguous.
+    // Resolve a user/model-supplied source reference against Sources/.
+    // Supports exact filename, Sources/<name>, stem-only, and unique
+    // case-insensitive partial matches. Returns false when there is no
+    // match or the reference is ambiguous.
     static bool ResolveProjectSource(const std::string& rootPath,
                                      const std::string& requested,
                                      ProjectSourceInfo& outSource,
                                      std::string& outError);
 
-    // Projects Phase 5: lightweight workflow files live in Workflows/.
-    // A workflow is a Markdown instruction/plan file, not a separate engine.
+    // Lightweight workflow files live in Workflows/.  A workflow is a
+    // Markdown instruction/plan file, not a separate engine.
     static bool CreateProjectWorkflow(const std::string& rootPath,
                                       const std::string& workflowName,
                                       ProjectWorkflowInfo& outWorkflow,
                                       std::string& outError);
 
-    // Projects Phase 5.5: optional project workflow helper script. The
-    // workflow remains a Markdown plan; the .py file is an optional helper
-    // that can be run with python_run_script from an active project.
+    // Optional project workflow helper script. The workflow remains a
+    // Markdown plan; the .py file is an optional helper that can be run
+    // with python_run_script from an active project.
     static bool CreateProjectWorkflowWithScript(const std::string& rootPath,
                                                 const std::string& workflowName,
                                                 ProjectWorkflowInfo& outWorkflow,
@@ -137,9 +137,9 @@ public:
                                              ProjectWorkflowScriptInfo& outScript,
                                              std::string& outError);
 
-    // Projects Phase 2: load the trusted project contract from PROJECT.md.
-    // The body is capped so a very large project file cannot crowd out the
-    // rest of the chat/tool prompt. outStatus is informational, for example
+    // Load the trusted project contract from PROJECT.md.  The body is
+    // capped so a very large project file cannot crowd out the rest of
+    // the chat/tool prompt. outStatus is informational, for example
     // when PROJECT.md is missing, blank, unreadable, or truncated.
     static bool ReadProjectInstructions(const std::string& rootPath,
                                         std::string& outText,

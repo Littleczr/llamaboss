@@ -1,6 +1,6 @@
 // tool_edit.h
 //
-// Phase 7: edit an existing file by find/replace.
+// Edit an existing file by find/replace.
 //
 // EditFile reads a file, finds exactly one occurrence of OLD, replaces
 // it with NEW, and writes the result back atomically.  The file must
@@ -62,18 +62,15 @@
 // auditable from a single tool_call block.
 //
 // ─── Line endings ────────────────────────────────────────────────
-// File on disk may be CRLF (the Windows convention -- and the
-// shape of every existing source file in the LlamaBoss tree),
-// LF-only, or mixed.  The model emits LF.  Naive matching breaks
-// every multi-line edit on a CRLF file.
+// File on disk may be CRLF (the Windows convention), LF-only, or
+// mixed.  The model emits LF.  Naive matching breaks every
+// multi-line edit on a CRLF file.
 //
-// Strategy: detect the file's dominant line ending by counting
-// CRLF sequences vs lone LFs.  Normalize file content, OLD, and
-// NEW to LF for matching.  After substitution, convert the result
-// back to the file's native ending before writing.  Files with
-// mixed endings get the dominant ending applied uniformly -- a
-// tradeoff that prefers internal consistency over perfect
-// preservation of pre-existing inconsistency.
+// Strategy: match OLD against an LF view of the file that carries an
+// offset map back into the original bytes (ToLfWithMap), then splice
+// the replacement into the ORIGINAL bytes, converting NEW to the
+// ending used around the match.  Lines outside the match keep their
+// endings exactly, so mixed-ending files are not normalized.
 //
 // ─── Atomicity ───────────────────────────────────────────────────
 // Same unique sibling staging-file + MoveFileExW pattern as

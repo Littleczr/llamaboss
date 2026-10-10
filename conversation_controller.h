@@ -97,10 +97,12 @@ public:
     // Save one conversation as a readable Markdown transcript (.md, or the
     // same text as .txt).  Read-only: works for the active chat, chats
     // open in other windows, and archived chats; never modifies the JSON.
-    void ExportConversation(const std::string& path);
+    // withMetrics appends a "## Metrics" section built from the chat
+    // folder's turn_stats.tsv and ctx_calibration.tsv (export_metrics.h).
+    void ExportConversation(const std::string& path, bool withMetrics = false);
 
     // ── Batch delete ─────────────────────────────────────────────
-    // Paths open in another window are skipped (Phase 3b guard).
+    // Paths open in another window are skipped.
     void DeleteConversations(const std::vector<std::string>& requestedPaths);
 
     // ── Load a specific file (also used by sidebar click) ────────

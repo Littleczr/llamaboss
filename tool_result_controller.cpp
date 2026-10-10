@@ -5,16 +5,6 @@
 // m_isClosing became IsClosing(), and the local WxToUtf8 helper).
 #include "tool_result_controller.h"
 
-#include <wx/wx.h>
-
-#include <algorithm>
-#include <filesystem>
-#include <fstream>
-#include <memory>
-#include <sstream>
-#include <string>
-#include <utility>
-
 #include "chat_display.h"
 #include "chat_history.h"
 #include "agent_controller.h"
@@ -222,13 +212,11 @@ void ToolResultController::OnCmdComplete(wxCommandEvent& evt)
         if (consumed) return;
     }
 
-    // ── Slash arm (Phase 4 unified) ──────────────────────────────
+    // ── Slash arm ────────────────────────────────────────────────
     // Build the same ToolInvocationResult shape the agent's
     // HandleCmdComplete builds, then render + persist via the
-    // shared helper.  Chip ordering matches the agent path and
-    // the saved-history tool-card layout — pre-Phase
-    // 4 the on-screen ordering was [elapsed, status]; it's now
-    // [status, elapsed] consistently across display and history.
+    // shared helper.  Chip ordering is [status, elapsed]
+    // consistently across display, history, and the agent path.
     ToolInvocationResult tir;
     tir.toolTag       = tool_names::kPowerShell;
     tir.invocationRaw.clear();
@@ -502,8 +490,8 @@ void ToolResultController::OnPythonError(wxCommandEvent& evt)
         m_convController.AutoSaveConversation();
 }
 
-// ── /grep completion handler (Phase 3) ───────────────────────────
-// Worker posts this from the thread.  Pattern matches /cmd:
+// ── grep completion handler ──────────────────────────────────────
+// Worker posts this from the thread.  Pattern matches PowerShell:
 // unpack the client data, render, persist, reset UI state,
 // auto-save if anything's in history.
 void ToolResultController::OnGrepComplete(wxCommandEvent& evt)
@@ -533,7 +521,7 @@ void ToolResultController::OnGrepComplete(wxCommandEvent& evt)
         // /grep, never both simultaneously — but defensive).
     }
 
-    // ── Slash arm (Phase 4 unified) ──────────────────────────────
+    // ── Slash arm ────────────────────────────────────────────────
     // Build a ToolInvocationResult from GrepResult, then render
     // + persist via the shared helper.  Same shape the agent's
     // HandleGrepComplete uses (minus the toolCallId threading).

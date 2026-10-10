@@ -1,20 +1,16 @@
 // tool_context.h
 //
-// Phase 3 foundation: the resolved execution context passed into every
-// tool handler (/cmd, /read, /ls, /grep, and future tools).
+// The resolved execution context passed into every tool handler.
 //
-// A ToolContext is built at command-dispatch time by resolving two
-// layers:
-//   1. Per-conversation overrides from ChatHistory (m_toolCwd,
-//      m_toolTimeoutMs).  Empty / 0 means "fall back".
-//   2. Global defaults — kDefaultToolTimeoutMs for timeout, wxGetCwd()
-//      for working directory.
+// A ToolContext is built at dispatch time by resolving two layers:
+//   1. Per-conversation overrides from ChatHistory (m_toolCwd set by
+//      /cd, m_toolTimeoutMs).  Empty / 0 means "fall back".
+//   2. Defaults — kDefaultToolTimeoutMs for timeout, the conversation
+//      workspace for working directory.
 //
 // Handlers never read from ChatHistory or AppState directly; everything
-// they need is on the context.  This makes them straightforward to
-// exercise from the Phase 4 agent harness, where the agent loop will
-// synthesise a ToolContext and hand it to the same handlers the user
-// drives today via slash commands.
+// they need is on the context, so the agent loop and slash commands
+// drive the same handlers identically.
 //
 #pragma once
 

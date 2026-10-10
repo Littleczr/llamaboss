@@ -1,6 +1,6 @@
 // cmd_executor.cpp
 //
-// Phase 1 PowerShell /cmd runner.  See cmd_executor.h for lifetime notes.
+// PowerShell command runner.  See cmd_executor.h for lifetime notes.
 //
 // Key Windows idioms used:
 //   - CreateProcessW with CREATE_SUSPENDED | CREATE_NO_WINDOW so we can
@@ -28,28 +28,10 @@
 #include "chat_folders.h"     // chat folder recognizer
 #include "server_manager.h"    // ConversationLaneDirForCwd
 
-// wx
-#include <wx/log.h>
-#include <wx/filename.h>
-
-// std
-#include <algorithm>
-#include <fstream>
-#include <chrono>
-#include <cctype>
 #include "ui_event_post.h"
-#include <mutex>
-#include <sstream>
-#include <string>
-#include <thread>
-#include <vector>
-
-// Poco (Base64 — already linked via existing usage in LlamaBoss.cpp)
-#include <Poco/Base64Encoder.h>
 
 // Win32
-#define NOMINMAX
-#include <windows.h>
+#include "lb_windows.h"
 #include <shlobj.h>       // SHGetKnownFolderPath (PowerShell 7 location)
 #include <knownfolders.h>
 
@@ -118,9 +100,9 @@ std::string Base64EncodeUtf16LE(const std::wstring& w) {
 //       code reliably reflect whether anything failed.
 //
 // Semantic cost: multi-statement commands abort at the first error rather
-// than continuing.  For Phase 1 user-typed one-liners, this is correct —
-// you want to see the error and know it failed.  Users who need partial-
-// success can pass `-ErrorAction SilentlyContinue` on the offending cmdlet.
+// than continuing.  That is usually right — you want to see the error and
+// know it failed.  Commands that need partial success can pass
+// `-ErrorAction SilentlyContinue` on the offending cmdlet.
 // Escape a UTF-8 string for embedding inside a PowerShell single-quoted
 // literal: the only special character is the single quote, doubled.
 std::string EscapePsSingleQuoted(const std::string& s) {
@@ -149,8 +131,7 @@ std::wstring BuildPowerShellPayload(const std::string& userCommand) {
         "$env:MSBUILDDISABLENODEREUSE = '1';"
         // Windows PowerShell 5.1 does not load the ZIP types by default:
         // [IO.Compression.ZipFile] fails with "Unable to find type" until
-        // Add-Type runs (2026-10-01: one failed call in r16c3, and the
-        // model prepended Add-Type by hand 7 times across two sessions).
+        // Add-Type runs, and models otherwise prepend Add-Type by hand.
         // GAC load, milliseconds; silent and before 'Stop' is set, so a
         // missing assembly can never fail the user's command.
         "try { Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem -ErrorAction SilentlyContinue } catch { };"
@@ -172,17 +153,16 @@ std::wstring BuildPowerShellPayload(const std::string& userCommand) {
         "$PSDefaultParameterValues['Import-Csv:Encoding']='UTF8';"
         "$PSDefaultParameterValues['Export-Csv:Encoding']='UTF8';"
         "$ErrorActionPreference = 'Stop';"
-        // 2026-10-01: Windows PowerShell 5.1 wraps each line a NATIVE
-        // program writes to a redirected stderr (2> file, 2>&1) in an
-        // ErrorRecord.  Under 'Stop' the first such line is fatal: the
-        // script dies mid-call and the job cleanup kills the still-running
-        // child.  The trap printed only that stderr line, which read like
-        // the program's own failure (an ssh session announcing itself was
-        // misdiagnosed as a key-unlock problem).  Say what really happened.
-        // Wording (2026-10-01): the script may have set 'Stop' itself, and
-        // the steps before the fatal line DID run -- in r16c2 a packaging
-        // script had already appended a stale note to PROJECT_STATE.md
-        // when git's LF/CRLF warning stopped it.
+        // Windows PowerShell 5.1 wraps each line a NATIVE program writes
+        // to a redirected stderr (2> file, 2>&1) in an ErrorRecord.  Under
+        // 'Stop' the first such line is fatal: the script dies mid-call
+        // and the job cleanup kills the still-running child.  Printing
+        // only that stderr line reads like the program's own failure (an
+        // ssh session announcing itself looks like a key-unlock problem),
+        // so say what really happened.  Note that the script may have set
+        // 'Stop' itself, and the steps before the fatal line DID run
+        // (e.g. git's LF/CRLF warning stopping a script that had already
+        // appended to a file).
         "trap { "
             "if ($_.FullyQualifiedErrorId -like 'NativeCommandError*') { "
                 "[Console]::Error.WriteLine('[native stderr] ' + $_.ToString()); "
@@ -540,11 +520,10 @@ void ApplyLargeOutputHandlingLocal(CmdResult& result, const std::string& cwd)
 
 // ─── Workspace-delta support (see workspace_delta.h) ─────────────
 // PowerShell commands routinely create files (Compress-Archive,
-// Out-File, Copy-Item, redirects) but, unlike the write tool, never
-// attached the result as a card and never told the model whether the
-// file system actually changed.  Observed consequence (2026-06-11):
-// a silently-empty Get-ChildItem pipeline created nothing, exit 0,
-// and the model told the user the file was "attached above".
+// Out-File, Copy-Item, redirects).  Attaching the result as a card and
+// telling the model whether the file system actually changed stops it
+// from claiming a file was "attached above" when a silently-empty
+// pipeline created nothing and exited 0.
 
 std::string LanguageForCreatedFileLocal(const std::string& path)
 {
@@ -740,17 +719,17 @@ double NowSec() {
 //   #< CLIXML
 //   <Objs ...>...</Objs>
 // even when we set $ProgressPreference = SilentlyContinue.  It's noise
-// to the user and burns context budget downstream (harness phase).
+// to the user and burns context budget downstream.
 // Handles multiple blocks in a single buffer and trims a single trailing
 // newline per block so the surrounding text doesn't gain blank lines.
 //
-// 2026-10-01: ERROR records are kept.  A block can carry
+// ERROR records are kept.  A block can carry
 //   <S S="Error">message_x000D__x000A_</S>
 // strings, which is how PowerShell reports failures that happen before
 // the payload's trap is installed — most importantly PARSE errors, where
-// nothing runs at all.  Deleting the whole block turned those into a
+// nothing runs at all.  Deleting the whole block would turn those into a
 // bare "exit 1" with no text.  Error strings are decoded and left in
-// place of the block; progress and other records are still dropped.
+// place of the block; progress and other records are dropped.
 
 // Decode CLIXML string content: XML entities plus _xHHHH_ escapes
 // (CLIXML encodes CR/LF and other control characters that way).
@@ -1368,8 +1347,8 @@ private:
         // Workspace-delta snapshot (see workspace_delta.h).  Taken only
         // when a caller-provided CWD exists: agent/tool invocations pass
         // the per-conversation Workspace folder, which is small and
-        // bounded.  The legacy empty-CWD path falls back to
-        // %USERPROFILE%, which is far too broad to scan — skip it there.
+        // bounded.  The empty-CWD path falls back to %USERPROFILE%,
+        // which is far too broad to scan — skip it there.
         workspace_delta::Snapshot wsBefore;
         const bool trackWorkspace = !m_cwd.empty();
         if (trackWorkspace) {
@@ -1500,8 +1479,8 @@ private:
             WaitForSingleObject(proc.h, 2000);
         }
 
-        // Give buffered stdout/stderr a bounded drain window. The old code
-        // joined unconditionally; one inherited writer handle could therefore
+        // Give buffered stdout/stderr a bounded drain window.  An
+        // unconditional join would let one inherited writer handle
         // bypass the command timeout forever. If either reader is still
         // blocked after the grace period, ask its synchronous ReadFile to
         // return and make the loop observe stopReaders before another read.
@@ -1548,11 +1527,11 @@ private:
         StripClixmlInPlace(result.stderrText);
 
         // Fold runs of "<src> -> <dst> done" lines (MSBuild/vcpkg
-        // app-local DLL copies: ~4 KB per build run, 23% of the r16c1
-        // transcript) into one summary line each.  Shape-matched, never
-        // folds errors/warnings/the .vcxproj -> .exe line; see
-        // copy_line_fold.h.  Before the breadcrumbs and large-output
-        // handling, so neither sees the noise.
+        // app-local DLL copies: ~4 KB per build run) into one summary
+        // line each.  Shape-matched, never folds errors/warnings/the
+        // .vcxproj -> .exe line; see copy_line_fold.h.  Before the
+        // breadcrumbs and large-output handling, so neither sees the
+        // noise.
         lb_copyfold::FoldCopyProgressLines(result.stdoutText);
         lb_copyfold::FoldCopyProgressLines(result.stderrText);
 
@@ -1561,18 +1540,15 @@ private:
         // NativeCommandError records.  Collapse both, and when stderr is
         // nothing but progress, move a one-line summary to stdout so a
         // successful download is not rendered (or scored) as a failure.
-        // 2026-10-02 v0.1.19 release: ~130 red "####  37.8%" lines on an
-        // exit-0 curl call.  See progress_output_fold.h.
+        // See progress_output_fold.h.
         lb_progressfold::TidyCapturedStreams(result.stdoutText, result.stderrText);
 
         // Lingering MSVC helpers (mspdbsrv, vctip) are identified by
         // process name and outlive FAILED builds exactly as they outlive
-        // successful ones.  2026-10-01: the exit-0/empty-stderr
-        // requirement sent every failed MSBuild run down the
-        // "[background process stopped]" warning path (six times in one
-        // r16c1 session), adding a misleading second problem to read next
-        // to the real compiler or test failure.  The exit code no longer
-        // decides the classification, only the wording.
+        // successful ones, so the exit code does not decide the
+        // classification, only the wording.  Otherwise every failed
+        // MSBuild run would get a misleading "[background process
+        // stopped]" warning next to the real compiler or test failure.
         result.buildHelpersCleaned = result.descendantsTerminated &&
             buildHelpersOnly && !result.timedOut &&
             !result.cancelled && !killIt && !forcedReaderStop;
@@ -1622,16 +1598,15 @@ private:
         // If we killed and nothing was written to stderr, leave a
         // breadcrumb the display layer can style.  On timeout, make the
         // breadcrumb CORRECTIVE for the model, not just diagnostic.  Two
-        // observed failure modes:
+        // common failure modes:
         //   * a script that silently scans far more than asked (build
         //     trees, IDE caches) and emits nothing before the deadline;
         //   * a process blocked on input nobody can see: an interactive
-        //     prompt, or a GUI dialog (2026-10-01: a wx debug assert box
-        //     in LlamaBossTests.exe turned a test run into a silent 1800 s
-        //     timeout, and the old text only suggested excluding folders).
-        // The timeout breadcrumb is now appended even when stderr already
-        // has text: a process that printed warnings and then hung got no
-        // explanation at all before.
+        //     prompt, or a GUI dialog (e.g. a debug assert box in a test
+        //     executable turning a test run into a silent timeout).
+        // The timeout breadcrumb is appended even when stderr already
+        // has text, so a process that printed warnings and then hung
+        // still gets an explanation.
         if (result.cancelled && result.stderrText.empty()) {
             result.stderrText = "[cancelled by user]\r\n";
         } else if (result.timedOut) {
@@ -1704,9 +1679,9 @@ private:
             }
         }
 
-        // Wildcard -Path + -Recurse -File (2026-09-30): surfaced on any
-        // successful run, not only blank ones -- the form can return a
-        // partial result, and a plain folder path is always the fix.
+        // Wildcard -Path + -Recurse -File: surfaced on any successful
+        // run, not only blank ones -- the form can return a partial
+        // result, and a plain folder path is always the fix.
         if (result.exitCode == 0 && !result.timedOut && !result.cancelled) {
             std::string hint =
                 ps_command_hints::GetChildItemWildcardRecurseHint(result.command);

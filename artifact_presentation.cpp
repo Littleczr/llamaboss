@@ -5,10 +5,6 @@
 #include "presented_file.h"
 #include "tool_dispatcher.h"
 
-#include <algorithm>
-#include <string>
-#include <vector>
-
 namespace {
 
 std::string LbPresentedFileExtLower(const PresentedFile& f)

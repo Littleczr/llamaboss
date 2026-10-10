@@ -1,45 +1,41 @@
-// project_controller.h — Projects subsystem extracted from MyFrame.
+// project_controller.h — Projects subsystem.
 //
-// Owns the project *action surface* that previously lived inline in
-// LlamaBoss.cpp: creating / attaching / switching / clearing projects,
-// deleting a project's folder, moving chats between projects (and to
-// Unassigned), adding Source files, and creating / opening Workflows.
+// Owns the project *action surface*: creating / attaching / switching /
+// clearing projects, deleting a project's folder, moving chats between
+// projects (and to Unassigned), adding Source files, and creating /
+// opening Workflows.
 //
-// Mirrors the SkillDraftController extraction: the
-// behavior moves here, the *menus* stay in the frame.  Specifically:
+// The behavior lives here; the *menus* stay in the frame:
 //
-//   - The strip popups (ShowProjectPopupMenu / ShowSkillPopupMenu) keep
-//     living in MyFrame because they build wxMenus out of the frame's
+//   - The strip popups (ShowProjectPopupMenu / ShowSkillPopupMenu) live
+//     in MyFrame because they build wxMenus out of the frame's
 //     ID_PROJECT_* command ids, which are Bound to the frame's thin
-//     OnProject* handlers.  After this extraction those OnProject*
-//     handlers become one-line delegations into this controller.
+//     OnProject* handlers.  Those handlers are one-line delegations
+//     into this controller.
 //
 //   - The sidebar context menus (ShowSidebarChatContextMenu /
 //     ShowSidebarProjectHeaderContextMenu) also stay in MyFrame: they
-//     need a live wxWindow to PopupMenu against and bind inline lambdas.
-//     Those lambdas change from calling MyFrame::MoveChatsToProject /
-//     AttachProjectToCurrentChat / DeleteProjectByInfo to calling the
-//     identically-named methods on this controller.  No behavior moves;
-//     only the callee changes.
+//     need a live wxWindow to PopupMenu against and bind inline lambdas
+//     that call MoveChatsToProject / AttachProjectToCurrentChat /
+//     DeleteProjectByInfo on this controller.
 //
-// Ownership rules (same split as before, now enforced by the seam):
+// Ownership rules:
 //   - ChatHistory owns the durable project association on the active
 //     conversation (project id / name / root).  This controller only
 //     reads it and calls its mutators (SetProject / ClearProject).
 //   - ProjectManager owns everything on disk (project folders,
 //     project.json, Sources/Workflows) and is reached only through its
-//     static API, same as today.
+//     static API.
 //   - ProjectContextBuilder owns the cached project-context block and
 //     the strip counts; this controller drives it via Invalidate() and
-//     GetProjectStripCounts(), unchanged.
+//     GetProjectStripCounts().
 //   - MyFrame keeps the ProjectStatusStrip, so RefreshProjectStrip()
 //     stays in the frame and this controller pokes it through
 //     Callbacks::refreshProjectStrip.
 //
-// Threading: every method must be called on the UI thread, same as the
-// MyFrame methods they replace.  There are no hidden turns and no
-// deferred work here, so there is no callAfter
-// seam — all dialogs are modal and synchronous, exactly as before.
+// Threading: every method must be called on the UI thread.  There are
+// no hidden turns and no deferred work here, so there is no callAfter
+// seam — all dialogs are modal and synchronous.
 
 #pragma once
 

@@ -1,9 +1,9 @@
 // copy_line_fold_tests.cpp
 //
-// Regression harness for copy_line_fold.h (2026-10-01).  No dependencies:
+// Regression harness for copy_line_fold.h.  No dependencies:
 //   g++ -std=c++17 -I . copy_line_fold_tests.cpp && ./a.out
 //
-// The first fixture is a verbatim MSBuild block from the r16c1 Luna
+// The first fixture is a verbatim MSBuild block from a real build
 // transcript (test-project rebuild: compile echo, LTCG banner, the
 // .vcxproj -> .exe output line, the vcpkg app-local DLL copies, the
 // script's exit line), CRLF line endings as captured.

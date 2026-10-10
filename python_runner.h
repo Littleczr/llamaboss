@@ -256,17 +256,15 @@ public:
     }
 
 private:
-    // Shared startup path for every public Start* helper.  The Start*
-    // wrappers used to inline a byte-identical block: check IsRunning,
-    // flip cancel/running flags, construct a PythonWorkerThread with
-    // the per-tool helperName and helperArg, Run() it, and on
-    // wxTHREAD_NO_ERROR failure post a wxEVT_PYTHON_ERROR through the
-    // alive-token guard.  Centralizing it here means any future change
-    // to that contract (alive-token semantics, error event payload,
-    // observability hooks) is a one-line edit instead of a sweep
-    // across 13 call sites.
+    // Shared startup path for every public Start* helper: check
+    // IsRunning, flip cancel/running flags, construct a
+    // PythonWorkerThread with the per-tool helperName and helperArg,
+    // Run() it, and on wxTHREAD_NO_ERROR failure post a
+    // wxEVT_PYTHON_ERROR through the alive-token guard.  One place to
+    // change that contract (alive-token semantics, error event payload,
+    // observability hooks).
     //
-    // defaultTimeoutMs preserves the two existing per-tool fallbacks
+    // defaultTimeoutMs preserves the two per-tool fallbacks
     // (python_run_script -> 30s, python_install_package -> 300s) that
     // need to override the worker's own kDefaultTimeoutMs without
     // committing every helper to a non-zero default.  Pass 0 (the

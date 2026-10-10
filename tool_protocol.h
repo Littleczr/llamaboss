@@ -1,12 +1,12 @@
 // tool_protocol.h
 //
-// Phase 3b: per-model tool-call protocol detection.
+// Per-model tool-call protocol detection.
 //
 // llama-server can serve OpenAI-style native function calling for
 // models whose chat template carries tool markers (Hermes 2 Pro,
 // Qwen 2.5, Llama 3.x, etc.) when started with --jinja.  For models
 // whose templates lack those markers, we fall back to LlamaBoss's
-// existing XML <tool_call> protocol.
+// XML <tool_call> protocol.
 //
 // This module probes a freshly-loaded model and decides which path
 // it supports.  The probe runs in three steps, each gating the next:

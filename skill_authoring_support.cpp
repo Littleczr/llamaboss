@@ -6,15 +6,6 @@
 #include "skill_authoring_support.h"
 #include "lb_string_utils.h"
 
-#include <algorithm>
-#include <cctype>
-#include <cstddef>
-#include <filesystem>
-#include <fstream>
-#include <sstream>
-#include <system_error>
-#include <utility>
-
 // ─── Public marker definitions ─────────────────────────────────────
 const char* const kSkillPythonHelperBeginMarker =
     "<<<LLAMABOSS_SKILL_PYTHON_HELPER_BEGIN>>>";
@@ -23,9 +14,9 @@ const char* const kSkillPythonHelperEndMarker =
 
 namespace {
 
-// Skills Phase 2I: Skill creation is now a real design conversation.
-// While that design session is active, only explicit control messages
-// should be intercepted here.  Ordinary messages must reach the model.
+// Skill creation is a real design conversation.  While that design
+// session is active, only explicit control messages should be
+// intercepted here.  Ordinary messages must reach the model.
 std::string LbNormalizeSkillAuthoringControl(std::string text)
 {
     text = LbLowerAscii(LbTrimAscii(std::move(text)));

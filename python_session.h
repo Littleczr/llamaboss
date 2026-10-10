@@ -206,9 +206,8 @@ public:
     size_t ReapIdle(unsigned long maxIdleMs = kIdleReapAfterMs);
 
     // Kills and forgets the session for one conversation workspace.
-    // Safe to call when none exists.  Wired to conversation close
-    // (the typed /py reset verb was removed 2026-09-28).  Returns true if
-    // a live session was actually torn down.
+    // Safe to call when none exists.  Wired to conversation close.
+    // Returns true if a live session was actually torn down.
     bool CloseSessionFor(const std::string& cwd);
 
     // Kills and forgets every session (frame close / app exit).  Also

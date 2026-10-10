@@ -1,37 +1,18 @@
-#define _CRT_SECURE_NO_WARNINGS
-
 #include "project_manager.h"
 #include "path_safety.h"
 
-#include <Poco/JSON/Object.h>
-#include <Poco/JSON/Parser.h>
-#include <Poco/JSON/Stringifier.h>
 #include <Poco/Timestamp.h>
 #include <Poco/DateTimeFormatter.h>
 #include <Poco/DateTimeFormat.h>
 
-#include <wx/stdpaths.h>
-#include <wx/filename.h>
-#include <wx/utils.h>
-#include <wx/dir.h>
-#include <wx/filefn.h>
 #include <wx/wfstream.h>   // wxFFileInputStream/OutputStream (skill zip import/export)
 #include <wx/zipstrm.h>    // wxZipInputStream/OutputStream (skill zip import/export)
 
-#include <algorithm>
-#include <cctype>
-#include <fstream>
-#include <functional>
 #include <iterator>
-#include <memory>
-#include <sstream>
-#include <utility>
 
 #include "skill_authoring_support.h"   // frontmatter read/ensure/rewrite for skill import
 
-#ifdef __WXMSW__
-#include <windows.h>   // GetFileAttributesW — reparse-point check in skill import
-#endif
+#include "lb_windows.h"   // GetFileAttributesW — reparse-point check in skill import
 
 namespace {
 
@@ -232,16 +213,16 @@ std::string NormalizeExistingPathForCompare(const std::string& path);
 // differ only in which directory they walk and which instruction-doc
 // name they expect (`docName`): WORKFLOW.md for project workflows,
 // SKILL.md for global Skills.
-// Phase 2 layout: each skill / workflow is a subfolder containing its
+// Layout: each skill / workflow is a subfolder containing its
 // instruction doc (plus optional .py scripts and other supporting files).
 // This helper walks the subfolders of `workflowsDir` and returns one
 // ProjectWorkflowInfo per folder that has `docName` inside.
 //
-// The display `name` stays in the legacy `<stem>.workflow.md` shape so
+// The display `name` keeps the `<stem>.workflow.md` shape so
 // ResolveWorkflowInList's fuzzy matching (which checks full name, the
-// .workflow.md-stripped stem, and the .ext-stripped stem) keeps working
-// without changes.  The on-disk `path` points at the real instruction
-// doc so callers that read or open the file land in the right place.
+// .workflow.md-stripped stem, and the .ext-stripped stem) keeps working.
+// The on-disk `path` points at the real instruction doc so callers that
+// read or open the file land in the right place.
 //
 // Idempotent against a transitional state where the folder exists but
 // `docName` is missing -- such folders are silently skipped.
@@ -285,14 +266,13 @@ std::vector<ProjectWorkflowInfo> ListWorkflowsInDir(const std::string& workflows
     return workflows;
 }
 
-// Phase 2 layout: helper .py scripts live INSIDE each skill folder,
-// alongside the instruction doc.  This helper iterates entry folders and reports
+// Helper .py scripts live INSIDE each skill folder, alongside the
+// instruction doc.  This helper iterates entry folders and reports
 // every .py file found within them.  The display `name` is the bare
-// filename ("skill_test.py"), matching the legacy contract so the
-// fuzzy resolver doesn't need updating.  Path collisions across
-// different skill folders are tolerated -- the resolver flags them
-// as ambiguous; in practice a skill author should keep script names
-// unique enough to be self-identifying.
+// filename ("skill_test.py") so the fuzzy resolver matches by name.
+// Path collisions across different skill folders are tolerated -- the
+// resolver flags them as ambiguous; in practice a skill author should
+// keep script names unique enough to be self-identifying.
 std::vector<ProjectWorkflowScriptInfo> ListWorkflowScriptsInDir(const std::string& workflowsDir,
                                                                 const std::string& docName,
                                                                 std::size_t maxItems)
@@ -306,17 +286,12 @@ std::vector<ProjectWorkflowScriptInfo> ListWorkflowScriptsInDir(const std::strin
 
     // Flat top-level *.py files are first-class runnable scripts.
     // python_create_script in a project chat writes DIRECTLY into the
-    // project's Workflows folder (tool_router: "create reusable
-    // workflow scripts directly in the active project's Workflows
-    // folder"), and models also drop scripts there with
-    // write/overwrite_file.  Before this scan, the resolver only saw
-    // per-workflow FOLDERS, so a freshly created flat script was
-    // unfindable by bare name or Workflows\<name>.py — the creator and
-    // the resolver disagreed about the on-disk layout (observed
-    // 2026-08-03: create → run → "not found" → PowerShell
-    // copy-to-Scripts workaround, repeated after every edit).  The
-    // flat lane has no instruction-doc requirement: a runnable .py is
-    // the whole contract.
+    // project's Workflows folder, and models also drop scripts there
+    // with write/overwrite_file, so the resolver must see flat scripts
+    // by bare name or Workflows\<name>.py — otherwise the creator and
+    // the resolver disagree about the on-disk layout.  The flat lane
+    // has no instruction-doc requirement: a runnable .py is the whole
+    // contract.
     {
         wxString fileName;
         bool moreFiles = dir.GetFirst(&fileName, wxEmptyString, wxDIR_FILES);
@@ -366,12 +341,11 @@ std::vector<ProjectWorkflowScriptInfo> ListWorkflowScriptsInDir(const std::strin
         }
 
         // Also enumerate the conventional scripts\ subfolder.  Larger
-        // skills keep their helpers there (Skills\runPod\scripts\
-        // runpod_ssh.py); before this scan, those helpers were invisible
-        // to bare-name and Skills\-prefixed resolution and could only be
-        // run through an absolute path (observed 2026-08-03).  info.name
-        // stays the bare filename so resolution-by-name is unchanged;
-        // same-named scripts across skills surface as the existing
+        // skills keep their helpers there
+        // (Skills\runPod\scripts\runpod_ssh.py), and they must be reachable by bare name and
+        // Skills\-prefixed resolution, not only by absolute path.
+        // info.name stays the bare filename so resolution-by-name is
+        // unchanged; same-named scripts across skills surface as the
         // "ambiguous" error rather than a silent pick.
         {
             const std::string scriptsSubdir =
@@ -438,12 +412,11 @@ std::string UniqueWorkflowStem(const std::string& dir,
                                const std::string& baseName,
                                bool kebabSuffix)
 {
-    // Phase 2 layout: each skill lives in its own folder, so the
-    // collision check is "does <dir>/<stem>/ already exist?" rather
-    // than the old "does <dir>/<stem>.workflow.md already exist?".
-    // kebabSuffix (Skills lane) makes the collision suffix "-2"
-    // instead of " (2)" so skill folder names stay valid Agent Skills
-    // kebab-case names; project workflows keep the legacy suffix.
+    // Each skill lives in its own folder, so the collision check is
+    // "does <dir>/<stem>/ already exist?".  kebabSuffix (Skills lane)
+    // makes the collision suffix "-2" instead of " (2)" so skill folder
+    // names stay valid Agent Skills kebab-case names; project workflows
+    // keep the " (2)" suffix.
     for (int i = 1; i < 10000; ++i) {
         std::ostringstream stem;
         stem << baseName;
@@ -697,9 +670,9 @@ void MoveLegacySkillFilesIfNeeded(const std::string& skillsDir)
     }
 }
 
-// One-time (idempotent) migration from the Phase 1 flat layout to
-// the Phase 2 folder-per-skill layout.  For every "<stem>.workflow.md"
-// file at the top of `workflowsDir`, this:
+// One-time (idempotent) migration from the old flat layout to the
+// folder-per-skill layout.  For every "<stem>.workflow.md" file at the
+// top of `workflowsDir`, this:
 //
 //   1. Creates "<workflowsDir>/<stem>/" if it doesn't already exist
 //   2. Renames "<workflowsDir>/<stem>.workflow.md"
@@ -838,8 +811,8 @@ bool IsDirectChildOfProjectsDir(const std::string& rootPath)
     const std::string prefix = projectsDir + "/";
     if (root.rfind(prefix, 0) != 0) return false;
 
-    // In Phase 1 project folders are direct children of Projects/. Refuse
-    // nested paths here so a bad project.json cannot point deletion at an
+    // Project folders are direct children of Projects/.  Refuse nested
+    // paths here so a bad project.json cannot point deletion at an
     // arbitrary subfolder elsewhere.
     const std::string tail = root.substr(prefix.size());
     return !tail.empty() && tail.find('/') == std::string::npos;
@@ -875,9 +848,9 @@ bool ProjectManager::EnsureSkillsRoot()
     const bool exists = ok || wxDirExists(wxString::FromUTF8(dir));
     if (exists) {
         // Order matters: pull files in from the legacy Workflows/
-        // root first (pre-Skills builds), THEN run the flat ->
-        // folder migrator so anything that lands here gets wrapped
-        // into Phase 2's folder-per-skill layout in the same launch.
+        // root first, THEN run the flat -> folder migrator so anything
+        // that lands here gets wrapped into the folder-per-skill layout
+        // in the same launch.
         MoveLegacySkillFilesIfNeeded(dir);
         MigrateFlatWorkflowsToFolders(dir, kSkillDocName);
     }
@@ -1259,7 +1232,7 @@ bool CreateWorkflowInternal(const std::string& workflowsDir,
     const std::string uniqueStem =
         UniqueWorkflowStem(workflowsDir, baseName, /*kebabSuffix=*/isGlobal);
 
-    // Phase 2 layout: skill / workflow lives in its own folder.
+    // Each skill / workflow lives in its own folder:
     //     <workflowsDir>/<uniqueStem>/<docName>   (SKILL.md or WORKFLOW.md)
     //     <workflowsDir>/<uniqueStem>/<uniqueStem>.py   (optional)
     // Folder gets created here; the instruction doc and the script are
@@ -1443,10 +1416,10 @@ bool CreateWorkflowInternal(const std::string& workflowsDir,
     }
 
     wxFileName fn(wxString::FromUTF8(workflowPath));
-    // Display name keeps the legacy "<stem>.workflow.md" shape so
+    // Display name keeps the "<stem>.workflow.md" shape so
     // ResolveWorkflowInList's fuzzy match (which strips .workflow.md
-    // and .ext) keeps working without changes -- and so every skill
-    // doesn't collapse to the literal "SKILL.md" name.
+    // and .ext) keeps working -- and so every skill doesn't collapse to
+    // the literal "SKILL.md" name.
     outWorkflow.name = uniqueStem + ".workflow.md";
     outWorkflow.path = workflowPath;
     outWorkflow.sizeBytes = FileSizeBytes(workflowPath);

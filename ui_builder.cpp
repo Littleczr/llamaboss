@@ -3,7 +3,8 @@
 #include "widgets.h"
 #include "chat_input_ctrl.h"
 #include "theme.h"
-#include "settings_icon.h"
+#include "lb_icons.h"
+#include "lb_scroll_rail.h"
 
 namespace UIBuilder {
 
@@ -87,7 +88,7 @@ TopBarWidgets BuildTopBar(wxWindow* parent, wxBoxSizer* mainSizer,
     w.modelLabel->SetFont(pillMonoFont);
     pillSizer->Add(w.modelLabel, 0, wxALIGN_CENTER_VERTICAL | wxLEFT, 6);
 
-    // ── Protocol chip (Phase 3b) ──
+    // ── Protocol chip ──
     // Sits to the right of the model name showing "native" or "xml"
     // once tool-protocol detection has completed for the active
     // model.  Hidden until then, and hidden again across model
@@ -198,7 +199,8 @@ TopBarWidgets BuildTopBar(wxWindow* parent, wxBoxSizer* mainSizer,
         wxBORDER_NONE | wxBU_NOTEXT);
     w.settingsButton->SetName("Settings");
     w.settingsButton->SetToolTip("Settings");
-    LbSettingsIcon::Apply(w.settingsButton, theme);
+    LbIcons::ApplyFlatButton(w.settingsButton, LbIcons::Id::Settings,
+                             theme, theme.bgToolbar);
     w.settingsButton->SetCursor(wxCURSOR_HAND);
     rightSizer->Add(w.settingsButton, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 2);
 
@@ -253,30 +255,35 @@ InputAreaWidgets BuildInputArea(wxWindow* parent, wxBoxSizer* parentSizer,
     // Input row: [📎] [TextInput] [Send/Stop]
     w.inputSizer = new wxBoxSizer(wxHORIZONTAL);
 
-    // Attach button — sized up slightly (52x42/18pt → 58x46/21pt) so the
-    // paperclip reads clearly at high-DPI / large-monitor sizes.  If the
-    // frame styles a sibling icon button off this one (e.g. the agent
-    // toggle), keep its font size in step so the row stays balanced.
-    wxString clip = wxString::FromUTF8("\xF0\x9F\x93\x8E");
-    w.attachButton = new wxButton(w.inputContainer, wxID_ANY, clip,
-        wxDefaultPosition, wxSize(58, 46), wxBORDER_NONE);
-    w.attachButton->SetBackgroundColour(theme.bgInputArea);
-    w.attachButton->SetForegroundColour(theme.textMuted);
+    // Attach button: a theme-aware vector paperclip, rendered at 24 DIPs.
+    // Keep the text label for accessibility while displaying only the icon.
+    w.attachButton = new wxButton(w.inputContainer, wxID_ANY, "Attach files",
+        wxDefaultPosition, w.inputContainer->FromDIP(wxSize(58, 46)),
+        wxBORDER_NONE | wxBU_NOTEXT);
+    w.attachButton->SetName("Attach files");
     w.attachButton->SetToolTip("Attach files");
-    wxFont clipFont = w.attachButton->GetFont();
-    clipFont.SetPointSize(21);
-    w.attachButton->SetFont(clipFont);
+    LbIcons::ApplyFlatButton(w.attachButton, LbIcons::Id::Attach,
+                             theme, theme.bgInputArea);
     w.attachButton->SetCursor(wxCURSOR_HAND);
     w.inputSizer->Add(w.attachButton, 0, wxALIGN_CENTER_VERTICAL | wxLEFT, 6);
 
-    // Text input field (ChatInputCtrl intercepts WM_PASTE for image clipboard)
-    w.userInputCtrl = new ChatInputCtrl(w.inputContainer, wxID_ANY, wxEmptyString,
+    // Text input field (ChatInputCtrl intercepts WM_PASTE for image clipboard).
+    // It lives in a clip panel so MyFrame's LbScrollRail can push the native
+    // vertical scrollbar out of view and draw the themed rail beside it,
+    // like the transcript and sidebar.  The clip follows the control's min
+    // height, so SetMinSize() auto-grow / drag-resize keep working.
+    w.inputClip = new LbFollowClip(w.inputContainer);
+    w.inputClip->SetBackgroundColour(theme.bgInputField);
+    w.userInputCtrl = new ChatInputCtrl(w.inputClip, wxID_ANY, wxEmptyString,
         wxDefaultPosition, wxDefaultSize,
         wxTE_PROCESS_ENTER | wxTE_MULTILINE | wxBORDER_NONE);
     w.userInputCtrl->SetBackgroundColour(theme.bgInputField);
     w.userInputCtrl->SetForegroundColour(theme.textPrimary);
     w.userInputCtrl->SetHint("Message...");
-    w.inputSizer->Add(w.userInputCtrl, 1, wxEXPAND | wxTOP | wxBOTTOM, 6);
+    w.inputClip->SetFollowed(w.userInputCtrl);
+    w.inputFieldRow = new wxBoxSizer(wxHORIZONTAL);
+    w.inputFieldRow->Add(w.inputClip, 1, wxEXPAND);
+    w.inputSizer->Add(w.inputFieldRow, 1, wxEXPAND | wxTOP | wxBOTTOM, 6);
 
     // Send button — the primary action
     w.sendButton = new wxButton(w.inputContainer, wxID_ANY, "Send",

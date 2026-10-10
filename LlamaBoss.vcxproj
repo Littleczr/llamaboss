@@ -173,6 +173,7 @@
     <ClCompile Include="python_arg_policy.cpp" />
     <ClCompile Include="secrets_store.cpp" />
     <ClCompile Include="endpoint_store.cpp" />
+    <ClCompile Include="chatgpt_auth.cpp" />
     <ClCompile Include="connections_dialog.cpp" />
     <ClCompile Include="endpoints_dialog.cpp" />
     <ClCompile Include="tool_path.cpp" />
@@ -200,6 +201,7 @@
     <ClCompile Include="LlamaBoss.cpp" />
     <ClCompile Include="settings.cpp" />
     <ClCompile Include="theme.cpp" />
+    <ClCompile Include="lb_icons.cpp" />
     <ClCompile Include="model_manager.cpp" />
     <ClCompile Include="server_manager.cpp" />
     <ClCompile Include="gguf_metadata.cpp" />
@@ -234,6 +236,7 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="pch.h" />
+    <ClInclude Include="lb_windows.h" />
     <ClInclude Include="app_state.h" />
     <ClInclude Include="app.h" />
     <ClInclude Include="conversation_registry.h" />
@@ -259,6 +262,8 @@
     <ClInclude Include="python_arg_policy.h" />
     <ClInclude Include="secrets_store.h" />
     <ClInclude Include="endpoint_store.h" />
+    <ClInclude Include="chatgpt_auth.h" />
+    <ClInclude Include="chatgpt_auth_core.h" />
     <ClInclude Include="connections_dialog.h" />
     <ClInclude Include="endpoints_dialog.h" />
     <ClInclude Include="tool_context.h" />
@@ -300,7 +305,7 @@
     <ClInclude Include="chat_input_ctrl.h" />
     <ClInclude Include="chat_display_ctrl.h" />
     <ClInclude Include="ui_builder.h" />
-    <ClInclude Include="settings_icon.h" />
+    <ClInclude Include="lb_icons.h" />
     <ClInclude Include="lb_hover_tile.h" />
     <ClInclude Include="lb_scroll_rail.h" />
     <ClInclude Include="model_switcher.h" />
@@ -333,6 +338,7 @@
     <ClInclude Include="prompt_prewarm.h" />
     <ClInclude Include="tool_call_elision.h" />
     <ClInclude Include="elision_budget.h" />
+    <ClInclude Include="export_metrics.h" />
     <ClInclude Include="copy_line_fold.h" />
     <ClInclude Include="progress_output_fold.h" />
     <ClInclude Include="python_resources.h" />
@@ -345,6 +351,8 @@
   </ItemGroup>
   <ItemGroup>
     <None Include="assets\icons\LlamaBoss_Cogwheel.svg" />
+    <None Include="assets\icons\LlamaBoss_Paperclip.svg" />
+    <None Include="assets\icons\LlamaBoss_Agent.svg" />
     <None Include="python_helpers.rc2" />
     <None Include="assets\python\python_health.py" />
     <None Include="assets\python\csv_inspect.py" />

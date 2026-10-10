@@ -6,18 +6,16 @@
 #include "tool_router.h"   // GetCachedToolNamesListText — registry-generated tool list
 #include "cmd_executor.h"  // LbPowerShellPromptNote — which shell the tool runs
 
-#include <sstream>
-
 namespace {
 
 // Everything specific to THIS conversation goes in one section at the very
 // end of the agent prompts.  The rest of the prompt is then byte-identical
 // across chats (for a given protocol and tool set), which is what lets
 // llama-server's prompt cache and providers' prompt caching (OpenAI) reuse
-// it: caches reuse a prompt only up to its first differing byte, and the
-// chat folder path used to appear 317 bytes into the native prompt and ~45%
-// of the way into the XML one, forcing everything after it to be
-// reprocessed on every new chat.  Keep new per-chat details in here.
+// it: caches reuse a prompt only up to its first differing byte, so a
+// per-chat detail early in the prompt (the chat folder path, say) forces
+// everything after it to be reprocessed on every new chat.  Keep new
+// per-chat details in here.
 void AppendWorkingContext(std::ostringstream& p,
                           const AgentPromptBuilderInput& input,
                           bool xmlProtocol)
@@ -404,7 +402,7 @@ std::string BuildAgentSystemPromptXml(const AgentPromptBuilderInput& input)
         << "\n"
         << "Emit AT MOST ONE tool call per assistant reply. Multi-step tasks are allowed: after each tool result, either emit one next tool call if more filesystem/system information is needed, or answer normally when you have enough information. You have a small tool-step safety cap, so avoid exploratory loops and answer as soon as you have enough evidence.\n";
 
-    p << "AI provider setup: when the user asks to connect OpenRouter, OpenAI or a custom service, use setup_connection alone, with provider and optional model_query. The native dialog handles API key entry and explicit save. Never request or echo keys in chat, and never edit connection or secrets files using shell/file tools. XML args are JSON, e.g. {\"provider\":\"openrouter\"}. The turn ends after this dialog closes.\n";
+    p << "AI provider setup: when the user asks to connect OpenRouter, OpenAI, a custom service, or their ChatGPT Plus/Pro plan (provider chatgpt: browser sign-in, no API key), use setup_connection alone, with provider and optional model_query. The native dialog handles API key entry or ChatGPT sign-in and explicit save. Never request or echo keys in chat, and never edit connection or secrets files using shell/file tools. XML args are JSON, e.g. {\"provider\":\"openrouter\"}. The turn ends after this dialog closes.\n";
     AppendWorkingContext(p, input, /*xmlProtocol*/ true);
     return p.str();
 }
@@ -530,7 +528,7 @@ std::string BuildAgentSystemPromptNative(const AgentPromptBuilderInput& input)
       << "\n"
       << "Use tools ONLY when the user's latest request requires filesystem actions, filesystem information, public webpage inspection, live system data, or explicit reminder creation/listing/cancellation. For prose writing, brainstorming, greetings, or casual conversation, answer normally without tools.\n";
 
-    p << "AI provider setup: when the user asks to connect OpenRouter, OpenAI or a custom service, use setup_connection alone, with provider and optional model_query. The native dialog handles API key entry and explicit save. Never request or echo keys in chat, and never edit connection or secrets files using shell/file tools. XML args are JSON, e.g. {\"provider\":\"openrouter\"}. The turn ends after this dialog closes.\n";
+    p << "AI provider setup: when the user asks to connect OpenRouter, OpenAI, a custom service, or their ChatGPT Plus/Pro plan (provider chatgpt: browser sign-in, no API key), use setup_connection alone, with provider and optional model_query. The native dialog handles API key entry or ChatGPT sign-in and explicit save. Never request or echo keys in chat, and never edit connection or secrets files using shell/file tools. XML args are JSON, e.g. {\"provider\":\"openrouter\"}. The turn ends after this dialog closes.\n";
     AppendWorkingContext(p, input, /*xmlProtocol*/ false);
     return p.str();
 }

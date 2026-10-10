@@ -2,10 +2,7 @@
 
 // Native file mutations only. Read-only tools and shell/Python permissions
 // retain their existing policy. The lexical root check must pass FIRST.
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#include <windows.h>
+#include "lb_windows.h"
 #include <mutex>
 #include <string>
 #include <vector>

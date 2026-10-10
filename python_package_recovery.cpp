@@ -3,21 +3,10 @@
 // extracted from LlamaBoss.cpp.  See python_package_recovery.h for
 // the public API contract.
 
-// Required because tool_dispatcher.h transitively pulls in wxWidgets
-// headers (wxcrt.h), whose strcpy/wcscpy calls trip MSVC's SDLCheck
-// C4996 deprecation-as-error.  Mirrors the define at the top of
-// LlamaBoss.cpp and other TUs that include wx headers.  Must come
-// before any other #include.
-#define _CRT_SECURE_NO_WARNINGS
-
 #include "python_package_recovery.h"
 #include "lb_string_utils.h"
 #include "tool_dispatcher.h"   // ToolInvocationResult
 #include "python_runner.h"     // PythonRunResult
-
-#include <algorithm>
-#include <sstream>
-#include <string>
 
 namespace {
 
@@ -159,9 +148,8 @@ bool LbFindMissingPythonPackage(const std::string& stdoutText,
     importNameOut = candidate;
     packageNameOut = LbNormalizeMissingPackageName(candidate);
     // installableOut is true when the normalized name is a syntactically
-    // valid pip target (no path/URL/version/extras/flags).  The historical
-    // allowlist that this used to consult has been retired; the per-package
-    // approval card is now the safety boundary.
+    // valid pip target (no path/URL/version/extras/flags).  The
+    // per-package approval card is the safety boundary.
     installableOut = LbPackageIsAllowed(packageNameOut);
     return true;
 }
@@ -170,9 +158,9 @@ bool LbFindMissingPythonPackage(const std::string& stdoutText,
 // machine whose output was merely relayed through a local wrapper
 // script (the runPod skill's runpod_ssh.py is the canonical case:
 // verify_env.py fails on the pod, its ModuleNotFoundError traceback
-// rides home inside the wrapper's stdout, and the recovery card then
-// wrongly suggests python_install_package — which installs LOCALLY
-// and cannot fix the pod).  Observed in production 2026-08-03.
+// rides home inside the wrapper's stdout, and a recovery card would
+// wrongly suggest python_install_package — which installs LOCALLY
+// and cannot fix the pod).
 //
 // Two independent signals:
 //   1. Relay envelope markers: runpod_ssh.py prints a JSON envelope

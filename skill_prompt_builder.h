@@ -1,7 +1,7 @@
 #pragma once
 
 // ─── skill_prompt_builder.h ────────────────────────────────────────
-// Prompt construction for the Skills Phase 2I authoring flow.
+// Prompt construction for the Skill authoring flow.
 //
 // This module owns the two large prompt bodies used by the hidden
 // Skill Draft Builder request.  LlamaBoss.cpp decides when drafting

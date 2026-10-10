@@ -89,6 +89,17 @@ struct InferenceTarget
     std::string authHeaderName;
     std::string authHeaderValue;
 
+    // ChatGPT plan lane (AuthScheme::ChatGpt).  Non-empty = the issued
+    // "Sign in with ChatGPT" client id whose OAuth access token pays for
+    // this request.  The token is NOT resolved on the UI thread: it
+    // expires hourly and renewing it is a network call, so the chat
+    // worker fetches it (lb_chatgpt::Auth::GetAccessToken) right before
+    // connecting and fills authHeaderValue itself.  Also switches the
+    // Responses converter to the plan route's request rules
+    // (instructions instead of system items, namespaced tools, no
+    // max_output_tokens).
+    std::string chatgptAccount;
+
     // Any additional fixed headers a provider requires, e.g.
     //   { "anthropic-version", "2023-06-01" }
     // Applied verbatim after the auth header.
@@ -139,9 +150,8 @@ struct InferenceTarget
     // Reasoning-control dialect for /think on remote lanes (see the
     // enum above).  Ignored for local lanes — those are addressed via
     // chat_template_kwargs.enable_thinking, selected by the request
-    // builder's own .gguf model check.  Defaults to the historical
-    // OpenRouter-style object so unresolved/legacy targets behave
-    // exactly as before.
+    // builder's own .gguf model check.  Defaults to the OpenRouter-style
+    // object, the safe default for unresolved targets.
     ReasoningDialect reasoningDialect = ReasoningDialect::OpenRouterStyle;
 
     // Build the default LOCAL target that reproduces the historical
@@ -163,16 +173,15 @@ struct InferenceTarget
     }
 };
 
-// ── Context budget per lane (2026-10-01) ────────────────────────
+// ── Context budget per lane ─────────────────────────────────────
 // Local models use the Settings context length, which is also what
 // llama-server is launched with.  Remote endpoints have no launch
-// length and used to inherit that same local number, so a remote model
-// with a far larger window had old tool results elided at ~68k real
-// tokens and then re-read them.  Remote lanes now get one fixed
-// budget instead.  It is a COST ceiling as much as a size: every
-// prompt token is billed per request, so it is deliberately not the
-// provider's full window.  Applies to the meter, the elision budget
-// and the ctx-aware read caps alike.
+// length; inheriting the local number would elide old tool results
+// long before a large remote window fills, and the model would re-read
+// them.  Remote lanes get one fixed budget instead.  It is a COST
+// ceiling as much as a size: every prompt token is billed per request,
+// so it is deliberately not the provider's full window.  Applies to
+// the meter, the elision budget and the ctx-aware read caps alike.
 constexpr int kRemoteContextTokens = 262144;   // 256k
 
 inline int ContextTokensForLane(bool remote, int localCtxTokens)

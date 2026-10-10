@@ -89,12 +89,18 @@ public:
     enum class AuthScheme {
         Bearer,     // Authorization: Bearer <key>   (OpenAI, OpenRouter)
         XApiKey,    // x-api-key: <key>              (Anthropic-native, future)
-        None        // no auth header at all — local or SSH-tunneled
+        None,       // no auth header at all — local or SSH-tunneled
                     // servers with no credential check (FreeToken,
                     // llama-server, vLLM without --api-key).
                     // ResolveTarget skips the SecretsStore lookup
                     // entirely, so no key needs to exist.
                     // Persisted as "auth_scheme": "none".
+        ChatGpt     // "Sign in with ChatGPT": requests run on the user's
+                    // ChatGPT Plus/Pro plan.  No API key; the credential
+                    // is an OAuth token held by lb_chatgpt::Auth for the
+                    // account in Endpoint::chatgptAccount.  Transport is
+                    // fixed: https://api.openai.com + /v1/responses.
+                    // Persisted as "auth_scheme": "chatgpt".
     };
 
     struct Endpoint {
@@ -125,6 +131,12 @@ public:
         // dialect"); values hand-edited into endpoints.json round-trip
         // through the editor unchanged.
         std::string reasoningDialect;
+
+        // AuthScheme::ChatGpt only: the issued Sign in with ChatGPT
+        // client id ("oaiapp_...") that identifies the signed-in ChatGPT
+        // account.  Persisted as "chatgpt_account" only when non-empty.
+        // Empty on a ChatGPT endpoint means "not signed in yet".
+        std::string chatgptAccount;
     };
 
     EndpointStore() = default;

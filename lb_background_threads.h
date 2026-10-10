@@ -3,13 +3,9 @@
 // lb_background_threads.h — joins fire-and-forget background threads at
 // process exit.
 //
-// Moved out of LlamaBoss.cpp so the About dialog (update check + installer
-// download) can use it too.  Behavior is unchanged:
-//
-// CheckForUpdates() used to std::thread(...).detach().  If the user quit
-// while the HTTP check was stalled, the leftover thread kept running
-// through static destruction and could touch function-local statics
-// (ui_event_post's mutex) mid-teardown -- the classic sporadic
+// A detached thread (e.g. a stalled update check) that outlives the app
+// keeps running through static destruction and can touch function-local
+// statics (ui_event_post's mutex) mid-teardown -- the classic sporadic
 // crash-on-exit that never reproduces under a debugger.
 //
 // Threads launched through the keeper behave exactly like detached ones

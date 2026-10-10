@@ -1,27 +1,13 @@
 // secrets_store.cpp
-#define _CRT_SECURE_NO_WARNINGS
 
 #include "secrets_store.h"
+#include "chatgpt_auth_core.h"   // lb_chatgpt::Base64UrlEncode / Base64UrlDecode
 
-#include <wx/wx.h>
-#include <wx/stdpaths.h>
-#include <wx/filename.h>
-#include <wx/dir.h>
-#include <wx/log.h>
+#include "lb_windows.h"
+#include <wincrypt.h>
+#pragma comment(lib, "crypt32.lib")
+
 #include <wx/datetime.h>
-#include <wx/filefn.h>
-
-#include <Poco/JSON/Parser.h>
-#include <Poco/JSON/Object.h>
-#include <Poco/JSON/Stringifier.h>
-#include <Poco/Dynamic/Var.h>
-
-#include <fstream>
-#include <sstream>
-#include <algorithm>
-#include <cctype>
-#include <cstdlib>
-#include <set>
 
 namespace {
 
@@ -230,6 +216,54 @@ std::string NormalizeDirectSecretValue(std::string value)
     return StripOneMatchingQuotePair(std::move(value));
 }
 
+// ── DPAPI at-rest protection (file version 2) ────────────────────
+// Plaintext secrets.json was readable by the approval-free read/grep
+// tools and by auto-run PowerShell (Get-Content), and web_fetch_url
+// could then send the keys anywhere without an approval card.  The
+// whole v1 body is now encrypted with DPAPI (current-user scope), the
+// same protection chatgpt_auth.cpp already uses.  Decrypting needs a
+// CryptUnprotectData call, which only approval-gated paths (py,
+// PowerShell with [type]:: / parentheses) can make.
+const char kSecretsEntropy[] = "LlamaBoss.Secrets.v2";
+constexpr int kEncryptedFileVersion = 2;
+
+bool ProtectSecretsBody(const std::string& plain, std::string& encOut)
+{
+    encOut.clear();
+    DATA_BLOB in{ static_cast<DWORD>(plain.size()),
+                  reinterpret_cast<BYTE*>(const_cast<char*>(plain.data())) };
+    DATA_BLOB entropy{ static_cast<DWORD>(sizeof(kSecretsEntropy) - 1),
+                       reinterpret_cast<BYTE*>(const_cast<char*>(kSecretsEntropy)) };
+    DATA_BLOB out{};
+    if (!CryptProtectData(&in, L"LlamaBoss secrets", &entropy, nullptr,
+                          nullptr, CRYPTPROTECT_UI_FORBIDDEN, &out))
+        return false;
+    encOut = lb_chatgpt::Base64UrlEncode(
+        reinterpret_cast<const std::uint8_t*>(out.pbData), out.cbData);
+    SecureZeroMemory(out.pbData, out.cbData);
+    LocalFree(out.pbData);
+    return !encOut.empty();
+}
+
+bool UnprotectSecretsBody(const std::string& enc, std::string& plainOut)
+{
+    plainOut.clear();
+    std::string blob;
+    if (!lb_chatgpt::Base64UrlDecode(enc, blob) || blob.empty()) return false;
+    DATA_BLOB in{ static_cast<DWORD>(blob.size()),
+                  reinterpret_cast<BYTE*>(&blob[0]) };
+    DATA_BLOB entropy{ static_cast<DWORD>(sizeof(kSecretsEntropy) - 1),
+                       reinterpret_cast<BYTE*>(const_cast<char*>(kSecretsEntropy)) };
+    DATA_BLOB out{};
+    if (!CryptUnprotectData(&in, nullptr, &entropy, nullptr, nullptr,
+                            CRYPTPROTECT_UI_FORBIDDEN, &out))
+        return false;
+    plainOut.assign(reinterpret_cast<const char*>(out.pbData), out.cbData);
+    SecureZeroMemory(out.pbData, out.cbData);
+    LocalFree(out.pbData);
+    return true;
+}
+
 }  // namespace
 
 // ─── Path resolution ────────────────────────────────────────────
@@ -284,11 +318,27 @@ bool SecretsStore::Load()
         return fail("secrets.json could not be read");
     if (body.empty()) return true;
 
+    bool wasPlaintext = false;
     try {
         Poco::JSON::Parser parser;
         auto val = parser.parse(body);
         auto root = val.extract<Poco::JSON::Object::Ptr>();
         if (!root) return fail("secrets.json is not a JSON object");
+
+        // Version 2: the v1 document is DPAPI-encrypted inside "data".
+        if (root->has("data")) {
+            std::string plain;
+            if (!UnprotectSecretsBody(root->getValue<std::string>("data"), plain))
+                return fail("secrets.json could not be decrypted (was it "
+                            "created by another Windows user or on another PC?)");
+            Poco::JSON::Parser inner;
+            auto innerVal = inner.parse(plain);
+            SecureZeroMemory(&plain[0], plain.size());
+            root = innerVal.extract<Poco::JSON::Object::Ptr>();
+            if (!root) return fail("secrets.json decrypted to a non-object");
+        } else {
+            wasPlaintext = true;
+        }
 
         if (!root->has("providers")) return true;  // no providers, fine
         auto providers = root->getObject("providers");
@@ -311,6 +361,14 @@ bool SecretsStore::Load()
             }
             if (!kvs.empty())
                 m_providers[name] = std::move(kvs);
+        }
+
+        // One-time migration: re-save a legacy plaintext file encrypted.
+        // Best effort: a failed save leaves the plaintext file in place
+        // and the keys loaded; the next successful Save() encrypts it.
+        if (wasPlaintext && !m_providers.empty() && !Save()) {
+            wxLogWarning("SecretsStore: could not re-save secrets.json "
+                         "encrypted; it remains plaintext for now.");
         }
         return true;
     }
@@ -344,8 +402,8 @@ bool SecretsStore::Save()
             // jsonText is either a quoted direct-secret string or a
             // {"$env":"X"} object.  Decode direct strings explicitly
             // instead of handing a bare top-level JSON string to
-            // Poco::JSON::Parser; that path previously failed and then
-            // stored the quote characters as part of the secret value.
+            // Poco::JSON::Parser, which fails on it and would lead to the
+            // quote characters being stored as part of the secret value.
             //
             // The stored value is already canonical (NormalizeDirectSecretValue
             // ran at the SetSecret input boundary), so write the decoded value
@@ -374,8 +432,30 @@ bool SecretsStore::Save()
     std::ostringstream body;
     Poco::JSON::Stringifier::stringify(root, body, 2);
 
+    // Encrypt the whole v1 document.  Fail closed: never fall back to
+    // writing plaintext if DPAPI is unavailable.
+    std::string plain = body.str();
+    std::string enc;
+    const bool protectedOk = ProtectSecretsBody(plain, enc);
+    if (!plain.empty()) SecureZeroMemory(&plain[0], plain.size());
+    if (!protectedOk) {
+        wxLogWarning("SecretsStore: DPAPI encryption failed; secrets.json was not written.");
+        return false;
+    }
+
+    Poco::JSON::Object::Ptr outer = new Poco::JSON::Object(true);
+    outer->set("version", kEncryptedFileVersion);
+    outer->set("protection", "dpapi-current-user");
+    outer->set("note", "LlamaBoss Connection keys, encrypted for this Windows "
+                       "user (DPAPI). Edit them in LlamaBoss > Connections; "
+                       "this file is useless on another account or PC.");
+    outer->set("data", enc);
+
+    std::ostringstream outBody;
+    Poco::JSON::Stringifier::stringify(outer, outBody, 2);
+
     wxString path = wxString::FromUTF8(GetSecretsFilePath().c_str());
-    return WriteWholeFileAtomic(path, body.str());
+    return WriteWholeFileAtomic(path, outBody.str());
 }
 
 // ─── Per-secret access ──────────────────────────────────────────
@@ -442,7 +522,7 @@ std::string SecretsStore::GetSecret(const std::string& provider,
         return decodedString;
     }
 
-    // Object path: must be {"$env": "VAR"} (Phase 2 may add $file).
+    // Object path: must be {"$env": "VAR"}.
     std::string envName;
     if (TryParseEnvRefJson(jsonText, envName)) {
         const char* env = std::getenv(envName.c_str());

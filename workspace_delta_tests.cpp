@@ -1,7 +1,6 @@
-// Regression harness for workspace_delta.h + ps_command_hints.h
-// (2026-06-11).  Exercises the POSIX branch of the scanner; the
-// Windows branch mirrors the FindFirstFileW pattern already proven in
-// python_runner.cpp.
+// Regression harness for workspace_delta.h + ps_command_hints.h.
+// Exercises the POSIX branch of the scanner; the Windows branch
+// mirrors the FindFirstFileW pattern used in python_runner.cpp.
 
 #include "workspace_delta.h"
 #include "ps_command_hints.h"
@@ -128,7 +127,7 @@ int main()
         CHECK(s.files.empty(), "snapshot: bogus root yields empty snapshot");
     }
 
-    // ── ps_command_hints: the exact failing command from the transcript ──
+    // ── ps_command_hints: the -Include footgun command ──
     {
         std::string cmd =
             "Get-ChildItem -Path \"C:\\Users\\Cesar\\source\\repos\\LlamaBoss\" "
@@ -166,7 +165,7 @@ int main()
               "hint: case-insensitive");
     }
 
-    // ── ps_command_hints: wildcard -Path + -Recurse -File (2026-09-30) ──
+    // ── ps_command_hints: wildcard -Path + -Recurse -File ──
     {
         using ps_command_hints::GetChildItemWildcardRecurseHint;
         // Exact commands a Qwen model ran against D: in the transcripts.
@@ -212,7 +211,7 @@ int main()
               "wildcard hint: silent with implicit path");
     }
 
-    // The -Include hint must no longer suggest adding -Recurse to a \* path.
+    // The -Include hint must not suggest adding -Recurse to a \* path.
     {
         std::string hint = ps_command_hints::GetChildItemIncludeHint(
             "gci -Path C:\\dir -Include *.h");

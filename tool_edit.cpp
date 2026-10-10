@@ -8,18 +8,7 @@
 #include "path_safety.h"
 #include "tool_mutation_guard.h"
 
-#include <algorithm>
-#include <chrono>
-#include <cstdint>
-#include <fstream>
-#include <sstream>
-#include <utility>
-#include <vector>
-
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#include <windows.h>
+#include "lb_windows.h"
 
 namespace {
 
@@ -316,13 +305,11 @@ std::string ToCrlf(const std::string& s)
 // raw offset of LF-view byte i, and rawIndexOut[lf.size()] == raw.size()
 // so a match END maps cleanly too.
 //
-// Matching against this view instead of a majority-style conversion
-// fixes two mixed-ending failures:
+// Matching against this view handles mixed line endings:
 //   * mostly-LF file with some CRLF lines: an OLD block spanning the
-//     CRLF lines can now match (it used to be unfindable);
+//     CRLF lines still matches;
 //   * mostly-CRLF file with some LF lines: the edit is spliced into the
-//     ORIGINAL bytes, so lines outside the match keep their endings
-//     (it used to rewrite every LF line in the file to CRLF).
+//     ORIGINAL bytes, so lines outside the match keep their endings.
 std::string ToLfWithMap(const std::string& raw, std::vector<size_t>& rawIndexOut)
 {
     std::string lf;

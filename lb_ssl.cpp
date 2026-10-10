@@ -13,13 +13,7 @@
 // <openssl/x509.h>. So: Windows first, #undef the offenders, Poco
 // second.
 #ifdef _WIN32
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
+#include "lb_windows.h"
 #include <wincrypt.h>
 #pragma comment(lib, "crypt32.lib")
 
@@ -32,14 +26,7 @@
 #undef OCSP_RESPONSE
 #endif // _WIN32
 
-#include <cstdlib>
-#include <mutex>
-#include <sstream>
-#include <string>
-#include <vector>
-
 #include <Poco/SharedPtr.h>
-#include <Poco/Base64Encoder.h>
 #include <Poco/Net/SSLManager.h>
 // SSLManager::initializeClient takes SharedPtr<PrivateKeyPassphraseHandler>;
 // include the complete interface so Poco::SharedPtr's inline release sees

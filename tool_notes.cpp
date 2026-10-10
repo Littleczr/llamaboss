@@ -1,5 +1,3 @@
-#define _CRT_SECURE_NO_WARNINGS
-
 // tool_notes.cpp
 
 #include "tool_notes.h"
@@ -7,20 +5,9 @@
 #include "lb_string_utils.h"     // LbUtf8SafeTruncate
 #include "tool_staged_write.h"   // CreateStagedTempFile, atomic save
 
-#include <wx/filename.h>
-#include <wx/stdpaths.h>
-#include <wx/utils.h>             // wxGetEnv, wxGetHomeDir
-
-#include <algorithm>
-#include <chrono>
 #include <ctime>
-#include <fstream>
-#include <sstream>
 
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#include <windows.h>
+#include "lb_windows.h"
 
 namespace {
 

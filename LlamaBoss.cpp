@@ -1,69 +1,19 @@
-#define _CRT_SECURE_NO_WARNINGS
-
 #include "endpoints_dialog.h"
 #include <cassert>
-#include <cctype>
-#include <cstdio>    // snprintf (context meter's k-formatter)
-#include <wx/wx.h>
-#include <wx/artprov.h>
-#include <wx/textdlg.h>
-#include <wx/log.h>
-#include <wx/richtext/richtextctrl.h>
-#include <wx/utils.h>
-#include <wx/thread.h>
-#include <wx/filedlg.h>
 #include <wx/file.h>
 #include <wx/datetime.h>
-#include <wx/filename.h>
-#include <wx/filefn.h>
-#include <wx/dcbuffer.h>
-#include <wx/dnd.h>
-#include <wx/clipbrd.h>
-#include <wx/mstream.h>
-#include <wx/dir.h>
-#include <wx/scrolwin.h>
-#include <wx/wrapsizer.h>
-#include <wx/statline.h>
 
-#ifdef __WXMSW__
-#include <windows.h>
-#endif
+#include "lb_windows.h"
 
-#include <vector>
-#include <string>
-#include <string_view>
-#include <sstream>
 #include "lb_ssl.h"
 #include "ui_event_post.h"
 #include "app.h"
 #include "model_service.h"
-#include <fstream>
-#include <algorithm>
-#include <memory>
-#include <functional>
-#include <map>
 #include <iterator>
-#include <utility>
-#include <filesystem>
-#include <system_error>
-#include <atomic>
-#include <thread>
-#include <mutex>
 #include <stdexcept>
-#include <chrono>
-#include <cstdint>
 
 // Poco headers for base64 and JSON
-#include <Poco/Base64Encoder.h>
 #include <Poco/Base64Decoder.h>   // generated-image data URL decode
-#include <Poco/JSON/Parser.h>
-#include <Poco/JSON/Array.h>
-#include <Poco/JSON/Stringifier.h>
-#include <Poco/Net/HTTPClientSession.h>
-#include <Poco/Net/HTTPRequest.h>
-#include <Poco/Net/HTTPResponse.h>
-#include <Poco/StreamCopier.h>
-#include <Poco/Timespan.h>
 
 #include "settings.h"
 #include "chat_client.h"
@@ -90,10 +40,10 @@
 #include "wait_executor.h"
 #include "tool_call_parser.h"  // ToolCallStreamDetector for hiding raw <tool_call> blocks
 #include "agent_controller.h"
-#include "tool_protocol.h"     // Phase 3b: tool-call protocol detection
-#include "tool_router.h"       // Phase 3c-i: BuildToolsArrayJson for native requests
-#include "tool_approval.h"     // Phase 6 approval cards
-#include "project_manager.h"   // Projects Phase 1/2
+#include "tool_protocol.h"     // tool-call protocol detection
+#include "tool_router.h"       // BuildToolsArrayJson for native requests
+#include "tool_approval.h"     // approval cards
+#include "project_manager.h"   // Projects
 #include "project_attach_dialog.h"
 #include "project_status_strip.h"
 #include "activity_strip.h"     // live long-task progress strip above the composer
@@ -119,8 +69,9 @@
 #include "chat_input_ctrl.h"
 #include "chat_display_ctrl.h"
 #include "ui_builder.h"
-#include "settings_icon.h"
+#include "lb_icons.h"
 #include "lb_hover_tile.h"
+#include "lb_scroll_rail.h"
 #include "model_switcher.h"
 #include "path_safety.h"      // SameModelPath for queued-send matching
 #include "conversation_controller.h"
@@ -133,7 +84,7 @@
 #include "var_store.h"
 
 // ─── Application version ─────────────────────────────────────
-static const char* LLAMABOSS_VERSION = "0.1.20";
+static const char* LLAMABOSS_VERSION = "0.1.21";
 
 // Native menu command ids. Keep above wxID_HIGHEST to avoid collisions
 // with stock wxWidgets commands.
@@ -450,12 +401,11 @@ public:
         wxULongLong fileSize = fname.GetSize();
         if (fileSize == wxInvalidSize) return false;
 
-        // RLM Phase B: small text inline-bakes exactly as before; large
-        // text routes like CSV/PDF — workspace import + handle card —
-        // instead of flooding the request (or, previously, being
-        // refused outright above 100 KB).  One threshold, shared with
-        // tool-result demotion, so "large" means the same thing on
-        // every path into the model's context.
+        // Small text is baked inline.  Large text routes like CSV/PDF:
+        // workspace import + handle card, so it never floods the
+        // request.  The threshold is shared with tool-result demotion,
+        // so "large" means the same thing on every path into the
+        // model's context.
         if (fileSize.GetValue() > varstore::DemotionConfig{}.thresholdBytes) {
             bool ok = m_dropImportController &&
                       m_dropImportController->QueueLargeTextAttachmentFromDrop(filePath);
@@ -541,9 +491,8 @@ public:
 private:
 
     // ─── Constructor setup phases ──────────────────────────────────
-    // Keep MyFrame construction order explicit while shrinking the
-    // constructor body. These helpers intentionally remain in this .cpp
-    // for now; no behavior should change in this Phase 1 refactor.
+    // Keep MyFrame construction order explicit while keeping the
+    // constructor body short.
     void InitializeCoreServices()
     {
         // AppState and ModelService are created and initialized by
@@ -679,7 +628,7 @@ private:
             // the kernel can't hold handles inside a folder tree the
             // delete is about to walk.  Best effort: a session keyed
             // on a /cd override cwd isn't derivable here and is left
-            // for app close (S3's idle timeout is the general fix).
+            // to the idle reaper / app close.
             if (m_pySessionManager) {
                 for (const std::string& p : paths) {
                     m_pySessionManager->CloseSessionFor(
@@ -723,8 +672,13 @@ private:
         _rightPanel->SetBackgroundColour(m_appState->GetTheme().bgMain);
         auto* rightSizer = new wxBoxSizer(wxVERTICAL);
 
+        // The transcript sits in a clip panel with the same slim scroll
+        // rail as the sidebar: the native vertical scrollbar is pushed just
+        // outside the clip (lb_scroll_rail.h), scrolling itself is unchanged.
+        _chatClip = new wxPanel(_rightPanel, wxID_ANY);
+        _chatClip->SetBackgroundColour(m_appState->GetTheme().bgMain);
         _chatDisplayCtrl = new ChatDisplayCtrl(
-            _rightPanel, wxID_ANY, wxEmptyString,
+            _chatClip, wxID_ANY, wxEmptyString,
             wxDefaultPosition, wxDefaultSize,
             wxRE_MULTILINE | wxRE_READONLY | wxBORDER_NONE
         );
@@ -742,7 +696,25 @@ private:
         // per session, all dead weight.  Suppress undo for the
         // control's lifetime; never paired with EndSuppressUndo.
         _chatDisplayCtrl->BeginSuppressUndo();
-        rightSizer->Add(_chatDisplayCtrl, 1, wxEXPAND | wxLEFT | wxRIGHT, 8);
+
+        m_chatRail = new LbScrollRail(
+            _rightPanel, _chatClip, _chatDisplayCtrl, _chatDisplayCtrl,
+            [this]() -> const ThemeData& { return m_appState->GetTheme(); });
+        m_chatRail->SetBackgroundSlot(&ThemeData::bgMain);
+        // Wheel over the rail uses the transcript's own (faster) wheel step;
+        // rail drags and track clicks report back so follow mode updates.
+        m_chatRail->SetWheelTarget(_chatDisplayCtrl);
+        m_chatRail->SetScrolledCallback([this]() {
+            if (_chatDisplayCtrl) _chatDisplayCtrl->NotifyUserScrolled();
+        });
+
+        // One sizer item in the transcript's slot (index 0): later code
+        // inserts the attachment bar at index 1.  The 8 px rail column
+        // doubles as the right margin.
+        auto* chatRow = new wxBoxSizer(wxHORIZONTAL);
+        chatRow->Add(_chatClip, 1, wxEXPAND);
+        chatRow->Add(m_chatRail, 0, wxEXPAND);
+        rightSizer->Add(chatRow, 1, wxEXPAND | wxLEFT, 8);
 
         // ─── INPUT AREA (via UIBuilder) ──────────────────────────────
         auto ia = UIBuilder::BuildInputArea(_rightPanel, rightSizer, m_appState->GetTheme());
@@ -753,6 +725,15 @@ private:
         _stopButton     = ia.stopButton;
         _attachButton   = ia.attachButton;
         _inputSizer     = ia.inputSizer;
+
+        // Composer scroll rail: same slim themed rail as the transcript and
+        // sidebar.  The native EDIT scrollbar is pushed outside ia.inputClip;
+        // the rail sits on the input field colour so it reads as part of it.
+        m_inputRail = new LbScrollRail(
+            _inputContainer, ia.inputClip, _userInputCtrl,
+            [this]() -> const ThemeData& { return m_appState->GetTheme(); });
+        m_inputRail->SetBackgroundSlot(&ThemeData::bgInputField);
+        ia.inputFieldRow->Add(m_inputRail, 0, wxEXPAND);
 
         // ─── ATTACHMENT CHIP BAR (hidden by default) ─────────────────
         // Keep pending cards on the chat surface, immediately above the
@@ -784,23 +765,16 @@ private:
         m_attachments->SetLogger(m_appState->GetLogger());
         m_attachments->SetOnChanged([this]() { RebuildAttachmentChips(); });
 
-        // ─── Agent-mode toggle (Phase 4) ─────────────────────────────
+        // ─── Agent-mode toggle ───────────────────────────────────────
         // Sits right after the attach button in _inputSizer.  Visual
         // state: muted when off, interactive-accent-colored when on.  Click flips
         // m_agentModeEnabled and re-tints.
         _agentToggleButton = new wxButton(
             _inputContainer, wxID_ANY,
-            wxString::FromUTF8("\xF0\x9F\xA4\x96"),   // 🤖
+            wxEmptyString,
             wxDefaultPosition, wxSize(44, 46),
             wxBORDER_NONE);
-        _agentToggleButton->SetBackgroundColour(m_appState->GetTheme().bgInputArea);
-        _agentToggleButton->SetForegroundColour(
-            m_agentModeEnabled ? LbInteractiveAccentForTheme(m_appState->GetTheme())
-                               : m_appState->GetTheme().textMuted);
-        // 17pt keeps the robot visually balanced against the enlarged
-        // 21pt paperclip in ui_builder (same ~0.8 ratio as the old
-        // 14pt/18pt pairing).
-        _agentToggleButton->SetFont(wxFont(wxFontInfo(17)));
+        LbIcons::ApplyAgentToggle(_agentToggleButton, m_appState->GetTheme(), m_agentModeEnabled);
         _agentToggleButton->SetToolTip(
             "Agent mode: when ON, the model can call tools (read, ls, open, grep, pwd, powershell) "
             "to answer your questions.  Click to toggle.");
@@ -967,13 +941,12 @@ private:
         m_projectContextBuilder =
             std::make_unique<ProjectContextBuilder>(m_chatHistory);
 
-        // ─── Create agent controller (Phase 5) ───────────────────────
-        // Phase 5: MyFrame is the AgentEventSink — it receives
-        // structured loop-progress events and translates them to UI
-        // operations.  The Phase-4 ChatDisplay* slot is gone; tool
-        // blocks now arrive via OnAgentToolBlock and are forwarded
-        // to the display from there.  Callbacks are wired below,
-        // after all coordinators are in place.
+        // ─── Create agent controller ─────────────────────────────────
+        // MyFrame is the AgentEventSink: it receives structured
+        // loop-progress events and translates them to UI operations.
+        // Tool blocks arrive via OnAgentToolBlock and are forwarded to
+        // the display from there.  Callbacks are wired below, after all
+        // coordinators are in place.
         m_agentController = std::make_unique<AgentController>(
             m_chatHistory,
             this,
@@ -986,8 +959,7 @@ private:
             m_toolWorker.get(),
             m_waitExecutor.get());
 
-        // Phase 10: apply the user-configurable tool-step cap persisted
-        // by AppState.  /agent_steps updates both sides at runtime.
+        // Apply the user-configurable tool-step cap persisted by AppState.
         m_agentController->SetMaxToolSteps(
             m_appState->GetAgentMaxToolSteps());
 
@@ -1041,9 +1013,8 @@ private:
                     // A path change is NOT always an identity change: a
                     // new chat's first autosave assigns its path right
                     // after the first completed turn, and rename/save-as
-                    // keep the same transcript.  Both used to drop the
-                    // exact anchor adopted seconds earlier (the "~" on
-                    // every new chat's first turn).  ChatHistory's
+                    // keep the same transcript, so neither may drop the
+                    // exact anchor adopted seconds earlier.  ChatHistory's
                     // revision is the discriminator: Clear() and a load
                     // reset it to 0, so an anchor whose revision is still
                     // <= the current one describes this same transcript.
@@ -1072,12 +1043,11 @@ private:
         RefreshProjectStrip();
 
         // ─── AgentController callbacks ───────────────────────────────
-        // Phase 5: Callbacks now contain only logic concerns
-        // (sendRequest, buildToolContext, buildSystemPrompt,
-        // bumpGenerationId, getActiveProtocol).  The Phase-4 UI-shaped
-        // entries (beginNextIteration, onLoopEnd) moved into the
+        // Callbacks carry only logic concerns (sendRequest,
+        // buildToolContext, buildSystemPrompt, bumpGenerationId,
+        // getActiveProtocol).  UI-shaped work lives in the
         // AgentEventSink methods further down (OnAgentIterationBegin,
-        // OnAgentLoopEnd) — same body, cleaner separation.
+        // OnAgentLoopEnd).
         m_agentController->SetCallbacks({
             /*sendRequest*/ [this](const std::string& /*model*/,
                                    const std::string& body,
@@ -1195,44 +1165,35 @@ private:
              m_pendingSendProtocolTimer.GetId());
 
 
-        // Attach (📎) button: sidebar-style hover tile plus the theme's
-        // interactive accent on the glyph.
+        // Attach: native SVG bitmap states tint the paperclip on hover;
+        // no background tile (glyph-only, like the ctx meter).
         _attachButton->Bind(wxEVT_BUTTON, &MyFrame::OnAttachImage, this);
-        BindIconHover(_attachButton, &ThemeData::bgInputArea, true);
+        BindIconHover(_attachButton, &ThemeData::bgInputArea, false);
 
-        // Agent toggle — same hover tile as attach; click flips
+        // Agent toggle — glyph-only hover like attach; click flips
         // m_agentModeEnabled and re-tints.  The glyph keeps its state
         // colour (accent when ON); when OFF it brightens on hover.
         _agentToggleButton->Bind(wxEVT_BUTTON, &MyFrame::OnToggleAgentMode, this);
-        LbHoverTile::Bind(
-            _agentToggleButton,
-            [this]() -> const ThemeData& { return m_appState->GetTheme(); },
-            [](const ThemeData& t) { return t.bgInputArea; },
-            [this](bool hovered) {
-                const ThemeData& t = m_appState->GetTheme();
-                _agentToggleButton->SetForegroundColour(
-                    m_agentModeEnabled ? LbInteractiveAccentForTheme(t)
-                                       : (hovered ? t.textPrimary : t.textMuted));
-            });
+        LbHoverTile::BindGlyph(_agentToggleButton);
         
         
         _userInputCtrl->Bind(wxEVT_TEXT_ENTER, &MyFrame::OnSendMessage, this);
         _userInputCtrl->Bind(wxEVT_TEXT, &MyFrame::OnUserInputChanged, this);
 
         // Native bitmap states handle the glyph's hover, focus, pressed and
-        // disabled colors; the hover tile adds the sidebar-style background.
+        // disabled colors; no background tile.
         _settingsButton->Bind(wxEVT_BUTTON, &MyFrame::OnOpenSettings, this);
         BindIconHover(_settingsButton, &ThemeData::bgToolbar, false);
 
-        // New Chat (+): hover tile + interactive accent glyph.
+        // New Chat (+): interactive accent glyph on hover.
         _newChatButton->Bind(wxEVT_BUTTON, &MyFrame::OnNewChat, this);
         BindIconHover(_newChatButton, &ThemeData::bgToolbar, true);
 
 
-        // Sidebar/history toggle (hamburger): same hover tile as + and ⚙.
+        // Sidebar/history toggle (hamburger): same glyph hover as + and ⚙.
         _sidebarToggle->Bind(wxEVT_BUTTON, &MyFrame::OnToggleSidebar, this);
         BindIconHover(_sidebarToggle, &ThemeData::bgToolbar, true);
-        // About (i): same hover tile.
+        // About (i): same glyph hover.
         _aboutButton->Bind(wxEVT_BUTTON, &MyFrame::OnAbout, this);
         BindIconHover(_aboutButton, &ThemeData::bgToolbar, true);
 
@@ -1330,7 +1291,7 @@ private:
         Bind(wxEVT_ASSISTANT_COMPLETE, &MyFrame::OnAssistantComplete, this);
         Bind(wxEVT_ASSISTANT_ERROR, &MyFrame::OnAssistantError, this);
 
-        // ─── /cmd (Phase 1 tool executor) ─────────────────────────
+        // ─── PowerShell executor ──────────────────────────────────
         Bind(wxEVT_CMD_COMPLETE, &ToolResultController::OnCmdComplete, m_toolResultController.get());
         Bind(wxEVT_CMD_OUTPUT, [this](wxCommandEvent& e) {
             if (m_isClosing || !m_activityStrip) return;
@@ -1348,7 +1309,7 @@ private:
         // (agent loop first, slash card otherwise).
         Bind(wxEVT_PY_SESSION_COMPLETE, &ToolResultController::OnPySessionComplete, m_toolResultController.get());
 
-        // ─── /grep (Phase 3 threaded executor) ────────────────────
+        // ─── grep (threaded executor) ─────────────────────────────
         Bind(wxEVT_GREP_COMPLETE, &ToolResultController::OnGrepComplete, m_toolResultController.get());
         Bind(wxEVT_WEB_FETCH_COMPLETE, &ToolResultController::OnWebFetchComplete, m_toolResultController.get());
         Bind(wxEVT_WEB_FETCH_ERROR,    &ToolResultController::OnWebFetchError,    m_toolResultController.get());
@@ -1469,7 +1430,7 @@ private:
         Bind(wxEVT_SERVER_READY, &MyFrame::OnServerReady, this);
         Bind(wxEVT_SERVER_ERROR, &MyFrame::OnServerError, this);
 
-        // Phase 3b: tool protocol detection result
+        // Tool protocol detection result
         Bind(wxEVT_TOOL_PROTOCOL_DETECTED,
              &MyFrame::OnToolProtocolDetected, this);
     }
@@ -1616,6 +1577,9 @@ private:
 
     // ─── UI Controls ──────────────────────────────────────────────
     ChatDisplayCtrl* _chatDisplayCtrl;
+    wxPanel*         _chatClip = nullptr;    // clips the transcript's native scrollbar
+    LbScrollRail*    m_chatRail = nullptr;   // slim themed scrollbar beside the transcript
+    LbScrollRail*    m_inputRail = nullptr;  // same rail beside the composer
     ChatInputCtrl*   _userInputCtrl;
     wxButton*        _sendButton;
     wxButton*        _stopButton;
@@ -1667,8 +1631,8 @@ private:
     wxStaticText* _modelPillLeftBracket = nullptr;   // "[" — hover-recolored
     wxStaticText* _modelPillRightBracket = nullptr;  // "]" — hover-recolored
     StatusDot*    _statusDot;
-    wxStaticText* _protocolChip;   // Phase 3b: native/xml chip beside model name
-    ToolProtocol  _activeProtocol = ToolProtocol::Unknown;   // Phase 3c-i
+    wxStaticText* _protocolChip;   // native/xml chip beside model name
+    ToolProtocol  _activeProtocol = ToolProtocol::Unknown;   // detected protocol of the loaded model
 
     // ── Context meter ──────────────────────────────────────────────
     // Top-bar "ctx <used>/<window>" occupancy readout.
@@ -1707,6 +1671,7 @@ private:
     mutable const ChatHistory*  m_ctxEstimateHistory         = nullptr;
     mutable std::uint64_t       m_ctxEstimateRevision        = 0;
     std::string m_ctxMeterHistoryPath;             // conversation-identity tracker
+    std::string m_ctxCalibHeaderCheckedPath;       // ctx_calibration.tsv whose last header is current
     // Timings / speeds of the last completed transcript reply in this
     // window (turn_stats.h).  Empty until the first reply; cleared with
     // the context anchor on New Chat / load / model switch.
@@ -1785,7 +1750,7 @@ private:
     bool m_agentModeEnabled;
 
     // Lazy model loading (paired with ModelSwitcher deferred-model helpers).
-    // Opening a saved conversation no longer reloads its model immediately;
+    // Opening a saved conversation does not reload its model immediately;
     // the model is parked and loaded on the first Send.  If the user hits
     // Send before that model is ready, the typed prompt is stashed here and
     // fired automatically from OnServerReady once the matching model finishes
@@ -1879,10 +1844,10 @@ private:
     }
 
 
-    // Phase 6: slash-command approval state.  Agent approvals live
-    // inside AgentController because native tool_call_id threading
-    // must remain with the loop.  Slash approvals live here because
-    // MyFrame owns slash rendering, persistence, and async state.
+    // Slash-command approval state.  Agent approvals live inside
+    // AgentController because native tool_call_id threading must
+    // remain with the loop.  Slash approvals live here because MyFrame
+    // owns slash rendering, persistence, and async state.
     struct PendingSlashApproval {
         ToolInvocation invocation;
         ToolContext    context;
@@ -1921,13 +1886,12 @@ private:
     }
 
     // ═════════════════════════════════════════════════════════════
-    //  AgentEventSink implementation (Phase 5)
+    //  AgentEventSink implementation
     // ═════════════════════════════════════════════════════════════
     //
-    // The agent loop reports progress through these four hooks
-    // instead of reaching into ChatDisplay or invoking UI lambdas.
-    // Bodies are the same work the Phase-4 callbacks did — just
-    // moved here so the controller stays UI-free.
+    // The agent loop reports progress through these hooks instead of
+    // reaching into ChatDisplay or invoking UI lambdas, so the
+    // controller stays UI-free.
 
     std::filesystem::path NewAgentTracePath()
     {
@@ -2068,9 +2032,9 @@ private:
         }
     }
 
-    // Phase 3 tees the typed AgentEvent stream to a per-loop JSONL trace
-    // before the default sink bridge fans events back out to existing UI
-    // callbacks, so renderer behavior stays unchanged.
+    // Tees the typed AgentEvent stream to a per-loop JSONL trace
+    // before the default sink bridge fans events back out to the UI
+    // callbacks.
     void OnAgentEvent(const AgentEvent& event) override
     {
         AppendAgentTraceEvent(event);
@@ -2116,10 +2080,10 @@ private:
         m_chatDisplay->DisplayToolBlock(block, startExpanded);
     }
 
-    // Phase 6: agent approval pauses the loop before the risky tool
-    // runs.  The card is UI-only; the Allow Once / Allow Always / Deny
-    // buttons (or the typed-command fallback) resolve the pending
-    // invocation held by AgentController.
+    // Agent approval pauses the loop before the risky tool runs.  The
+    // card is UI-only; the Allow Once / Allow Always / Deny buttons (or
+    // the typed-command fallback) resolve the pending invocation held
+    // by AgentController.
     void OnAgentApprovalRequired(const ToolBlock& block) override
     {
         // UX polish: approval cards should not show the full script/source
@@ -2232,12 +2196,13 @@ private:
     //  HELPERS
     // ═════════════════════════════════════════════════════════════
 
-    // Sidebar-style hover tile for a flat icon button.  `restingBg` names
-    // the ThemeData slot the button normally sits on.  With tintGlyph the
-    // glyph also switches to the interactive accent while hovered (the
-    // previous hover behavior), otherwise only the background changes
-    // (the settings cogwheel tints its own SVG via native bitmap states).
-    void BindIconHover(wxButton* button, wxColour ThemeData::* restingBg,
+    // Glyph-only hover for a flat icon button: no background tile, just
+    // the glyph colour, like the ctx meter and [ Skills ] label.
+    // `restingBg` is unused (kept for call-site compatibility).
+    // With tintGlyph a text glyph switches to the interactive accent while
+    // hovered; without it (the SVG icons) SetBitmapCurrent() does the tint
+    // and the helper only forces the repaint.
+    void BindIconHover(wxButton* button, wxColour ThemeData::* /*restingBg*/,
                        bool tintGlyph)
     {
         std::function<void(bool)> glyph;
@@ -2248,11 +2213,7 @@ private:
                     hovered ? LbInteractiveAccentForTheme(t) : t.textMuted);
             };
         }
-        LbHoverTile::Bind(
-            button,
-            [this]() -> const ThemeData& { return m_appState->GetTheme(); },
-            [restingBg](const ThemeData& t) { return t.*restingBg; },
-            glyph);
+        LbHoverTile::BindGlyph(button, glyph);
     }
 
     void ApplyThemeToUI()
@@ -2277,7 +2238,8 @@ private:
         if (_protocolChip) UpdateProtocolChip(_activeProtocol);
         _newChatButton->SetBackgroundColour(t.bgToolbar);
         _newChatButton->SetForegroundColour(t.textMuted);
-        LbSettingsIcon::Apply(_settingsButton, t);
+        LbIcons::ApplyFlatButton(_settingsButton, LbIcons::Id::Settings,
+                                 t, t.bgToolbar);
         _aboutButton->SetBackgroundColour(t.bgToolbar);
         _aboutButton->SetForegroundColour(t.textMuted);
         _topSeparator->SetBackgroundColour(t.borderSubtle);
@@ -2298,18 +2260,18 @@ private:
         _rightPanel->SetBackgroundColour(t.bgMain);
         _chatDisplayCtrl->SetBackgroundColour(t.bgMain);
         _chatDisplayCtrl->SetForegroundColour(t.textPrimary);
+        if (m_chatRail) m_chatRail->ApplyTheme();   // also recolours _chatClip
         _attachChipBar->SetBackgroundColour(t.bgMain);
         RebuildAttachmentChips();
 
         _inputContainer->SetBackgroundColour(t.bgInputArea);
         _inputSeparator->SetBackgroundColour(t.borderSubtle);
-        _attachButton->SetBackgroundColour(t.bgInputArea);
-        _attachButton->SetForegroundColour(t.textMuted);
-        _agentToggleButton->SetBackgroundColour(t.bgInputArea);
-        _agentToggleButton->SetForegroundColour(
-            m_agentModeEnabled ? LbInteractiveAccentForTheme(t) : t.textMuted);
+        LbIcons::ApplyFlatButton(_attachButton, LbIcons::Id::Attach,
+                                 t, t.bgInputArea);
+        LbIcons::ApplyAgentToggle(_agentToggleButton, t, m_agentModeEnabled);
         _userInputCtrl->SetBackgroundColour(t.bgInputField);
         _userInputCtrl->SetForegroundColour(t.textPrimary);
+        if (m_inputRail) m_inputRail->ApplyTheme();  // also recolours the clip
         _sendButton->SetBackgroundColour(t.accentButton);
         _sendButton->SetForegroundColour(t.accentButtonText);
         _stopButton->SetBackgroundColour(t.stopButton);
@@ -2702,10 +2664,7 @@ private:
     {
         if (IsBusy()) return;  // ignore toggle while something's running
         m_agentModeEnabled = !m_agentModeEnabled;
-        _agentToggleButton->SetForegroundColour(
-            m_agentModeEnabled ? LbInteractiveAccentForTheme(m_appState->GetTheme())
-                               : m_appState->GetTheme().textMuted);
-        _agentToggleButton->Refresh();
+        LbIcons::ApplyAgentToggle(_agentToggleButton, m_appState->GetTheme(), m_agentModeEnabled);
         m_chatDisplay->DisplaySystemMessage(
             m_agentModeEnabled
               ? "\xF0\x9F\xA4\x96 Agent mode ON. The model can use read/ls/open/grep/pwd/powershell."
@@ -2733,8 +2692,7 @@ private:
         // default, so users don't have to hunt for a per-kind filter.
         // CSV lives under Spreadsheets — it routes through
         // QueueCsvAttachmentFromDrop (workspace import + csv_inspect
-        // hint), NOT through AttachTextFile.  IsTextFile no longer
-        // claims the extension.
+        // hint), NOT through AttachTextFile.
         const wxString filter =
             "All supported files"
             "|*.png;*.jpg;*.jpeg;*.gif;*.bmp;*.webp;"
@@ -2964,15 +2922,14 @@ private:
             //
             // `sub` is remote-endpoint-controlled text: everything
             // between "image/" and the first ';' in a header that came
-            // off the wire.  It used to reach the filename verbatim,
-            // bypassing the path_safety::SanitizeFilename boundary rule
-            // every other filesystem call site follows.  A subtype like
-            // "png:hidden" produced an NTFS alternate-data-stream write,
-            // and one ending in '.' or ' ' defeated the collision-bump
-            // loop below (Windows normalizes those away at open time, so
-            // wxFileExists missed and the write clobbered the file the
-            // loop exists to protect).  This field has exactly one
-            // legitimate shape, so allowlist rather than sanitize.
+            // off the wire.  It must not reach the filename verbatim: a
+            // subtype like "png:hidden" would produce an NTFS
+            // alternate-data-stream write, and one ending in '.' or ' '
+            // would defeat the collision-bump loop below (Windows
+            // normalizes those away at open time, so wxFileExists would
+            // miss and the write would clobber the file the loop
+            // protects).  This field has exactly one legitimate shape,
+            // so allowlist rather than sanitize.
             std::string ext = "png";
             if (header.rfind("image/", 0) == 0) {
                 std::string sub = header.substr(6);
@@ -3162,11 +3119,11 @@ private:
             RefreshContextMeter();
         }
 
-        // Phase 3 bugfix #3: extract native tool_calls before deciding
-        // whether this assistant turn has visible UI text. Native
-        // function-calling turns often complete with content == "" and
-        // tool_calls != []; if we call DisplayAssistantComplete() first,
-        // the chat renders an empty "model:" row before the tool card.
+        // Extract native tool_calls before deciding whether this
+        // assistant turn has visible UI text.  Native function-calling
+        // turns often complete with content == "" and tool_calls != [];
+        // calling DisplayAssistantComplete() first would render an
+        // empty "model:" row before the tool card.
         std::string toolCallsJson;
         std::vector<std::string> imageDataUrls;
         if (payload) {
@@ -3224,7 +3181,7 @@ private:
             logger->warning("Assistant complete event arrived empty; keeping streamed content");
         }
 
-        // OpenAI Responses (Phase 2): keep the model's own output items
+        // OpenAI Responses: keep the model's own output items
         // (encrypted reasoning + function calls) on this assistant turn.
         // Must land BEFORE the agent controller attaches tool_calls and
         // appends the first tool result, so the next iteration's request
@@ -3252,7 +3209,7 @@ private:
         // event (tool call found, loop continuing), skip the
         // normal "finalize and stop streaming" path — the next
         // iteration is already in flight and SetStreamingState(true)
-        // was re-applied by OnAgentIterationBegin (Phase 5).
+        // was re-applied by OnAgentIterationBegin.
         if (interruptedTurn && m_agentController->IsActive()) {
             // Same unwind as OnAssistantError: reset the XML stream
             // filter, end the loop (StreamError reason -- the notice
@@ -3261,9 +3218,9 @@ private:
             m_agentController->HandleAssistantError("repetition loop");
         }
         else if (m_agentController->IsActive()) {
-            // Phase 3c-ii: structured tool_calls were extracted above
-            // before UI finalization so native tool-only turns can be
-            // hidden cleanly instead of rendering blank assistant rows.
+            // Structured tool_calls were extracted above before UI
+            // finalization so native tool-only turns can be hidden
+            // cleanly instead of rendering blank assistant rows.
             if (auto* logger = m_appState->GetLogger();
                 logger && !toolCallsJson.empty()) {
                 logger->information(
@@ -3360,9 +3317,9 @@ private:
     // tool_result_controller.{h,cpp} (bound there in BindFrameEvents).
 
     // ── Slash-command handlers ───────────────────────────────────
-    // After Phase 4, tool-shaped slash commands all route through
-    // HandleSlashCommand → DispatchInvocation, the same path the agent
-    // uses.  Stateful conversation commands keep their own handlers:
+    // Tool-shaped slash commands route through HandleSlashCommand →
+    // DispatchInvocation, the same path the agent uses.  Stateful
+    // conversation commands keep their own handlers:
     //   - /cd mutates the per-conversation tool cwd.
     //
     // /cd resolution: per-conversation tool CWD if set, else the
@@ -3430,8 +3387,7 @@ private:
                                              : path.substr(a, b - a + 1);
         }
 
-        // Bare /cd reports the current directory (/pwd was removed with
-        // the other typed tool mirrors on 2026-09-28).
+        // Bare /cd reports the current directory.
         if (path.empty()) {
             m_chatDisplay->DisplaySystemMessage(
                 "Working directory: " + ResolveCurrentCwd() +
@@ -3473,38 +3429,23 @@ private:
             m_pySessionManager->ReapIdle();
     }
 
-    // ─── Unified slash-command dispatch (Phase 4 / 4.1) ──────────
+    // ─── Unified slash-command dispatch ──────────────────────────
     //
-    // Typed tool commands (since 2026-09-28 only /reminder_create,
-    // /reminder_list and /reminder_cancel; see kToolSlashTable in
-    // lb_input_parsers.cpp) flow through HandleSlashCommand below.  The
-    // method builds a ToolInvocation, calls DispatchInvocation, and
-    // either renders the sync result or sets the chat-state so the
-    // matching OnGrepComplete / OnCmdComplete picks up the async
-    // continuation.
+    // Typed tool commands (/reminder_create, /reminder_list and
+    // /reminder_cancel; see kToolSlashTable in lb_input_parsers.cpp)
+    // flow through HandleSlashCommand below.  The method builds a
+    // ToolInvocation, calls DispatchInvocation, and either renders the
+    // sync result or sets the chat-state so the matching
+    // OnGrepComplete / OnCmdComplete picks up the async continuation.
     //
-    // /cd is NOT a tool — it mutates per-conversation state
-    // and keeps a dedicated handler.  Everything else that used to live in
-    // HandleSlashRead/Ls/Grep/Open/Pwd is gone: dispatch,
-    // validation, rendering, and history are now identical to the
-    // agent path.
+    // /cd is NOT a tool — it mutates per-conversation state and keeps
+    // a dedicated handler.  Dispatch, validation, rendering, and
+    // history for everything else are identical to the agent path.
     //
     // toolCallId is always empty for slash invocations: there is no
     // model-emitted call to thread.  AddUserMessage (rather than
     // AddToolResultMessage) is therefore the correct persistence
     // call for the result — see RenderAndPersistSlashResult.
-    //
-    // Behavioral deltas vs Phase 3 user-typed slash:
-    //   - /pwd renders as a tool card now (Pwd icon + body) instead
-    //     of a system message.  Same body text, different chrome.
-    //   - /cmd is now classified by the PowerShell policy layer
-    //     (EvaluatePowerShellCommand), matching the agent path.
-    //     Clearly read-only commands run immediately, broader valid
-    //     commands pause for approval, and malformed commands render
-    //     with a "blocked" chip plus an explanation in errorBody.
-    //   - /cmd chip ordering becomes [status, elapsed, truncated?]
-    //     to match the saved-history order and the agent path
-    //     (previously the on-screen order was [elapsed, status]).
     void DisplaySlashPendingIndicator(const std::string& toolName,
                                       const std::string& args)
     {
@@ -3872,12 +3813,12 @@ private:
     // request while the loop is active; not stored in history so
     // saved conversations stay clean.  Kept short — small models
     // follow short prompts much more reliably than long ones.
-    // Phase 3c-ii: split the agent system prompt by tool protocol.
-    // Native models receive a trimmed prompt (no XML grammar
-    // examples, no "Available tool names" list) because the
-    // wire-level `tools` field teaches the model what tools exist
-    // and how to call them.  XML models still need the full
-    // grammar tutorial below.
+    //
+    // The prompt is split by tool protocol.  Native models receive a
+    // trimmed prompt (no XML grammar examples, no "Available tool
+    // names" list) because the wire-level `tools` field teaches the
+    // model what tools exist and how to call them.  XML models still
+    // need the full grammar tutorial below.
     //
     // BuildAgentSystemPrompt() is the dispatcher; it picks based
     // on _activeProtocol.  Both branches share workspace context
@@ -4032,8 +3973,8 @@ private:
     //  Sidebar context menus (chat row + project header)
     // ═════════════════════════════════════════════════════════════
 
-    // Right-click on one or more chat rows.  Phase 4 expands the
-    // existing Move/Delete menu with rename, pin, and archive actions.
+    // Right-click on one or more chat rows: move, delete, rename, pin,
+    // and archive actions.
     void ShowSidebarChatContextMenu(const std::vector<std::string>& paths,
                                     wxWindow* anchor)
     {
@@ -4115,10 +4056,14 @@ private:
 
         // ── Export (single conversation; read-only, so not busy-gated) ─
         int exportItemId = 0;
+        int exportMetricsItemId = 0;
         if (paths.size() == 1) {
             wxMenuItem* exportItem =
                 menu.Append(wxID_ANY, "Export conversation...");
             exportItemId = exportItem->GetId();
+            wxMenuItem* exportMetricsItem =
+                menu.Append(wxID_ANY, "Export with metrics...");
+            exportMetricsItemId = exportMetricsItem->GetId();
         }
 
         menu.AppendSeparator();
@@ -4192,6 +4137,14 @@ private:
                     m_convController->ExportConversation(path);
                 },
                 exportItemId);
+        }
+        if (exportMetricsItemId) {
+            menu.Bind(
+                wxEVT_MENU,
+                [this, path = paths.front()](wxCommandEvent&) {
+                    m_convController->ExportConversation(path, /*withMetrics=*/true);
+                },
+                exportMetricsItemId);
         }
 
         menu.Bind(
@@ -4315,7 +4268,7 @@ private:
 
 
     // ═════════════════════════════════════════════════════════════
-    //  Projects Phase 1-5 menu handlers
+    //  Project menu handlers
     // ═════════════════════════════════════════════════════════════
 
     // AttachProjectToCurrentChat() moved to ProjectController (project_controller.cpp).
@@ -4780,8 +4733,7 @@ private:
 
     // Queues a prime of the stable part of the agent prompt when this
     // window shows an empty agent-mode chat on a local model and nothing
-    // is running.  Returns false (and logs why) otherwise.  Always on:
-    // the /prewarm on|off|now command was removed 2026-09-28.
+    // is running.  Returns false (and logs why) otherwise.  Always on.
     bool TryPromptPrewarm(const std::string& reason)
     {
         auto skip = [&](const std::string& why) {
@@ -4935,8 +4887,8 @@ private:
         // Stop any running Easter egg animation
         if (m_activeAnimation) { StopAnimation(); return; }
 
-        // Phase 6: Stop while an approval card is pending means
-        // cancel the pending tool, not a nonexistent chat stream.
+        // Stop while an approval card is pending means cancel the
+        // pending tool, not a nonexistent chat stream.
         if (m_chatState == ChatState::AwaitingApproval) {
             if (m_pendingSlashApproval.active) {
                 DenyPendingSlashTool(
@@ -5169,7 +5121,7 @@ private:
         bool kvCacheQ8Changed          = dlg.WasKvCacheQ8Changed();
         bool mtpChanged                = dlg.WasMtpEnabledChanged();
 
-        // ── Multi-window courtesy check (Phase 3c) ────────────────
+        // ── Multi-window courtesy check ───────────────────────────
         // The folder / model / launch-arg branches below stop or
         // restart the shared llama-server, which kills any stream
         // another window has in flight.  Confirm once, up front,
@@ -5204,7 +5156,7 @@ private:
         // Persist every accepted launch-argument setting before branch
         // selection.  The folder-change branch takes precedence over model
         // and restart branches, so persisting only inside those later
-        // branches used to silently lose context/KV/MTP changes made in the
+        // branches would silently lose context/KV/MTP changes made in the
         // same Settings session as a models-folder change.
         if (ctxSizeChanged)
             m_appState->SetCtxSize(dlg.GetSelectedCtxSize());
@@ -5273,17 +5225,14 @@ private:
 
             m_modelSwitcher->SetConversationPreferredLocalModel(newModel);
             _statusDot->SetConnected(false);
-            // Phase 3b: hide the chip until the new model passes
-            // detection.  Without this, switching from a "native"
-            // model briefly displays the old chip on the new model.
+            // Hide the chip until the new model passes detection, so
+            // the old model's chip never shows on the new one.
             if (_protocolChip) UpdateProtocolChip(ToolProtocol::Unknown);
-            // Phase 3c-i: also reset the active-protocol cache so
-            // the next request defaults back to XML until detection
-            // confirms the new model.
+            // Also reset the active-protocol cache so the next request
+            // defaults back to XML until detection confirms the new model.
             _activeProtocol = ToolProtocol::Unknown;
-            // Clear the old conversation before showing the reload status.
-            // Previously, the "Loading <model>..." message was written and
-            // then immediately erased by m_chatDisplay->Clear().
+            // Clear the old conversation before showing the reload status,
+            // so Clear() doesn't erase the "Loading <model>..." message.
             m_chatHistory->Clear();
             m_chatDisplay->Clear();
             m_attachments->Clear();
@@ -5501,7 +5450,7 @@ private:
         Close(/*force=*/true);
     }
 
-    // ── Phase 3a: multiple windows ───────────────────────────────
+    // ── Multiple windows ─────────────────────────────────────────
     // Every window is a full MyFrame borrowing the app-owned AppState
     // and ModelService; the ctor's ConsumeInitialBootstrap gate means
     // a new window never boots a second server — it joins the running
@@ -5540,14 +5489,14 @@ private:
         // KV fast path: snapshot the outgoing conversation's slot state
         // before Clear().  Ownership-guarded no-op unless the slot holds
         // this conversation's KV and a generation ran since restore.
-        // Routed through ModelService (Phase 3c): skipped when another
-        // window is mid-generation on the shared slot.
+        // Routed through ModelService: skipped when another window is
+        // mid-generation on the shared slot.
         m_modelService->SaveSlotStateForConversation(
             this, m_chatHistory->GetFilePath());
 
         m_chatHistory->Clear();
         // Fresh chat = no conversation claim; the first autosave will
-        // claim the newly generated path (Phase 3b).
+        // claim the newly generated path.
         wxGetApp().GetConversationRegistry().SetCurrent(this, "");
         CancelPendingSendForConversationSwitch();
         RefreshProjectStrip();
@@ -5570,10 +5519,7 @@ private:
         const bool desired = m_appState->GetAgentDefaultOn();
         if (m_agentModeEnabled != desired) {
             m_agentModeEnabled = desired;
-            _agentToggleButton->SetForegroundColour(
-                m_agentModeEnabled ? LbInteractiveAccentForTheme(m_appState->GetTheme())
-                                   : m_appState->GetTheme().textMuted);
-            _agentToggleButton->Refresh();
+            LbIcons::ApplyAgentToggle(_agentToggleButton, m_appState->GetTheme(), m_agentModeEnabled);
         }
 
         if (auto* logger = m_appState->GetLogger())
@@ -5664,11 +5610,10 @@ private:
         if (!m_modelSwitcher->IsConversationTargetActive())
             return;
 
-        // Phase 3 bugfix #2: immediately clear any stale protocol from
-        // the previously loaded server before detection for this server
-        // completes. Without this, a user could send an agent request in
-        // the small ready-to-probe-result window and build it with the old
-        // model's protocol.
+        // Immediately clear any stale protocol from the previously
+        // loaded server before detection for this server completes, so
+        // a request sent in the ready-to-probe-result window can't be
+        // built with the old model's protocol.
         _activeProtocol = ToolProtocol::Unknown;
         if (_protocolChip) UpdateProtocolChip(ToolProtocol::Unknown);
 
@@ -5689,12 +5634,12 @@ private:
         // service ready.  The frame now performs UI-only work.
         m_modelSwitcher->OnServerReady();
 
-        // Phase 3b: kick off tool-protocol detection for the active
-        // (model, mmproj) pair.  Cache hits resolve immediately
-        // (no thread); fresh probes run /props + heuristic + smoke
-        // test on a worker and post wxEVT_TOOL_PROTOCOL_DETECTED
-        // back to OnToolProtocolDetected.  The chip stays hidden
-        // until the result arrives.
+        // Kick off tool-protocol detection for the active (model,
+        // mmproj) pair.  Cache hits resolve immediately (no thread);
+        // fresh probes run /props + heuristic + smoke test on a worker
+        // and post wxEVT_TOOL_PROTOCOL_DETECTED back to
+        // OnToolProtocolDetected.  The chip stays hidden until the
+        // result arrives.
         if (_protocolChip) {
             _protocolChip->Hide();
             _protocolChip->SetLabel("");
@@ -5709,11 +5654,10 @@ private:
                     this, m_alive, baseUrl, modelPath, mmprojPath,
                     serverJinjaEnabled)) {
                 // The probe never started.  Leaving _activeProtocol at
-                // Unknown used to be the silent failure mode: the
-                // request builder gets no protocol, the tooltip never
-                // updates, and nothing is logged - tool calling just
-                // quietly does not happen.  Fall back to the XML path,
-                // which every model can drive, and say so.
+                // Unknown would fail silently: the request builder gets
+                // no protocol, the tooltip never updates, and tool
+                // calling just quietly does not happen.  Fall back to
+                // the XML path, which every model can drive, and say so.
                 _activeProtocol = ToolProtocol::Xml;
                 UpdateProtocolChip(ToolProtocol::Xml);
                 if (auto* logger = m_appState->GetLogger())
@@ -5759,10 +5703,10 @@ private:
         }
     }
 
-    // Phase 3b: handle the worker's result event.  Updates the chip
-    // to "native" or "xml" with theme-appropriate colors and shows
-    // it.  Logs the decision so server.log/llamaboss.log stays
-    // useful for debugging which models passed detection and why.
+    // Handle the protocol-detection worker's result event.  Updates the
+    // chip to "native" or "xml" with theme-appropriate colors and shows
+    // it.  Logs the decision so server.log/llamaboss.log stays useful
+    // for debugging which models passed detection and why.
     void OnToolProtocolDetected(wxThreadEvent& event)
     {
         if (m_isClosing) return;
@@ -5785,9 +5729,9 @@ private:
             logger->information(line);
         }
 
-        // Phase 3c-i: cache the result for the request builder.  The
-        // agent controller reads this via the getActiveProtocol
-        // callback when building each request body.
+        // Cache the result for the request builder.  The agent
+        // controller reads this via the getActiveProtocol callback when
+        // building each request body.
         _activeProtocol = r.protocol;
 
         UpdateProtocolChip(r.protocol);
@@ -5862,15 +5806,43 @@ private:
         try {
             const std::filesystem::path p =
                 std::filesystem::path(dir) / "ctx_calibration.tsv";
-            const bool fresh = !std::filesystem::exists(p);
+
+            // Request-makeup columns follow `elided` (read by "Export
+            // with metrics...").  New columns go at the END so the
+            // elision seeder's positions never move.  A log started by
+            // an older build gets the new header repeated once
+            // (export_metrics.h and turn_stats.tsv handle repeated
+            // headers; the seeder skips the line as an unparsable row).
+            static const char* const kHeader =
+                "time\tmodel\treq_bytes\tprompt_tokens\test_tokens"
+                "\tbytes_per_token\test_error_pct\telided"
+                "\targs_elided\tsystem_bytes\ttools_bytes\tuser_bytes"
+                "\tassistant_bytes\ttool_result_bytes\timage_bytes"
+                "\treasoning_replay_bytes";
+            const std::string pathKey = p.string();
+            if (pathKey != m_ctxCalibHeaderCheckedPath ||
+                !std::filesystem::exists(p)) {
+                std::string lastHeader;
+                if (std::filesystem::exists(p)) {
+                    std::ifstream existing(p, std::ios::binary);
+                    if (!existing) return;
+                    std::string line;
+                    while (std::getline(existing, line)) {
+                        if (!line.empty() && line.back() == '\r') line.pop_back();
+                        if (line.compare(0, 5, "time\t") == 0) lastHeader = line;
+                    }
+                    if (existing.bad()) return;
+                }
+                if (lastHeader != kHeader) {
+                    std::ofstream h(p, std::ios::app);
+                    if (!h) return;
+                    h << kHeader << '\n';
+                }
+                m_ctxCalibHeaderCheckedPath = pathKey;
+            }
 
             std::ofstream f(p, std::ios::app);
             if (!f) return;
-
-            if (fresh) {
-                f << "time\tmodel\treq_bytes\tprompt_tokens\test_tokens"
-                     "\tbytes_per_token\test_error_pct\telided\n";
-            }
 
             char nums[96];
             snprintf(nums, sizeof(nums), "%.3f\t%+.1f", bpt, errPc);
@@ -5883,7 +5855,16 @@ private:
               << promptTokens  << '\t'
               << est           << '\t'
               << nums          << '\t'
-              << m_chatHistory->GetLastBuildElidedCount()
+              << m_chatHistory->GetLastBuildElidedCount() << '\t'
+              << m_chatHistory->GetLastBuildArgsElidedCount() << '\t';
+            const RequestBreakdown& b = m_chatHistory->GetLastBuildBreakdown();
+            f << b.systemBytes     << '\t'
+              << b.toolsBytes      << '\t'
+              << b.userBytes       << '\t'
+              << b.assistantBytes  << '\t'
+              << b.toolResultBytes << '\t'
+              << b.imageBytes      << '\t'
+              << b.replayBytes
               << '\n';
         } catch (...) {
             // best-effort only
@@ -5988,11 +5969,10 @@ private:
     }
 
     // Meter fallback when no exact usage anchor exists (endpoint sends no
-    // usage, or the chat was just reopened).  2026-10-01: the raw
-    // history-at-3.0-bytes estimate read ~324.5k/262.1k (red) for a
-    // reopened GPT-6 Luna chat whose real requests ran ~150k tokens.
-    // Now: measured bytes-per-token for the conversation model (seeded
-    // from ctx_calibration.tsv on load), capped at the elision budget the
+    // usage, or the chat was just reopened).  A flat bytes-per-token
+    // guess badly overstates long reopened chats, so this uses the
+    // measured bytes-per-token for the conversation model (seeded from
+    // ctx_calibration.tsv on load), capped at the elision budget the
     // next request will enforce; *wouldElide drives "·elided".
     long long FallbackContextEstimate(const ChatHistory& h, int window,
                                       bool* wouldElide) const
@@ -6108,8 +6088,10 @@ private:
         m_contextHud = new ContextHud(this, m_appState->GetTheme(),
                                       context_stats::BuildContextHudModel(BuildHudInputs()),
                                       std::move(actions));
-        m_contextHud->ShowInCorner(_chatDisplayCtrl ? static_cast<wxWindow*>(_chatDisplayCtrl)
-                                                    : static_cast<wxWindow*>(this));
+        // Anchor to the visible transcript area: the control itself extends
+        // under the clip edge by the hidden native scrollbar's width.
+        m_contextHud->ShowInCorner(_chatClip ? static_cast<wxWindow*>(_chatClip)
+                                             : static_cast<wxWindow*>(this));
         m_appState->SetContextHudOpen(true);   // reopened on next launch
 #ifdef __WXMSW__
         m_contextHudVisTimer.Start(250);
@@ -6171,8 +6153,7 @@ private:
         if (!wantShown) {
             // The meter is only the panel's toggle, not its data source:
             // an open HUD must keep following chat switches and replies
-            // (it still has its own [ Close ]).  Returning before this
-            // froze it on the previous chat's numbers.
+            // (it still has its own [ Close ]), so don't return early.
             UpdateContextHud();
             return;
         }
@@ -6703,9 +6684,9 @@ private:
 
         bool TryHandlePendingApprovalInput(const std::string& userInput)
     {
-        // Phase 6: approval is a special busy state.  The input is
-        // enabled only for /approve or /deny; ordinary messages wait
-        // until the pending tool is resolved.
+        // Approval is a special busy state.  The input is enabled only
+        // for /approve or /deny; ordinary messages wait until the
+        // pending tool is resolved.
         if (m_chatState == ChatState::AwaitingApproval) {
             if (userInput.empty()) return true;
 
@@ -6714,13 +6695,11 @@ private:
 
             if (action ==
                 lb_input_parsers::ApprovalInputAction::Unrecognized) {
-                // Two fixes vs the old branch:
-                //  * do NOT clear the composer -- clearing silently
-                //    destroyed the user's typed draft;
-                //  * use a system line, not DisplayAssistantMessage --
-                //    the old fake assistant turn was never added to
-                //    history, so the transcript and the saved
-                //    conversation diverged on reload.
+                // Do NOT clear the composer (that would destroy the
+                // user's typed draft), and use a system line rather than
+                // a fake assistant turn that never reaches history (the
+                // transcript and saved conversation would diverge on
+                // reload).
                 m_chatDisplay->DisplaySystemMessage(
                     "Approval is still pending. Use the buttons above, "
                     "or type approve / allow once / deny. Your draft is "
@@ -6932,8 +6911,8 @@ private:
             return true;
         }
 
-        // ── Tool-shaped slash commands (Phase 4 / 4.1) ────────────
-        // Parsing now lives in lb_input_parsers so MyFrame keeps the
+        // ── Tool-shaped slash commands ────────────────────────────
+        // Parsing lives in lb_input_parsers so MyFrame keeps the
         // execution/UI responsibilities while the command table stays
         // isolated and easier to test.
         if (!hasAttachments) {
@@ -7166,7 +7145,7 @@ private:
         // refreshes it defensively as well.
         m_chatHistory->SetActiveReasoningDialect(target.reasoningDialect);
         // Same lifetime: lets the request builder attach the Responses
-        // reasoning-replay sidecar (Phase 2) only for Responses targets.
+        // reasoning-replay sidecar only for Responses targets.
         m_chatHistory->SetActiveResponsesApi(target.responsesApi);
 
         // A conversation can restore Off or carry it across a model switch.
@@ -7197,11 +7176,11 @@ private:
             const int ctxTokens = m_modelSwitcher->ConversationContextTokens();
             m_chatHistory->SetElisionSpoolWorkspace(ResolveCurrentCwd());
 
-            // Phase 3c-i: attach the tool catalog when the loaded
-            // model supports native function calling.  The agent
-            // controller does the same on subsequent iterations
-            // (see AgentController::BuildRequestBody); this is the
-            // first turn before the controller takes over the loop.
+            // Attach the tool catalog when the loaded model supports
+            // native function calling.  The agent controller does the
+            // same on subsequent iterations (see
+            // AgentController::BuildRequestBody); this is the first
+            // turn before the controller takes over the loop.
             firstTurnProto = _activeProtocol;
             std::string tools;
             const bool native = (firstTurnProto == ToolProtocol::Native);
@@ -7243,10 +7222,10 @@ private:
                 /*imageOutput*/ imageModel);
         }
 
-        // Inject images after the final body shape is known.
-        // This fixes agent mode dropping image attachments on the first request.
+        // Inject images after the final body shape is known, so agent
+        // mode keeps image attachments on the first request.
         //
-        // Skip when the Phase 1c carrier projection already emitted the
+        // Skip when the carrier projection already emitted the
         // multimodal content array from the persisted attachments: the
         // injector's only remaining action on such a body is a full
         // Poco parse of the multi-MB request to find there is nothing
@@ -7277,9 +7256,9 @@ private:
         // state.  Stamp ownership so switch-away knows a save is both
         // safe and worthwhile.  No-op on the remote lane (no loaded
         // local model — StopServer cleared it before going remote).
-        // Routed through ModelService (Phase 3c): if another window
-        // is mid-generation, this request queues behind it and the
-        // stamp is invalidated instead — see ModelService::NoteSlotOwner.
+        // Routed through ModelService: if another window is
+        // mid-generation, this request queues behind it and the stamp
+        // is invalidated instead — see ModelService::NoteSlotOwner.
         m_modelService->NoteSlotOwner(this, m_chatHistory->GetFilePath());
         {
             std::string genDir = ChatHistory::GetGeneratedFilesDir(
@@ -7312,16 +7291,15 @@ private:
         m_chatState = ChatState::Streaming;
         SetStreamingState(true);
 
-        // Phase 3c-i: log the outbound body so the operator can
-        // verify whether a `tools` array got attached for a
-        // native-protocol model.  Two lines:
+        // Log the outbound body so the operator can verify whether a
+        // `tools` array got attached for a native-protocol model.  Two
+        // lines:
         //   * Request shape — a single grep-friendly summary
         //     ("tools=yes, messages=N, body=BYTES") that answers
         //     "is the wire shape correct?" without eyeballing JSON.
-        //   * Outbound — the first ~2000 chars of the body for
-        //     deeper inspection.  2000 covers the agent system
-        //     prompt (~1k chars) plus the head of the tools array,
-        //     which 500 was clipping.
+        //   * Outbound — the first ~2000 chars of the body for deeper
+        //     inspection: enough for the agent system prompt (~1k
+        //     chars) plus the head of the tools array.
         if (auto* logger = m_appState->GetLogger()) {
             // Cheap textual sniff — these substrings appear at the
             // top level of the JSON because Poco preserves insertion
@@ -7415,7 +7393,7 @@ private:
 
         const bool hasAttachments = m_attachments->HasPending();
 
-        // ── Multi-window queue notice (Phase 3c) ─────────────────
+        // ── Multi-window queue notice ─────────────────────────────
         // llama-server runs a single slot, so if another window is
         // mid-generation this request waits silently inside the
         // server until that stream finishes.  Say so up front — a
@@ -7458,7 +7436,7 @@ private:
             // now sent a prompt, so load that model and queue this prompt to
             // fire from OnServerReady once it's up.
 
-            // ── Multi-window courtesy check (Phase 3c) ────────────
+            // ── Multi-window courtesy check ───────────────────────
             // The deferred load below restarts llama-server, which
             // kills any stream another window has in flight — and
             // unlike the pill switch, the user's mental action here
@@ -7560,19 +7538,12 @@ private:
 bool ImageDropTarget::OnDropFiles(wxCoord /*x*/, wxCoord /*y*/,
     const wxArrayString& filenames)
 {
-    // Single classifying loop — fixes two prior bugs:
-    //
-    //   1. Dropping multiple PDFs / spreadsheets / DOCX files only imported
-    //      the first because each kind-specific loop returned early.
-    //
-    //   2. Mixed drops (e.g. one PDF plus two screenshots) silently lost the
-    //      images for the same reason — the PDF branch returned before the
-    //      image loop ran.
-    //
-    // Importing each file independently lets the same drop yield N artifact
-    // chips of mixed kinds.  PDF / spreadsheet / DOCX / image / text route
-    // through their existing per-kind queue helpers; unknown extensions are
-    // ignored as before.
+    // Single classifying loop: each file is imported independently, so
+    // one drop of several PDFs / spreadsheets / DOCX files imports all
+    // of them, and a mixed drop (one PDF plus two screenshots) keeps
+    // the images too.  A per-kind loop that returns early would lose
+    // the rest.  PDF / spreadsheet / DOCX / image / text route through
+    // their per-kind queue helpers; unknown extensions are ignored.
     bool anyAttached = false;
     for (const auto& file : filenames) {
         std::string path(file.ToUTF8().data());
@@ -7593,16 +7564,16 @@ bool ImageDropTarget::OnDropFiles(wxCoord /*x*/, wxCoord /*y*/,
         }
         else if (ext == "docm") {
             // Macro-enabled Word docs are intentionally not auto-routed
-            // (VBA execution risk).  Previously this fell through silently,
-            // which looked like a broken drop target.  Surface a short
-            // explanation so the user knows what happened and what to do.
-            // anyAttached stays false: nothing landed as an attachment.
+            // (VBA execution risk).  Surface a short explanation rather
+            // than ignoring the drop, so it doesn't look like a broken
+            // drop target.  anyAttached stays false: nothing landed as
+            // an attachment.
             m_frame->NotifyDocmDropRejected(path);
         }
         else if (AttachmentManager::IsCsvFile(path)) {
             // Before IsTextFile by necessity: CSV routes through the
             // workspace-import path (csv_inspect hint), and IsTextFile
-            // no longer claims the extension.
+            // does not claim the extension.
             if (m_frame->QueueCsvAttachmentFromDrop(path))
                 anyAttached = true;
         }

@@ -25,12 +25,7 @@
 
 #include "gguf_metadata.h"
 
-#include <fstream>
-#include <cstring>
-
-#ifdef _WIN32
-#include <windows.h>
-#endif
+#include "lb_windows.h"
 
 namespace {
 

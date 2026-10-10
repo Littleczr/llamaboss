@@ -4,8 +4,6 @@
 #include "skill_prompt_builder.h"
 #include "skill_authoring_support.h"
 
-#include <sstream>
-
 std::string BuildSkillDraftBuilderSystemPrompt(const SkillPromptBuilderInput& input)
 {
     // Agent Skills `name` = the skill's folder stem (kebab-case at
@@ -35,12 +33,11 @@ std::string BuildSkillDraftBuilderSystemPrompt(const SkillPromptBuilderInput& in
       << "# <Skill Name> Skill, an introductory paragraph, ## Trigger Phrases, "
       << "## Inputs to Ask For, ## Steps, ## Output Expectations. "
 
-      // The single most important rule -- this is what was failing
-      // before. The builder used to convert every concrete value
-      // from the design conversation into an "Inputs to Ask For"
-      // entry, which made every Skill re-interrogate the user at
-      // use-time even when the design conversation had already
-      // settled the same values.
+      // The single most important rule: concrete values settled in the
+      // design conversation must be captured in the Skill, not turned
+      // into "Inputs to Ask For" entries -- otherwise every Skill
+      // re-interrogates the user at use-time for values the design
+      // conversation already settled.
       << "\n\nCAPTURE-SPECIFICS RULE (HIGHEST PRIORITY). "
       << "Every concrete value the user established in the design conversation -- folder paths, output filenames, file extensions, recursion choices, target directories, specific files, URLs, named identifiers, numeric thresholds -- MUST be encoded directly in the Steps section as a fixed hardcoded value. "
       << "Do NOT move these values into ## Inputs to Ask For. "
@@ -61,9 +58,9 @@ std::string BuildSkillDraftBuilderSystemPrompt(const SkillPromptBuilderInput& in
 
       // Implementation-path preference order (only when no tool
       // sequence was demonstrated -- otherwise the rule above wins).
-      // This order is now also the Python-helper decision rule: the
-      // user no longer picks with/without a script at creation, so
-      // whether a helper ships is decided HERE, by this preference.
+      // This order is also the Python-helper decision rule: the user
+      // does not pick with/without a script at creation, so whether a
+      // helper ships is decided HERE, by this preference.
       << "\n\nIMPLEMENTATION-PATH PREFERENCE (apply only when the design conversation did NOT demonstrate a working tool sequence). "
       << "First, prefer native LlamaBoss tools for ordinary file and text operations. "
       << "Second, prefer approved PowerShell for Windows-native tasks that native tools cannot express -- recursive multi-folder searches, metadata-heavy reports, archive workflows, bulk file operations, OS-level utilities. "
@@ -72,14 +69,15 @@ std::string BuildSkillDraftBuilderSystemPrompt(const SkillPromptBuilderInput& in
       << "Do not choose Python for ordinary file lists, source manifests, basic ZIP backups, basic text reports, or other straightforward Windows file operations. "
 
       // PowerShell guardrails -- the empty-output footgun: -Include
-      // without -Recurse needs a trailing \* on -Path.  Corrected
-      // 2026-09-30 after measuring on Windows PowerShell 5.1 (62,392
-      // files on D:):  'D:\' -Recurse -Include  -> 191,
+      // without -Recurse needs a trailing \* on -Path.  Measured on
+      // Windows PowerShell 5.1 (62,392 files on D:):
+      //                'D:\' -Recurse -Include  -> 191,
       //                'D:\*' -Recurse -Include -> 191,
       //                'D:\*' -Recurse -File    -> 0  (silent!),
       //                'D:\' -Recurse -File     -> 62,392.
-      // The old guardrail called the trailing \* REQUIRED with -Recurse,
-      // which steered models into the -File combination that returns 0.
+      // So the trailing \* must NOT be described as required with
+      // -Recurse; that steers models into the -File combination that
+      // returns 0.
       << "\n\nPOWERSHELL GUARDRAILS (when PowerShell is the chosen path). "
       << "For Get-ChildItem with a recursive multi-extension filter, the correct pattern is `Get-ChildItem -Path '<dir>' -Recurse -Include '*.ext1','*.ext2'` -- a plain folder path with NO trailing `\\*`. "
       << "Do NOT put a wildcard on -Path when using -Recurse: in Windows PowerShell 5.1, `-Path '<dir>\\*' -Recurse -File` can silently return nothing (measured: 0 of 62,392 files on a drive; exit 0, no error). "

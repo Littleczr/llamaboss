@@ -9,14 +9,10 @@
 #include "update_installer.h"
 #include "widgets.h"               // ApplyDarkTitleBar
 
-#include <wx/filefn.h>
 #include <wx/gauge.h>
-#include <wx/log.h>
 #include <wx/hyperlink.h>
 #include <wx/sizer.h>
 #include <wx/stattext.h>
-
-#include <cstdint>
 
 wxDEFINE_EVENT(wxEVT_LB_ABOUT_CHECK_RESULT,   wxThreadEvent);
 wxDEFINE_EVENT(wxEVT_LB_ABOUT_DL_PROGRESS,    wxThreadEvent);

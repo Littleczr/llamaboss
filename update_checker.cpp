@@ -6,15 +6,8 @@
 //
 #include "update_checker.h"
 
-#include <windows.h>
+#include "lb_windows.h"
 #include <winhttp.h>
-
-#include <Poco/JSON/Parser.h>
-#include <Poco/JSON/Object.h>
-#include <Poco/Dynamic/Var.h>
-
-#include <vector>
-#include <cstdlib>
 
 #pragma comment(lib, "winhttp.lib")
 

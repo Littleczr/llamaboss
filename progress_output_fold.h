@@ -3,14 +3,14 @@
 //  progress_output_fold.h — tame progress bars and PS 5.1 stderr noise
 // ═══════════════════════════════════════════════════════════════════
 //
-// 2026-10-02 v0.1.19 release session: one curl download of three
-// llama.cpp archives produced ~130 red "####   37.8%" lines in the
-// PowerShell card (exit 0).  Three separate problems, three passes:
+// A single curl download can produce ~130 red "####   37.8%" lines in the
+// PowerShell card on an exit-0 call.  Three separate problems, three
+// passes:
 //
 //   1. CollapseCarriageReturns()
 //      Progress bars (curl --progress-bar, tqdm, pip, git) redraw one
 //      line with bare '\r'.  A terminal shows only the final redraw; we
-//      captured every frame and the rich-text control renders each '\r'
+//      capture every frame and the rich-text control renders each '\r'
 //      as a line break.  Keep the LAST non-empty '\r' segment of each
 //      line, like a terminal would.  CRLF terminators are untouched.
 //

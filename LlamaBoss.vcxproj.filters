@@ -61,6 +61,9 @@
     <ClCompile Include="theme.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="lb_icons.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="model_manager.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -101,6 +104,9 @@
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="endpoint_store.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="chatgpt_auth.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="connections_dialog.cpp">
@@ -243,6 +249,9 @@
     <ClInclude Include="pch.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="lb_windows.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="app_state.h">
       <Filter>Header Files</Filter>
     </ClInclude>
@@ -343,6 +352,12 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="endpoint_store.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="chatgpt_auth.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="chatgpt_auth_core.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="connections_dialog.h">
@@ -501,6 +516,9 @@
     <ClInclude Include="elision_budget.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="export_metrics.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="copy_line_fold.h">
       <Filter>Header Files</Filter>
     </ClInclude>
@@ -522,7 +540,7 @@
     </Image>
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="settings_icon.h">
+    <ClInclude Include="lb_icons.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="lb_hover_tile.h">
@@ -581,6 +599,16 @@
     </None>
     <None Include="assets\python\lb_kernel.py">
       <Filter>Python Scripts</Filter>
+    </None>
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="assets\icons\LlamaBoss_Paperclip.svg">
+      <Filter>Resource Files</Filter>
+    </None>
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="assets\icons\LlamaBoss_Agent.svg">
+      <Filter>Resource Files</Filter>
     </None>
   </ItemGroup>
 </Project>

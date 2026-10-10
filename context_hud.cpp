@@ -2,13 +2,9 @@
 
 #include "context_hud.h"
 
-#include <wx/clipbrd.h>
 #include <wx/control.h>
-#include <wx/dcbuffer.h>
 #include <wx/display.h>
 #include <wx/settings.h>
-
-#include <algorithm>
 
 #ifdef __WXMSW__
 #include <wx/msw/wrapwin.h>
@@ -391,8 +387,7 @@ void ContextHud::OnPaint(wxPaintEvent&)
     }
 
     // Footer actions: pinned to the bottom so they stay reachable while
-    // the sections scroll.  (Unscrolled and uncapped, this is exactly
-    // where the footer used to follow the last section.)
+    // the sections scroll.
     y = viewTop + viewH + FromDIP(10);
     dc.SetFont(m_font);
     int x = left;

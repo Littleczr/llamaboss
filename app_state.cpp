@@ -6,7 +6,6 @@
 
 // wxWidgets headers
 #include <wx/fileconf.h>
-#include <wx/log.h>
 #include <wx/icon.h>
 #include <wx/display.h>
 
@@ -49,11 +48,10 @@ AppState::~AppState()
     // Never let logging throw out of a destructor: if this dtor runs
     // during stack unwinding (e.g. MyFrame's ctor aborting because
     // Initialize() failed) a second in-flight exception means
-    // std::terminate — which is exactly the anonymous CRT abort()
-    // dialog this guard was added to kill.  The swallowing channel
-    // below makes Poco log calls non-throwing anyway; this is the
-    // belt-and-suspenders layer for the one place a throw is fatal
-    // by language rule rather than merely rude.
+    // std::terminate and an anonymous CRT abort() dialog.  The
+    // swallowing channel below makes Poco log calls non-throwing
+    // anyway; this is the belt-and-suspenders layer for the one place
+    // a throw is fatal by language rule rather than merely rude.
     try {
         LogShutdownMessage();
     }
@@ -138,12 +136,11 @@ bool AppState::Initialize()
         return true;
     }
     catch (const std::exception& ex) {
-        // This catch used to be a throw site itself: when the logger's
-        // file channel is the broken component, logging the failure
-        // re-attempts the file open and throws a second time, which
-        // then cascaded into terminate() via ~AppState during
-        // unwinding.  Guard it so Initialize() keeps its contract of
-        // returning false instead of exploding.
+        // Guarded: when the logger's file channel is the broken
+        // component, logging the failure re-attempts the file open and
+        // throws a second time, which would cascade into terminate() via
+        // ~AppState during unwinding.  Initialize() must keep its
+        // contract of returning false instead of exploding.
         try {
             if (m_logger) {
                 m_logger->error("Failed to initialize application state: "

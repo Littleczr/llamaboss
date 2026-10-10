@@ -1,28 +1,29 @@
 // tool_open.h
 //
-// Phase 2: Open / play / view files.
+// Open / play / view files.
 //
 // Single tool that handles three semantically distinct dispositions
 // based on the resolved file's classification:
 //
 //   TextLike  — file is text or code.  Returns content inline (same
-//               shape as /read) so the model can answer questions
+//               shape as read) so the model can answer questions
 //               about the file without needing a separate read step.
-//   Safe      — file is a media or document type that's safe to open
-//               with the user's default application (audio, video,
-//               image, PDF, Office docs, archives).  Launches via
-//               ShellExecuteW with the default verb.
+//   Safe      — not on the kill-list and not text.  Launched via
+//               ShellExecuteW with the default verb ONLY when the
+//               extension is on the passive viewer/player allowlist
+//               (images, audio, video, PDF, macro-free Office docs,
+//               archives); anything else is refused.
 //   Risky     — file extension is on the executable / scriptable
-//               kill-list (.exe, .bat, .ps1, .reg, .lnk, .vbs,
-//               macro Office docs, etc.).  Returns a "blocked" tool
-//               block; no launch.  The user can still open these
-//               manually from File Explorer.
+//               kill-list (.exe, .bat, .ps1, .reg, .lnk, .vbs, .pyw,
+//               .rdp, .msc, macro Office docs, etc.).  Returns a
+//               "blocked" tool block; no launch.  The user can still
+//               open these manually from File Explorer.
 //
 // ─── Resolution order ────────────────────────────────────────────
 //  1. Try ResolveToolPath(input, ctx.cwd) directly.  If it lands on
 //     an existing file or directory, use it.
 //  2. Otherwise, fuzzy-match the input against basenames from the
-//     most recent file-listing context in ChatHistory: native /ls or
+//     most recent file-listing context in ChatHistory: native ls or
 //     a recognized PowerShell Get-ChildItem result.  Recursive filtered
 //     Get-ChildItem searches keep relative paths, so "D: somewhere"
 //     discovery can still open the nested file afterward.  This is what
@@ -33,13 +34,11 @@
 //     the user which one.
 //
 // ─── Security posture ────────────────────────────────────────────
-// Risky-file blocking is the mandatory floor.  The model never gets
-// to bypass it via prompt — the classifier is local code, not part
-// of the system prompt.  When risky files are blocked, the result
-// body explicitly tells the model to ask the user to open it
-// manually from File Explorer.  Phase 2b will add a click-to-confirm
-// affordance on the rendered tool block; until then, blocked is
-// blocked.
+// Risky-file blocking and the launch allowlist are the mandatory
+// floor.  The model never gets to bypass them via prompt — the
+// classifier is local code, not part of the system prompt.  When a
+// file is blocked, the result body explicitly tells the model to ask
+// the user to open it manually from File Explorer.
 //
 // ─── Threading ───────────────────────────────────────────────────
 // Synchronous on the caller's thread.  ShellExecuteW must run on

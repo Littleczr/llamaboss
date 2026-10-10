@@ -6,34 +6,10 @@
 #include "chat_folders.h"
 #include "prompt_prewarm.h"
 
-#include <wx/filename.h>
-#include <wx/dir.h>
-#include <wx/stdpaths.h>
 #include <wx/fileconf.h>
-#include <wx/utils.h>
 
-#include <Poco/URI.h>
-#include <Poco/Net/HTTPClientSession.h>
-#include <thread>
-#include <mutex>
 #include <deque>
-#include <algorithm>
-#include <Poco/Net/HTTPRequest.h>
-#include <Poco/Net/HTTPResponse.h>
-#include <Poco/StreamCopier.h>
-#include <Poco/Timespan.h>
-#include <Poco/JSON/Parser.h>
-#include <Poco/JSON/Array.h>
-#include <Poco/JSON/Object.h>
 
-#include <sstream>
-#include <fstream>
-#include <algorithm>
-#include <chrono>
-#include <set>
-#include <cctype>
-#include <cstdint>
-#include <cstdlib>
 #include <initializer_list>
 #include "ui_event_post.h"
 
@@ -608,9 +584,9 @@ ServerManager::ServerManager(wxEvtHandler* eventHandler,
     , m_logger(logger)
     // Lifecycle state, not optional work state.  Creating the queue here
     // guarantees StartServer() can stamp every successful launch with its
-    // generation before the first save/restore is ever enqueued.  The old
-    // lazy construction path created the queue after launch and left
-    // liveGeneration invalid, so every first-launch KV action was dropped.
+    // generation before the first save/restore is ever enqueued.  A queue
+    // created lazily after launch would leave liveGeneration invalid, so
+    // every first-launch KV action would be dropped.
     , m_slotQueue(std::make_shared<SlotActionQueue>())
 {
 }
@@ -1456,7 +1432,7 @@ std::string ServerManager::ModelDisplayName(const std::string& ggufPath)
     // in the UI instead of noisy quantization-tagged filenames
     // ("gemma-3-27b-it-abliterated-q4_k_m"). For loose files (power
     // mode, or dropped into the default folder without a bundle),
-    // fall back to the .gguf filename stem — matches legacy behavior.
+    // fall back to the .gguf filename stem.
     wxFileName fn(wxString::FromUTF8(ggufPath.c_str()));
     wxString modelFolder = fn.GetPath();
 
@@ -2007,8 +1983,7 @@ std::vector<ServerManager::ModelEntry> ServerManager::ScanModels()
                 wxString fullPath = root + wxFILE_SEP_PATH + filename;
                 ModelEntry e;
                 e.ggufPath = fullPath.ToUTF8().data();
-                // Use filename stem as display name (matches legacy UX
-                // so users who dropped files in don't see a regression).
+                // Use filename stem as display name.
                 wxFileName fn(fullPath);
                 e.displayName = fn.GetName().ToUTF8().data();
                 e.isBundle = false;
@@ -2407,15 +2382,15 @@ bool ServerManager::StartServer(const std::string& ggufPath, const ServerConfig&
         << " --port " << config.port
         << " -c " << config.ctxSize;
 
-    // ── --jinja (Phase 3a) ───────────────────────────────────────
+    // ── --jinja ──────────────────────────────────────────────────
     // Required by llama-server for native /v1/chat/completions tool
     // calling on tool-aware chat templates (Hermes 2 Pro, Qwen 2.5,
     // Llama 3.x, etc.).  Cost on non-tool models is one Jinja render
     // per chat completion — negligible on a modern GPU.  If the
     // server fails to start with this flag (rare; some custom chat
     // templates don't compile under Jinja), startup fallback
-    // re-launches without it and we fall back to the existing XML
-    // tool-call protocol for that model.
+    // re-launches without it and we fall back to the XML tool-call
+    // protocol for that model.
     if (launchJinjaEnabled) {
         cmd << " --jinja";
     }
@@ -2884,9 +2859,8 @@ void ServerManager::StopServerInternal(bool invalidateGeneration)
     }
 
     // Drop queued slot actions and cut short anything in flight
-    // BEFORE the process dies.  The old code only set the stop flag
-    // in ~ServerManager, so a normal model switch left queued
-    // actions alive to be delivered to the next server.
+    // BEFORE the process dies, so a model switch never delivers
+    // queued actions to the next server.
     AbandonSlotQueue(m_slotQueue, m_logger);
 
     KillProcess();

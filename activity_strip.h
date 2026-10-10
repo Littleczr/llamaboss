@@ -1,11 +1,11 @@
 // activity_strip.h
 //
 // Single-row "something is running" strip that sits between the chat
-// transcript and the composer.  It replaces the old 1 Hz rewrite of a
-// progress line *inside* the wxRichTextCtrl (which re-laid-out the tail
-// paragraph every second for up to 30 minutes and fought the user's
-// scroll position).  A wxStaticText updated once a second costs nothing
-// and never touches the transcript.
+// transcript and the composer.  Live progress is drawn here rather than
+// inside the wxRichTextCtrl, where rewriting a progress line every second
+// would re-lay-out the tail paragraph for up to 30 minutes and fight the
+// user's scroll position.  A wxStaticText updated once a second costs
+// nothing and never touches the transcript.
 //
 // What it shows, left to right:
 //

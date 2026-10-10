@@ -5,10 +5,7 @@
 #include "app_state.h"
 #include "ui_event_post.h"
 
-#include <algorithm>
 #include <climits>
-
-#include <wx/thread.h>
 
 wxDEFINE_EVENT(wxEVT_MODEL_SERVICE_STATE_CHANGED, wxCommandEvent);
 
@@ -269,7 +266,7 @@ InferenceTarget ModelService::ResolveTarget() const
     return m_appState.GetActiveTarget();
 }
 
-// ── KV slot actions, multi-window adjudicated (Phase 3c) ─────────
+// ── KV slot actions, multi-window adjudicated ────────────────────
 // See the header comment.  All three run on the main thread (send
 // path, New Chat, conversation load — all UI-driven), so the
 // AnyOtherWindowBusy pull is race-free against sink registration.

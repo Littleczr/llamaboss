@@ -641,9 +641,9 @@ ThemeData ThemeManager::GetTokyoNightTheme()
     t.attachChipBg      = wxColour(41, 46, 66);      // #292e42
 
     // Chat — keep the chat body plain white for readability.
-    // Tokyo Night still keeps its blue/purple surfaces and accent buttons,
-    // but normal conversation text no longer competes with cyan/yellow
-    // syntax colors. Thought/detail text stays slightly softer.
+    // Tokyo Night keeps its blue/purple surfaces and accent buttons, but
+    // normal conversation text doesn't compete with cyan/yellow syntax
+    // colors. Thought/detail text stays slightly softer.
     t.chatUser          = wxColour(255, 255, 255);   // #FFFFFF plain chat text
     t.chatAssistant     = wxColour(255, 255, 255);   // #FFFFFF plain chat text
     t.chatAssistantB    = wxColour(255, 255, 255);   // #FFFFFF plain chat text

@@ -6,16 +6,10 @@
 //
 #include "update_installer.h"
 
-#include <windows.h>
+#include "lb_windows.h"
 #include <winhttp.h>
 #include <bcrypt.h>
 #include <shellapi.h>
-
-#include <atomic>
-#include <filesystem>
-#include <fstream>
-#include <system_error>
-#include <vector>
 
 #pragma comment(lib, "winhttp.lib")
 #pragma comment(lib, "bcrypt.lib")

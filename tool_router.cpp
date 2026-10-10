@@ -1,5 +1,3 @@
-#define _CRT_SECURE_NO_WARNINGS
-
 // tool_router.cpp
 
 #include "tool_router.h"
@@ -32,34 +30,14 @@
 #include "tool_path_safety.h"
 #include "tool_python_syntax.h"
 
-#include <algorithm>
-#include <chrono>
-#include <cctype>
-#include <cstdint>
 #include <cassert>
-#include <filesystem>
-#include <fstream>
-#include <mutex>
-#include <sstream>
-#include <vector>
 
-#include <wx/filename.h>
-
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#include <windows.h>
-
-#include <Poco/JSON/Object.h>
-#include <Poco/JSON/Array.h>
-#include <Poco/JSON/Parser.h>
-#include <Poco/JSON/Stringifier.h>
+#include "lb_windows.h"
 
 namespace {
 
-// ─── Local helpers (mirror the older anonymous helpers in
-// tool_dispatcher.cpp / tool_invocation.cpp).  Self-contained on
-// purpose — Phase 2 deliberately doesn't introduce a tool_util TU.
+// ─── Local helpers.  Self-contained on purpose (no shared tool_util
+// translation unit).
 
 std::string Lower(std::string s)
 {
@@ -77,15 +55,12 @@ std::string Trim(const std::string& s)
 }
 
 
-// NOTE: The historical C++-side pre-repair helpers (LooksLikeNamePropertyAt,
-// IsValidJsonObjectForToolArg, RepairXlsxWorkbookJsonArg) used to insert a
-// missing rows-array ']' before xlsx_create_workbook ran.  The Python helper
-// (load_workbook_spec) now performs string-aware JSON repair covering this
-// case and several others (trailing commas, spurious closers, missing commas
-// between adjacent containers, invalid backslash escapes), and surfaces
-// repair_note in the helper output.  The C++ layer was redundant and not
-// string-aware, so it has been removed.  Repair reporting still flows back
-// through the helper JSON.
+// NOTE: JSON repair for xlsx_create_workbook lives in the Python helper
+// (load_workbook_spec), which performs string-aware repair (trailing
+// commas, spurious closers, missing commas between adjacent containers,
+// a missing rows-array ']', invalid backslash escapes) and surfaces
+// repair_note in the helper output.  Don't add a C++-side pre-repair
+// layer; it can't be string-aware.
 
 // "/read foo.cpp" style echo, identical to what HandleSlash* and the
 // historical MakeCommandEcho produced.
@@ -127,10 +102,10 @@ bool ExistingPathAsGivenOrCwdRelative(const std::string& arg, const ToolContext&
     return !path.empty() && (IsFile(path) || IsDirectory(path));
 }
 
-// Phase 4: when a project is attached, let read/open/helper tools accept a
+// When a project is attached, let read/open/helper tools accept a
 // project source by bare filename ("zayra.pdf"), stem ("zayra"),
-// Sources/<name>, or unique partial match. Existing absolute/cwd-relative paths
-// still win, so old behavior does not change.
+// Sources/<name>, or unique partial match. Existing absolute/cwd-relative
+// paths still win.
 std::string ResolveProjectSourceArgForSinglePathTool(const std::string& args,
                                                      const ToolContext& ctx)
 {
@@ -449,8 +424,7 @@ DispatchOutcome PreFill(const ToolInvocation& inv,
     // Presentation comes from the spec's kPresentation row when one
     // exists; the literal passed by the call site is the fallback.
     // (The per-body `out.result.iconUtf8 = ...` lines that follow
-    // some PreFill calls are now redundant identical overrides and
-    // can be deleted in a later mechanical sweep.)
+    // some PreFill calls are redundant identical overrides.)
     const ToolSpec* spec = GetGlobalRouter().Find(toolTag);
     out.result.toolName = (spec && !spec->displayName.empty())
                               ? spec->displayName
@@ -462,10 +436,7 @@ DispatchOutcome PreFill(const ToolInvocation& inv,
 }
 
 // ─── Per-tool dispatch implementations ──────────────────────────
-// These are the same bodies as the old static DispatchRead/Ls/...
-// functions in tool_dispatcher.cpp, captured here as named functions
-// so the spec lambdas can call them by name.  Logic is byte-equivalent
-// to Phase 1; behavior unchanged.
+// Named functions so the spec lambdas can call them by name.
 
 DispatchOutcome DoRead(const ToolInvocation& inv,
                        const ToolContext&    ctx,
@@ -598,12 +569,11 @@ DispatchOutcome DoReadHead(const ToolInvocation& inv,
 // a single "START:END <path>", "START-END <path>", or "@START:END <path>";
 // comma-separated ranges extend that form without breaking it.
 // `errorOut` (optional) receives the SPECIFIC reason this projection
-// failed.  Every failure used to be indistinguishable to the caller,
-// so a missing path, a zero line number, and a stray comma all reached
-// the model as the same sentence — the one failure mode most likely to
-// send a small model into a retry loop, because it is told to supply a
-// range it already supplied.  ValReadRange prefixes this reason to its
-// form reminder; DoReadRange uses it as a defensive fallback.
+// failed.  A missing path, a zero line number, and a stray comma must not
+// reach the model as the same sentence — that is the failure mode most
+// likely to send a small model into a retry loop, because it is told to
+// supply a range it already supplied.  ValReadRange prefixes this reason
+// to its form reminder; DoReadRange uses it as a defensive fallback.
 bool ParseReadRangesArgs(const std::string&       args,
                          std::string&             pathOut,
                          std::vector<ReadLineRange>& rangesOut,
@@ -751,7 +721,8 @@ bool ParseSetupConnection(const std::string& args, std::string& provider, std::s
             if (!it->second.isString()) return false;
         }
         provider = object->getValue<std::string>("provider");
-        if (provider != "openrouter" && provider != "openai" && provider != "custom") return false;
+        if (provider != "openrouter" && provider != "openai" && provider != "custom" &&
+            provider != "chatgpt") return false;
         query = object->optValue<std::string>("model_query", "");
         if (query.size() > 100) return false;
         for (unsigned char c : query) if (c < 32 || c == 127) return false;
@@ -763,7 +734,7 @@ bool ValSetupConnection(const std::string& args, std::string& error)
 {
     std::string provider, query;
     if (ParseSetupConnection(args, provider, query)) return true;
-    error = "Use provider openrouter, openai or custom, and optional model_query (up to 100 bytes). Do not include API keys.";
+    error = "Use provider openrouter, openai, custom or chatgpt, and optional model_query (up to 100 bytes). Do not include API keys.";
     return false;
 }
 
@@ -1529,15 +1500,11 @@ DispatchOutcome DoZipExtract(const ToolInvocation& inv,
 // ─── view_image ─────────────────────────────────────────────────
 // Read-only bridge from a FILE on disk to the model's VISION input.
 //
-// Before this tool the only way pixels reached the model was the
-// composer: an image dropped/pasted/picked in the input box becomes a
-// PendingAttachment::Image, is persisted to the attachments sidecar,
-// and the Phase 1c image carrier projects it as image_url parts.  An
-// image that arrives any other way -- extracted from a .zip by
-// zip_extract, downloaded by web_fetch_url, produced by a python
-// script, or simply sitting in a folder -- was only ever reachable
-// through `read`, which returns a 256-byte hex dump.  The model could
-// list the files but never see them.
+// Composer images reach the model through the attachments sidecar and
+// the image carrier.  An image that arrives any other way -- extracted
+// from a .zip by zip_extract, downloaded by web_fetch_url, produced by
+// a python script, or simply sitting in a folder -- is otherwise only
+// reachable through `read`, which returns a 256-byte hex dump.
 //
 // view_image validates the file(s) (extension + magic bytes + size)
 // and returns the absolute paths on ToolInvocationResult::
@@ -3291,21 +3258,20 @@ DispatchOutcome DoWebFetchUrl(const ToolInvocation& inv,
 
 // ─── Schemas ────────────────────────────────────────────────────
 // Hand-written JSON Schema strings.  These are the contract between
-// LlamaBoss and the model under Phase 3 native function calling: the
-// model sees these via /v1/chat/completions and emits structured
-// tool_calls keyed to them.  Phase 2 stores them on the spec but
-// doesn't consume them.
+// LlamaBoss and the model under native function calling: the model
+// sees these via /v1/chat/completions and emits structured tool_calls
+// keyed to them.
 //
 // Style notes:
 //   - Each schema is a top-level JSON object (the `parameters` field
 //     of an OpenAI-style function definition).
 //   - Single freeform string args use one "args" property — matches
-//     the current XML protocol where the entire <args> blob is one
-//     string regardless of internal structure.
-//   - Future Phase 3 work may split write/edit into typed properties
-//     ({path, content} / {path, old, new}), but for the P2 → P3
-//     migration the args-string shape lets the existing tool
-//     implementations keep their parsers unchanged.
+//     the XML protocol where the entire <args> blob is one string
+//     regardless of internal structure, so tool implementations keep
+//     their parsers unchanged.
+//   - Tools whose args carry multi-line content (write, edit, ...) use
+//     typed properties; AgentController::ProjectStructuredArgs flattens
+//     them back to the args string.
 
 constexpr const char* kSchemaRead = R"({
 "type":"object",
@@ -3490,15 +3456,13 @@ constexpr const char* kSchemaOpen = R"({
 "required":["args"]
 })";
 
-// Phase 3c-iii: write moves to structured {path, content}.  The
-// legacy single-string schema (path on the first line, content
-// after the first newline) forced models to embed multi-line
-// content as a JSON-escaped \n-laden string, which is exactly
-// where small models fumble escaping.  Splitting into named
-// fields removes that class of error entirely.  ProjectStructuredArgs
-// flattens {path, content} back to the legacy "path\ncontent"
-// string the WriteNewFile parser consumes, so tool internals
-// stay unchanged.
+// write uses structured {path, content}.  A single-string schema (path
+// on the first line, content after the first newline) forces models to
+// embed multi-line content as a JSON-escaped \n-laden string, which is
+// exactly where small models fumble escaping.  Named fields remove that
+// class of error.  ProjectStructuredArgs flattens {path, content} back
+// to the "path\ncontent" string the WriteNewFile parser consumes, so
+// tool internals stay unchanged.
 constexpr const char* kSchemaWrite = R"({
 "type":"object",
 "properties":{
@@ -3532,12 +3496,11 @@ constexpr const char* kSchemaMkdir = R"({
 "required":["args"]
 })";
 
-// Phase 3c-iii: edit moves to structured {path, old_str, new_str}.
-// Same reasoning as write — embedding the <<<OLD>>>...<<<NEW>>>...
-// sentinel form inside a JSON-escaped string is fragile.  The
-// structured shape lets the model write the OLD and NEW blocks
-// as plain JSON strings.  ProjectStructuredArgs reconstructs the
-// sentinel form for ParseEditArgs.
+// edit uses structured {path, old_str, new_str}.  Same reasoning as
+// write — embedding the <<<OLD>>>...<<<NEW>>>... sentinel form inside a
+// JSON-escaped string is fragile.  The structured shape lets the model
+// write the OLD and NEW blocks as plain JSON strings.
+// ProjectStructuredArgs reconstructs the sentinel form for ParseEditArgs.
 //
 // Field names match the str_replace convention (old_str / new_str)
 // that's familiar from major editor-tool ecosystems; small models
@@ -3697,10 +3660,12 @@ std::vector<ToolSpec> BuildBuiltinSpecs()
         ToolSafetyProfile setupSafety;
         setupSafety.mutatesFiles = true; // explicit Connect in the native dialog
         setupSafety.network = NetworkReach::AuthenticatedRead;
-        setupSafety.summary = "Opens the native setup dialog. The user enters the key and explicitly clicks Connect to save. No secret arguments.";
+        setupSafety.summary = "Opens the native setup dialog. The user enters the key (or signs in to ChatGPT in the browser) and explicitly saves. No secret arguments.";
         add(tool_names::kSetupConnection,
-            "When the user asks to add or configure an AI provider, open guided setup. Pass only provider and optional model search. Never ask for an API key in chat. Call this tool alone; the turn ends after setup.",
-            R"({"type":"object","properties":{"provider":{"type":"string","enum":["openrouter","openai","custom"]},"model_query":{"type":"string","maxLength":100}},"required":["provider"],"additionalProperties":false})",
+            "When the user asks to add or configure an AI provider, open guided setup. Pass only provider and optional model search. "
+            "Use provider chatgpt when the user wants to use their ChatGPT Plus or Pro plan/subscription (sign in with ChatGPT, no API key); "
+            "use openai for an OpenAI API key. Never ask for an API key or password in chat. Call this tool alone; the turn ends after setup.",
+            R"({"type":"object","properties":{"provider":{"type":"string","enum":["openrouter","openai","custom","chatgpt"]},"model_query":{"type":"string","maxLength":100}},"required":["provider"],"additionalProperties":false})",
             std::move(setupSafety), ValSetupConnection, DoSetupConnection);
     }
 
@@ -3972,12 +3937,21 @@ std::vector<ToolSpec> BuildBuiltinSpecs()
 
     {
         ToolSafetyProfile runSafety;
-        runSafety.tier         = RiskTier::Moderate;
+        // Dangerous, not Moderate: write/overwrite_file/edit are
+        // approval-free and may write .py files into the project
+        // Workflows folder and the Skills folder, both of which this
+        // tool runs from.  At Moderate, write + python_run_script would
+        // execute arbitrary code (with every Connection key injected
+        // into its environment) without a single approval card.  The
+        // one-shot carry-forward from python_create_script still skips
+        // the second card, and "approve" (trust for this chat) still
+        // applies.
+        runSafety.tier         = RiskTier::Dangerous;
         runSafety.mutatesFiles = true;
         runSafety.isAsync      = true;
         runSafety.summary = "Runs one existing .py script from the fixed conversation Scripts folder, an optional .py helper script from the active project Workflows folder, or a .py helper script from the LlamaBoss Skills folder. It does not run ordinary Workspace .py files created by write/overwrite_file. A full .py path inside one of those script lanes is also accepted. Native mode supplies argv as a string array; XML/legacy mode supplies one argv token per line after the script. Captures stdout, stderr, exit code, runtime, and may attach newly-created files under the chat folder as artifact cards.";
         add(tool_names::kPythonRunScript,
-            "Run an existing Python script from the conversation Scripts folder, an optional Python helper script from the active project's Workflows folder, or a Python helper script from the LlamaBoss Skills folder. Native args use {script, argv:[...]}; XML/legacy args still accept script on line 1 and one argv token per later line. Lookup order for bare filenames is conversation Scripts, then project Workflows (when a project is attached), then Skills -- so a project-scoped script with the same filename shadows a Skill one. This tool does not run ordinary Workspace .py files created by write/overwrite_file; create runnable scripts with python_create_script. Captures stdout/stderr/exit code. If the tool exits nonzero, do not claim success; fix the script or explain the failure.",
+            "Run an existing Python script from the conversation Scripts folder, an optional Python helper script from the active project's Workflows folder, or a Python helper script from the LlamaBoss Skills folder. Native args use {script, argv:[...]}; XML/legacy args still accept script on line 1 and one argv token per later line. Lookup order for bare filenames is conversation Scripts, then project Workflows (when a project is attached), then Skills -- so a project-scoped script with the same filename shadows a Skill one. This tool does not run ordinary Workspace .py files created by write/overwrite_file; create runnable scripts with python_create_script. Captures stdout/stderr/exit code. Requires approval, except for the one immediate run of a script you just created with python_create_script. If the tool exits nonzero, do not claim success; fix the script or explain the failure.",
             kSchemaPythonRunScript,
             std::move(runSafety),
             ValPythonRunScript, DoPythonRunScript);
@@ -4353,7 +4327,7 @@ ToolRouter& GetGlobalRouter()
     return router;
 }
 
-// ─── Phase 3c-i: native tool catalog ────────────────────────────
+// ─── Native tool catalog ────────────────────────────────────────
 // Walk every registered spec and emit an OpenAI-shape tool entry.
 // Each spec carries its parameter schema as a stringified JSON
 // object (constructed in BuildBuiltinSpecs from the kSchemaXxx raw

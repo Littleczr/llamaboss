@@ -34,14 +34,13 @@ public:
                         const std::vector<AttachmentInfo>& attachments = {});
     void AddAssistantMessage(const std::string& content, const std::string& model = "");
 
-    // ── Phase 3c-ii: native function-calling sidecar fields ─────
+    // ── Native function-calling sidecar fields ──────────────────
     //
     // Attach a JSON tool_calls array to the most-recent assistant
     // message.  The array is the verbatim payload received from
-    // llama-server's structured streaming response (see
-    // ChatClient's accumulator in Phase 3c-ii) — id/type/function
-    // tuples that the next request must thread back as role:"tool"
-    // replies via tool_call_id.
+    // the structured streaming response (see ChatClient's
+    // accumulator) — id/type/function tuples that the next request
+    // must thread back as role:"tool" replies via tool_call_id.
     //
     // Stored as a Poco::JSON::Array on the message object so the
     // request builder can serialize it without re-parsing.  No-op
@@ -50,7 +49,7 @@ public:
     // pure prose).
     void SetLastAssistantToolCalls(const std::string& toolCallsJson);
 
-    // ── OpenAI Responses sidecar (Phase 2) ───────────────────────
+    // ── OpenAI Responses sidecar ─────────────────────────────────
     // Attach the verbatim Responses `output` array of an assistant
     // tool-call turn (reasoning items with encrypted_content, message
     // items, function_call items) to the most-recent assistant message
@@ -109,34 +108,35 @@ public:
     bool IsEmpty() const;
 
     // True when the conversation has something worth saving even if it
-    // has no chat messages yet.  Projects Phase 1 uses this so attaching
-    // a project to a brand-new chat can persist across reloads, and so
-    // clearing metadata from an already-saved empty chat can persist too.
+    // has no chat messages yet: attaching a project to a brand-new chat
+    // persists across reloads, and clearing metadata from an
+    // already-saved empty chat persists too.
     bool HasPersistableContent() const;
 
     // ── API integration ───────────────────────────────────────────
     // Build a JSON request body for the OpenAI-compatible /v1/chat/completions endpoint.
     // If systemPrompt is non-empty, it is prepended as a system message.
     // If contextTokens > 0 and the body would exceed ~70% of the token budget
-    // (estimated at 3 bytes/token), older tool-result bodies are elided with
-    // a replay hint so the model can re-issue the call if it needs the data.
-    // The most recent 2 tool results are always preserved intact.
+    // (bytes-per-token calibrated from usage reports; see elision_budget.h),
+    // old tool-call arguments are shortened and older tool-result bodies are
+    // elided, oldest first.  Elided results are spooled to the workspace
+    // Vars\ lane and the marker names the file.  The most recent 2 tool
+    // results are always preserved intact.
     //
-    // Phase 3c-i: when toolsArrayJson is non-empty, it is parsed and
-    // attached to the body as the OpenAI function-calling "tools"
-    // field.  Empty (the default) preserves Phase 1/2 behavior — no
-    // tools field, the model sees only chat messages.  Build with
-    // BuildToolsArrayJson(GetGlobalRouter()) when the active model
-    // is on the Native tool protocol.
+    // When toolsArrayJson is non-empty, it is parsed and attached to the
+    // body as the OpenAI function-calling "tools" field.  Empty (the
+    // default) means no tools field — the model sees only chat
+    // messages.  Build with BuildToolsArrayJson(GetGlobalRouter()) when
+    // the active model is on the Native tool protocol.
     //
-    // Phase 3c-ii: when nativeProtocol is true, stored assistant
-    // messages with a "tool_calls" sidecar are emitted as proper
-    // assistant tool_call messages (with their content cleared per
-    // OpenAI spec), and stored user messages tagged with a
-    // "tool_call_id" sidecar are emitted as role:"tool" messages
-    // referencing that id.  Dangling tool_calls (an assistant call
-    // without a matching tool reply remaining after elision) are
-    // dropped to satisfy llama-server's strict request validation.
+    // When nativeProtocol is true, stored assistant messages with a
+    // "tool_calls" sidecar are emitted as proper assistant tool_call
+    // messages (with their content cleared per OpenAI spec), and stored
+    // user messages tagged with a "tool_call_id" sidecar are emitted as
+    // role:"tool" messages referencing that id.  Dangling tool_calls (an
+    // assistant call without a matching tool reply remaining after
+    // elision) are dropped to satisfy llama-server's strict request
+    // validation.
     //
     // Sampling: local llama-server requests (detected by a .gguf model
     // path) get explicit generation controls instead of server defaults.
@@ -180,17 +180,17 @@ public:
     int GetLastBuildElidedCount() const { return m_lastBuildElidedCount; }
 
     // Number of OLD assistant tool-call turns whose arguments the most
-    // recent BuildChatRequestJson shortened (2026-10-01, native protocol
-    // only).  Long PowerShell scripts and write_file bodies the model
-    // already ran dominate long agent chats; see tool_call_elision.h.
+    // recent BuildChatRequestJson shortened (native protocol only).
+    // Long PowerShell scripts and write_file bodies the model already
+    // ran dominate long agent chats; see tool_call_elision.h.
     // 0 when no turn was shortened.
     int GetLastBuildArgsElidedCount() const { return m_lastBuildArgsElidedCount; }
 
-    // Elision spool (2026-10-01): the conversation workspace (tool cwd)
-    // whose Vars\ lane receives the full text of tool results that
+    // Elision spool: the conversation workspace (tool cwd) whose
+    // Vars\ lane receives the full text of tool results that
     // BuildChatRequestJson elides, so the marker can point at a file
     // instead of inviting a rerun.  Empty disables spooling (marker
-    // only, the previous behaviour).  Set before each request build.
+    // only).  Set before each request build.
     void SetElisionSpoolWorkspace(const std::string& workspaceDirUtf8)
     {
         if (workspaceDirUtf8 != m_elisionSpoolWorkspace) {
@@ -207,14 +207,14 @@ public:
     // no request has been built yet on this instance.
     size_t GetLastBuildRequestBytes() const { return m_lastBuildRequestBytes; }
 
-    // Self-calibrating elision budget (2026-10-01; elision_budget.h).
-    // Call with the server's exact prompt_tokens for the request most
-    // recently built by BuildChatRequestJson (the same pairing the
-    // ctx_calibration.tsv logger uses).  Later builds for the same model
-    // then size the elision budget from the measured bytes-per-token
-    // instead of the fixed 3.0, which held GPT-6 Luna at ~40% of its
-    // window.  Implausible or tiny reports are ignored.  The context
-    // meter's estimate (EstimateTokensFromBytes) is unaffected.
+    // Self-calibrating elision budget (elision_budget.h).  Call with the
+    // server's exact prompt_tokens for the request most recently built
+    // by BuildChatRequestJson (the same pairing the ctx_calibration.tsv
+    // logger uses).  Later builds for the same model then size the
+    // elision budget from the measured bytes-per-token instead of a
+    // fixed 3.0, which can hold a model well below its real window.
+    // Implausible or tiny reports are ignored.  The context meter's
+    // estimate (EstimateTokensFromBytes) is unaffected.
     void RecordExactPromptTokens(long long promptTokens)
     {
         // A body that elided anything may only lower the ratio (see
@@ -251,16 +251,15 @@ public:
     const RequestBreakdown& GetLastBuildBreakdown() const { return m_lastBuildBreakdown; }
 
     // True when the most recent BuildChatRequestJson emitted a
-    // multimodal content array for the image-carrier user message
-    // (Phase 1c projection).  Read by the send path to skip the
-    // legacy AttachmentManager::InjectImagesIntoRequest fallback,
-    // whose only remaining job on a projected body is to Poco-parse
-    // the entire request (multi-MB once base64 data URIs are aboard)
-    // and discover the content is already structured.  False when
-    // projection could not run (unsaved conversation → no chat
-    // dir, or attachment rows without a persisted storage_path) —
-    // in those cases the injector is still the only way images
-    // reach the wire.
+    // multimodal content array for the image-carrier user message.
+    // Read by the send path to skip the AttachmentManager::
+    // InjectImagesIntoRequest fallback, whose only remaining job on a
+    // projected body is to Poco-parse the entire request (multi-MB
+    // once base64 data URIs are aboard) and discover the content is
+    // already structured.  False when projection could not run
+    // (unsaved conversation → no chat dir, or attachment rows without
+    // a persisted storage_path) — in those cases the injector is still
+    // the only way images reach the wire.
     bool LastBuildProjectedImages() const { return m_lastBuildProjectedImages; }
 
     // ── Streaming support methods ─────────────────────────────────
@@ -444,9 +443,9 @@ public:
     const std::string& GetModelSelection() const { return m_modelSelection; }
     void SetModelSelection(const std::string& key) { m_modelSelection = key; }
 
-    // ── Project association (Projects Phase 1) ───────────────────
+    // ── Project association ──────────────────────────────────────
     // Optional long-lived project attached to this conversation.  A
-    // missing project keeps legacy chat behavior.  Project folders are
+    // missing project keeps plain chat behavior.  Project folders are
     // never deleted when a chat is deleted; they are durable user data.
     bool HasProject() const { return !m_projectId.empty() && !m_projectRoot.empty(); }
     std::string GetProjectId() const { return m_projectId; }
@@ -471,11 +470,11 @@ public:
         }
     }
 
-    // ── Tool execution context (Phase 3) ──────────────────────────
-    // Per-conversation working directory for slash-command tools
-    // (/cmd, /read, /ls, /grep).  Empty string means "fall back to
-    // the app's current directory".  Persisted alongside the
-    // conversation so switching chats restores the right context.
+    // ── Tool execution context ────────────────────────────────────
+    // Per-conversation working directory override set by /cd.  Empty
+    // string means "use the conversation workspace".  Persisted
+    // alongside the conversation so switching chats restores the right
+    // context.
     std::string GetToolCwd() const { return m_toolCwd; }
     void        SetToolCwd(const std::string& cwd) {
         if (cwd != m_toolCwd) {
@@ -642,9 +641,9 @@ public:
     };
     static ChatFolderMigrationResult MigrateLegacyChatFolders();
 
-    // ── Attachment sidecar helpers (Phase 3) ──────────────────────
-    // User-uploaded attachments now live inside the conversation
-    // chat folder instead of one global sidecar area.
+    // ── Attachment sidecar helpers ────────────────────────────────
+    // User-uploaded attachments live inside the conversation chat
+    // folder.
     static std::string GetAttachmentDir(const std::string& conversationPath);
 
     // Relative path prefix stored in message attachment metadata.  This
@@ -657,7 +656,7 @@ public:
     static std::string GetGeneratedFilesDir(const std::string& conversationPath);
     static std::string GetGeneratedFilesRelDir(const std::string& conversationPath);
 
-    // ── Tool-result formatting (Phase 3) ──────────────────────────
+    // ── Tool-result formatting ────────────────────────────────────
     // Unified formatter for any tool invocation round-tripped into the
     // conversation history as a user message.  Emits:
     //
@@ -677,7 +676,7 @@ public:
     //
     // The body fence length is computed as N+1 backticks where N is
     // the longest backtick run in the body — this keeps the fence
-    // robust when /read dumps a markdown file or a code sample that
+    // robust when a read dumps a markdown file or a code sample that
     // itself contains ``` fences.  Error body uses the same rule.
     // Any section whose input string is empty is skipped; an empty
     // body is common for "did nothing useful" commands like
@@ -725,7 +724,7 @@ private:
     RequestBreakdown m_lastBuildBreakdown;
 
     // Whether the most recent BuildChatRequestJson projected persisted
-    // image attachments into a multimodal content array (Phase 1c
+    // image attachments into a multimodal content array (image
     // carrier).  Reset at the start of every build and of every
     // stringify pass, so the value always reflects the FINAL body.
     bool m_lastBuildProjectedImages = false;
@@ -745,8 +744,8 @@ private:
         ++m_revision;
     }
 
-    // Tool execution context (Phase 3) — persisted per-conversation.
-    // Empty / 0 means "use the global default" at resolution time.
+    // Tool execution context — persisted per-conversation.
+    // Empty / 0 means "use the default" at resolution time.
     std::string   m_toolCwd;
     unsigned long m_toolTimeoutMs = 0;
 
@@ -760,12 +759,12 @@ private:
     // Current send target is a Responses endpoint (see SetActiveResponsesApi).
     bool m_responsesApi = false;
 
-    // Optional project association (Projects Phase 1).
+    // Optional project association.
     std::string m_projectId;
     std::string m_projectName;
     std::string m_projectRoot;
 
-    // Sidebar organization metadata (Phase 4).
+    // Sidebar organization metadata.
     bool m_pinned = false;
     bool m_archived = false;
 
@@ -791,9 +790,9 @@ private:
     // a response is streaming.  The two are reconciled lazily by
     // FlushStreamBuffer() — called automatically before any reader (Save,
     // BuildChatRequestJson) and on stream completion via
-    // UpdateLastAssistantMessage().  Per-delta sync used to be unconditional
-    // and made streaming O(n²) in body bytes; now we sync only after enough
-    // bytes have accumulated to amortize the cost.
+    // UpdateLastAssistantMessage().  Syncing only after enough bytes have
+    // accumulated amortizes the cost; per-delta sync would make streaming
+    // O(n²) in body bytes.
     //
     // m_streamBufferDirty is the byte count buffered since the last sync to
     // the JSON object.  It only ticks under non-const flush paths, so it

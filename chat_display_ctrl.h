@@ -5,7 +5,7 @@
 // wxRichTextCtrl's built-in behaviors are tuned for an editor, not a
 // reading surface:
 //   - auto-scroll during drag-select is extremely slow -> timer-driven
-//     edge scroll that scales with distance (original feature);
+//     edge scroll that scales with distance;
 //   - the default wheel handler moves the system 3 lines per notch
 //     against small scroll units, which reads as sluggish next to a
 //     browser chat (Claude/ChatGPT) -> OnMouseWheel multiplies it and
@@ -153,6 +153,12 @@ public:
             caret->Hide();
         }
     }
+
+    // External scroll controls (the slim scroll rail beside the transcript)
+    // call this after moving the viewport, exactly like the control's own
+    // wheel/pan/keyboard paths, so follow-the-stream pauses when the user
+    // scrolls up and resumes near the bottom.
+    void NotifyUserScrolled() { NotifyViewportChangedSoon(); }
 
     // ChatDisplay installs this after construction. Direct scrolling done
     // inside this custom control does not consistently emit wxScrollWinEvent,

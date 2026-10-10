@@ -8,6 +8,7 @@
 
 class StatusDot;
 class ChatInputCtrl;
+class LbFollowClip;   // lb_scroll_rail.h
 struct ThemeData;
 
 namespace UIBuilder {
@@ -21,7 +22,7 @@ struct TopBarWidgets {
     wxStaticText*  modelLabel;
     wxStaticText*  modelPillRightBracket;  // "]" — recolored on hover
     StatusDot*     statusDot;
-    wxStaticText*  protocolChip;  // Phase 3b: "native" / "xml" / hidden
+    wxStaticText*  protocolChip;  // "native" / "xml" / hidden
     wxStaticText*  thinkingChip;  // ". Auto" segment inside the model pill; per-conversation /think override
     wxStaticText*  ctxMeter;      // context occupancy readout ("ctx 18.2k/32k")
     wxButton*      sidebarToggle;
@@ -46,6 +47,10 @@ struct InputAreaWidgets {
     wxButton*      stopButton;
     wxButton*      attachButton;
     wxBoxSizer*    inputSizer;
+    // Composer scroll rail support (lb_scroll_rail.h): the text control sits
+    // in inputClip; MyFrame adds its LbScrollRail to inputFieldRow.
+    LbFollowClip*  inputClip;
+    wxBoxSizer*    inputFieldRow;
 };
 
 // Creates the input row: [📎] [TextInput] [Send/Stop].

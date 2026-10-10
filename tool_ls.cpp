@@ -4,15 +4,7 @@
 #include "tool_path.h"
 #include "tool_path_safety.h"
 
-#include <algorithm>
-#include <chrono>
-#include <cstdint>
-#include <cstdio>
-#include <iomanip>
-#include <sstream>
-
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
+#include "lb_windows.h"
 
 namespace {
 
@@ -296,17 +288,14 @@ LsResult ListDirectory(const std::string& inputPath, const ToolContext& ctx)
     }
 
     // ── Empty directory ──────────────────────────────────────────
-    // Hint BEFORE path.  Earlier versions led with the path so the
-    // model could use the cwd as a reasoning cue, but in practice
-    // that backfired: when the cwd path coincidentally contained
-    // the project or topic name (e.g. C:\Users\Cesar\LlamaBoss\
-    // Chats\2026-09-26_..._1ed3d3c2 and the user asks about "LlamaBoss source
-    // code"), small models grabbed the path as a confident lead and
-    // climbed to the parent, never consulting notes.  Hint-first
-    // reverses precedence: the actionable suggestion is what the
-    // model reads first, and the path is kept for cases where the
-    // model wisely consults notes and then wants to compare what it
-    // finds against the cwd location.
+    // Hint BEFORE path.  Leading with the path backfires: when the
+    // cwd path coincidentally contains the project or topic name (e.g.
+    // C:\Users\Cesar\LlamaBoss\Chats\..._1ed3d3c2 and the user asks
+    // about "LlamaBoss source code"), small models grab the path as a
+    // confident lead and climb to the parent, never consulting notes.
+    // Hint-first puts the actionable suggestion first; the path is kept
+    // for cases where the model consults notes and then wants to
+    // compare what it finds against the cwd location.
     if (emitted == 0 && !hitEntryCap && !hitByteCap) {
         ss << "HINT: this directory is empty.  If the user is asking about "
               "source code, project files, or named saved locations they "

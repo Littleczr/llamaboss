@@ -32,6 +32,8 @@ struct RequestBreakdown
     size_t assistantBytes  = 0;  // assistant replies, incl. native tool_calls
     size_t toolResultBytes = 0;  // tool results fed back to the model
     size_t imageBytes      = 0;  // base64 image data URLs on the wire
+    size_t replayBytes     = 0;  // OpenAI Responses: encrypted reasoning items replayed
+                                 // from earlier tool turns (not in TextBytes; logged only)
     int    imageCount      = 0;
     int    messageCount    = 0;  // wire messages, system included
     int    elidedCount     = 0;  // tool-result bodies trimmed by the budget pass

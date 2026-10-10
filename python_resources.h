@@ -62,10 +62,7 @@ inline std::string ResourceName(const std::string& name)
 } // namespace lb_pyres
 
 #ifdef _WIN32
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
+#include "lb_windows.h"
 
 namespace lb_pyres {
 

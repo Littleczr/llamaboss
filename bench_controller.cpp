@@ -7,16 +7,6 @@
 #include "ui_event_post.h"
 
 #include <wx/datetime.h>
-#include <wx/filename.h>
-
-#include <Poco/JSON/Object.h>
-#include <Poco/JSON/Parser.h>
-#include <Poco/JSON/Stringifier.h>
-
-#include <filesystem>
-#include <fstream>
-#include <memory>
-#include <sstream>
 
 BenchController::BenchController(Callbacks callbacks)
     : m_cb(std::move(callbacks))

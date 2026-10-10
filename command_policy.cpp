@@ -14,12 +14,15 @@ namespace {
 // Any cmdlet whose name begins (case-insensitively) with one of
 // these may remain on the silent read-only path, provided the full
 // command also avoids broader shell syntax that now routes to approval.
-constexpr std::array<const char*, 13> kVerbPrefixes = {
+//
+// "Format-" is deliberately NOT a prefix: Format-Volume (Storage module)
+// formats a disk.  The read-only Format-* output cmdlets are listed by
+// exact name in kExactNames instead.
+constexpr std::array<const char*, 12> kVerbPrefixes = {
     "Get-",        "Test-",        "Measure-",
     "Select-",     "Where-",       "Sort-",
     "Group-",      "Compare-",     "ConvertTo-",
-    "ConvertFrom-","Format-",      "Find-",
-    "Resolve-"
+    "ConvertFrom-","Find-",        "Resolve-"
 };
 
 // ─── Auto-run allowlist: exact names ────────────────────────────
@@ -35,8 +38,10 @@ constexpr std::array<const char*, 13> kVerbPrefixes = {
 // The classifier cannot tell a property read from a method call
 // without type information, so ForEach-Object always routes to
 // approval.  Select-Object -ExpandProperty covers the read-only case.
-constexpr std::array<const char*, 8> kExactNames = {
+constexpr std::array<const char*, 13> kExactNames = {
     "Out-String", "Out-Default", "Out-Host", "Out-Null",
+    "Format-Table", "Format-List", "Format-Wide", "Format-Custom",
+    "Format-Hex",
     "date", "whoami", "hostname", "echo"
 };
 
@@ -45,19 +50,16 @@ struct ReviewChar {
     const char* humanName;
 };
 
-// Characters that historically triggered hard rejection because they
-// make a simplistic allowlist checker unsafe.  They are still not
-// eligible for silent auto-run, but they now route to approval instead
-// of being blocked outright.
+// Characters that make a simplistic allowlist checker unsafe.  They are
+// not eligible for silent auto-run; they route to approval instead of
+// being blocked outright.
 //
-// NOTE: ';' used to live in this list (flagged unconditionally as a
-// "statement separator").  It has been promoted to a real statement
-// boundary — see ScanAndSplitStages — because reflexively gating every
-// semicolon punished the extremely common pattern of chaining several
-// already-read-only diagnostic commands (e.g. a preference assignment
-// followed by two Get- calls). Each ';'-separated statement is still
-// independently required to be read-only-safe; nothing about that
-// change widens what a single statement is allowed to do.
+// NOTE: ';' is not in this list: it is a real statement boundary (see
+// ScanAndSplitStages), because gating every semicolon would punish the
+// extremely common pattern of chaining several read-only diagnostic
+// commands (e.g. a preference assignment followed by two Get- calls).
+// Each ';'-separated statement is still independently required to be
+// read-only-safe.
 constexpr std::array<ReviewChar, 7> kReviewOutsideQuotes = {{
     { '&', "call/background operator '&'" },
     { '>', "redirection '>'" },
@@ -484,9 +486,8 @@ bool IsSafeSimpleAssignment(const std::string& stmt) {
 // the closer is '@ or "@ at the very start of a line.  Inside the body,
 // quotes of either kind are ordinary characters, so a C++ literal such
 // as L'"' in a single-quoted here-string must NOT flip the scanner's
-// quote state.  Before this rule existed the scanner did exactly that,
-// drifted out of phase, and rejected valid scripts as "unterminated
-// double-quoted string".
+// quote state, or the scanner drifts out of phase and rejects valid
+// scripts as "unterminated double-quoted string".
 //
 // On entry `i` indexes the '@'.  Returns:
 //   kNotHereString  - not an opener; caller scans '@' normally
@@ -537,6 +538,22 @@ ScanResult ScanAndSplitStages(const std::string& cmd) {
     for (size_t i = 0; i < cmd.size(); ++i) {
         const char c = cmd[i];
 
+        // Non-ASCII anywhere (inside or outside quotes) leaves the silent
+        // read-only path.  PowerShell's tokenizer treats Unicode curly
+        // quotes (U+2018-201E) as quote characters, Unicode dashes
+        // (U+2013-2015) as '-', and Unicode whitespace as separators, but
+        // this scanner works on ASCII bytes.  Without this check
+        //     Get-Item 'a’; Remove-Item C:\x; ‘b'
+        // looks like ONE single-quoted argument here while PowerShell
+        // closes the string at U+2019 and runs Remove-Item.  The command
+        // stays valid; it just needs approval.  Keep scanning so quote
+        // state (and hard rejects for malformed text) stay accurate.
+        if (static_cast<unsigned char>(c) >= 0x80) {
+            MarkApproval(out, "non-ASCII characters require approval "
+                              "(PowerShell treats Unicode quotes, dashes and "
+                              "spaces as syntax)");
+        }
+
         // Backtick is PowerShell's escape/line-continuation character.
         // It remains valid for an approved command, but it is too rich
         // for the silent read-only classifier.  Outside single quotes it
@@ -577,8 +594,8 @@ ScanResult ScanAndSplitStages(const std::string& cmd) {
         // Outside quotes from here down.
 
         // Comments.  Their text is inert, so quotes, pipes and ';' inside
-        // them must not be scanned: "Get-Item . # user's folder" used to
-        // be rejected as an unterminated single-quoted string.
+        // them must not be scanned ("Get-Item . # user's folder" is not an
+        // unterminated single-quoted string).
         //
         //   * '#' at the start or after whitespace opens a line comment
         //     that PowerShell ignores to end of line.  Skip to (not past)
@@ -589,9 +606,9 @@ ScanResult ScanAndSplitStages(const std::string& cmd) {
         //   * '<#' opens a block comment: approval required, content
         //     skipped, and an unterminated one stays a hard reject.
         //     Belt and braces: a comment that contains command
-        //     separators still requires approval (as it did before this
-        //     rule existed), so skipping comment text can never widen
-        //     what auto-runs even if this rule and PowerShell disagreed.
+        //     separators still requires approval, so skipping comment
+        //     text can never widen what auto-runs even if this rule and
+        //     PowerShell disagreed.
         if (c == '#' &&
             (i == 0 || cmd[i - 1] == ' ' || cmd[i - 1] == '\t')) {
             const size_t commentStart = i;

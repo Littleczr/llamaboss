@@ -14,7 +14,7 @@
 #include <thread>
 #endif
 
-// ── Single-instance handoff machinery (Phase 3d) ─────────────────
+// ── Single-instance handoff machinery ─────────────────────────────
 // A second LlamaBoss.exe launch must not boot a second llama-server
 // (port collision, double VRAM) — it should behave like Ctrl+Shift+N
 // in the running process.  Handshake: the primary owns a named
@@ -130,7 +130,7 @@ bool MyApp::OnInit()
     SetAppName("LlamaBoss");
     SetAppDisplayName("LlamaBoss");
 
-    // ── Single-instance check (Phase 3d) ─────────────────────────
+    // ── Single-instance check ────────────────────────────────────
     // Must come right after SetAppName (nothing else needed) and
     // before any real initialization: a secondary launch should do
     // zero work — no data dirs, no settings load, no logger — just
@@ -153,8 +153,7 @@ bool MyApp::OnInit()
     // ── App-level singletons, in dependency order ────────────────
     // Data dirs first (cheap no-op when they exist), then AppState
     // (settings + logger), then ModelService (needs the logger).
-    // All of this used to happen inside the first frame's ctor; it
-    // lives here now so N frames can borrow one instance of each.
+    // They live here so N frames can borrow one instance of each.
     ServerManager::EnsureDataDirs();
 
     m_appState = std::make_unique<AppState>();
@@ -261,7 +260,7 @@ int MyApp::OnExit()
     // actual bytes live in this process, and wx's cleanup EMPTIES the
     // clipboard on exit unless Flush() renders it out first
     // (OleFlushClipboard underneath).  Without this, copying a chat
-    // response and then closing the app made the paste target come up
+    // response and then closing the app leaves the paste target
     // empty.  Covers Ctrl+C from the transcript, the input box, and
     // the code-block [Copy] button alike.  Runs first, while the app
     // is fully alive; harmless no-op when we don't own the clipboard.

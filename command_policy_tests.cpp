@@ -1,13 +1,13 @@
 // command_policy_tests.cpp
 //
-// Regression harness for command_policy.cpp (2026-09-30).  Pure, no wx:
+// Regression harness for command_policy.cpp.  Pure, no wx:
 //   g++ -std=c++17 -I . command_policy_tests.cpp command_policy.cpp && ./a.out
 //
-// Covers the quote-scanner fix: backtick escapes and '#' comments used to
-// make valid PowerShell fail the quote-balance check and be REJECTED
-// outright (not even offered for approval).  Also pins the safety
-// properties around comments: skipping comment text must never widen
-// what auto-runs.
+// Covers the quote scanner (backtick escapes and '#' comments must not
+// make valid PowerShell fail the quote-balance check), here-strings,
+// Unicode quote handling, and the auto-run allowlist.  Also pins the
+// safety properties around comments: skipping comment text must never
+// widen what auto-runs.
 #include "command_policy.h"
 #include <iostream>
 #include <string>
@@ -19,7 +19,7 @@ void t(const std::string& c, const char* want){
   std::cout << (ok?"PASS ":"FAIL ") << got << " (want " << want << ")  " << c << (d.reason.empty()?"":"   ["+d.reason+"]") << "\n";
 }
 int main(){
-  // ChatGPT's two repros
+  // backtick escape and '#' comment repros
   t("Write-Output \"hello`\"\"", "APPROVE");
   t("Get-Item . # user's folder", "ALLOW");
   // comments
@@ -43,8 +43,8 @@ int main(){
   t("Get-ChildItem -Path 'D:\\' -Recurse -File -Filter '*child*'", "ALLOW");
   t("Write-Output 'it''s'", "APPROVE");
   t("Remove-Item C:\\x", "APPROVE");
-  // here-strings (2026-10-01): quotes inside a here-string body are
-  // ordinary characters.  The M9 rejection was L'"' inside @'...'@.
+  // here-strings: quotes inside a here-string body are ordinary
+  // characters (e.g. L'"' inside @'...'@).
   t("$t=@'\nconst wchar_t q = L'\"';\n'@\nWrite-Output $t", "APPROVE");
   t("$t=@'\r\nconst wchar_t q = L'\"';\r\n'@\r\nWrite-Output $t", "APPROVE");  // CRLF
   t("$t=@'\ndon't \"stop\" ; | here\n'@", "APPROVE");                         // separators inert
@@ -57,8 +57,19 @@ int main(){
   t("$a=@'\none\n'@\n$b=@'\ntwo's\n'@", "APPROVE");                           // two in a row
   t("$x = @('a','b')", "APPROVE");                                              // @( still the array digraph
   t("Get-Item 'a@b'", "ALLOW");                                                 // @ inside a plain string
-  // lint: underscore variable inside a double here-string is still flagged,
-  // and a quote inside a literal here-string no longer misleads the linter
+  // Unicode quote/dash bypass: PowerShell closes a string at a curly
+  // quote, so non-ASCII text must never auto-run.
+  t("Get-Item 'a\xE2\x80\x99; Remove-Item -Recurse C:\\x; \xE2\x80\x98" "b'", "APPROVE");
+  t("Get-Item \"a\xE2\x80\x9D; Stop-Computer; \xE2\x80\x9C\"", "APPROVE");
+  t("Get-Item \xE2\x80\x93Path C:\\x", "APPROVE");                          // en dash
+  t("Get-Item 'caf\xC3\xA9.txt'", "APPROVE");                                  // accepted trade-off
+  // Format-Volume formats a disk; Format-* output cmdlets stay allowed.
+  t("Format-Volume -DriveLetter D -Force", "APPROVE");
+  t("Get-Process | Format-Table Name, Id", "ALLOW");
+  t("Get-ChildItem | Format-List", "ALLOW");
+  t("Get-Content x.bin | Format-Hex", "ALLOW");
+  // lint: underscore variable inside a double here-string is flagged,
+  // and a quote inside a literal here-string does not mislead the linter
   {
     auto w = LintPowerShellHazards("$s=@\"\nv=$Version_DRAFT\n\"@");
     bool ok = w.size()==1; if(!ok) ++fails;

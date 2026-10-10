@@ -1,18 +1,18 @@
 // tool_read.h
 //
-// Implementation of the /read slash command — Phase 3.
+// Implementation of the read tool.
 //
 // ReadFile is intentionally UI-framework-free: it takes a path and a
 // resolved ToolContext, and returns a ReadResult that's ready to be
 // packed into a ChatDisplay::ToolBlock for rendering AND passed to
 // ChatHistory::FormatToolBlockAsUserMessage for history round-trip.
-// The handler on MyFrame does the plumbing; this file contains no
-// wx includes so it's straightforward to exercise from the Phase 4
-// agent harness.
+// No wx includes, so the native test runner and the agent harness
+// drive it directly.
 //
-// The read is synchronous.  Worst case is the 1 MiB content cap,
-// which is ~ms on any SSD — blocking the UI thread briefly is
-// simpler than threading and has no observable cost.
+// The read itself is synchronous; the router dispatches read on a
+// worker thread (ToolWorkerExecutor), so even the 1 MiB content cap
+// never blocks the UI.  The open tool's inline-text path calls it on
+// the UI thread, where the cap keeps it to milliseconds.
 //
 #pragma once
 

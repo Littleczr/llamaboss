@@ -6,9 +6,9 @@
 // MSBuild + vcpkg app-local deployment prints one line per dependency
 // copied next to the built binary:
 //   C:\...\vcpkg_installed\...\bin\PocoFoundation.dll -> C:\...\out\PocoFoundation.dll done
-// 2026-10-01 r16c1 session: 198 such lines, 35.8 KB, ~23% of the whole
-// transcript, ~4 KB per build-and-test run.  Each line only says a copy
-// SUCCEEDED; the model never needs them individually.
+// That is ~4 KB per build-and-test run, and a large share of a long
+// build transcript.  Each line only says a copy SUCCEEDED; the model
+// never needs them individually.
 //
 // FoldCopyProgressLines() replaces every run of >= kMinRun consecutive
 // such lines with ONE summary line:

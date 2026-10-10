@@ -35,7 +35,7 @@
       "name": "R0_S3_Python_Kernel_Keeps_State_And_Prints_Final_Expression",
       "action": "source_contract",
       "input": {
-        "path": "assets/python/lb_kernel.py"
+        "path": "python_session.cpp"
       },
       "expect": {
         "contains": [

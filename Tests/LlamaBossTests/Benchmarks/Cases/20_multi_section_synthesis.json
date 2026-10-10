@@ -1,0 +1,137 @@
+{
+    "schema_version":  1,
+    "benchmarks":  [
+                       {
+                           "name":  "RLM_PA17_Multi_Section_Synthesis",
+                           "task":  "Prepare the authoritative PA-17 project summary. Report the approved start date, final lead, original budget, approved reduction, calculated net budget, final deadline, selected vendor, principal risk with its reason, and next milestone with its date. Resolve drafts and superseded values in favor of later authoritative records.",
+                           "modes":  [
+                                         "direct",
+                                         "rlm"
+                                     ],
+                           "source":  {
+                                          "type":  "generated_lines",
+                                          "line_count":  12000,
+                                          "template":  "row {line}: routine",
+                                          "patches":  [
+                                                          {
+                                                              "line":  1200,
+                                                              "text":  "[PA-17][AUTHORIZATION][AUTHORITATIVE] Approved project start date: September 14, 2026."
+                                                          },
+                                                          {
+                                                              "line":  2050,
+                                                              "text":  "[PA-17][DRAFT][SUPERSEDED] Proposed project lead: Omar Reed. This proposal was not approved."
+                                                          },
+                                                          {
+                                                              "line":  2780,
+                                                              "text":  "[PA-17][STAFFING][AUTHORITATIVE] Final approved project lead: Priya Shah. This record supersedes earlier staffing proposals."
+                                                          },
+                                                          {
+                                                              "line":  3420,
+                                                              "text":  "[PA-17][FINANCE][BASELINE] Original approved budget: $480,000."
+                                                          },
+                                                          {
+                                                              "line":  4480,
+                                                              "text":  "[PA-17][FINANCE][AUTHORITATIVE] Approved budget reduction: $35,500. Calculate the net from the original baseline less this reduction."
+                                                          },
+                                                          {
+                                                              "line":  5660,
+                                                              "text":  "[PA-17][SCHEDULE][AUTHORITATIVE] Final delivery deadline: November 30, 2026."
+                                                          },
+                                                          {
+                                                              "line":  6340,
+                                                              "text":  "[PA-17][DRAFT][SUPERSEDED] Early vendor candidate: Bluepeak Systems. Procurement rejected this candidate."
+                                                          },
+                                                          {
+                                                              "line":  7140,
+                                                              "text":  "[PA-17][PROCUREMENT][AUTHORITATIVE] Selected vendor: Northstar Signal Labs."
+                                                          },
+                                                          {
+                                                              "line":  8260,
+                                                              "text":  "[PA-17][RISK][AUTHORITATIVE] Principal risk: permit delay. Reason: the county review office has a documented application backlog."
+                                                          },
+                                                          {
+                                                              "line":  9540,
+                                                              "text":  "[PA-17][MILESTONE][AUTHORITATIVE] Next milestone: design freeze, scheduled for September 28, 2026."
+                                                          }
+                                                      ]
+                                      },
+                           "expect":  {
+                                          "required":  [
+                                                           {
+                                                               "id":  "start_date",
+                                                               "any_of":  [
+                                                                              "September 14, 2026",
+                                                                              "2026-09-14"
+                                                                          ]
+                                                           },
+                                                           {
+                                                               "id":  "final_lead",
+                                                               "all_of":  [
+                                                                              "Priya Shah"
+                                                                          ]
+                                                           },
+                                                           {
+                                                               "id":  "original_budget",
+                                                               "any_of":  [
+                                                                              "$480,000",
+                                                                              "480000"
+                                                                          ]
+                                                           },
+                                                           {
+                                                               "id":  "approved_reduction",
+                                                               "any_of":  [
+                                                                              "$35,500",
+                                                                              "35500"
+                                                                          ]
+                                                           },
+                                                           {
+                                                               "id":  "net_budget",
+                                                               "any_of":  [
+                                                                              "$444,500",
+                                                                              "444500"
+                                                                          ]
+                                                           },
+                                                           {
+                                                               "id":  "deadline",
+                                                               "any_of":  [
+                                                                              "November 30, 2026",
+                                                                              "2026-11-30"
+                                                                          ]
+                                                           },
+                                                           {
+                                                               "id":  "selected_vendor",
+                                                               "all_of":  [
+                                                                              "Northstar Signal Labs"
+                                                                          ]
+                                                           },
+                                                           {
+                                                               "id":  "risk",
+                                                               "all_of":  [
+                                                                              "permit delay",
+                                                                              "county",
+                                                                              "backlog"
+                                                                          ]
+                                                           },
+                                                           {
+                                                               "id":  "next_milestone",
+                                                               "all_of":  [
+                                                                              "design freeze"
+                                                                          ],
+                                                               "any_of":  [
+                                                                              "September 28, 2026",
+                                                                              "2026-09-28"
+                                                                          ]
+                                                           }
+                                                       ],
+                                          "forbidden":  [
+                                                            "Omar Reed is the final",
+                                                            "Bluepeak Systems is the selected"
+                                                        ],
+                                          "required_tools":  [
+                                                                 "grep"
+                                                             ],
+                                          "min_score":  1.0
+                                      }
+                       }
+                   ]
+}

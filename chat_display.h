@@ -100,10 +100,10 @@ public:
     // "3 matches").  `bodyLang` is reserved for future syntax
     // highlighting; empty means "plain".
     //
-    // Phase 5: the struct itself moved to tool_block.h so non-UI
-    // components (AgentController, tool dispatchers, future P6/P9
-    // pieces) can build payloads without dragging in wx.  The alias
-    // here keeps existing `ChatDisplay::ToolBlock` callers compiling.
+    // The struct itself lives in tool_block.h so non-UI components
+    // (AgentController, tool dispatchers) can build payloads without
+    // dragging in wx.  The alias keeps `ChatDisplay::ToolBlock`
+    // callers compiling.
     using ToolBlock = ::ToolBlock;
 
     void DisplayToolBlock(const ToolBlock& block, bool startExpanded = false);
@@ -113,7 +113,7 @@ public:
     // from corrupting live tool output. File actions stay clickable.
     void SetToolBlockInteractionEnabled(bool enabled);
 
-    // ── Approval buttons (Phase 6 UX) ────────────────────────────
+    // ── Approval buttons ─────────────────────────────────────────
     // When a ToolBlock with requiresApproval=true is rendered,
     // DisplayToolBlock writes a clickable button row beneath
     // [show details]:
@@ -126,7 +126,7 @@ public:
     // Each label is a separately-registered click region styled the
     // same as the [show details] affordance (italic Consolas, soft
     // blue).  Clicks dispatch through the registered callback to the
-    // frame, which routes to HandleApprovalCommand using the existing
+    // frame, which routes to HandleApprovalCommand using the
     // chat-scoped approval semantics:
     //
     //   Once   -> HandleApprovalCommand(true,  /*rememberForChat=*/false)
@@ -253,11 +253,12 @@ private:
     // ── Live async-tool progress ────────────────────────────────
     // The pending card in the transcript is static and UI-only; it is
     // removed before the terminal tool card is rendered.  The *live*
-    // part (elapsed clock, output tail, gauge) is no longer drawn inside
-    // the rich text control — it is delegated to the owner via the
+    // part (elapsed clock, output tail, gauge) is not drawn inside the
+    // rich text control — it is delegated to the owner via the
     // callbacks below (MyFrame wires them to ActivityStrip).  Drawing it
-    // here re-laid-out the tail paragraph every second and fought the
-    // user's scroll position for the whole duration of a long command.
+    // here would re-lay-out the tail paragraph every second and fight
+    // the user's scroll position for the whole duration of a long
+    // command.
     long m_pendingCardStartPos     = -1;
     long m_pendingCardEndPos       = -1;
     bool m_pendingProgressActive   = false;

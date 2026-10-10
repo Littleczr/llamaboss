@@ -1,8 +1,7 @@
 #pragma once
 
 // ─── skill_authoring_support.h ─────────────────────────────────────
-// Helpers extracted from LlamaBoss.cpp for the Skills Phase 2I
-// "skill authoring is a real design conversation" flow.
+// Helpers for the "skill authoring is a real design conversation" flow.
 //
 // Everything in here is pure: no wxWidgets, no MyFrame, no global
 // state.  These helpers classify user control messages during an

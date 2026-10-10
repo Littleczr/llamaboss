@@ -14,30 +14,18 @@
 #include "theme.h"
 #include "ui_event_post.h"
 #include "lb_string_utils.h"   // LbUtf8SafeTruncate
+#include "export_metrics.h"    // "Export with metrics..." section
+#include "path_safety.h"       // Utf8ToWide for the chat-folder logs
 
-#include <wx/filedlg.h>
-#include <wx/textdlg.h>
-#include <wx/filename.h>
-#include <wx/dir.h>
 #include <wx/dirdlg.h>
 #include <wx/msgdlg.h>
-#include <wx/stdpaths.h>
 #include <wx/file.h>
 #include <wx/datetime.h>
 
-#include <algorithm>
-#include <cctype>
-#include <sstream>
 #include <exception>
 #include <condition_variable>
 #include <deque>
-#include <memory>
-#include <mutex>
-#include <thread>
-#include <utility>
 
-#include <Poco/JSON/Object.h>
-#include <Poco/JSON/Parser.h>
 #include <Poco/Types.h>
 
 wxDEFINE_EVENT(wxEVT_LB_CONVERSATION_SAVE_COMPLETE, wxCommandEvent);
@@ -576,7 +564,7 @@ void ConversationController::OnSaveConversation()
 
         std::string path = dlg.GetPath().ToUTF8().data();
 
-        // ── Cross-window ownership guard (Phase 3b) ──────────────
+        // ── Cross-window ownership guard ──────────────────────────
         // Save-As onto a conversation another window has open would
         // silently clobber that window's file — the overwrite prompt
         // above only checks the disk, not window ownership, and the
@@ -601,8 +589,7 @@ void ConversationController::OnSaveConversation()
             // the registry claim so no other window can open the new
             // path underneath us.  SetCurrent is one-claim-per-frame,
             // so this also releases the stale claim on the old path
-            // (Phase 3b; the registry header lists Save-As as a claim
-            // point, and this is that point).
+            // (the registry header lists Save-As as a claim point).
             wxGetApp().GetConversationRegistry().SetCurrent(
                 &m_frame, m_chatHistory->GetFilePath());
             // Session trust follows the conversation to its new path.
@@ -1101,7 +1088,25 @@ std::string BuildConversationMarkdown(const ChatHistory& history,
 
 } // anonymous namespace
 
-void ConversationController::ExportConversation(const std::string& path)
+namespace {
+// Whole file as bytes; empty when missing or unreadable.
+std::string ReadChatLog(const std::string& folderUtf8, const wchar_t* name)
+{
+    try {
+        const std::filesystem::path p =
+            std::filesystem::path(path_safety::Utf8ToWide(folderUtf8)) / name;
+        std::ifstream f(p, std::ios::binary);
+        if (!f) return {};
+        std::ostringstream ss;
+        ss << f.rdbuf();
+        return ss.str();
+    } catch (...) {
+        return {};
+    }
+}
+} // anonymous namespace
+
+void ConversationController::ExportConversation(const std::string& path, bool withMetrics)
 {
     if (path.empty()) return;
 
@@ -1135,13 +1140,27 @@ void ConversationController::ExportConversation(const std::string& path)
         if (title.empty()) title = tmp.GenerateTitle();
     }
 
+    // Metrics come from the chat folder's logs, which every completed
+    // reply has already appended to, so the active chat needs no flush.
+    if (withMetrics) {
+        const std::string folder = ChatHistory::GetChatFolder(path);
+        markdown += "\n\n---\n\n";
+        markdown += lb_export_metrics::BuildMetricsMarkdown(
+            folder.empty() ? std::string() : ReadChatLog(folder, L"turn_stats.tsv"),
+            folder.empty() ? std::string() : ReadChatLog(folder, L"ctx_calibration.tsv"));
+        while (!markdown.empty() && markdown.back() == '\n') markdown.pop_back();
+    }
+
     // Remember the folder for the rest of the session; start in Documents.
     static wxString s_lastExportDir;
     if (s_lastExportDir.empty() || !wxDirExists(s_lastExportDir))
         s_lastExportDir = wxStandardPaths::Get().GetDocumentsDir();
 
-    wxFileDialog dlg(&m_frame, "Export Conversation", s_lastExportDir,
-        wxString::FromUTF8(ExportSafeFileName(title) + ".md"),
+    wxFileDialog dlg(&m_frame,
+        withMetrics ? "Export Conversation with Metrics" : "Export Conversation",
+        s_lastExportDir,
+        wxString::FromUTF8(ExportSafeFileName(title) +
+                           (withMetrics ? " (metrics).md" : ".md")),
         "Markdown (*.md)|*.md|Text (*.txt)|*.txt",
         wxFD_SAVE | wxFD_OVERWRITE_PROMPT);
     if (dlg.ShowModal() == wxID_CANCEL) return;
@@ -1166,7 +1185,8 @@ void ConversationController::ExportConversation(const std::string& path)
 
     if (m_chatDisplay)
         m_chatDisplay->DisplaySystemMessage(
-            std::string("Exported conversation to ") +
+            std::string(withMetrics ? "Exported conversation with metrics to "
+                                    : "Exported conversation to ") +
             out.GetFullPath().ToUTF8().data());
 }
 
@@ -1471,13 +1491,11 @@ void ConversationController::DeleteConversations(
         return;
     }
 
-    // ── Cross-window ownership guard (Phase 3b) ──────────────────
+    // ── Cross-window ownership guard ─────────────────────────────
     // Deleting a conversation another window has open would pull the
     // file out from under it (its next autosave resurrects a ghost;
     // its chat folder vanishes mid-use).  Filter those out BEFORE
-    // the confirmation so the dialog quotes an honest count.  The
-    // local |filePaths| keeps the rest of this function byte-for-byte
-    // identical to the single-window version.
+    // the confirmation so the dialog quotes an honest count.
     //
     // Defined as a lambda because the filter must run TWICE: once
     // here, and once more after the confirmation dialog below.  The
@@ -1677,7 +1695,7 @@ bool ConversationController::LoadConversationFromPath(const std::string& path)
 {
     if (m_cb.isBusy && m_cb.isBusy()) return false;
 
-    // ── Cross-window ownership guard (Phase 3b) ──────────────────
+    // ── Cross-window ownership guard ─────────────────────────────
     // The same conversation open in two windows is last-writer-wins
     // data loss on every autosave.  If another window already has
     // this one, raise that window instead of loading.
@@ -1697,8 +1715,8 @@ bool ConversationController::LoadConversationFromPath(const std::string& path)
     // slot verifiably holds this conversation's KV (see
     // SaveSlotStateForConversation).  Must run while m_chatHistory
     // still points at the conversation being left.  Routed through
-    // ModelService (Phase 3c): skipped when another window is mid-
-    // generation on the shared slot.
+    // ModelService: skipped when another window is mid-generation on
+    // the shared slot.
     wxGetApp().GetModelService().SaveSlotStateForConversation(
         &m_frame, m_chatHistory->GetFilePath());
 
@@ -1754,9 +1772,9 @@ bool ConversationController::LoadConversationFromPath(const std::string& path)
             if (m_statusDot) m_statusDot->SetConnected(true);
 
             // Slot persistence applies only to a matching live local model.
-            // Routed through ModelService (Phase 3c): a restore against
-            // the slot another window's stream is generating into would
-            // clobber that stream's KV, so it is skipped under contention.
+            // Routed through ModelService: a restore against the slot
+            // another window's stream is generating into would clobber
+            // that stream's KV, so it is skipped under contention.
             if (savedModelIsLocal)
                 wxGetApp().GetModelService().RestoreSlotStateForConversation(
                     &m_frame, path);

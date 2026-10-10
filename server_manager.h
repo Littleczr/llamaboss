@@ -11,9 +11,7 @@
 #include <cstdint>
 #include <limits>
 
-#ifdef __WXMSW__
-#include <windows.h>
-#endif
+#include "lb_windows.h"
 
 #include <Poco/Logger.h>
 
@@ -139,11 +137,10 @@ public:
     // is true and the answering process isn't ours — see the guard
     // block there for why silent attach is the failure mode.
     //
-    // Takes the port explicitly.  It used to read m_port, which is
-    // not assigned from config.port until AFTER process creation —
-    // so on any launch with a non-default port the guard probed the
-    // PREVIOUS port and missed exactly the collision it exists to
-    // catch.
+    // Takes the port explicitly: m_port is not assigned from
+    // config.port until AFTER process creation, so reading it here
+    // would probe the PREVIOUS port on any launch with a non-default
+    // port and miss exactly the collision this guard exists to catch.
     bool IsPortAnswering(int port) const;
 
     // ── Startup fallback retries ────────────────────────────────
@@ -169,7 +166,7 @@ public:
     void NotifyServerReady();
 
     // True only for the currently running llama-server process when
-    // that process was launched with --jinja. Phase 3 tool-call
+    // that process was launched with --jinja.  Tool-call protocol
     // detection must check this because native function calling is a
     // server-runtime capability, not only a model/template capability.
     bool IsCurrentServerJinjaEnabled() const { return m_currentJinjaEnabled; }
@@ -356,9 +353,9 @@ public:
     // files in power mode. Sorted alphabetically by displayName.
     static std::vector<ModelEntry> ScanModels();
 
-    // Legacy path-only scan — kept for settings-combo backward compat
-    // where callers only want a flat list of .gguf paths to load.
-    // New code should use ScanModels() and consume ModelEntry directly.
+    // Path-only scan for callers that only want a flat list of .gguf
+    // paths to load.  New code should use ScanModels() and consume
+    // ModelEntry directly.
     static std::vector<std::string> ScanModelPaths();
 
 private:
@@ -373,7 +370,7 @@ private:
     std::weak_ptr<std::atomic<bool>> m_aliveToken;
     Poco::Logger* m_logger;
     std::string   m_loadedModel;
-    std::string   m_loadedMmproj;   // Phase 3b: paired mmproj (or empty)
+    std::string   m_loadedMmproj;   // paired mmproj (or empty)
     std::string   m_slotOwner;      // cache filename the slot's KV belongs to
     bool          m_slotDirty = false; // generation ran since last save/restore
 
