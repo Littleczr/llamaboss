@@ -33,8 +33,10 @@
 // Win32
 #include "lb_windows.h"
 #include "lb_utf.h"
+#ifdef _WIN32
 #include <shlobj.h>       // SHGetKnownFolderPath (PowerShell 7 location)
 #include <knownfolders.h>
+#endif
 
 // ─── Event definitions ───────────────────────────────────────────
 wxDEFINE_EVENT(wxEVT_CMD_COMPLETE, wxCommandEvent);
@@ -194,6 +196,7 @@ std::wstring BuildPowerShellPayload(const std::string& userCommand) {
     return Utf8ToWide(prefix + lintBlock + userCommand);
 }
 
+#ifdef _WIN32
 // Resolve %USERPROFILE% for CWD; fall back to empty (= inherit parent CWD)
 // if the env var is missing for some reason.
 std::wstring ResolveUserProfileDir() {
@@ -268,6 +271,8 @@ const PowerShellChoice& ResolvePowerShell()
     }();
     return choice;
 }
+
+#endif // _WIN32
 
 std::string WideToUtf8(const std::wstring& in) {
 #ifndef _WIN32
@@ -388,8 +393,13 @@ std::string UniqueOutputPathLocal(const std::string& dir,
             ? (safeStem + suffix)
             : (safeStem + "_" + std::to_string(i + 1) + suffix);
         std::string path = JoinPathLocal(dir, displayNameOut);
+#ifdef _WIN32
         DWORD attrs = GetFileAttributesW(Utf8ToWide(path).c_str());
         if (attrs == INVALID_FILE_ATTRIBUTES) return path;
+#else
+        struct stat st {};
+        if (::lstat(path.c_str(), &st) != 0) return path;
+#endif
     }
     displayNameOut.clear();
     return std::string();
@@ -453,12 +463,17 @@ std::string BuildHeadTailPreviewLocal(const std::string& text,
 
 size_t FileSizeLocal(const std::string& path)
 {
+#ifndef _WIN32
+    struct stat st {};
+    return ::stat(path.c_str(), &st) == 0 ? static_cast<size_t>(st.st_size) : 0;
+#else
     WIN32_FILE_ATTRIBUTE_DATA data = {};
     if (!GetFileAttributesExW(Utf8ToWide(path).c_str(), GetFileExInfoStandard, &data)) return 0;
     ULARGE_INTEGER u;
     u.HighPart = data.nFileSizeHigh;
     u.LowPart = data.nFileSizeLow;
     return static_cast<size_t>(u.QuadPart);
+#endif
 }
 
 bool WriteUtf8TextFileLocal(const std::string& path, const std::string& content)
@@ -564,9 +579,14 @@ bool IsBlankTextLocal(const std::string& s)
 
 bool IsRegularFileLocal(const std::string& path)
 {
+#ifdef _WIN32
     DWORD attrs = GetFileAttributesW(Utf8ToWide(path).c_str());
     return attrs != INVALID_FILE_ATTRIBUTES &&
            (attrs & FILE_ATTRIBUTE_DIRECTORY) == 0;
+#else
+    struct stat st {};
+    return ::stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode);
+#endif
 }
 
 std::string TrimArtifactValueLocal(const std::string& raw)
@@ -830,6 +850,7 @@ void StripClixmlInPlace(std::string& s) {
     }
 }
 
+#ifdef _WIN32
 // RAII for Win32 HANDLEs.
 struct HandleGuard {
     HANDLE h = nullptr;
@@ -1198,6 +1219,8 @@ bool WaitForJobDescendantsLocal(
            accounting.ActiveProcesses > 0;
 }
 
+#endif // _WIN32
+
 // ─── Worker thread ───────────────────────────────────────────────
 
 class CmdWorkerThread : public wxThread {
@@ -1244,6 +1267,11 @@ protected:
 private:
     // Fills `result` with stdout/stderr/exit/flags.  Never throws.
     void RunOne(CmdResult& result) {
+#ifndef _WIN32
+        // macOS: the shell tool is ported in Phase 3 (shell choice pending).
+        result.stderrText = "The command tool is not available on macOS yet.";
+        result.exitCode = -1;
+#else
         // 1. Build the command line:
         //    powershell.exe -NoProfile -NonInteractive
         //                   -OutputFormat Text -EncodedCommand <b64>
@@ -1701,6 +1729,7 @@ private:
                 result.stdoutText += "\r\n";
             }
         }
+#endif
     }
 
     // Post the completion event back to the UI thread iff the frame
@@ -1727,11 +1756,18 @@ private:
 // ── Shell version (for the agent prompt) ─────────────────────────
 bool LbToolUsesPowerShell7()
 {
+#ifdef _WIN32
     return ResolvePowerShell().isPwsh;
+#else
+    return false;
+#endif
 }
 
 std::string LbPowerShellPromptNote()
 {
+#ifndef _WIN32
+    return "The powershell tool is not available on macOS yet; do not call it.";
+#endif
     if (LbToolUsesPowerShell7()) {
         return "The powershell tool runs PowerShell 7 (pwsh.exe, modern .NET), "
                "not Windows PowerShell 5.1: newer .NET APIs such as "

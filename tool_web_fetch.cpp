@@ -10,11 +10,13 @@
 
 #include "lb_windows.h"
 #include "lb_utf.h"
+#ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <winhttp.h>
 #pragma comment(lib, "winhttp.lib")
 #pragma comment(lib, "ws2_32.lib")
+#endif
 
 wxDEFINE_EVENT(wxEVT_WEB_FETCH_COMPLETE, wxCommandEvent);
 wxDEFINE_EVENT(wxEVT_WEB_FETCH_ERROR,    wxCommandEvent);
@@ -41,6 +43,7 @@ wxDEFINE_EVENT(wxEVT_WEB_FETCH_ERROR,    wxCommandEvent);
 
 #include <array>
 
+#ifdef _WIN32
 namespace {
 
 constexpr std::size_t kMaxDownloadBytes        = 10u * 1024u * 1024u; // 10 MB
@@ -2591,6 +2594,33 @@ WebFetchResult FetchWebPageUrlImpl(const std::string& urlArg,
 
     return r;
 }
+
+#else  // ── macOS: web fetch (with its SSRF guard) is ported in Phase 3 ──
+
+namespace {
+void AbortActiveWebFetch(const std::shared_ptr<std::atomic<bool>>&) {}
+
+std::string Trim(std::string s)
+{
+    auto isWs = [](unsigned char c) { return std::isspace(c) != 0; };
+    while (!s.empty() && isWs(static_cast<unsigned char>(s.front()))) s.erase(s.begin());
+    while (!s.empty() && isWs(static_cast<unsigned char>(s.back()))) s.pop_back();
+    return s;
+}
+}
+
+WebFetchResult FetchWebPageUrlImpl(const std::string& urlArg,
+                                   const ToolContext& /*ctx*/,
+                                   const std::shared_ptr<std::atomic<bool>>& /*cancelFlag*/)
+{
+    WebFetchResult r;
+    r.commandEcho = "/web_fetch_url " + urlArg;
+    r.chips = { "unavailable" };
+    r.errorBody = "Web fetch is not available on macOS yet.";
+    return r;
+}
+
+#endif  // _WIN32
 
 WebFetchResult FetchWebPageUrl(const std::string& urlArg,
                                const ToolContext& ctx)

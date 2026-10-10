@@ -26,6 +26,8 @@
 
 wxDEFINE_EVENT(wxEVT_PY_SESSION_COMPLETE, wxCommandEvent);
 
+#ifdef _WIN32
+
 namespace {
 
 // ═══════════════════════════════════════════════════════════════════
@@ -1007,6 +1009,47 @@ size_t PythonSessionManager::ReapIdle(unsigned long maxIdleMs)
     return n;
 }
 
+#else  // ── macOS: persistent py sessions arrive in Phase 3 ─────────────
+
+struct PythonSessionManager::Impl {
+    wxEvtHandler*                    eventHandler = nullptr;
+    std::weak_ptr<std::atomic<bool>> aliveToken;
+};
+
+PythonSessionManager::PythonSessionManager(wxEvtHandler* eventHandler,
+                                           std::weak_ptr<std::atomic<bool>> aliveToken)
+    : m_impl(std::make_shared<Impl>())
+{
+    m_impl->eventHandler = eventHandler;
+    m_impl->aliveToken = std::move(aliveToken);
+}
+
+PythonSessionManager::~PythonSessionManager() = default;
+
+bool PythonSessionManager::StartExec(const std::string& code,
+                                     const std::string& /*cwd*/,
+                                     unsigned long      /*timeoutMs*/)
+{
+    // Complete asynchronously, like a real exec, so the caller's flow is unchanged.
+    PySessionResult r;
+    r.code = code;
+    r.ok = false;
+    r.excType = "NotAvailable";
+    r.excMessage = "The py tool is not available on macOS yet.";
+    auto* ev = new wxCommandEvent(wxEVT_PY_SESSION_COMPLETE);
+    ev->SetClientObject(new PySessionResultClientData(std::move(r)));
+    LbQueueEventIfAlive(m_impl->eventHandler, m_impl->aliveToken, ev);
+    return true;
+}
+
+void PythonSessionManager::Cancel() {}
+bool PythonSessionManager::IsRunning() const { return false; }
+size_t PythonSessionManager::ReapIdle(unsigned long) { return 0; }
+bool PythonSessionManager::CloseSessionFor(const std::string&) { return false; }
+void PythonSessionManager::Shutdown() {}
+
+#endif  // _WIN32
+
 // ═══════════════════════════════════════════════════════════════════
 //  Shared card presentation
 // ═══════════════════════════════════════════════════════════════════
@@ -1050,6 +1093,8 @@ void BuildPySessionCardParts(const PySessionResult&    r,
     if (!r.pythonCommand.empty()) chipsOut.push_back(r.pythonCommand);
     if (r.truncated)              chipsOut.push_back("truncated");
 }
+
+#ifdef _WIN32
 
 bool PythonSessionManager::StartExec(const std::string& code,
                                      const std::string& cwd,
@@ -1355,3 +1400,5 @@ bool PythonSessionManager::StartExec(const std::string& code,
 
     return true;
 }
+
+#endif  // _WIN32

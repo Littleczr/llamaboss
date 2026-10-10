@@ -33,6 +33,7 @@
 #include <cassert>
 
 #include "lb_windows.h"
+#include "tool_staged_write.h"
 
 namespace {
 
@@ -2084,9 +2085,15 @@ std::string TempScriptPathForFinal(const std::string& dir,
     std::ostringstream name;
     name << stem
          << ".llamaboss_tmp_"
+#ifdef _WIN32
          << static_cast<unsigned long>(::GetCurrentProcessId())
          << "_"
          << static_cast<unsigned long long>(::GetTickCount64())
+#else
+         << static_cast<unsigned long>(::getpid())
+         << "_"
+         << static_cast<unsigned long long>(::clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) / 1000000ull)
+#endif
          << "_"
          << attempt
          << ext;
@@ -2097,6 +2104,7 @@ bool WriteAllBytesToNewFileFlushed(const std::string& path,
                                    const std::string& bytes,
                                    std::string&       errorOut)
 {
+#ifdef _WIN32
     std::wstring wPath = path_safety::Utf8ToWide(path);
     if (wPath.empty()) {
         errorOut = "Path conversion failed: " + path;
@@ -2156,6 +2164,30 @@ bool WriteAllBytesToNewFileFlushed(const std::string& path,
         return false;
     }
 
+#else
+    const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0644);
+    if (fd < 0) {
+        errorOut = "Could not create temp Python script: " + path +
+                   " (" + std::strerror(errno) + ")";
+        return false;
+    }
+    int err = 0;
+    if (!tool_staged_write::WriteAll(fd, bytes.data(), bytes.size(), err) ||
+        !tool_staged_write::FlushToDisk(fd, err)) {
+        ::close(fd);
+        ::unlink(path.c_str());
+        errorOut = "Failed while writing temp Python script: " + path +
+                   " (" + std::strerror(err) + ")";
+        return false;
+    }
+    if (::close(fd) != 0) {
+        err = errno;
+        ::unlink(path.c_str());
+        errorOut = "Failed while closing temp Python script after write: " +
+                   path + " (" + std::strerror(err) + ")";
+        return false;
+    }
+#endif
     return true;
 }
 
@@ -2242,6 +2274,7 @@ PythonCreateScriptResult CreatePythonScriptArtifact(const std::string& argsBlob,
             continue;
         }
 
+#ifdef _WIN32
         tool_python_syntax::SyntaxCheckResult syntax =
             tool_python_syntax::CheckFile(tempPath);
         if (!syntax.ok) {
@@ -2282,6 +2315,39 @@ PythonCreateScriptResult CreatePythonScriptArtifact(const std::string& argsBlob,
         return r;
     }
 
+#else
+        tool_python_syntax::SyntaxCheckResult syntax =
+            tool_python_syntax::CheckFile(tempPath);
+        if (!syntax.ok) {
+            ::unlink(tempPath.c_str());
+            r.chips = { "failed", "syntax error", ElapsedChipLocal(t0) };
+            r.errorBody = "Python syntax check failed; the script was not created.\n\n" + syntax.message;
+            return r;
+        }
+
+        // RENAME_EXCL: never replace a script that appeared meanwhile,
+        // matching MoveFileExW without MOVEFILE_REPLACE_EXISTING.
+        if (::renamex_np(tempPath.c_str(), candidatePath.c_str(), RENAME_EXCL) == 0) {
+            finalName = candidateName;
+            outPath = candidatePath;
+            created = true;
+            break;
+        }
+
+        const int renameErr = errno;
+        ::unlink(tempPath.c_str());
+        if (renameErr == EEXIST) {
+            lastError = "Collision while finalizing Python script; retrying.";
+            continue;
+        }
+
+        r.chips = { "failed", ElapsedChipLocal(t0) };
+        r.errorBody = "Could not finalize Python script atomically: " + candidatePath +
+                      " (" + std::strerror(renameErr) + ")";
+        return r;
+    }
+
+#endif
     if (!created) {
         r.chips = { "failed", ElapsedChipLocal(t0) };
         r.errorBody = lastError.empty()

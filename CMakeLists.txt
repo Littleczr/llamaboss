@@ -24,6 +24,8 @@ execute_process(COMMAND ${WX_CONFIG} --cxxflags
 execute_process(COMMAND ${WX_CONFIG} --libs std,aui,html,richtext
     OUTPUT_VARIABLE WX_LIBS OUTPUT_STRIP_TRAILING_WHITESPACE)
 separate_arguments(WX_CXXFLAGS_LIST UNIX_COMMAND "${WX_CXXFLAGS}")
+# Keep "-framework X" pairs together; CMake de-duplicates bare "-framework" tokens.
+string(REGEX REPLACE "-framework ([^ ]+)" "-Wl,-framework,\\1" WX_LIBS "${WX_LIBS}")
 separate_arguments(WX_LIBS_LIST UNIX_COMMAND "${WX_LIBS}")
 
 # ── Poco ──

@@ -27,6 +27,7 @@
 wxDEFINE_EVENT(wxEVT_PYTHON_COMPLETE, wxCommandEvent);
 wxDEFINE_EVENT(wxEVT_PYTHON_ERROR,    wxCommandEvent);
 
+#ifdef _WIN32
 namespace {
 
 std::wstring Utf8ToWide(const std::string& s)
@@ -2748,6 +2749,7 @@ private:
 };
 
 } // namespace
+#endif // _WIN32
 
 PythonRunner::PythonRunner(wxEvtHandler* eventHandler,
                            std::weak_ptr<std::atomic<bool>> aliveToken)
@@ -2769,6 +2771,20 @@ bool PythonRunner::StartWorker(const std::string& helperName,
                                unsigned long      defaultTimeoutMs,
                                const std::string& activeProjectRoot)
 {
+#ifndef _WIN32
+    // macOS: Python helpers arrive in Phase 3.  Complete asynchronously
+    // with a clear message so the tool card and agent loop finish normally.
+    (void)helperArg; (void)cwd; (void)timeoutMs; (void)defaultTimeoutMs; (void)activeProjectRoot;
+    PythonRunResult r;
+    r.toolName = helperName;
+    r.helperName = helperName;
+    r.stderrText = "Python tools are not available on macOS yet.";
+    r.exitCode = -1;
+    auto* ev = new wxCommandEvent(wxEVT_PYTHON_COMPLETE);
+    ev->SetClientObject(new PythonRunResultClientData(std::move(r)));
+    LbQueueEventIfAlive(m_eventHandler, m_aliveToken, ev);
+    return true;
+#else
     bool expected = false;
     if (!m_isRunning->compare_exchange_strong(expected, true)) {
         return false;
@@ -2814,6 +2830,7 @@ bool PythonRunner::StartWorker(const std::string& helperName,
     }
 
     return true;
+#endif
 }
 
 bool PythonRunner::StartHealth(const std::string& cwd,
