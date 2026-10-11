@@ -91,8 +91,8 @@ void ProjectController::AttachProjectToCurrentChat(const ProjectInfo& project,
         // user toward the first useful action instead of a bare one-liner.
         msg  = "Created project: " + project.name + "\n";
         msg += project.rootPath + "\n\n";
-        msg += "This project is empty. It has Sources/, Templates/, Workflows/, "
-               "Outputs/, and Notes/ folders, plus a placeholder PROJECT.md.\n\n";
+        msg += "This project is empty. It has Sources/, Workflows/, and "
+               "Outputs/ folders, plus a placeholder PROJECT.md.\n\n";
         msg += "To get started:\n";
         msg += "  - Tell me what this project is for and ask me to fill in PROJECT.md.\n";
         msg += "  - Drag reference files into the chat to add them as Sources.\n";

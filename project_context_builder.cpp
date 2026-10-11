@@ -8,6 +8,7 @@
 #include "chat_history.h"
 #include "lb_string_utils.h"   // ProjectSource_HumanBytes
 #include "skill_authoring_support.h"   // LbReadSkillFrontmatterDescription
+#include "tool_notes.h"                // BuildNotesIndexBlock, ListNoteFiles
 
 namespace {
 
@@ -113,6 +114,13 @@ ProjectContextBuilder::BuildCacheSignature() const
     sig.skillScriptsListHash = FingerprintItems(
         ProjectManager::ListSkillScripts(30));
 
+    // Notes index: folder mtime catches add/remove at the root; the file
+    // fingerprint (name/size/mtime, root + one subfolder level) catches
+    // edited descriptions.  The legacy NOTES.md mtime toggles its pointer.
+    sig.notesDirMTime = LbPathMTimeTicks(GetNotesRootDir());
+    sig.notesListHash = FingerprintItems(ListNoteFiles());
+    sig.legacyNotesMTime = LbPathMTimeTicks(GetLegacyNotesPath());
+
     if (sig.hasProject) {
         sig.projectRoot = m_chatHistory->GetProjectRoot();
         sig.projectName = m_chatHistory->GetProjectName();
@@ -177,9 +185,12 @@ ProjectContextBuilder::GetProjectStripCounts(const std::string& root) const
 
 void ProjectContextBuilder::AppendSkillsBlock(std::ostringstream& p) const
 {
-    const auto skills = ProjectManager::ListSkills(30);
-    const auto skillScripts = ProjectManager::ListSkillScripts(30);
-    if (skills.empty() && skillScripts.empty()) return;
+    // Listing is capped at 30 (alphabetical).  Count the full set too so a
+    // 31st Skill is announced instead of silently vanishing from the prompt.
+    constexpr std::size_t kMaxListedSkills = 30;
+    const auto skills = ProjectManager::ListSkills(kMaxListedSkills);
+    if (skills.empty()) return;
+    const std::size_t totalSkills = ProjectManager::ListSkills(0).size();
 
     p << "LlamaBoss Skills (cross-project; available even when no project is attached):\n"
       << "  Folder: " << ProjectManager::GetSkillsDir() << "\n"
@@ -187,7 +198,7 @@ void ProjectContextBuilder::AppendSkillsBlock(std::ostringstream& p) const
       << "  After the saved SKILL.md is read, treat that contract and the saved files in the Skill folder as the source of truth. Do not substitute temporary workspace scripts, design-time test scripts, or remembered helper names from an earlier Skill-design conversation unless the saved SKILL.md explicitly directs that exact file.\n"
       << "  Use a Skill by reading its SKILL.md contract first, then following its steps using normal tools and approval rules. python_run_script can run a Skill's .py helper (same folder or its scripts subfolder) by filename or in-lane path. If the helper needs runtime inputs, put the helper filename/path on the first args line and each optional command-line argument on its own later line; never call python_run_script with only data arguments and no .py script filename/path. Skill helper scripts are files, not tool names: never call the .py filename or Skill name directly as a tool. If an active project has a project workflow with the same name, the project workflow takes precedence.\n";
 
-    if (!skills.empty()) {
+    {
         p << "  Skills (read the listed SKILL.md contract path before using one):\n";
         for (const auto& skill : skills) {
             p << "    - " << LbSkillDisplayNameFromContractPath(skill)
@@ -203,8 +214,8 @@ void ProjectContextBuilder::AppendSkillsBlock(std::ostringstream& p) const
             // FingerprintItems already mixes each SKILL.md mtime into the
             // signature, so an edited description invalidates the cached
             // prompt.
-            // 500 matches the authoring contract (skill_prompt_builder.cpp
-            // asks for descriptions "under 500 characters"); a shorter cap
+            // 500 matches the authoring hard limit (skill_prompt_builder.cpp
+            // asks for ~200 characters, at most 500); a shorter cap
             // would cut the trailing "Do not use for..." clauses that
             // disambiguate skills.
             const std::string description =
@@ -215,20 +226,23 @@ void ProjectContextBuilder::AppendSkillsBlock(std::ostringstream& p) const
         }
     }
 
-    if (!skillScripts.empty()) {
-        p << "  Skill Python helper scripts (run only after reading the matching Skill and only when needed):\n";
-        for (const auto& script : skillScripts) {
-            p << "    - " << script.name
-              << " (" << ProjectSource_HumanBytes(script.sizeBytes) << ")\n"
-              << "      " << script.path << "\n";
-        }
+    if (totalSkills > skills.size()) {
+        p << "    - (" << (totalSkills - skills.size())
+          << " more Skills not listed -- ls the Skills folder to see them all)\n";
     }
+
+    // Helper .py scripts are intentionally NOT listed: each SKILL.md names
+    // its own helper, the grounding rule requires reading SKILL.md first,
+    // and python_run_script resolves helpers by filename on its own.  The
+    // list cost ~25 tokens per script on every request and invited running
+    // a helper before reading its contract.
 }
 
 std::string ProjectContextBuilder::BuildActiveProjectContextBlockFresh() const
 {
     std::ostringstream p;
     AppendSkillsBlock(p);
+    p << BuildNotesIndexBlock();
 
     if (!m_chatHistory->HasProject()) return p.str();
 
@@ -245,18 +259,17 @@ std::string ProjectContextBuilder::BuildActiveProjectContextBlockFresh() const
       << "  Root: " << projectRoot << "\n"
       << "  PROJECT.md: " << projectMdPath << "\n"
       << "  Sources folder: " << ProjectManager::ProjectSourcesPath(projectRoot) << "\n"
-      << "  Notes folder: " << projectRoot << "\\Notes\n"
       << "  Project Workflows folder: " << ProjectManager::ProjectWorkflowsPath(projectRoot) << "\n"
       << "  This is a long-lived project folder attached to the current chat. Chat workspace files remain separate from project files.\n"
       << "  PROJECT.md is loaded into this system prompt on every request while the project is attached. Treat it as the project contract for project-related work.\n"
-      << "  Project-relative paths are supported by tools for the standard project lanes: Inputs\\, Outputs\\, Workflows\\, Notes\\, Sources\\, Templates\\, PROJECT.md, and project.json resolve under the active project root. Use those short project-relative paths for durable project files instead of writing them to the chat workspace.\n"
+      << "  Project-relative paths are supported by tools for the standard project lanes: Inputs\\, Outputs\\, Workflows\\, Sources\\, Templates\\, PROJECT.md, and project.json resolve under the active project root. Use those short project-relative paths for durable project files instead of writing them to the chat workspace.\n"
       << "  The active project root is an allowed write root for write/mkdir/edit/delete. Other arbitrary relative paths still resolve against the chat workspace, so prefer the standard project lane prefixes above for project files.\n"
       << "  Follow PROJECT.md for project-related requests. For unrelated general questions or casual chat, answer normally and do not force the request into this project.\n"
       << "  Do not invent project sources, templates, workflows, or policies that are not provided. Do not modify PROJECT.md or other project files unless the user explicitly asks.\n"
       << "  Project-aware file use: when the user asks to inspect, summarize, open, extract, report on, or fill a file that appears in Project Sources, use the listed project source path or the source filename with the appropriate read/open/helper tool. Source files are read-only reference inputs; built-in helper artifacts still save to the chat folder unless a project workflow or the user explicitly asks for a project output path.\n"
       << "  Project workflows: workflow files are reusable Markdown instruction plans in Workflows/. When the user asks to run or use a workflow, read the relevant workflow file first, then follow its steps using normal tools and approval rules. A workflow file is not automatic code execution by itself.\n"
       << "  Project workflow Python scripts: optional .py helper scripts may live in Workflows/. Do not run a project workflow script unless the workflow file or user request calls for it. python_run_script can run an active project's workflow script by filename or in-lane path; if the script needs runtime inputs, put the script filename/path on the first args line and each optional command-line argument on its own later line. read/open/ls/write/edit/delete/mkdir can use Workflows\\... project-relative paths; scripts run from the conversation workspace and can infer the project root from their own file path.\n"
-      << "  Project notes: durable project-specific memory lives in Notes/NOTES.md. If the user says save this to my notes while this project is active, use notes_append so the full note is saved to project notes and a compact pointer is saved to global NOTES.md. If the user specifically says project notes, use project_notes_append.\n";
+      << "  Notes about this project live in the user's Notes folder (see User notes), in projects\\<project name>.md -- not in the project folder.\n";
 
     const auto projectSources = ProjectManager::ListProjectSources(projectRoot, 30);
     if (projectSources.empty()) {

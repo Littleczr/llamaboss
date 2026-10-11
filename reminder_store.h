@@ -16,7 +16,7 @@
 //   not silently lose the reminder.  Snooze moves the due time forward.
 #pragma once
 
-#include "tool_notes.h"   // GetNotesPath() gives us the canonical user root.
+#include "tool_notes.h"   // GetLlamaBossUserRootDir() gives us the canonical user root.
 
 #include <wx/filefn.h>
 #include <wx/filename.h>
@@ -81,10 +81,10 @@ inline std::string Lower(std::string s)
 
 inline wxString StoragePathWx()
 {
-    // Keep reminders next to the existing NOTES.md user root instead of
-    // inventing a second location policy.
-    wxFileName notes(wxString::FromUTF8(GetNotesPath().c_str()));
-    return wxFileName(notes.GetPath(), "REMINDERS.json").GetFullPath();
+    // Keep reminders in the shared LlamaBoss user root (next to the Notes
+    // folder) instead of inventing a second location policy.
+    return wxFileName(wxString::FromUTF8(GetLlamaBossUserRootDir().c_str()),
+                      "REMINDERS.json").GetFullPath();
 }
 
 inline std::string StoragePathUtf8()

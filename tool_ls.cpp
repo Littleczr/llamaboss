@@ -299,7 +299,8 @@ LsResult ListDirectory(const std::string& inputPath, const ToolContext& ctx)
     if (emitted == 0 && !hitEntryCap && !hitByteCap) {
         ss << "HINT: this directory is empty.  If the user is asking about "
               "source code, project files, or named saved locations they "
-              "likely have a saved path for, call notes_read FIRST -- "
+              "likely have a saved path for, check the User notes index "
+              "and read the matching notes file (usually paths.md) FIRST -- "
               "before climbing to a parent directory or guessing sibling "
               "paths.  The cwd path below is the conversation workspace, "
               "not a clue to where the user's files actually live.\n";

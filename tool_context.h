@@ -91,6 +91,13 @@ struct ToolContext {
     // hard-blocking Skill development outside the chat workspace.
     std::string skillsRoot;
 
+    // The user's Notes folder (%USERPROFILE%\LlamaBoss\Notes).  NOT a
+    // default write root: write/edit/mkdir into it go through the normal
+    // "Folder Access Required" grant, and when the target is anywhere
+    // under this folder the grant covers the whole Notes folder (one card
+    // per chat) instead of just the target's parent subfolder.
+    std::string notesRoot;
+
     // Additional user-approved write roots for this chat.  These grants are
     // created by the folder-access approval card when a native mutation
     // targets an absolute path outside cwd/project/Skills.  ChatHistory owns

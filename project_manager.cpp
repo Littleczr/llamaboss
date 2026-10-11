@@ -1033,7 +1033,7 @@ bool ProjectManager::CreateProject(const std::string& name,
        << "## Layout\n\n"
        << "Reference files live in `Sources/` (add them by dragging files into the chat while "
        << "this project is attached). Reusable instruction plans live in `Workflows/`. Durable "
-       << "notes go to `Notes/NOTES.md` (say \"save this to project notes\"). Deliverables can be "
+       << "notes about this project belong in the LlamaBoss Notes folder (`projects\\` subfolder), not here. Deliverables can be "
        << "written to `Outputs/` when a request asks for it.\n";
 
     if (!WriteUtf8File(ProjectInstructionsPath(root), md.str())) {

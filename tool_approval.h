@@ -580,6 +580,14 @@ inline bool RequiresWriteRootGrant(const ToolInvocation& inv,
     std::string grantRoot = tool_path_safety::ParentDir(resolved);
     if (grantRoot.empty()) return false;
 
+    // Notes folder: grant the whole folder once rather than one subfolder
+    // at a time, so creating mac-mini\setup-log.md and later editing
+    // paths.md in the same chat needs a single card.
+    const bool notesTarget =
+        !ctx.notesRoot.empty() &&
+        tool_path_safety::IsUnderCwd(resolved, ctx.notesRoot);
+    if (notesTarget) grantRoot = ctx.notesRoot;
+
     // Never turn a root-level file request into an all-drive capability.
     // Equality still lets the one requested file (or directory being created)
     // pass the containment check without authorizing its siblings.
@@ -589,10 +597,13 @@ inline bool RequiresWriteRootGrant(const ToolInvocation& inv,
     out.grantsWriteRoot = true;
     out.target          = resolved;
     out.writeRoot       = grantRoot;
-    out.reason =
-        "The requested native file change is outside this chat's current "
-        "writable workspace, attached project, Skills folder, and previously "
-        "granted folders.";
+    out.reason = notesTarget
+        ? "The requested native file change is in the user's Notes folder, "
+          "which needs a one-time folder grant per chat (short facts saved "
+          "with notes_append do not)."
+        : "The requested native file change is outside this chat's current "
+          "writable workspace, attached project, Skills folder, and previously "
+          "granted folders.";
 
     out.block.iconUtf8    = "\xF0\x9F\x94\x92"; // lock
     out.block.toolName    = "Folder Access Required";

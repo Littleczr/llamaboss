@@ -25,7 +25,7 @@ std::string BuildSkillDraftBuilderSystemPrompt(const SkillPromptBuilderInput& in
       << "\n\nFRONTMATTER (REQUIRED, FIRST). "
       << "The very first line of the file must be `---` opening a YAML frontmatter block, followed by exactly two fields and a closing `---` line: "
       << "`name: " << (skillFolderName.empty() ? input.skillName : skillFolderName) << "` (use this exact value; do not change it) "
-      << "and `description: ` -- one or two plain sentences, under 500 characters, stating BOTH what the Skill does AND when the user would want it used. "
+      << "and `description: ` -- one or two plain sentences, ideally under 200 characters (hard limit 500, because every Skill description is loaded on every request), stating BOTH what the Skill does AND when the user would want it used. "
       << "The description is shown to the model when it decides whether to use this Skill, so make it concrete: name the task, the inputs it acts on, and the trigger situation. "
       << "Do not add any other frontmatter fields. "
 
@@ -54,7 +54,7 @@ std::string BuildSkillDraftBuilderSystemPrompt(const SkillPromptBuilderInput& in
       << "\n\nDEMONSTRATED-TOOL RULE. "
       << "If the design conversation included an actual tool call that produced a result the user approved (for example, the user said `that list is fine` after an `ls` of a folder), encode that exact tool sequence in Steps. "
       << "Do NOT substitute a different tool family (PowerShell, Python) for a task that was already demonstrated to work with native LlamaBoss tools. "
-      << "For one-level or shallow folder listings, simple extension filtering, file reads, writes, grep, or notes lookups, draft the Skill around native LlamaBoss tools: ls, read, write, grep, edit, notes_read, open. "
+      << "For one-level or shallow folder listings, simple extension filtering, file reads, writes, grep, or notes lookups, draft the Skill around native LlamaBoss tools: ls, read, write, grep, edit, open. "
 
       // Implementation-path preference order (only when no tool
       // sequence was demonstrated -- otherwise the rule above wins).

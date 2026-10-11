@@ -2078,7 +2078,7 @@ bool AgentController::DispatchApprovedAndContinue(const ToolInvocation& inv,
             "\n\n[notice] You just repeated an exact tool call that "
             "previously FAILED. One more identical call will trip the "
             "loop guard. Try a different approach: fix the cause of the "
-            "failure first, call notes_read if a saved path may exist, "
+            "failure first, read the user's notes (paths.md) if a saved path may exist, "
             "ask the user where the file lives, or use a different tool. "
             "Do NOT repeat this exact call.";
     }

@@ -385,6 +385,10 @@ bool LbFindFrontmatterBlock(const std::string& text,
 
 // Extract a top-level `field:` value from a frontmatter body slice.
 // Strips one layer of surrounding quotes and collapses whitespace.
+// Multi-line values are joined into one line: YAML block scalars
+// (`description: >-` / `|` followed by indented lines) and plain scalars
+// that continue on more-indented lines.  Without this, a valid imported
+// SKILL.md using `description: >-` surfaced as the literal text ">-".
 std::string LbReadFrontmatterFieldFromText(const std::string& text,
                                            const std::string& field,
                                            std::size_t maxChars)
@@ -393,16 +397,66 @@ std::string LbReadFrontmatterFieldFromText(const std::string& text,
     if (!LbFindFrontmatterBlock(text, bodyStart, bodyEnd))
         return std::string();
 
+    std::vector<std::string> lines;
+    {
+        std::istringstream block(text.substr(bodyStart, bodyEnd - bodyStart));
+        std::string line;
+        while (std::getline(block, line)) {
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            lines.push_back(line);
+        }
+    }
+
+    auto indentOf = [](const std::string& l) {
+        size_t n = 0;
+        while (n < l.size() && (l[n] == ' ' || l[n] == '\t')) ++n;
+        return n;
+    };
+
     const std::string prefix = field + ":";
-    std::istringstream block(text.substr(bodyStart, bodyEnd - bodyStart));
-    std::string line;
-    while (std::getline(block, line)) {
-        if (!line.empty() && line.back() == '\r') line.pop_back();
-        const std::string trimmed = LbTrimAscii(line);
+    for (size_t li = 0; li < lines.size(); ++li) {
+        const std::string trimmed = LbTrimAscii(lines[li]);
         const std::string lower = LbLowerAscii(trimmed);
         if (lower.rfind(prefix, 0) != 0) continue;
 
+        const size_t keyIndent = indentOf(lines[li]);
         std::string value = LbTrimAscii(trimmed.substr(prefix.size()));
+
+        // Block scalar header: '|' or '>' plus optional chomping/indent
+        // indicators (e.g. ">-", "|+", ">2").  The content is on the
+        // following lines.
+        bool blockScalar = false;
+        if (!value.empty() && (value[0] == '|' || value[0] == '>')) {
+            blockScalar = true;
+            for (size_t k = 1; k < value.size(); ++k) {
+                const char c = value[k];
+                if (!(c == '-' || c == '+' || (c >= '0' && c <= '9'))) {
+                    // Only a trailing comment may follow the indicators.
+                    if (c == ' ' || c == '\t') {
+                        const std::string rest = LbTrimAscii(value.substr(k));
+                        if (!rest.empty() && rest[0] != '#') blockScalar = false;
+                    } else {
+                        blockScalar = false;
+                    }
+                    break;
+                }
+            }
+            if (blockScalar) value.clear();
+        }
+
+        const bool quoted = !value.empty() && (value[0] == '"' || value[0] == '\'');
+        if (blockScalar || !quoted) {
+            // Gather continuation lines: more indented than the key, or
+            // blank lines inside the scalar.
+            for (size_t nx = li + 1; nx < lines.size(); ++nx) {
+                const std::string t = LbTrimAscii(lines[nx]);
+                if (t.empty()) continue;
+                if (indentOf(lines[nx]) <= keyIndent) break;
+                if (!value.empty()) value += " ";
+                value += t;
+            }
+        }
+
         if (value.size() >= 2 &&
             ((value.front() == '"' && value.back() == '"') ||
              (value.front() == '\'' && value.back() == '\''))) {
@@ -410,7 +464,9 @@ std::string LbReadFrontmatterFieldFromText(const std::string& text,
         }
         value = LbCollapseWhitespaceOneLine(value);
         if (maxChars > 0 && value.size() > maxChars) {
-            value.resize(maxChars);
+            // UTF-8-safe cut: descriptions land in the system prompt, and a
+            // split multi-byte character makes llama-server reject requests.
+            value = LbUtf8SafeTruncate(value, maxChars);
             value += "...";
         }
         return value;
@@ -485,52 +541,125 @@ std::string LbRewriteSkillFrontmatterName(std::string markdown,
     return markdown;
 }
 
-std::string LbEnsureSkillFrontmatter(std::string markdown,
-                                     const std::string& skillFolderName)
+namespace {
+
+// Description synthesized from the first non-heading, non-list body line
+// (the intro paragraph in the required section order).
+std::string LbSynthesizeSkillDescription(const std::string& body)
 {
-    const size_t start = LbSkipUtf8Bom(markdown);
-
-    // Builder already emitted a frontmatter block: keep it verbatim.
-    if (LbIsFrontmatterFenceAt(markdown, start)) return markdown;
-
-    // Synthesize a description from the first non-heading, non-blank
-    // body line (the intro paragraph in the required section order).
     std::string description;
-    {
-        std::istringstream body(markdown);
-        std::string line;
-        while (std::getline(body, line)) {
-            if (!line.empty() && line.back() == '\r') line.pop_back();
-            const std::string trimmed = LbTrimAscii(line);
-            if (trimmed.empty()) continue;
-            if (trimmed[0] == '#') continue;   // headings
-            if (trimmed[0] == '-' || trimmed[0] == '*') continue; // list items
-            description = LbCollapseWhitespaceOneLine(trimmed);
-            break;
-        }
+    std::istringstream lines(body);
+    std::string line;
+    while (std::getline(lines, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        const std::string trimmed = LbTrimAscii(line);
+        if (trimmed.empty()) continue;
+        if (trimmed[0] == '#') continue;                       // headings
+        if (trimmed[0] == '-' || trimmed[0] == '*') continue;  // list items
+        description = LbCollapseWhitespaceOneLine(trimmed);
+        break;
     }
     if (description.empty()) {
         description = "Reusable LlamaBoss Skill. Read this SKILL.md and "
                       "follow its steps when the user asks to run it.";
     }
     if (description.size() > 400) {
-        description.resize(400);
+        // UTF-8-safe cut: this text is saved into SKILL.md and later
+        // injected into the system prompt; a split multi-byte character
+        // makes llama-server reject every request.
+        description = LbUtf8SafeTruncate(description, 400);
         description += "...";
     }
-    // YAML double-quoted scalar escaping.
+    return description;
+}
+
+// YAML double-quoted scalar.
+std::string LbYamlQuote(const std::string& value)
+{
     std::string escaped;
-    escaped.reserve(description.size());
-    for (char ch : description) {
+    escaped.reserve(value.size() + 2);
+    escaped.push_back('"');
+    for (char ch : value) {
         if (ch == '\\' || ch == '"') escaped.push_back('\\');
         escaped.push_back(ch);
+    }
+    escaped.push_back('"');
+    return escaped;
+}
+
+// True for a `key:` line (YAML-style key at column 0).
+bool LbLooksLikeYamlKeyLine(const std::string& line)
+{
+    const size_t colon = line.find(':');
+    if (colon == std::string::npos || colon == 0) return false;
+    for (size_t k = 0; k < colon; ++k) {
+        const char c = line[k];
+        const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                        (c >= '0' && c <= '9') || c == '_' || c == '-';
+        if (!ok) return false;
+    }
+    return true;
+}
+
+} // namespace
+
+std::string LbEnsureSkillFrontmatter(std::string markdown,
+                                     const std::string& skillFolderName)
+{
+    const size_t start = LbSkipUtf8Bom(markdown);
+    const std::string name =
+        skillFolderName.empty() ? std::string("skill") : skillFolderName;
+
+    if (LbIsFrontmatterFenceAt(markdown, start)) {
+        size_t bodyStart = 0, bodyEnd = 0;
+        if (!LbFindFrontmatterBlock(markdown, bodyStart, bodyEnd)) {
+            // Unterminated block (no closing fence): close it after the
+            // leading run of `key:` lines and their indented continuations,
+            // so the rest of the draft stays body text instead of
+            // silently swallowing the whole file.
+            const size_t openNl = markdown.find('\n', start);
+            size_t insertAt = (openNl == std::string::npos) ? markdown.size() : openNl + 1;
+            while (insertAt < markdown.size()) {
+                const size_t nl = markdown.find('\n', insertAt);
+                const size_t lineEnd = (nl == std::string::npos) ? markdown.size() : nl;
+                std::string line = markdown.substr(insertAt, lineEnd - insertAt);
+                if (!line.empty() && line.back() == '\r') line.pop_back();
+                const bool continuation = !line.empty() &&
+                                          (line[0] == ' ' || line[0] == '\t') &&
+                                          !LbTrimAscii(line).empty();
+                if (!LbLooksLikeYamlKeyLine(line) && !continuation) break;
+                insertAt = (nl == std::string::npos) ? markdown.size() : nl + 1;
+            }
+            if (insertAt == markdown.size() &&
+                (markdown.empty() || markdown.back() != '\n')) {
+                markdown += "\n";
+                insertAt = markdown.size();
+            }
+            markdown.insert(insertAt, "---\n");
+            if (!LbFindFrontmatterBlock(markdown, bodyStart, bodyEnd))
+                return markdown;
+        }
+
+        // Valid block: fill in required fields the builder left out.
+        // Insert description first, then name, both right after the
+        // opening fence (name ends up first).
+        if (LbReadFrontmatterFieldFromText(markdown, "description", 0).empty()) {
+            const size_t closeNl = markdown.find('\n', bodyEnd);
+            const std::string body = (closeNl == std::string::npos)
+                ? std::string() : markdown.substr(closeNl + 1);
+            markdown.insert(bodyStart, "description: " +
+                LbYamlQuote(LbSynthesizeSkillDescription(body)) + "\n");
+        }
+        if (LbReadFrontmatterFieldFromText(markdown, "name", 0).empty()) {
+            markdown.insert(bodyStart, "name: " + name + "\n");
+        }
+        return markdown;
     }
 
     std::ostringstream fm;
     fm << "---\n"
-       << "name: "
-       << (skillFolderName.empty() ? std::string("skill") : skillFolderName)
-       << "\n"
-       << "description: \"" << escaped << "\"\n"
+       << "name: " << name << "\n"
+       << "description: " << LbYamlQuote(LbSynthesizeSkillDescription(markdown)) << "\n"
        << "---\n\n";
     return fm.str() + markdown;
 }

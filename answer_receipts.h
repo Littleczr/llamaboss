@@ -9,7 +9,8 @@
 // had all 64.  Nothing in the harness noticed; the user did, by counting.
 //
 // After an agent turn ends, every hex run of 32+ characters in the final
-// reply is looked up, case-insensitively, in what the model could legitimately
+// reply is looked up, case-insensitively and as a complete token (so a
+// truncated digest does not match the longer original), in what the model could legitimately
 // have copied it from: tool results and the user's own messages in this chat,
 // plus the chat's spilled tool output files (Vars\, ToolOutputs\, Web Pages\),
 // since large results reach history only as a handle card.  Values found
@@ -144,7 +145,29 @@ inline std::string EvidenceFromMessage(const std::string& role,
     return Lower(text);
 }
 
-// Tokens absent from every evidence string.
+// True when `tok` occurs in `hay` as a COMPLETE hex token: the match must
+// not be extended by more word characters on either side.  A plain substring
+// test let a truncated digest pass -- a 58-character prefix of a real
+// 64-character SHA-256 is "found" inside it -- which is exactly the failure
+// this check exists to catch.  A "0x" prefix in the evidence is allowed.
+inline bool ContainsWholeHexToken(const std::string& hay, const std::string& tok)
+{
+    if (tok.empty()) return false;
+    size_t pos = hay.find(tok);
+    while (pos != std::string::npos) {
+        const size_t end = pos + tok.size();
+        bool leftOk = (pos == 0) || !IsWordChar(hay[pos - 1]);
+        if (!leftOk && pos >= 2 && (hay[pos - 1] == 'x' || hay[pos - 1] == 'X') &&
+            hay[pos - 2] == '0' && (pos == 2 || !IsWordChar(hay[pos - 3])))
+            leftOk = true;
+        const bool rightOk = (end == hay.size()) || !IsWordChar(hay[end]);
+        if (leftOk && rightOk) return true;
+        pos = hay.find(tok, pos + 1);
+    }
+    return false;
+}
+
+// Tokens absent, as complete tokens, from every evidence string.
 inline std::vector<std::string> FindUnbacked(const std::vector<std::string>& tokens,
                                              const std::vector<std::string>& lowerEvidence)
 {
@@ -152,7 +175,7 @@ inline std::vector<std::string> FindUnbacked(const std::vector<std::string>& tok
     for (const std::string& tok : tokens) {
         bool found = false;
         for (const std::string& ev : lowerEvidence) {
-            if (ev.find(tok) != std::string::npos) { found = true; break; }
+            if (ContainsWholeHexToken(ev, tok)) { found = true; break; }
         }
         if (!found) missing.push_back(tok);
     }
@@ -194,7 +217,7 @@ inline void RemoveTokensFoundInFiles(std::vector<std::string>& tokens,
             total += data.size();
             data = Lower(data);
             tokens.erase(std::remove_if(tokens.begin(), tokens.end(),
-                             [&](const std::string& t) { return data.find(t) != std::string::npos; }),
+                             [&](const std::string& t) { return ContainsWholeHexToken(data, t); }),
                          tokens.end());
         }
     }
