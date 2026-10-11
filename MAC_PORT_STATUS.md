@@ -81,7 +81,7 @@ CMake copies `llama-server` and its dylibs into
 | 1 | Reproducible arm64 build | **Done**: all 91 translation units compile and link |
 | 2 | App launches, main window | **Done**: main window and Welcome dialog open |
 | 3 | Conversations save and reopen (Unicode paths) | **Verified 2026-10-09** for ASCII titles: the chat saved to `~/LlamaBoss/Chats/…`, reopened after quit/relaunch, and the model auto-reloaded. Unicode file names not yet tested |
-| 4 | Local llama-server starts, reports errors, stops | **Verified 2026-10-09** with Gemma 3 1B Q4_K_M: bundled server on Metal, ready in 0.85 s, single slot confirmed, two chat turns, stopped cleanly on quit (0.1 s). The error path (bad model, crash at startup) is not yet exercised |
+| 4 | Local llama-server starts, reports errors, stops | **Verified 2026-10-09** with Gemma 3 1B Q4_K_M: bundled server on Metal, ready in 0.85 s, single slot confirmed, two chat turns, stopped cleanly on quit (0.1 s). Error path **verified 2026-10-11** (see below) |
 | 5 | Remote endpoint streams; stop works | Not started |
 | 6 | Shell and Python tools | Stubbed (see below) |
 | 7 | File-tool boundaries, protected credentials, packaged app | Partly implemented, not verified |
@@ -195,7 +195,20 @@ old author email and must stay local.
 - In-app chat test of notes (save, then recall in a new chat) still needs a person at the
   keyboard: this terminal has no Accessibility permission to type into the app.
 
+## Startup error path — verified 2026-10-11
+
+Both cases use shared code (`model_switcher.cpp`, `server_manager.cpp`), so the behavior matches Windows.
+
+- **Saved model file missing:** startup falls back to the first installed model
+  (`model_switcher.cpp:582`), saves it as the new selection, and loads it normally.
+- **Corrupt GGUF** (`GGUF` magic + random bytes): llama-server exits with code 1 in about 0.6 s
+  ("failed to read header"). `lb_process::Child::Exited` reports it, and the app logs
+  the error with the server's last output. The chat shows "Server error: llama-server exited
+  (code 1) before becoming ready ..." and the status dot goes disconnected. There is no
+  --jinja retry, because the error isn't template-related. There is no respawn loop, no
+  zombie process, and no modal popup. Quit with no server running is clean.
+
 ## Next task
 
-Test the startup error path (a broken model file), then an OpenRouter endpoint
-(milestone 5), then the Phase 3 tool ports.
+OpenRouter endpoint (milestone 5): needs an API key entered in the Mac app's
+Add AI provider dialog. Then the in-app notes test, then the Phase 3 tool ports.
