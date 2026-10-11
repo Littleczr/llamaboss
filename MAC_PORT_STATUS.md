@@ -160,6 +160,25 @@ normal quit, llama-server stopped, port 8384 free. Commit authors were rewritten
 GitHub noreply identity before the first push; `macos/port-v0.1.21-backup` keeps the
 old author email and must stay local.
 
+## Merge of `main` 9d08ccd (post-0.1.21) — 2026-10-10
+
+- Merged `origin/main` (9d08ccd) into this branch. **No textual conflicts.**
+- Semantic follow-ups (main changed Windows-only code that has a Mac twin):
+  - `tool_mutation_guard.h`: Windows guard gained `MissingFolder()` and a plain
+    "Folder does not exist: <path>." message. The POSIX guard now does the same (ENOENT
+    while pinning a parent); mkdir's allow-missing-parents path clears it, as on Windows.
+  - `tool_write.cpp`: the new copy tool skips the Python syntax gate
+    (`opt.pythonSyntaxCheck`). The Mac staging branch now honors the same flag.
+- Connections scoping for `python_run_script` (`skill_connections.h`): the filter runs in
+  the Windows worker thread. The Mac runner is still a stand-in that reads **no** secrets, so
+  nothing leaks. The Phase 3 runner must call `BuildEnvInjectionSnapshot()` +
+  `SelectDeclaredConnections()`. `skill_connections.h` was tested on macOS paths (spaces,
+  nested `scripts/`, no-owner and out-of-root cases): only the declared providers pass.
+- New tools `tool_copy` / `tool_hash` and helper headers (`lb_sha256.h`,
+  `answer_receipts.h`, `markdown_image_line.h`) compile on the Mac unchanged.
+- `tool_web_fetch.cpp` changes are inside the Windows-only fetch (stubbed on Mac); fold
+  them into the Phase 3 port.
+
 ## Next task
 
 Test the startup error path (a broken model file), then an OpenRouter endpoint

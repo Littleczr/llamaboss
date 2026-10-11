@@ -2892,6 +2892,11 @@ bool PythonRunner::StartWorker(const std::string& helperName,
 #ifndef _WIN32
     // macOS: Python helpers arrive in Phase 3.  Complete asynchronously
     // with a clear message so the tool card and agent loop finish normally.
+    // No secrets are read here.  When the real Mac runner lands, it must use
+    // the same Connections scoping as Windows: BuildEnvInjectionSnapshot()
+    // on the UI thread, then SelectDeclaredConnections() (skill_connections.h)
+    // so python_run_script sees only the Connections declared in its owning
+    // SKILL.md / WORKFLOW.md -- never every stored secret.
     (void)helperArg; (void)cwd; (void)timeoutMs; (void)defaultTimeoutMs; (void)activeProjectRoot;
     PythonRunResult r;
     r.toolName = helperName;
