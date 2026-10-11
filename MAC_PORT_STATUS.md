@@ -71,6 +71,7 @@ CMake copies `llama-server` and its dylibs into
 | App data, settings, logs, secrets.json | `~/Library/Application Support/LlamaBoss/` |
 | Managed models (casual mode) | `~/Library/Application Support/LlamaBoss/models/<bundle>/` |
 | Chats, projects, workspace | `~/LlamaBoss/` (Windows: `%USERPROFILE%\LlamaBoss`) |
+| Notes (v0.1.23+) | `~/LlamaBoss/Notes/` (`paths.md` + subject files; index built on load) |
 | API-key encryption key | login Keychain, service `LlamaBoss`, account `secrets-file-key` |
 
 ## Milestones
@@ -178,6 +179,21 @@ old author email and must stay local.
   `answer_receipts.h`, `markdown_image_line.h`) compile on the Mac unchanged.
 - `tool_web_fetch.cpp` changes are inside the Windows-only fetch (stubbed on Mac); fold
   them into the Phase 3 port.
+
+## Merge of `main` 7929ef7 (v0.1.23) — 2026-10-11
+
+- One conflict, in `tool_notes.cpp`: main moved `ReadFileUtf8` above `AtomicWriteFile` and
+  added `maxBytes`. Took main's version and re-applied the two Mac edits: the
+  `std::filesystem::path` wrap on the `ifstream` (also covers `DescribeNoteFile`) and the
+  `#ifndef _WIN32` `AtomicReplaceFile` branch in `AtomicWriteFile`.
+- `NotesAppend` now uses `tool_mutation_guard::Guard` (same pattern as `tool_edit`); the
+  POSIX guard has the same API, so no further changes were needed.
+- Verified by linking the app objects into a small harness and calling the real
+  `NotesAppend` / `ListNoteFiles` / `BuildNotesIndexBlock`: `~/LlamaBoss/Notes/paths.md` is
+  created with the frontmatter description, a duplicate reports "already saved", a missing
+  explicit `file:` is refused, the index shows the description, and no temp files are left.
+- In-app chat test of notes (save, then recall in a new chat) still needs a person at the
+  keyboard: this terminal has no Accessibility permission to type into the app.
 
 ## Next task
 
