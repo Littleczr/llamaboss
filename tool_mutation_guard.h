@@ -306,6 +306,9 @@ public:
 
     const std::string& Error() const { return m_error; }
     bool TargetExisted() const { return m_existed; }
+    // True when Begin failed because a folder on the path does not exist
+    // (an ordinary "not found", not a safety refusal).
+    bool MissingFolder() const { return m_missingFolder; }
 
     bool Begin(const std::string& path, bool allowMissingParents = false) {
         if (!m_lock.owns_lock()) {
@@ -325,10 +328,13 @@ public:
         if (root < 0) return Fail("Cannot safely lock a parent directory", errno);
         m_parents.push_back(root);
         m_parentsComplete = true;
+        std::string prefix;
         for (std::size_t i = 0; i + 1 < parts.size(); ++i) {
-            if (!PinChild(parts[i], m_parents.size() == 1)) {
+            prefix += "/" + parts[i];
+            if (!PinChild(parts[i], prefix, m_parents.size() == 1)) {
                 if (allowMissingParents && Missing(m_lastError)) {
                     m_error.clear();
+                    m_missingFolder = false;
                     m_parentsComplete = false;
                     break; // mkdir pins each new directory before descending into it.
                 }
@@ -406,7 +412,7 @@ private:
         if (m_targetFd >= 0) ::close(m_targetFd);
         m_targetFd = -1;
     }
-    bool PinChild(const std::string& name, bool underRoot) {
+    bool PinChild(const std::string& name, const std::string& fullPath, bool underRoot) {
         const int parent = m_parents.back();
         int fd = ::openat(parent, name.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
         if (fd < 0 && (errno == ELOOP || errno == ENOTDIR)) {
@@ -420,7 +426,17 @@ private:
                 return Fail("A parent path is not a directory", ENOTDIR);
             }
         }
-        if (fd < 0) return Fail("Cannot safely lock a parent directory", errno);
+        if (fd < 0) {
+            const int err = errno;
+            if (Missing(err)) {
+                // Same plain "not found" wording as the Win32 guard.
+                m_lastError = err;
+                m_missingFolder = true;
+                m_error = "Folder does not exist: " + fullPath + ".";
+                return false;
+            }
+            return Fail("Cannot safely lock a parent directory", err);
+        }
         m_parents.push_back(fd);
         m_lastError = 0;
         return true;
@@ -469,6 +485,7 @@ private:
     bool m_existed = false;
     struct stat m_initial {};
     int m_lastError = 0;
+    bool m_missingFolder = false;
     std::string m_error;
 };
 

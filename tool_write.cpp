@@ -474,7 +474,7 @@ WriteResult WriteContentCore(const std::string& requestedPath,
     }
     tmp.fd = -1;
 
-    if (HasPythonExtension(resolved)) {
+    if (opt.pythonSyntaxCheck && HasPythonExtension(resolved)) {
         tool_python_syntax::SyntaxCheckResult syntax =
             tool_python_syntax::CheckFile(tmpPath);
         if (!syntax.ok) {
