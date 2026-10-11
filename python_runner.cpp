@@ -11,11 +11,14 @@
 #include "path_safety.h"
 #include "project_manager.h"
 #include "secrets_store.h"
+#include "skill_connections.h"
 #include "server_manager.h"
 #include "tool_path.h"
 #include "tool_path_safety.h"
 
 #include <cwchar>
+#include <filesystem>
+#include <fstream>
 #include <iterator>
 #include "ui_event_post.h"
 
@@ -2083,7 +2086,7 @@ public:
                        std::shared_ptr<std::atomic<bool>> cancelFlag,
                        std::shared_ptr<std::atomic<bool>> runningFlag,
                        std::weak_ptr<std::atomic<bool>> aliveToken,
-                       std::vector<std::pair<std::string, std::string>> envInjections = {})
+                       std::vector<SecretsStore::EnvInjection> connectionSnapshot = {})
         : wxThread(wxTHREAD_DETACHED)
         , m_evtHandler(evtHandler)
         , m_helperName(helperName)
@@ -2094,7 +2097,7 @@ public:
         , m_cancelFlag(std::move(cancelFlag))
         , m_runningFlag(std::move(runningFlag))
         , m_aliveToken(std::move(aliveToken))
-        , m_envInjections(std::move(envInjections))
+        , m_connectionSnapshot(std::move(connectionSnapshot))
     {}
 
 protected:
@@ -2299,6 +2302,7 @@ private:
                 result.exitCode = -1;
                 return;
             }
+            SelectDeclaredConnections(scriptPath, result);
 
             helperArgs.insert(helperArgs.end(),
                               pythonRunScriptArgvForHint.begin(),
@@ -2387,6 +2391,7 @@ private:
                                 "Put the flag and its value on separate lines, or write "
                                 "it as one token with '=' (e.g. --flag=value).";
                         }
+                        AppendWithheldConnectionHint(scriptPath, attempt);
                     }
                 }
                 result = std::move(attempt);
@@ -2739,12 +2744,125 @@ private:
     std::shared_ptr<std::atomic<bool>> m_runningFlag;
     std::weak_ptr<std::atomic<bool>>   m_aliveToken;
 
-    // Environment variables to inject into the child process.  Only
-    // populated for python_run_script (the one helper that runs
-    // user-authored skill scripts).  Empty for every built-in
-    // helper, so csv_inspect / xlsx_report / pdf_extract_text etc.
-    // never see API keys.
+    // ── Connections scoping (python_run_script only) ─────────────
+    // m_connectionSnapshot holds every stored secret (resolved on the
+    // UI thread).  After the script path is resolved,
+    // SelectDeclaredConnections keeps only the entries the owning
+    // SKILL.md / WORKFLOW.md declares and moves them into
+    // m_envInjections, which is all the child process ever sees.
+    // Built-in helpers (csv_inspect, xlsx_report, ...) get an empty
+    // snapshot, so they never see API keys either.
+    static std::string ReadTextCapped(const std::string& pathUtf8,
+                                      std::size_t        maxBytes)
+    {
+        std::ifstream in(std::filesystem::u8path(pathUtf8),
+                         std::ios::binary);
+        if (!in) return std::string();
+        std::string text(maxBytes, '\0');
+        in.read(&text[0], static_cast<std::streamsize>(maxBytes));
+        text.resize(static_cast<std::size_t>(in.gcount()));
+        return text;
+    }
+
+    void SelectDeclaredConnections(const std::string& scriptPath,
+                                   PythonRunResult&   result)
+    {
+        m_envInjections.clear();
+        m_ownerDocPath.clear();
+        result.connectionsPassed.clear();
+        if (m_connectionSnapshot.empty()) return;
+
+        std::vector<std::string> laneRoots;
+        laneRoots.push_back(ProjectManager::GetSkillsDir());
+        if (!m_activeProjectRoot.empty()) {
+            laneRoots.push_back(
+                ProjectManager::ProjectWorkflowsPath(m_activeProjectRoot));
+        }
+
+        m_ownerDocPath = lb_skill_connections::FindOwningInstructionDoc(
+            scriptPath, laneRoots);
+        if (m_ownerDocPath.empty()) return;
+
+        const std::vector<std::string> declared =
+            lb_skill_connections::ParseDeclaredConnections(
+                ReadTextCapped(m_ownerDocPath, 1024 * 1024));
+        if (declared.empty()) return;
+
+        for (const auto& e : m_connectionSnapshot) {
+            if (!lb_skill_connections::IsDeclared(declared, e.provider,
+                                                  e.envName)) {
+                continue;
+            }
+            m_envInjections.emplace_back(e.envName, e.value);
+            auto& passed = result.connectionsPassed;
+            if (std::find(passed.begin(), passed.end(), e.provider) ==
+                passed.end()) {
+                passed.push_back(e.provider);
+            }
+        }
+    }
+
+    // Failed run: if the script (or its output) names a stored key that
+    // was withheld, say so plainly -- otherwise "KeyError: RUNPOD_API_KEY"
+    // looks like a missing key and the model starts asking for it.
+    void AppendWithheldConnectionHint(const std::string& scriptPath,
+                                      PythonRunResult&   attempt) const
+    {
+        if (m_connectionSnapshot.empty()) return;
+        const std::string source = ReadTextCapped(scriptPath, 2 * 1024 * 1024);
+
+        std::vector<std::string> names;
+        std::vector<std::string> providers;
+        for (const auto& e : m_connectionSnapshot) {
+            bool passed = false;
+            for (const auto& kv : m_envInjections) {
+                if (kv.first == e.envName) { passed = true; break; }
+            }
+            if (passed) continue;
+            const bool mentioned =
+                source.find(e.envName) != std::string::npos ||
+                attempt.stdoutText.find(e.envName) != std::string::npos ||
+                attempt.stderrText.find(e.envName) != std::string::npos;
+            if (!mentioned) continue;
+            if (std::find(names.begin(), names.end(), e.envName) == names.end())
+                names.push_back(e.envName);
+            if (std::find(providers.begin(), providers.end(), e.provider) ==
+                providers.end()) {
+                providers.push_back(e.provider);
+            }
+        }
+        if (names.empty()) return;
+
+        std::string nameList;
+        for (size_t i = 0; i < names.size(); ++i) {
+            nameList += (i ? ", " : "") + names[i];
+        }
+
+        std::ostringstream hint;
+        if (!attempt.stderrText.empty() && attempt.stderrText.back() != '\n')
+            hint << "\n";
+        hint << "[connections] This script uses " << nameList
+             << ", but LlamaBoss did not pass "
+             << (names.size() == 1 ? "it" : "them") << ". ";
+        if (m_ownerDocPath.empty()) {
+            hint << "Only scripts inside a Skill folder (with SKILL.md) or a "
+                    "project workflow folder (with WORKFLOW.md) receive "
+                    "Connections, and only the ones that file declares.";
+        } else {
+            hint << "A script receives only the Connections its instruction "
+                    "file declares. To allow this, the user can add to "
+                 << m_ownerDocPath << ":\n## Connections\n";
+            for (const auto& p : providers) hint << "- " << p << "\n";
+        }
+        if (m_ownerDocPath.empty()) hint << " ";
+        hint << "Ask the user before changing that file; never ask for the "
+                "key itself in chat.";
+        attempt.stderrText += hint.str();
+    }
+
+    std::vector<SecretsStore::EnvInjection>          m_connectionSnapshot;
     std::vector<std::pair<std::string, std::string>> m_envInjections;
+    std::string                                      m_ownerDocPath;
 };
 
 } // namespace
@@ -2782,13 +2900,14 @@ bool PythonRunner::StartWorker(const std::string& helperName,
     const unsigned long effectiveTimeout =
         timeoutMs ? timeoutMs : defaultTimeoutMs;
 
-    // Build the env-var injection snapshot on the UI thread.  Only
-    // python_run_script (the one helper that runs user-authored
-    // skill scripts) sees Connections; every built-in helper gets
-    // an empty list so API keys never leak into csv/xlsx/pdf paths.
-    std::vector<std::pair<std::string, std::string>> envInjections;
+    // Resolve the secrets snapshot on the UI thread (SecretsStore is not
+    // thread-safe).  Only python_run_script gets one, and the worker
+    // narrows it to the Connections the script's SKILL.md / WORKFLOW.md
+    // declares once the script path is resolved.  Every built-in
+    // helper gets an empty list so API keys never reach csv/xlsx/pdf.
+    std::vector<SecretsStore::EnvInjection> connectionSnapshot;
     if (helperName == "python_run_script" && m_secretsStore) {
-        envInjections = m_secretsStore->BuildEnvInjections();
+        connectionSnapshot = m_secretsStore->BuildEnvInjectionSnapshot();
     }
 
     auto* worker = new PythonWorkerThread(
@@ -2801,7 +2920,7 @@ bool PythonRunner::StartWorker(const std::string& helperName,
         m_cancelFlag,
         m_isRunning,
         m_aliveToken,
-        std::move(envInjections));
+        std::move(connectionSnapshot));
 
     if (worker->Run() != wxTHREAD_NO_ERROR) {
         delete worker;

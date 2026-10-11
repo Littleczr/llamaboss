@@ -57,6 +57,16 @@ public:
     // Scaling matches DisplayUserMessage's thumbnail rules.
     void DisplayInlineImages(const std::vector<std::string>& imagePaths);
 
+    // Markdown images in assistant replies: a line that is only
+    // ![label](path) renders as an inline thumbnail (click = full-size
+    // viewer, right-click = save/show in folder, same as other thumbnails).
+    // The frame installs a resolver that maps the model's path -- absolute,
+    // Workspace-relative, or a chat-folder lane such as Web Pages\ -- to an
+    // existing absolute file using the same read-only resolution as the
+    // read tool.  Without a resolver only absolute paths display.
+    void SetImagePathResolver(std::function<std::string(const std::string&)> resolver)
+    { m_imagePathResolver = std::move(resolver); }
+
 private:
     // ── Image thumbnail context menu ─────────────────────────────
     // WriteImage embeds a bitmap with no memory of its source file,
@@ -296,6 +306,10 @@ private:
     // by Clear().  Never set back to false while the document lives —
     // images aren't individually removed, so no per-image tracking.
     bool m_hasImageThumbnails = false;
+
+    // Markdown image support (see SetImagePathResolver).
+    std::function<std::string(const std::string&)> m_imagePathResolver;
+    bool WriteMarkdownImage(const std::string& src);
     wxColour                    m_fileChipColor = wxColour(170, 190, 230);  // soft blue
 
     // Persistence context — set by the frame around streaming.

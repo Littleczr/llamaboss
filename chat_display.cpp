@@ -415,6 +415,11 @@ ChatDisplay::ChatDisplay(wxRichTextCtrl* displayCtrl)
         PresentFile(f);
     });
 
+    // ── Markdown images: ![label](path) lines become thumbnails ──
+    m_markdownRenderer->SetImageCallback([this](const std::string& src) {
+        return WriteMarkdownImage(src);
+    });
+
     // ── Sticky autoscroll: follow-mode tracking ───────────────────
     // The renderer consults follow mode before its per-delta scrolls.
     // Direct control input (wheel, keys, pan, selection drag) reports
@@ -437,6 +442,12 @@ ChatDisplay::ChatDisplay(wxRichTextCtrl* displayCtrl)
         transcript->SetViewportChangedHandler([this, alive]() {
             if (alive.expired()) return;
             UpdateFollowFromScrollPosition();
+        });
+        // Lets the control keep the bottom pinned through relayouts and
+        // height changes (activity strip, composer) while following, and
+        // refuse wxRichTextCtrl's own ScrollIntoView/ShowPosition jumps.
+        transcript->SetFollowPredicate([this, alive]() {
+            return !alive.expired() && m_followStream;
         });
     }
 
@@ -522,8 +533,11 @@ ChatDisplay::ChatDisplay(wxRichTextCtrl* displayCtrl)
                     releaseDisplayCapture();
                     return;
                 }
-                HandleToolBlockAffordanceClick(static_cast<size_t>(tbIdx));
+                // Release before the toggle: it ends by re-deciding follow
+                // mode, which deliberately ignores positions while the
+                // control holds the mouse (selection-drag protection).
                 releaseDisplayCapture();
+                HandleToolBlockAffordanceClick(static_cast<size_t>(tbIdx));
                 return;
             }
             // Approval buttons (Allow Once / Allow Always / Deny).
@@ -540,8 +554,12 @@ ChatDisplay::ChatDisplay(wxRichTextCtrl* displayCtrl)
                     releaseDisplayCapture();
                     return;
                 }
-                HandleApprovalButtonClick(static_cast<size_t>(abIdx));
+                // Release first: the click's mouse-down captured the mouse,
+                // and any 1px jiggle while pressed counted as a selection
+                // drag that switched follow off.  The approval resolution
+                // below re-engages follow and must not see a live capture.
                 releaseDisplayCapture();
+                HandleApprovalButtonClick(static_cast<size_t>(abIdx));
                 return;
             }
             // Image thumbnail — open the lightbox viewer.  Read-only
@@ -1227,6 +1245,12 @@ void ChatDisplay::HandleToolBlockAffordanceClick(size_t idx)
     // it.  The flicker cost on long bodies is acceptable for a
     // click-driven (not auto) operation.
 
+    // A details toggle is reading, not following: keep the viewport's top
+    // anchored while the body is inserted/removed (a following transcript
+    // would otherwise re-pin the bottom on every unfrozen relayout and push
+    // the clicked card away), then let the landing position decide follow.
+    m_followStream = false;
+
     if (r.expanded) {
         // ── Collapse ──
         long pivot = r.bodyEnd;
@@ -1270,6 +1294,7 @@ void ChatDisplay::HandleToolBlockAffordanceClick(size_t idx)
     // Keep the affordance line visible after the toggle so the user
     // can immediately click again or see the result of their click.
     m_displayCtrl->ShowPosition(r.affordanceStart);
+    UpdateFollowFromScrollPosition();
 }
 
 // ── Approval buttons ─────────────────────────────────────────────
@@ -1331,6 +1356,16 @@ void ChatDisplay::ClearApprovalButtons()
     m_approvalRowStart = -1;
     m_approvalRowEnd   = -1;
 
+    // Resolving an approval (click or typed) is a deliberate "carry on",
+    // like sending a message: whatever the tool prints next should be
+    // followed.  Without this, a click with the slightest mouse movement
+    // registered as a selection drag, switched follow off, and the tool's
+    // output then rendered below a viewport that no longer tracked it.
+    if (!IsReplayBatchActive()) m_followStream = true;
+
+    // One frozen transaction: the shrink and the bottom re-pin land in the
+    // same paint instead of the tail sliding down for a frame.
+    TranscriptUpdateGuard update(m_displayCtrl, m_followStream, !IsReplayBatchActive());
     m_displayCtrl->Remove(rowStart, rowEnd);
 
     // Approval rows live at the chat tail when visible, so in practice
@@ -1566,6 +1601,49 @@ void ChatDisplay::ShowInFolder(const wxString& path)
 #else
     wxLaunchDefaultApplication(wxFileName(path).GetPath());
 #endif
+}
+
+// Called by MarkdownRenderer (inside its transcript transaction, insertion
+// point at the end) for each image on an image-only Markdown line.
+bool ChatDisplay::WriteMarkdownImage(const std::string& src)
+{
+    if (!m_displayCtrl || src.empty()) return false;
+
+    const std::string path = m_imagePathResolver ? m_imagePathResolver(src) : src;
+    if (path.empty()) return false;
+
+    const wxFileName fn(wxString::FromUTF8(path));
+    if (!fn.IsAbsolute() || !fn.FileExists()) return false;
+
+    // Formats wx decodes with the handlers registered at startup.  Checking
+    // the extension first keeps a mistyped path to some other file type
+    // from being fed to the decoder at all.
+    static const char* const kImageExts[] = {
+        "png", "jpg", "jpeg", "gif", "bmp", "ico", "tif", "tiff"
+    };
+    const wxString ext = fn.GetExt().Lower();
+    bool known = false;
+    for (const char* e : kImageExts) if (ext == e) { known = true; break; }
+    if (!known) return false;
+
+    // Thumbnails are capped at kImageMaxWidth x kImageMaxHeight, but the
+    // first decode is full resolution on the UI thread; refuse absurd files.
+    constexpr unsigned long long kMaxImageFileBytes = 64ull * 1024 * 1024;
+    const wxULongLong size = fn.GetSize();
+    if (size == wxInvalidSize || size.GetValue() > kMaxImageFileBytes) return false;
+
+    wxImage img;
+    {
+        wxLogNull noLog;   // a corrupt file is a "not shown" note, not a popup
+        if (!LoadImageThumbnailCached(path, kImageMaxWidth, kImageMaxHeight, img))
+            return false;
+    }
+
+    m_displayCtrl->SetInsertionPointEnd();
+    m_displayCtrl->WriteImage(img);
+    TagLastWrittenImage(path);
+    m_displayCtrl->WriteText("\n");
+    return true;
 }
 
 void ChatDisplay::DisplayInlineImages(const std::vector<std::string>& imagePaths)

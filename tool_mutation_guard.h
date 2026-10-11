@@ -117,6 +117,9 @@ public:
 
     const std::string& Error() const { return m_error; }
     bool TargetExisted() const { return m_existed; }
+    // True when Begin failed because a folder on the path does not exist
+    // (an ordinary "not found", not a safety refusal).
+    bool MissingFolder() const { return m_missingFolder; }
 
     bool Begin(const std::string& path, bool allowMissingParents = false) {
         if (!m_lock.owns_lock()) {
@@ -134,6 +137,7 @@ public:
             if (!PinDirectory(parent)) {
                 if (allowMissingParents && Missing(m_lastError)) {
                     m_error.clear();
+                    m_missingFolder = false;
                     break; // mkdir pins each new directory before descending into it.
                 }
                 return false;
@@ -202,7 +206,19 @@ private:
         // reparse-point modification until this operation releases its pins.
         Handle h(::CreateFileW(path.c_str(), FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES, FILE_SHARE_READ,
             nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
-        if (!h.Valid()) return Fail("Cannot safely lock a parent directory", ::GetLastError());
+        if (!h.Valid()) {
+            const DWORD err = ::GetLastError();
+            if (Missing(err)) {
+                // Plain "not found" deserves a plain message naming the
+                // folder; "cannot safely lock (Win32 error 2)" read like a
+                // permission or locking problem and sent models sideways.
+                m_lastError = err;
+                m_missingFolder = true;
+                m_error = "Folder does not exist: " + path_safety::WideToUtf8(path) + ".";
+                return false;
+            }
+            return Fail("Cannot safely lock a parent directory", err);
+        }
         BY_HANDLE_FILE_INFORMATION info{};
         if (!::GetFileInformationByHandle(h.Get(), &info))
             return Fail("Cannot inspect a parent directory", ::GetLastError());
@@ -257,6 +273,7 @@ private:
     bool m_existed = false;
     BY_HANDLE_FILE_INFORMATION m_initial{};
     DWORD m_lastError = ERROR_SUCCESS;
+    bool m_missingFolder = false;
     std::string m_error;
 };
 

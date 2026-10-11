@@ -185,6 +185,8 @@
     <ClCompile Include="tool_write.cpp" />
     <ClCompile Include="tool_python_syntax.cpp" />
     <ClCompile Include="tool_mkdir.cpp" />
+    <ClCompile Include="tool_copy.cpp" />
+    <ClCompile Include="tool_hash.cpp" />
     <ClCompile Include="tool_edit.cpp" />
     <ClCompile Include="tool_delete.cpp" />
     <ClCompile Include="tool_notes.cpp" />
@@ -261,6 +263,7 @@
     <ClInclude Include="python_session.h" />
     <ClInclude Include="python_arg_policy.h" />
     <ClInclude Include="secrets_store.h" />
+    <ClInclude Include="skill_connections.h" />
     <ClInclude Include="endpoint_store.h" />
     <ClInclude Include="chatgpt_auth.h" />
     <ClInclude Include="chatgpt_auth_core.h" />
@@ -276,6 +279,11 @@
     <ClInclude Include="tool_write.h" />
     <ClInclude Include="tool_python_syntax.h" />
     <ClInclude Include="tool_mkdir.h" />
+    <ClInclude Include="tool_copy.h" />
+    <ClInclude Include="tool_hash.h" />
+    <ClInclude Include="lb_sha256.h" />
+    <ClInclude Include="answer_receipts.h" />
+    <ClInclude Include="markdown_image_line.h" />
     <ClInclude Include="tool_edit.h" />
     <ClInclude Include="tool_delete.h" />
     <ClInclude Include="tool_notes.h" />

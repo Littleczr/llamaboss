@@ -307,6 +307,10 @@ inline std::string TryResolveConversationLanePath(const std::string& input,
     else if (first == "filled forms") lane = "Filled Forms";
     else if (first == "word")         lane = "Word";
     else if (first == "tooloutputs")  lane = "ToolOutputs";
+    // web_fetch_url saves its raw/text artifacts here; models naturally
+    // follow up with "Web Pages\\<artifact>" (seen 2026-10-10: a grep on
+    // Web Pages/... resolved into Workspace and failed).
+    else if (first == "web pages")    lane = "Web Pages";
     else return std::string();
 
     const std::string cleanCwd = trimTrailingSeparators(cwd);
@@ -368,6 +372,38 @@ inline std::string ResolveReadOnlyToolPath(const std::string& input,
     }
 
     return primary;
+}
+
+// Write-type tools resolve relative paths inside Workspace (or the project);
+// the chat-folder lane aliases above are read-only by design.  When such a
+// tool fails because a lane-shaped path ("Scripts\\x.py") does not exist
+// under Workspace but does exist in the lane, say so instead of leaving the
+// model with a bare not-found.  Empty when the path is not lane-shaped or the
+// lane item does not exist either.
+inline std::string ConversationLaneWriteHint(const std::string& requested,
+                                             const std::string& cwd)
+{
+    const std::string lane = TryResolveConversationLanePath(requested, cwd);
+    if (lane.empty() || (!IsFile(lane) && !IsDirectory(lane))) return std::string();
+
+    std::string first = requested;
+    const size_t sep = first.find_first_of("\\/");
+    if (sep != std::string::npos) first = first.substr(0, sep);
+    for (char& c : first) c = LowerAscii(c);
+
+    std::string hint =
+        "\n\nNote: \"" + requested + "\" exists as a chat-folder lane item (" + lane +
+        "), but lane prefixes such as Scripts\\, ToolOutputs\\ and Extracted\\ "
+        "resolve only for read-only tools. write, overwrite_file, edit, copy and "
+        "delete resolve relative paths inside Workspace";
+    if (first == "scripts") {
+        hint += ". To change a runnable script, create a corrected version with "
+                "python_create_script (python_run_script only runs Scripts-lane files).";
+    } else {
+        hint += "; to work on this file, copy it into Workspace first (copy reads lane "
+                "paths) and change the copy.";
+    }
+    return hint;
 }
 
 inline bool IsUnderAllowedWriteRoot(const std::string& absPath,

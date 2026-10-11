@@ -124,33 +124,36 @@ enum class WriteRiskMode {
 // Lives in the anonymous namespace (internal linkage): only the two
 // public wrappers below call it, and it is not declared in
 // tool_write.h.
-WriteResult WriteFileContent(const std::string& argsBlob,
+// Knobs that differ between the text-writing tools and copy.  The safety
+// gates themselves (containment, mutation guard, filename sanitization,
+// risky-extension block, staged temp + atomic promote) are shared and not
+// configurable.
+struct WriteOptions {
+    bool          overwriteExisting = false;
+    WriteRiskMode riskMode          = WriteRiskMode::NormalTextOnly;
+    bool          pythonSyntaxCheck = true;   // copy writes exact bytes; no gate
+    size_t        maxBytes          = kWriteMaxBytes;
+    // Sentence appended to the "already exists" refusal.
+    const char*   existsHint =
+        "Use overwrite_file to replace the whole file, or edit for a small unique text replacement.";
+};
+
+WriteResult WriteContentCore(const std::string& requestedPath,
+                             const std::string& content,
                              const ToolContext& ctx,
-                             bool overwriteExisting,
-                             WriteRiskMode riskMode = WriteRiskMode::NormalTextOnly)
+                             const WriteOptions& opt,
+                             std::chrono::steady_clock::time_point t0)
 {
     WriteResult r;
-    auto t0 = std::chrono::steady_clock::now();
-
-    // ── Parse ────────────────────────────────────────────────────
-    std::string requestedPath, content;
-    SplitPathAndContent(argsBlob, requestedPath, content);
-
-    if (requestedPath.empty()) {
-        r.chips.push_back("failed");
-        r.errorBody = overwriteExisting
-            ? "overwrite_file requires a path on the first line of <args>."
-            : "write requires a path on the first line of <args>.";
-        r.chips.push_back(ElapsedChip(t0));
-        return r;
-    }
+    const bool overwriteExisting = opt.overwriteExisting;
+    const WriteRiskMode riskMode = opt.riskMode;
 
     // ── Size cap ─────────────────────────────────────────────────
-    if (content.size() > kWriteMaxBytes) {
+    if (content.size() > opt.maxBytes) {
         r.chips.push_back("too large");
         r.errorBody = "Content exceeds write cap: " +
                       HumanBytes(content.size()) +
-                      " (max " + HumanBytes(kWriteMaxBytes) + ").";
+                      " (max " + HumanBytes(opt.maxBytes) + ").";
         r.chips.push_back(ElapsedChip(t0));
         return r;
     }
@@ -192,8 +195,10 @@ WriteResult WriteFileContent(const std::string& argsBlob,
     // directory chain before touching the target. Reparse points fail closed.
     tool_mutation_guard::Guard mutation;
     if (!mutation.Begin(resolved)) {
-        r.chips.push_back("blocked");
+        r.chips.push_back(mutation.MissingFolder() ? "failed" : "blocked");
         r.errorBody = mutation.Error();
+        if (mutation.MissingFolder())
+            r.errorBody += tool_path_safety::ConversationLaneWriteHint(requestedPath, ctx.cwd);
         r.chips.push_back(ElapsedChip(t0));
         return r;
     }
@@ -252,7 +257,8 @@ WriteResult WriteFileContent(const std::string& argsBlob,
     if (parent.empty() || !IsDirectory(parent)) {
         r.chips.push_back("failed");
         r.errorBody = "Parent directory does not exist: " + parent +
-                      ".\nUse mkdir to create it first.";
+                      ".\nUse mkdir to create it first." +
+                      tool_path_safety::ConversationLaneWriteHint(requestedPath, ctx.cwd);
         r.chips.push_back(ElapsedChip(t0));
         return r;
     }
@@ -264,7 +270,7 @@ WriteResult WriteFileContent(const std::string& argsBlob,
     if (!overwriteExisting && (targetIsFile || targetIsDir)) {
         r.chips.push_back("exists");
         r.errorBody = "File or directory already exists: " + resolved +
-                      ".\nUse overwrite_file to replace the whole file, or edit for a small unique text replacement.";
+                      ".\n" + opt.existsHint;
         r.chips.push_back(ElapsedChip(t0));
         return r;
     }
@@ -380,7 +386,7 @@ WriteResult WriteFileContent(const std::string& argsBlob,
         return r;
     }
 
-    if (HasPythonExtension(resolved)) {
+    if (opt.pythonSyntaxCheck && HasPythonExtension(resolved)) {
         tool_python_syntax::SyntaxCheckResult syntax =
             tool_python_syntax::CheckFile(tmpPath);
         if (!syntax.ok) {
@@ -452,7 +458,50 @@ WriteResult WriteFileContent(const std::string& argsBlob,
     return r;
 }
 
+// Text-tool entry: parse "path\ncontent", then run the shared core.
+WriteResult WriteFileContent(const std::string& argsBlob,
+                             const ToolContext& ctx,
+                             bool overwriteExisting,
+                             WriteRiskMode riskMode = WriteRiskMode::NormalTextOnly)
+{
+    auto t0 = std::chrono::steady_clock::now();
+
+    // ── Parse ────────────────────────────────────────────────────
+    std::string requestedPath, content;
+    SplitPathAndContent(argsBlob, requestedPath, content);
+
+    if (requestedPath.empty()) {
+        WriteResult r;
+        r.chips.push_back("failed");
+        r.errorBody = overwriteExisting
+            ? "overwrite_file requires a path on the first line of <args>."
+            : "write requires a path on the first line of <args>.";
+        r.chips.push_back(ElapsedChip(t0));
+        return r;
+    }
+
+    WriteOptions opt;
+    opt.overwriteExisting = overwriteExisting;
+    opt.riskMode          = riskMode;
+    return WriteContentCore(requestedPath, content, ctx, opt, t0);
+}
+
 } // anonymous namespace
+
+WriteResult WriteExactBytes(const std::string& requestedPath,
+                            const std::string& bytes,
+                            const ToolContext& ctx,
+                            bool overwriteExisting)
+{
+    WriteOptions opt;
+    opt.overwriteExisting = overwriteExisting;
+    opt.pythonSyntaxCheck = false;
+    opt.maxBytes          = kExactWriteMaxBytes;
+    opt.existsHint =
+        "Set overwrite to true (native) or add a third line \"overwrite\" (text form) to replace it.";
+    return WriteContentCore(requestedPath, bytes, ctx, opt,
+                            std::chrono::steady_clock::now());
+}
 
 WriteResult WriteNewFile(const std::string& argsBlob,
                          const ToolContext& ctx)

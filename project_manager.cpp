@@ -504,6 +504,48 @@ bool SkillImportSkipsDirName(const std::string& name)
            lower == "node_modules" || lower == ".venv" || lower == "venv";
 }
 
+// Top-level entries a Skill folder is expected to hold.  Anything else next
+// to a picked SKILL.md (a Downloads folder of installers, a Desktop) means
+// the folder is not a Skill folder, and importing it whole would copy
+// unrelated files into Skills.
+bool IsSkillShapedTopLevelEntry(const std::string& name, bool isDir)
+{
+    const std::string lower = LowerAscii(name);
+    if (isDir) {
+        return lower == "scripts" || lower == "references" ||
+               lower == "assets" || lower == "templates" ||
+               lower == "examples" || SkillImportSkipsDirName(name);
+    }
+    if (lower == "skill.md" || lower == "requirements.txt") return true;
+    if (lower.rfind("license", 0) == 0 || lower.rfind("readme", 0) == 0)
+        return true;
+    const size_t dot = lower.find_last_of('.');
+    return dot != std::string::npos && lower.substr(dot) == ".py";
+}
+
+// Fresh, empty temp folder for a skill import staging area.  The caller
+// owns it and must remove it on every exit path.
+bool CreateSkillImportTempRoot(std::string& outTempRoot)
+{
+    outTempRoot.clear();
+    const std::string tempBase =
+        std::string(wxFileName::GetTempDir().ToUTF8().data());
+    for (int i = 0; i < 64; ++i) {
+        std::ostringstream stem;
+        stem << "LbSkillImport-" << ::wxGetProcessId() << "-" << i;
+        const std::string candidate = JoinProjectPath(tempBase, stem.str());
+        if (!FileOrDirExists(candidate)) { outTempRoot = candidate; break; }
+    }
+    if (outTempRoot.empty()) return false;
+    if (!wxFileName::Mkdir(wxString::FromUTF8(outTempRoot),
+                           wxS_DIR_DEFAULT, wxPATH_MKDIR_FULL) &&
+        !wxDirExists(wxString::FromUTF8(outTempRoot))) {
+        outTempRoot.clear();
+        return false;
+    }
+    return true;
+}
+
 // Walk `dirPath` recursively.  relPrefix is "" at the root and grows
 // "sub\" per level.  onDir/onFile may be null (probe mode).  Returns
 // false with outError set on any cap violation or callback failure.
@@ -1984,6 +2026,84 @@ bool ProjectManager::ImportSkillFolder(const std::string& sourceFolder,
     return true;
 }
 
+bool ProjectManager::DescribeNonSkillEntries(const std::string& folder,
+                                             std::string& outSummary)
+{
+    outSummary.clear();
+    wxDir dir(wxString::FromUTF8(folder));
+    if (!dir.IsOpened()) return false;
+
+    std::size_t files = 0, dirs = 0;
+    std::vector<std::string> examples;
+    wxString name;
+    bool cont = dir.GetFirst(&name, wxEmptyString,
+                             wxDIR_FILES | wxDIR_DIRS | wxDIR_HIDDEN);
+    while (cont) {
+        const std::string utf8 = std::string(name.ToUTF8().data());
+        const bool isDir =
+            wxDirExists(wxString::FromUTF8(JoinProjectPath(folder, utf8)));
+        if (!IsSkillShapedTopLevelEntry(utf8, isDir)) {
+            (isDir ? dirs : files)++;
+            if (examples.size() < 3) examples.push_back(utf8);
+        }
+        cont = dir.GetNext(&name);
+    }
+    if (files == 0 && dirs == 0) return false;
+
+    std::ostringstream s;
+    if (files) s << files << (files == 1 ? " other file" : " other files");
+    if (files && dirs) s << " and ";
+    if (dirs) s << dirs << (dirs == 1 ? " other folder" : " other folders");
+    s << ", e.g. ";
+    for (size_t i = 0; i < examples.size(); ++i) {
+        s << (i ? ", " : "") << examples[i];
+    }
+    outSummary = s.str();
+    return true;
+}
+
+bool ProjectManager::StageSkillDocOnlyToTemp(const std::string& skillDocPath,
+                                             std::string& outTempRoot,
+                                             std::string& outSkillFolder,
+                                             std::string& outError)
+{
+    outTempRoot.clear();
+    outSkillFolder.clear();
+    outError.clear();
+
+    if (!wxFileExists(wxString::FromUTF8(skillDocPath))) {
+        outError = "The selected SKILL.md does not exist.";
+        return false;
+    }
+    if (FileSizeBytes(skillDocPath) > kSkillImportMaxBytes) {
+        outError = "That SKILL.md is larger than 64 MB; this does not look "
+                   "like a Skill.";
+        return false;
+    }
+    if (!CreateSkillImportTempRoot(outTempRoot)) {
+        outError = "Could not create a temporary staging folder.";
+        return false;
+    }
+
+    // The staging folder name is the fallback Skill name when SKILL.md has
+    // no frontmatter `name` (the parent folder, e.g. "Downloads", would be
+    // a misleading name).
+    const std::string staged = JoinProjectPath(outTempRoot, "imported-skill");
+    const std::string stagedDoc = JoinProjectPath(staged, kSkillDocName);
+    if (!wxFileName::Mkdir(wxString::FromUTF8(staged), wxS_DIR_DEFAULT,
+                           wxPATH_MKDIR_FULL) ||
+        !wxCopyFile(wxString::FromUTF8(skillDocPath),
+                    wxString::FromUTF8(stagedDoc), /*overwrite=*/false)) {
+        wxFileName::Rmdir(wxString::FromUTF8(outTempRoot),
+                          wxPATH_RMDIR_RECURSIVE);
+        outTempRoot.clear();
+        outError = "Could not stage SKILL.md for import.";
+        return false;
+    }
+    outSkillFolder = staged;
+    return true;
+}
+
 bool ProjectManager::ExtractSkillZipToTemp(const std::string& zipPath,
                                            std::string& outTempRoot,
                                            std::string& outSkillFolder,
@@ -1999,19 +2119,8 @@ bool ProjectManager::ExtractSkillZipToTemp(const std::string& zipPath,
     }
 
     // Fresh temp root per extraction; the caller always removes it.
-    const std::string tempBase =
-        std::string(wxFileName::GetTempDir().ToUTF8().data());
     std::string tempRoot;
-    for (int i = 0; i < 64; ++i) {
-        std::ostringstream stem;
-        stem << "LbSkillImport-" << ::wxGetProcessId() << "-" << i;
-        const std::string candidate = JoinProjectPath(tempBase, stem.str());
-        if (!FileOrDirExists(candidate)) { tempRoot = candidate; break; }
-    }
-    if (tempRoot.empty() ||
-        (!wxFileName::Mkdir(wxString::FromUTF8(tempRoot),
-                            wxS_DIR_DEFAULT, wxPATH_MKDIR_FULL)
-         && !wxDirExists(wxString::FromUTF8(tempRoot)))) {
+    if (!CreateSkillImportTempRoot(tempRoot)) {
         outError = "Could not create a temporary extraction folder.";
         return false;
     }

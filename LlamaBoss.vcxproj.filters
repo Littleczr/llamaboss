@@ -142,6 +142,12 @@
     <ClCompile Include="tool_mkdir.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="tool_copy.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="tool_hash.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="tool_edit.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -351,6 +357,9 @@
     <ClInclude Include="secrets_store.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="skill_connections.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="endpoint_store.h">
       <Filter>Header Files</Filter>
     </ClInclude>
@@ -394,6 +403,21 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="tool_mkdir.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="tool_copy.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="tool_hash.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="lb_sha256.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="answer_receipts.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="markdown_image_line.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="tool_edit.h">

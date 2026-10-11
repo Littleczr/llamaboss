@@ -159,8 +159,10 @@ DeleteResult DeleteEntry(const std::string& pathIn,
     // directory chain before touching the target. Reparse points fail closed.
     tool_mutation_guard::Guard mutation;
     if (!mutation.Begin(resolved)) {
-        r.chips.push_back("blocked");
+        r.chips.push_back(mutation.MissingFolder() ? "failed" : "blocked");
         r.errorBody = mutation.Error();
+        if (mutation.MissingFolder())
+            r.errorBody += tool_path_safety::ConversationLaneWriteHint(requested, ctx.cwd);
         r.chips.push_back(ElapsedChip(t0));
         return r;
     }

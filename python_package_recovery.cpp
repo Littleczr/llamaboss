@@ -280,3 +280,28 @@ void ApplyMissingPythonPackageRecovery(ToolInvocationResult&  r,
     r.body = body.str();
     r.bodyLang = "markdown";
 }
+
+bool LbLooksLikeUrllibHttp403(const std::string& stderrText)
+{
+    // urllib.error.HTTPError's message; requests raises "403 Client Error",
+    // which is a different library and usually already sends a UA.
+    if (stderrText.find("HTTP Error 403") == std::string::npos) return false;
+    return stderrText.find("urllib") != std::string::npos;
+}
+
+void ApplyPythonHttpBlockedHint(ToolInvocationResult&  r,
+                                const PythonRunResult& py)
+{
+    if (py.exitCode == 0 || py.cancelled || py.timedOut) return;
+    if (!LbLooksLikeUrllibHttp403(py.stderrText)) return;
+
+    if (!r.errorBody.empty() && r.errorBody.back() != '\n') r.errorBody += '\n';
+    r.errorBody +=
+        "\nHint: HTTP 403 from urllib usually means the site's bot protection "
+        "(Cloudflare and similar) refuses Python's default User-Agent; retrying "
+        "the same request will fail the same way. To read or hash a public URL, "
+        "use web_fetch_url: it saves the exact response bytes and states their "
+        "size and SHA-256. If a script must fetch, send an explicit User-Agent "
+        "header, e.g. urllib.request.Request(url, headers={'User-Agent': "
+        "'Mozilla/5.0'}).";
+}

@@ -7,6 +7,7 @@
 #include "ui_event_post.h"
 #include "var_store.h"      // demotion threshold — see kInlineBodyBudget below
 #include "chat_folders.h"   // chat folder recognizer
+#include "lb_sha256.h"      // response digest line
 
 #include "lb_windows.h"
 #include <winsock2.h>
@@ -2377,6 +2378,8 @@ WebFetchResult FetchWebPageUrlImpl(const std::string& urlArg,
         if (statusCode) body << "HTTP status: " << statusCode << "\n";
         if (!contentType.empty()) body << "Content-Type: " << contentType << "\n";
         body << "Size: " << HumanBytes(html.size()) << "\n";
+        body << "Response body: " << html.size() << " bytes, SHA-256 "
+             << lb_sha256::HexOf(html) << " (the saved artifact is byte-identical)\n";
         body << "Raw content artifact: " << rawPath << "\n\n";
         if (ext == ".pdf") {
             body << "This looks like a PDF. Use pdf_extract_text on the saved artifact if the user wants the PDF summarized or searched.\n";
@@ -2439,7 +2442,20 @@ WebFetchResult FetchWebPageUrlImpl(const std::string& urlArg,
         if (!contentType.empty()) head << "Content-Type: " << contentType << "\n";
         head << "Saved artifact: " << textPath
              << " (" << totalLines << (totalLines == 1 ? " line, " : " lines, ")
-             << HumanBytes(decoded.size()) << ")\n\n";
+             << HumanBytes(decoded.size()) << ")\n";
+        // Exact digest of the body as received, so "does the live file
+        // match?" needs neither a script nor a retyped hash.  Python's
+        // urllib is often refused by Cloudflare-fronted hosts (HTTP 403);
+        // this line is the reliable way to get a live file's hash.
+        head << "Response body: " << html.size() << " bytes, SHA-256 "
+             << lb_sha256::HexOf(html);
+        if (reEncoded) {
+            head << "\nSaved artifact (re-encoded to UTF-8, so it differs from the response): "
+                 << decoded.size() << " bytes, SHA-256 " << lb_sha256::HexOf(decoded);
+        } else {
+            head << " (the saved artifact is byte-identical)";
+        }
+        head << "\n\n";
         head << "This response is not HTML, so it was saved exactly as received: no markup stripping, "
                 "entity decoding, or whitespace normalization. The artifact above is the COMPLETE response";
         if (reEncoded) {
@@ -2547,7 +2563,8 @@ WebFetchResult FetchWebPageUrlImpl(const std::string& urlArg,
     if (statusCode) head << "HTTP status: " << statusCode << "\n";
     if (!contentType.empty()) head << "Content-Type: " << contentType << "\n";
     head << "Raw HTML artifact: " << rawPath
-         << " (" << HumanBytes(html.size()) << ")\n";
+         << " (" << HumanBytes(html.size()) << "; response body " << html.size()
+         << " bytes, SHA-256 " << lb_sha256::HexOf(html) << ", byte-identical to the response)\n";
     head << "Extracted text artifact: " << textPath
          << " (" << r.textLineCount << (r.textLineCount == 1 ? " line, " : " lines, ")
          << HumanBytes(md.size()) << ")\n\n";

@@ -11,6 +11,7 @@
 
 #include "markdown_renderer.h"
 #include "chat_display_ctrl.h"
+#include "markdown_image_line.h"
 
 // ═══════════════════════════════════════════════════════════════════
 //  Construction / Reset
@@ -456,6 +457,12 @@ void MarkdownRenderer::RenderCompleteLine(const std::string& line, const wxColou
         return;
     }
 
+    // ── Image-only line? ─────────────────────────────────────────
+    // ![label](path) on a line of its own becomes an inline thumbnail.
+    if (m_imageCallback && TryRenderImageLine(line, baseColor)) {
+        return;
+    }
+
     // ── Horizontal rule? ─────────────────────────────────────────
     if (IsHorizontalRule(line)) {
         RenderHorizontalRule(baseColor);
@@ -847,6 +854,28 @@ void MarkdownRenderer::RenderInlineMarkdown(const std::string& text,
 // ═══════════════════════════════════════════════════════════════════
 //  Low-Level Text Output
 // ═══════════════════════════════════════════════════════════════════
+
+bool MarkdownRenderer::TryRenderImageLine(const std::string& line,
+                                          const wxColour& /*baseColor*/)
+{
+    std::vector<markdown_image_line::ImageRef> refs;
+    if (!markdown_image_line::Parse(line, refs)) return false;
+
+    for (const auto& ref : refs) {
+        m_ctrl->SetInsertionPointEnd();
+        const bool remote = markdown_image_line::IsRemoteOrInline(ref.src);
+        if (!remote && m_imageCallback(ref.src)) continue;
+
+        // Not shown: keep the information visible as one muted line rather
+        // than dropping it or leaving raw Markdown behind.
+        const std::string label = ref.alt.empty() ? std::string("image") : ref.alt;
+        const char* why = remote ? "remote images are not loaded"
+                                 : "file not found or not a supported image";
+        WriteStyled("[" + label + ": " + ref.src + " (" + why + ")]\n",
+                    m_codeLabelColor, false, true, false);
+    }
+    return true;
+}
 
 void MarkdownRenderer::WriteStyled(const std::string& text, const wxColour& color,
     bool bold, bool italic, bool monospace,

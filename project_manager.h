@@ -241,6 +241,25 @@ public:
                                       std::string& outSkillFolder,
                                       std::string& outError);
 
+    // A picked SKILL.md implies its parent folder is the Skill.  When that
+    // folder also holds things a Skill folder would not (anything beyond
+    // SKILL.md, README/LICENSE, requirements.txt, *.py and the scripts /
+    // references / assets / templates / examples folders), returns true
+    // with a short summary ("12 other files and 3 other folders, e.g. ...")
+    // so the UI can offer a SKILL.md-only import instead of copying a
+    // Downloads folder into Skills.
+    static bool DescribeNonSkillEntries(const std::string& folder,
+                                        std::string& outSummary);
+
+    // Copies just the given SKILL.md into a fresh temp staging folder
+    // (<temp>\imported-skill\SKILL.md).  Same contract as
+    // ExtractSkillZipToTemp: run the normal probe/confirm/import against
+    // outSkillFolder, then ALWAYS remove outTempRoot.
+    static bool StageSkillDocOnlyToTemp(const std::string& skillDocPath,
+                                        std::string& outTempRoot,
+                                        std::string& outSkillFolder,
+                                        std::string& outError);
+
     // Zip one Skill folder (identified by its SKILL.md contract path) to
     // zipPath, rooted as "<stem>/..." inside the archive so it re-imports
     // and shares cleanly.  Uses the same bounded walker as import, so the

@@ -31,3 +31,15 @@ struct PythonRunResult;
 // when no recognizable missing-package signal is found.
 void ApplyMissingPythonPackageRecovery(ToolInvocationResult&  r,
                                        const PythonRunResult& py);
+
+// Cloudflare and similar front ends refuse Python's default urllib
+// User-Agent with HTTP 403.  A failed run whose stderr shows urllib raising
+// HTTP Error 403 gets a short hint appended to its error body pointing at
+// web_fetch_url (which saves the exact bytes and states their SHA-256) or
+// an explicit User-Agent header.  Seen three times in one release chat
+// without the model generalizing.  Pure text check; no-op otherwise.
+void ApplyPythonHttpBlockedHint(ToolInvocationResult&  r,
+                                const PythonRunResult& py);
+
+// Pure predicate behind ApplyPythonHttpBlockedHint (unit-tested).
+bool LbLooksLikeUrllibHttp403(const std::string& stderrText);

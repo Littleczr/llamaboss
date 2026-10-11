@@ -133,6 +133,11 @@ public:
         // base control has moved the viewport.
         Bind(wxEVT_KEY_DOWN, &ChatDisplayCtrl::OnKeyDown, this);
 
+        // Height-only resizes (activity strip, attachment bar, composer
+        // growth) must not go through wxRichTextCtrl::OnSize; see
+        // OnSizeKeepView for why.
+        Bind(wxEVT_SIZE, &ChatDisplayCtrl::OnSizeKeepView, this);
+
 #ifdef __WXMSW__
         // Middle-click auto-scroll is a Windows convention; keep the
         // feature MSW-only so the control matches native expectations
@@ -230,6 +235,16 @@ public:
 
     void SetViewportChangingHandler(std::function<void()> handler) {
         m_viewportChangingHandler = std::move(handler);
+    }
+
+    // ChatDisplay installs this: true while the transcript is following the
+    // stream (the user is parked at the bottom).  While it returns true the
+    // control keeps the bottom pinned through every relayout and resize and
+    // refuses editor-style ScrollIntoView jumps.  User scroll input flips
+    // follow off BEFORE it moves the viewport (viewport-changing handler),
+    // so none of this can fight a deliberate scroll.
+    void SetFollowPredicate(std::function<bool()> predicate) {
+        m_followPredicate = std::move(predicate);
     }
 
 protected:
@@ -357,7 +372,32 @@ protected:
         // Programmatic writes must not run the editor's caret-follow scroll.
         // User keyboard navigation outside a transcript update still uses it.
         if (IsTranscriptUpdateActive()) return false;
+        // While following, the bottom is the only correct viewport.  This is
+        // the big one: after any resize of a transcript longer than 20k
+        // chars, wxRichTextCtrl::OnSize saves GetFirstVisiblePosition() and
+        // OnIdle later calls ShowPosition(saved) -> ScrollIntoView.  If a tool
+        // result was rendered (and followed) in between, that saved position
+        // is now above the viewport and the idle pass yanks the transcript
+        // back UP to it -- the "approve, then it scrolls back up" jump.
+        // Keyboard navigation is unaffected: OnKeyDown turns follow off
+        // before the base class handles the key.
+        if (IsFollowing()) return false;
         return wxRichTextCtrl::ScrollIntoView(position, keyCode);
+    }
+
+    void SetupScrollbars(bool atTop = false, bool fromOnPaint = false) override {
+        wxRichTextCtrl::SetupScrollbars(atTop, fromOnPaint);
+        // Every relayout funnels through here (LayoutContent, Thaw, resize,
+        // edits outside a transcript transaction).  The base keeps the TOP
+        // of the viewport and only clamps it, so a shrinking document or a
+        // growing viewport slides the tail down and a growing document hides
+        // it.  While following, keep the BOTTOM instead.  DoThaw's transcript
+        // restore does its own scroll, so stay out of its way.
+        if (IsFrozen() || m_restoreTranscriptView || !IsFollowing()) return;
+        // OnPaint calls this after PrepareDC: scrolling now would draw this
+        // frame at the old origin.  Defer that one case to right after paint.
+        if (fromOnPaint) PinToBottomSoon();
+        else PinToBottom();
     }
 
     void DoThaw() override {
@@ -404,6 +444,76 @@ private:
     int m_transcriptViewX = 0, m_transcriptViewY = 0, m_transcriptPpuY = 0;
     long m_transcriptSelectionStart = 0, m_transcriptSelectionEnd = 0;
     std::function<void()> m_viewportChangingHandler;
+
+    std::function<bool()> m_followPredicate;
+    bool m_pinPending = false;
+    int  m_lastClientWidth = -1;
+
+    bool IsFollowing() const {
+        return m_followPredicate && m_followPredicate();
+    }
+
+    void PinToBottom() {
+        int ppuX = 0, ppuY = 0;
+        GetScrollPixelsPerUnit(&ppuX, &ppuY);
+        if (ppuY <= 0) return;  // everything fits; nothing to pin
+        const int maxTop = std::max(0, GetVirtualSize().y - GetClientSize().y);
+        const int bottom = (maxTop + ppuY - 1) / ppuY;
+        int vx = 0, vy = 0;
+        GetViewStart(&vx, &vy);
+        if (vy != bottom) Scroll(vx, bottom);
+    }
+
+    void PinToBottomSoon() {
+        if (m_pinPending) return;
+        m_pinPending = true;
+        CallAfter([this]() {
+            m_pinPending = false;
+            if (!IsFrozen() && IsFollowing()) PinToBottom();
+        });
+    }
+
+    // wxRichTextCtrl::OnSize is written for width changes: it invalidates
+    // the whole layout (short docs) or, past 20k chars, does a visible-rect
+    // layout and schedules an idle full layout + ShowPosition(first visible
+    // position as of the resize).  A HEIGHT-only change needs none of that:
+    // text wraps to width, so the layout is identical.  The activity strip
+    // shows/hides for every async tool, so this ran constantly during agent
+    // turns and each run could replay a stale scroll position at idle.
+    //
+    // Height-only: resize the paint buffer and refit the scrollbars here
+    // (SetupScrollbars pins the bottom when following) and consume the
+    // event so the base handler never runs.  wxScrollHelper still sees the
+    // event afterwards -- its handler sits in front of the window's chain
+    // and always calls HandleOnSize -- so native scrollbar bookkeeping is
+    // unchanged.  Width changes take the stock path; ScrollIntoView above
+    // keeps its idle ShowPosition from yanking a following viewport.
+    void OnSizeKeepView(wxSizeEvent& evt) {
+        const wxSize client = GetClientSize();
+        const bool heightOnly = m_lastClientWidth > 0 &&
+                                client.x == m_lastClientWidth &&
+                                client.y > 0;
+        m_lastClientWidth = client.x;
+        if (!heightOnly) {
+            evt.Skip();
+            // The stock path's large-document branch only lays out the
+            // visible rect and never refits the scrollbars until idle, so
+            // nothing above gets a chance to re-pin.  Do it once the base
+            // handler and wxScrollHelper have both seen this resize.
+            if (IsFollowing()) PinToBottomSoon();
+            return;
+        }
+
+#if wxRICHTEXT_BUFFERED_PAINTING
+        RecreateBuffer(client);
+#endif
+        // Frozen (the strip toggled inside a transcript transaction): the
+        // Thaw/DoThaw path refits and restores against the final size.
+        if (!IsFrozen()) {
+            SetupScrollbars();
+            Refresh(false);
+        }
+    }
 
     // ── Tuning constants ────────────────────────────────────────
     // Wheel: 3x the system lines-per-notch.  With the default system

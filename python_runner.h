@@ -53,6 +53,11 @@ struct PythonRunResult {
     // Future artifact-producing Python helpers surface created files
     // through the same artifact-card path used by /write.
     std::vector<PresentedFile> presentedFiles;
+
+    // python_run_script only: Connection providers whose keys were
+    // passed to the script (names only, never values).  Rendered as a
+    // "keys: ..." chip so the user can see what a script received.
+    std::vector<std::string> connectionsPassed;
 };
 
 class PythonRunResultClientData : public wxClientData {

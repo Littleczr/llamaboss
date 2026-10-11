@@ -155,6 +155,7 @@
     <ClCompile Include="LlamaBossTests.cpp" />
     <ClCompile Include="read_grep_tests.cpp" />
     <ClCompile Include="var_store_tests.cpp" />
+    <ClCompile Include="skill_connections_tests.cpp" />
     <ClCompile Include="..\..\path_safety.cpp" />
     <ClCompile Include="..\..\tool_path.cpp" />
     <ClCompile Include="..\..\tool_read.cpp" />
@@ -163,6 +164,7 @@
   <ItemGroup>
     <ClInclude Include="json_case_loader.h" />
     <ClInclude Include="test_framework.h" />
+    <ClInclude Include="..\..\skill_connections.h" />
     <ClInclude Include="..\..\path_safety.h" />
     <ClInclude Include="..\..\tool_context.h" />
     <ClInclude Include="..\..\tool_grep_args.h" />
