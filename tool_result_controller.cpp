@@ -366,6 +366,7 @@ void ToolResultController::OnPythonComplete(wxCommandEvent& evt)
         ApplyArtifactPresentation(tir);
     }
     ApplyMissingPythonPackageRecovery(tir, r);
+    ApplyPythonHttpBlockedHint(tir, r);
 
     if (r.cancelled) {
         tir.chips.push_back("cancelled");
@@ -385,6 +386,12 @@ void ToolResultController::OnPythonComplete(wxCommandEvent& evt)
     }
     if (!r.pythonCommand.empty()) tir.chips.push_back(r.pythonCommand);
     if (r.truncated) tir.chips.push_back("truncated");
+    if (!r.connectionsPassed.empty()) {
+        std::string keys = "keys: ";
+        for (size_t i = 0; i < r.connectionsPassed.size(); ++i)
+            keys += (i ? ", " : "") + r.connectionsPassed[i];
+        tir.chips.push_back(keys);
+    }
 
     // PDF UX polish: card-first policy.  The artifact chip is always
     // the primary affordance for tool-produced files; for small

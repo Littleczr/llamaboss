@@ -128,9 +128,12 @@ public:
     std::vector<ConnectionRow> ListConnections() const;
 
     // ── Worker integration ───────────────────────────────────────
-    // Build the env-var injections for a python_run_script call.
-    // Returns a snapshot vector of (env_var_name, resolved_value)
-    // pairs covering every configured provider/key pair.
+    // Snapshot every configured secret as (provider, env var name,
+    // resolved value) for a python_run_script call.  The runner then
+    // keeps ONLY the entries the script's owning SKILL.md /
+    // WORKFLOW.md declares (see skill_connections.h); scripts with no
+    // owning instruction file get none.  This function does not
+    // decide scope -- it only resolves values on the UI thread.
     //
     // Naming convention: uppercase the provider name, append the
     // uppercased key, and normalize non-alphanumeric characters to
@@ -142,11 +145,12 @@ public:
     // Empty values are omitted from the result (an env ref pointing
     // at a missing env var won't shadow whatever the user has set
     // in their shell).
-    //
-    // TODO: narrow this to "only providers declared in the running
-    // skill's `## Connections` section."
-    std::vector<std::pair<std::string, std::string>>
-        BuildEnvInjections() const;
+    struct EnvInjection {
+        std::string provider;   // as stored, e.g. "runpod"
+        std::string envName;    // e.g. "RUNPOD_API_KEY"
+        std::string value;      // resolved secret
+    };
+    std::vector<EnvInjection> BuildEnvInjectionSnapshot() const;
 
 private:
     // provider -> (key -> value-as-JSON-string).  We store the raw

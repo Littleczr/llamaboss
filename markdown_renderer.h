@@ -102,6 +102,18 @@ public:
     void SetAutoScrollPredicate(std::function<bool()> pred)
     { m_autoScroll = std::move(pred); }
 
+    // ── Inline images ─────────────────────────────────────────────
+    // A complete line that consists only of Markdown images
+    // (![label](path), see markdown_image_line.h) is offered to this
+    // callback once per image with the cleaned target.  The callback
+    // resolves the path, writes a thumbnail at the end of the control and
+    // returns true; false (missing file, not an image) makes the renderer
+    // write a short "[label: path (not shown)]" note instead.  Remote
+    // http(s)/data targets never reach the callback.  Unset (default)
+    // keeps the old behaviour: the line renders as ordinary text.
+    using ImageCallback = std::function<bool(const std::string& src)>;
+    void SetImageCallback(ImageCallback cb) { m_imageCallback = std::move(cb); }
+
 private:
     wxRichTextCtrl* m_ctrl;
 
@@ -133,6 +145,7 @@ private:
     // ── File chip callback ────────────────────────────────────────
     FileCallback              m_fileCallback;        // Invoked when a fenced block closes
     std::function<bool()>     m_autoScroll;          // Empty = always scroll (legacy)
+    ImageCallback             m_imageCallback;       // Empty = images render as text
 
     bool ShouldAutoScroll() const
     { return !m_autoScroll || m_autoScroll(); }
@@ -163,6 +176,9 @@ private:
 
     // ── Inline markdown parsing ──────────────────────────────────
     void RenderInlineMarkdown(const std::string& text, const wxColour& baseColor);
+    // Image-only line -> thumbnails via m_imageCallback.  False when the
+    // line is not an image-only line (caller renders it normally).
+    bool TryRenderImageLine(const std::string& line, const wxColour& baseColor);
 
     // ── Low-level text output ────────────────────────────────────
     void WriteStyled(const std::string& text, const wxColour& color,

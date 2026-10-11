@@ -82,9 +82,12 @@
 #include "project_controller.h"
 #include "ascii_animation.h"
 #include "var_store.h"
+#include "answer_receipts.h"   // hex receipt check after agent turns
+#include "tool_path_safety.h"   // image path resolution for Markdown images
+#include "chat_folders.h"
 
 // ─── Application version ─────────────────────────────────────
-static const char* LLAMABOSS_VERSION = "0.1.21";
+static const char* LLAMABOSS_VERSION = "0.1.22";
 
 // Native menu command ids. Keep above wxID_HIGHEST to avoid collisions
 // with stock wxWidgets commands.
@@ -824,6 +827,14 @@ private:
         _userInputCtrl->SetFont(codeFont);
 
         m_chatDisplay = std::make_unique<ChatDisplay>(_chatDisplayCtrl);
+        // ![label](path) lines in replies display the image.  Paths resolve
+        // exactly like the read tool: absolute, Workspace-relative, project,
+        // or a chat-folder lane (Web Pages\, ToolOutputs\, ...).
+        m_chatDisplay->SetImagePathResolver([this](const std::string& src) -> std::string {
+            if (!m_chatHistory) return src;
+            return tool_path_safety::ResolveReadOnlyToolPath(
+                src, ResolveCurrentCwd(), m_chatHistory->GetProjectRoot());
+        });
         m_chatDisplay->SetFont(codeFont);
         m_chatDisplay->ApplyTheme(m_appState->GetTheme());
 
@@ -2128,6 +2139,56 @@ private:
     // Normal because the model's final answer is the message, and
     // StreamError because OnAssistantError already showed friendly
     // error text before unwinding the loop.
+    // Receipt check (answer_receipts.h): flag long hex values in the final
+    // reply that appear in no tool result, user message, or spilled tool
+    // output file of this chat.  Display-only notice; never sent to the model.
+    void RunAnswerReceiptCheck()
+    {
+        if (!m_chatHistory || !m_chatDisplay) return;
+        const auto& msgs = m_chatHistory->GetMessages();
+        if (msgs.empty() || !msgs.back()) return;
+
+        auto stringField = [](const Poco::JSON::Object::Ptr& m, const char* key) {
+            try {
+                if (m && m->has(key) && m->get(key).isString())
+                    return m->getValue<std::string>(key);
+            } catch (...) {}
+            return std::string();
+        };
+        if (stringField(msgs.back(), "role") != "assistant") return;
+
+        std::vector<std::string> tokens = answer_receipts::ExtractHexTokens(
+            answer_receipts::StripThinkBlocks(stringField(msgs.back(), "content")));
+        if (tokens.empty()) return;
+
+        std::vector<std::string> evidence;
+        evidence.reserve(msgs.size());
+        for (size_t i = 0; i + 1 < msgs.size(); ++i) {
+            const std::string content = stringField(msgs[i], "content");
+            if (content.empty()) continue;
+            evidence.push_back(answer_receipts::EvidenceFromMessage(
+                stringField(msgs[i], "role"), content));
+        }
+        std::vector<std::string> unbacked = answer_receipts::FindUnbacked(tokens, evidence);
+        if (unbacked.empty()) return;
+
+        // Large results reach history only as a Vars\ handle card; their
+        // full text lives in these lanes.
+        std::vector<std::filesystem::path> dirs;
+        const std::string ws = BuildToolContext().cwd;
+        if (!ws.empty()) {
+            dirs.push_back(LbUtf8FsPath(ws) / "Vars");
+            const std::string chat = chat_folders::ChatFolderFromWorkspaceCwd(ws);
+            const std::filesystem::path base = LbUtf8FsPath(chat.empty() ? ws : chat);
+            dirs.push_back(base / "ToolOutputs");
+            dirs.push_back(base / "Web Pages");
+        }
+        answer_receipts::RemoveTokensFoundInFiles(unbacked, dirs);
+
+        const std::string notice = answer_receipts::FormatNotice(unbacked);
+        if (!notice.empty()) m_chatDisplay->DisplaySystemNotice(notice);
+    }
+
     void OnAgentLoopEnd(AgentEndReason     reason,
                         const std::string& userFacingMessage) override
     {
@@ -2139,6 +2200,7 @@ private:
         ResetAgentToolStreamFilter();
         SetStreamingState(false);
         m_chatDisplay->ClearFilePersistenceContext();
+        if (reason == AgentEndReason::Normal) RunAnswerReceiptCheck();
         if (!m_chatHistory->IsEmpty())
             m_convController->AutoSaveConversation();
 
@@ -4411,6 +4473,37 @@ private:
                 return;
             }
             sourceFolder = std::string(fn.GetPath().ToUTF8().data());
+
+            // A SKILL.md sitting loose in Downloads or on the Desktop would
+            // otherwise import its whole folder.  Offer the file alone.
+            std::string foreign;
+            if (ProjectManager::DescribeNonSkillEntries(sourceFolder,
+                                                        foreign)) {
+                wxMessageDialog ask(
+                    this,
+                    wxString::FromUTF8(
+                        "This SKILL.md is in a folder that also holds things "
+                        "a Skill folder would not (" + foreign + ").\n\n"
+                        "Import just this SKILL.md as a new Skill? Nothing "
+                        "else from the folder will be copied.\n\n"
+                        "Choose Whole folder only if that folder really is "
+                        "the Skill."),
+                    "Import Skill",
+                    wxYES_NO | wxCANCEL | wxYES_DEFAULT | wxICON_QUESTION);
+                ask.SetYesNoCancelLabels("Just SKILL.md", "Whole folder",
+                                         "Cancel");
+                const int choice = ask.ShowModal();
+                if (choice == wxID_CANCEL) return;
+                if (choice == wxID_YES) {
+                    if (!ProjectManager::StageSkillDocOnlyToTemp(
+                            picked, tempRoot, sourceFolder, error)) {
+                        wxMessageBox(wxString::FromUTF8(error.c_str()),
+                                     "Import Skill", wxOK | wxICON_ERROR,
+                                     this);
+                        return;
+                    }
+                }
+            }
         }
 
         const auto cleanupTemp = [&tempRoot]() {

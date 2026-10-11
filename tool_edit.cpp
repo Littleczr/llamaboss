@@ -590,8 +590,10 @@ EditResult EditFile(const std::string& argsBlob,
     // directory chain before touching the target. Reparse points fail closed.
     tool_mutation_guard::Guard mutation;
     if (!mutation.Begin(resolved)) {
-        r.chips.push_back("blocked");
+        r.chips.push_back(mutation.MissingFolder() ? "failed" : "blocked");
         r.errorBody = mutation.Error();
+        if (mutation.MissingFolder())
+            r.errorBody += tool_path_safety::ConversationLaneWriteHint(parsed.path, ctx.cwd);
         r.chips.push_back(ElapsedChip(t0));
         return r;
     }

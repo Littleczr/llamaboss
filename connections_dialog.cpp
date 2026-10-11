@@ -447,9 +447,10 @@ ConnectionsDialog::ConnectionsDialog(wxWindow* parent,
     auto* root = new wxBoxSizer(wxVERTICAL);
 
     auto* help = new wxStaticText(this, wxID_ANY,
-        "Stored API keys for service skills. Skills running through "
-        "python_run_script see these as environment variables named "
-        "<PROVIDER>_<KEY> (e.g. GMAIL_API_KEY).");
+        "Stored API keys for service skills. A Skill's scripts receive a "
+        "key as an environment variable named <PROVIDER>_<KEY> (e.g. "
+        "GMAIL_API_KEY) only when its SKILL.md lists that provider under "
+        "## Connections (e.g. - gmail).");
     help->Wrap(540);
     root->Add(help, 0, wxALL, 12);
 

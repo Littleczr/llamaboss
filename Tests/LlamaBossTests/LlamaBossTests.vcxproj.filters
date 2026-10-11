@@ -33,6 +33,9 @@
     <ClCompile Include="var_store_tests.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="skill_connections_tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="..\..\path_safety.cpp">
       <Filter>Production Sources</Filter>
     </ClCompile>

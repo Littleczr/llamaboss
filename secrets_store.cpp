@@ -691,10 +691,10 @@ SecretsStore::ListConnections() const
 
 // ─── Worker integration ─────────────────────────────────────────
 
-std::vector<std::pair<std::string, std::string>>
-SecretsStore::BuildEnvInjections() const
+std::vector<SecretsStore::EnvInjection>
+SecretsStore::BuildEnvInjectionSnapshot() const
 {
-    std::vector<std::pair<std::string, std::string>> out;
+    std::vector<EnvInjection> out;
     std::set<std::string> emittedEnvNames;
 
     for (const auto& [provider, kvs] : m_providers) {
@@ -711,7 +711,8 @@ SecretsStore::BuildEnvInjections() const
                 continue;
             }
 
-            out.emplace_back(std::move(envName), std::move(value));
+            out.push_back(EnvInjection{ provider, std::move(envName),
+                                        std::move(value) });
         }
     }
     return out;

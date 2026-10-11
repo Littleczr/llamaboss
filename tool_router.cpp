@@ -15,6 +15,8 @@
 #include "tool_mkdir.h"
 #include "tool_edit.h"
 #include "tool_delete.h"
+#include "tool_copy.h"
+#include "tool_hash.h"
 #include "tool_notes.h"
 #include "reminder_store.h"
 #include "tool_web_fetch.h"
@@ -769,7 +771,20 @@ DispatchOutcome DoGrep(const ToolInvocation& inv,
     out.result.toolTag       = tool_names::kGrep;
     out.result.invocationRaw = inv.rawBlock;
     out.result.toolName      = "Grep";
-    out.result.commandEcho   = MakeCommandEcho(inv.name, inv.args);
+    // Native calls arrive as "@context=N\n<pattern>\n<path>"; echoing that
+    // raw put "/grep @context=0" on failed cards and hid the pattern.  Show
+    // the user-facing spelling on every path, including parse failures.
+    {
+        std::string flat = inv.args;
+        if (flat.rfind("@context=", 0) == 0) {
+            const size_t nl = flat.find('\n');
+            const std::string n = flat.substr(9, nl == std::string::npos ? std::string::npos : nl - 9);
+            flat = (nl == std::string::npos) ? std::string() : flat.substr(nl + 1);
+            if (!n.empty() && n != "0") flat = "-C " + n + "\n" + flat;
+        }
+        for (char& c : flat) if (c == '\n' || c == '\r') c = ' ';
+        out.result.commandEcho = MakeCommandEcho(inv.name, Trim(flat));
+    }
 
     if (!deps.grepExec) {
         out.status            = DispatchStatus::Invalid;
@@ -789,6 +804,16 @@ DispatchOutcome DoGrep(const ToolInvocation& inv,
     if (!parsed.path.empty()) {
         target = ResolveProjectFileArgForSinglePathTool(parsed.path, ctx);
     }
+
+    std::ostringstream echoBuilder;
+    echoBuilder << "/grep ";
+    if (parsed.contextLines > 0)
+        echoBuilder << "-C " << parsed.contextLines << ' ';
+    echoBuilder << parsed.pattern;
+    if (!parsed.path.empty()) echoBuilder << ' ' << target;
+    const std::string echo = echoBuilder.str();
+    out.result.commandEcho = echo;
+
     std::string resolved = tool_path_safety::ResolveReadOnlyToolPath(
         target, ctx.cwd, ctx.activeProjectRoot);
     if (resolved.empty()) {
@@ -801,14 +826,6 @@ DispatchOutcome DoGrep(const ToolInvocation& inv,
         out.result.errorBody  = "Path not found: " + resolved;
         return out;
     }
-
-    std::ostringstream echoBuilder;
-    echoBuilder << "/grep ";
-    if (parsed.contextLines > 0)
-        echoBuilder << "-C " << parsed.contextLines << ' ';
-    echoBuilder << parsed.pattern;
-    if (!parsed.path.empty()) echoBuilder << ' ' << target;
-    const std::string echo = echoBuilder.str();
 
     if (!deps.grepExec->Start(parsed.pattern, resolved, echo, ctx,
                               parsed.contextLines)) {
@@ -921,10 +938,11 @@ inline std::string PowerShellRejectionHint(const std::string& cmdRaw)
     if (head == "cp"  || head == "copy" ||
         head == "mv"  || head == "move" ||
         head == "ren" || head == "rename") {
-        return "\n\nHint: To produce a new file with "
-               "specific content, use <name>write</name>. There is no native copy/move "
-               "tool; if you need to duplicate an existing file, read its contents and "
-               "write them to the new path. Broader shell automation may require approval.";
+        return "\n\nHint: To duplicate a file, use <name>copy</name> with the source on "
+               "line 1 and the destination on line 2 (add a line \"overwrite\" to replace "
+               "an existing file); it copies byte-for-byte and verifies the SHA-256. Never "
+               "read a file and re-write its contents to copy it. There is no native move/"
+               "rename tool; broader shell automation may require approval.";
     }
     if (head == "cd" || head == "chdir" || head == "set-location") {
         return "\n\nHint: The working directory is per-conversation and tools cannot "
@@ -2706,6 +2724,65 @@ DispatchOutcome DoDelete(const ToolInvocation& inv,
     return out;
 }
 
+// "/copy <source> -> <destination>" -- the args carry the two paths on
+// separate lines, which would read as one run-on path in the header.
+std::string CopyCommandEcho(const std::string& args)
+{
+    const tool_copy::Args a = tool_copy::ParseArgs(args);
+    if (!a.error.empty()) return MakeCommandEcho(tool_names::kCopy, FirstLine(args));
+    return "/copy " + a.source + " -> " + a.destination +
+           (a.overwrite ? " (overwrite)" : "");
+}
+
+DispatchOutcome DoCopy(const ToolInvocation& inv,
+                       const ToolContext&    ctx,
+                       const DispatchDeps&   /*deps*/)
+{
+    DispatchOutcome out = PreFill(inv, tool_names::kCopy, "Copy");
+    out.result.iconUtf8    = "\xF0\x9F\x93\x8B";   // 📋
+    out.result.commandEcho = CopyCommandEcho(inv.args);
+
+    CopyResult r = CopyFileExact(inv.args, ctx);
+    out.result.chips     = r.chips;
+    out.result.body      = r.body;
+    out.result.errorBody = r.errorBody;
+    out.result.bodyLang  = r.bodyLang;
+
+    if (!r.createdPath.empty()) {
+        PresentedFile file;
+        file.displayName = r.displayName.empty() ? std::string("copied file")
+                                                 : r.displayName;
+        file.diskPath    = r.createdPath;
+        file.sizeBytes   = r.sizeBytes;
+        file.lineCount   = r.lineCount;
+        out.result.presentedFiles.push_back(std::move(file));
+    }
+    return out;
+}
+
+DispatchOutcome DoHash(const ToolInvocation& inv,
+                       const ToolContext&    ctx,
+                       const DispatchDeps&   /*deps*/)
+{
+    DispatchOutcome out = PreFill(inv, tool_names::kHash, "Hash");
+    out.result.iconUtf8 = "\xF0\x9F\x94\x91";   // 🔑
+
+    tool_hash::Args a = tool_hash::ParseArgs(inv.args);
+    // Same project/Skill path aliases as read for the file being hashed.
+    const std::string path = a.path.empty()
+        ? a.path : ResolveProjectFileArgForSinglePathTool(a.path, ctx);
+    std::string echo = "/hash " + path;
+    if (!a.expected.empty()) echo += "  vs " + a.expected;
+    out.result.commandEcho = echo;
+
+    HashResult r = HashFile(a.expected.empty() ? path : path + "\n" + a.expected, ctx);
+    out.result.chips     = r.chips;
+    out.result.body      = r.body;
+    out.result.errorBody = r.errorBody;
+    out.result.bodyLang  = r.bodyLang;
+    return out;
+}
+
 DispatchOutcome DoNotesRead(const ToolInvocation& inv,
                             const ToolContext&    ctx,
                             const DispatchDeps&   /*deps*/)
@@ -3231,6 +3308,19 @@ bool ValDelete(const std::string& a, std::string& r) {
     return ValRequireNonEmpty(a, r,
         "delete requires a path in args");
 }
+bool ValCopy(const std::string& a, std::string& r) {
+    const tool_copy::Args parsed = tool_copy::ParseArgs(a);
+    if (!parsed.error.empty()) { r = parsed.error; return false; }
+    return true;
+}
+bool ValHash(const std::string& a, std::string& r) {
+    if (tool_hash::ParseArgs(a).path.empty()) {
+        r = "hash requires a file path (line 1); optional line 2 is an expected "
+            "SHA-256 or a second file path to compare";
+        return false;
+    }
+    return true;
+}
 
 bool ValNotesRead(const std::string& a, std::string& r) {
     if (!Trim(a).empty()) {
@@ -3341,14 +3431,14 @@ DispatchOutcome DoWebFetchUrl(const ToolInvocation& inv,
 
 constexpr const char* kSchemaRead = R"({
 "type":"object",
-"properties":{"path":{"type":"string","description":"File path to read for read-only inspection. Relative project paths such as PROJECT.md, src/main.cpp, Workflows/script.py, and Outputs/... resolve to the active project root when attached. Explicit conversation-lane paths such as Extracted/archive/file.cpp, Scripts/helper.py, Documents/report.md, PDFs/extracted.md, Word/document.md, ToolOutputs/output.txt, and Spreadsheets/report.xlsx resolve beside Workspace. Absolute local paths outside it are allowed when readable."}},
+"properties":{"path":{"type":"string","description":"File path to read for read-only inspection. Relative project paths such as PROJECT.md, src/main.cpp, Workflows/script.py, and Outputs/... resolve to the active project root when attached. Explicit conversation-lane paths such as Extracted/archive/file.cpp, Scripts/helper.py, Documents/report.md, PDFs/extracted.md, Word/document.md, ToolOutputs/output.txt, Web Pages/<fetched artifact>, and Spreadsheets/report.xlsx resolve beside Workspace. Absolute local paths outside it are allowed when readable."}},
 "required":["path"]
 })";
 
 constexpr const char* kSchemaReadHead = R"({
 "type":"object",
 "properties":{
-"path":{"type":"string","description":"File path to preview. Relative project paths resolve to the active project root when attached; explicit conversation-lane paths such as Extracted/archive/file.cpp, Scripts/helper.py, and ToolOutputs/output.txt resolve beside Workspace."},
+"path":{"type":"string","description":"File path to preview. Relative project paths resolve to the active project root when attached; explicit conversation-lane paths such as Extracted/archive/file.cpp, Scripts/helper.py, ToolOutputs/output.txt, and Web Pages/<fetched artifact> resolve beside Workspace."},
 "lines":{"type":"integer","description":"Number of leading lines to read. Defaults to 40. Maximum 500."}
 },
 "required":["path"]
@@ -3357,7 +3447,7 @@ constexpr const char* kSchemaReadHead = R"({
 constexpr const char* kSchemaReadRange = R"({
 "type":"object",
 "properties":{
-"path":{"type":"string","description":"File path to read. Relative project paths resolve to the active project root when attached; Workspace-relative paths such as Vars/... or an imported attachment filename resolve to Workspace; explicit conversation-lane paths such as Extracted/archive/file.cpp, Scripts/helper.py, and ToolOutputs/output.txt resolve beside Workspace."},
+"path":{"type":"string","description":"File path to read. Relative project paths resolve to the active project root when attached; Workspace-relative paths such as Vars/... or an imported attachment filename resolve to Workspace; explicit conversation-lane paths such as Extracted/archive/file.cpp, Scripts/helper.py, ToolOutputs/output.txt, and Web Pages/<fetched artifact> resolve beside Workspace."},
 "start":{"type":"integer","description":"Backward-compatible single-range first line (1-based, inclusive). Use with end when only one range is needed."},
 "end":{"type":"integer","description":"Backward-compatible single-range last line (inclusive). Use with start when only one range is needed."},
 "ranges":{"type":"array","description":"One or more non-contiguous line ranges to retrieve in one call. Ranges must be in ascending order and must not overlap. Prefer this field when evidence is at several locations. Maximum 20 ranges; each range and the combined requested span may contain at most 1000 lines. Oversized requests fail instead of being silently shortened. Ranges are 1-based and inclusive: after 1:500, continue with 501:1000.","minItems":1,"maxItems":20,"items":{"type":"object","properties":{"start":{"type":"integer","minimum":1,"description":"First line (1-based, inclusive)."},"end":{"type":"integer","minimum":1,"description":"Last line (inclusive; must be >= start)."}},"required":["start","end"]}}
@@ -3379,7 +3469,7 @@ constexpr const char* kSchemaGrep = R"({
 "type":"object",
 "properties":{
 "pattern":{"type":"string","description":"Literal text pattern to search for. Spaces are allowed and are matched literally; this is not a regex."},
-"path":{"type":"string","description":"Optional file or directory to search. Empty or omitted searches the current working directory recursively. Explicit conversation-lane paths such as Extracted/archive or ToolOutputs/output.txt resolve beside Workspace; absolute local paths are allowed for read-only search."},
+"path":{"type":"string","description":"Optional file or directory to search. Empty or omitted searches the current working directory recursively. Explicit conversation-lane paths such as Extracted/archive, ToolOutputs/output.txt, or Web Pages/<fetched artifact> resolve beside Workspace; absolute local paths are allowed for read-only search."},
 "context":{"type":"integer","minimum":0,"maximum":50,"description":"Optional number of surrounding lines to return before and after each match, equivalent to grep -C. Defaults to 0. Overlapping neighborhoods are merged."}
 },
 "required":["pattern"]
@@ -3562,6 +3652,25 @@ constexpr const char* kSchemaMkdir = R"({
 "required":["args"]
 })";
 
+constexpr const char* kSchemaCopy = R"({
+"type":"object",
+"properties":{
+"source":{"type":"string","description":"File to copy. Resolves like read: relative to the working directory or active project, an absolute local path, or a conversation lane path such as ToolOutputs/out.txt or Web Pages/<artifact>."},
+"destination":{"type":"string","description":"Destination file path. Restricted to trusted write roots like overwrite_file; the parent folder must exist. Executable/scriptable extensions are blocked."},
+"overwrite":{"type":"boolean","description":"Replace an existing destination file. Default false."}
+},
+"required":["source","destination"]
+})";
+
+constexpr const char* kSchemaHash = R"({
+"type":"object",
+"properties":{
+"path":{"type":"string","description":"File to hash. Resolves like read (relative, absolute local, or conversation lane paths)."},
+"expected":{"type":"string","description":"Optional. Either an expected SHA-256 (64 hex characters, any case) or a second file path; the result then states Match: True or False."}
+},
+"required":["path"]
+})";
+
 // edit uses structured {path, old_str, new_str}.  Same reasoning as
 // write — embedding the <<<OLD>>>...<<<NEW>>>... sentinel form inside a
 // JSON-escaped string is fragile.  The structured shape lets the model
@@ -3720,6 +3829,17 @@ std::vector<ToolSpec> BuildBuiltinSpecs()
             kSchemaLs,
             std::move(lsSafety),
             ValLs, DoLs);
+    }
+
+    {
+        ToolSafetyProfile hashSafety = ReadOnlySafety(
+            "Read-only SHA-256 of one file, streamed. Absolute local paths outside the cwd may be inspected when readable.");
+        hashSafety.dispatchOnWorker = true;
+        addBatchSafe(tool_names::kHash,
+            "Compute a file's SHA-256 and byte size. Give expected (a 64-hex digest or a second file path) to get a literal Match: True/False line. Use this for every hash check or comparison instead of writing a script, and quote its output rather than retyping digests.",
+            kSchemaHash,
+            std::move(hashSafety),
+            ValHash, DoHash);
     }
 
     {
@@ -3982,7 +4102,7 @@ std::vector<ToolSpec> BuildBuiltinSpecs()
             "Read-only image viewer. Validates local image files (extension, magic bytes, 20 MB cap) and attaches them to the next model request as vision input. Does not modify, convert, or upload files anywhere other than the active model endpoint.");
         viewImageSafety.dispatchOnWorker = true;
         addBatchSafe(tool_names::kViewImage,
-            "Look at image files on disk with your own vision: the images are attached to the conversation right after this tool result. Use this whenever the user wants pictures described, compared, read, or analyzed and those pictures are FILES rather than images pasted into the chat -- e.g. photos inside a .zip after zip_extract (pass the extracted folder or individual files), images saved by web_fetch_url, charts produced by a script, or images in any local folder. read cannot show images (it only returns a hex dump). Accepts files or folders; at most 8 images per call. Requires a vision-capable model.",
+            "Look at image files on disk with your own vision: the images are attached to the conversation right after this tool result. Use this whenever the user wants pictures described, compared, read, or analyzed and those pictures are FILES rather than images pasted into the chat -- e.g. photos inside a .zip after zip_extract (pass the extracted folder or individual files), images saved by web_fetch_url, charts produced by a script, or images in any local folder. read cannot show images (it only returns a hex dump). Accepts files or folders; at most 8 images per call. Requires a vision-capable model. The user does NOT see these images; to show an image to the user, put ![label](absolute path) on its own line in your reply.",
             kSchemaViewImage,
             std::move(viewImageSafety),
             ValViewImage, DoViewImage);
@@ -4007,8 +4127,9 @@ std::vector<ToolSpec> BuildBuiltinSpecs()
         // approval-free and may write .py files into the project
         // Workflows folder and the Skills folder, both of which this
         // tool runs from.  At Moderate, write + python_run_script would
-        // execute arbitrary code (with every Connection key injected
-        // into its environment) without a single approval card.  The
+        // execute arbitrary code (with the owning Skill's declared
+        // Connection keys in its environment) without a single
+        // approval card.  The
         // one-shot carry-forward from python_create_script still skips
         // the second card, and "approve" (trust for this chat) still
         // applies.
@@ -4089,6 +4210,12 @@ std::vector<ToolSpec> BuildBuiltinSpecs()
         kSchemaMkdir,
         MutatingCwdSafety("Creates directories recursively. Controlled write scoped to trusted write roots."),
         ValMkdir, DoMkdir);
+
+    add(tool_names::kCopy,
+        "Copy one file byte-for-byte into a trusted write root and verify the copy by SHA-256. Use this whenever a file must be duplicated or made byte-identical to another file; never read a file and re-write its contents for that.",
+        kSchemaCopy,
+        MutatingCwdSafety("Copies one file byte-for-byte; the destination passes the same gates as overwrite_file (trusted write roots, executable extensions blocked) and is SHA-256 verified."),
+        ValCopy, DoCopy);
 
     add(tool_names::kEdit,
         "Replace a unique text block in an existing file.",
@@ -4301,6 +4428,8 @@ std::vector<ToolSpec> BuildBuiltinSpecs()
         { tool_names::kMkdir,                "\xE2\x9E\x95",     "Mkdir" },                   // ➕
         { tool_names::kEdit,                 "\xE2\x9C\x8F",     "Edit" },                    // ✏
         { tool_names::kDelete,               "\xF0\x9F\x97\x91", "Delete" },                  // 🗑
+        { tool_names::kCopy,                 "\xF0\x9F\x93\x8B", "Copy" },                    // 📋
+        { tool_names::kHash,                 "\xF0\x9F\x94\x91", "Hash" },                    // 🔑
         { tool_names::kNotesRead,            "\xF0\x9F\x93\x92", "Notes" },                   // 📒
         { tool_names::kNotesAppend,          "\xF0\x9F\x93\x92", "Notes" },                   // 📒
         { tool_names::kReminderCreate,       "\xE2\x8F\xB0",     "Reminder" },                  // ⏰

@@ -151,3 +151,15 @@ WriteResult OverwriteFileContent(const std::string& argsBlob,
 // never executed by this function.
 WriteResult WritePowerShellScriptFile(const std::string& argsBlob,
                                       const ToolContext& ctx);
+
+// Byte-exact write used by the copy tool: `bytes` land on disk unchanged
+// (no trailing-newline normalization, no Python syntax gate).  Every other
+// safety gate is the same as write/overwrite_file: trusted-write-root
+// containment, mutation guard, filename sanitization, the risky-extension
+// block, parent must exist, staged temp file + atomic promote.  Refuses an
+// existing target unless `overwriteExisting`.  Cap: kExactWriteMaxBytes.
+constexpr size_t kExactWriteMaxBytes = 64 * 1024 * 1024;  // 64 MiB
+WriteResult WriteExactBytes(const std::string& requestedPath,
+                            const std::string& bytes,
+                            const ToolContext& ctx,
+                            bool overwriteExisting);

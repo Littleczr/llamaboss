@@ -54,6 +54,8 @@ namespace tool_names {
     constexpr const char* kMkdir      = "mkdir";
     constexpr const char* kEdit       = "edit";
     constexpr const char* kDelete     = "delete";
+    constexpr const char* kCopy       = "copy";
+    constexpr const char* kHash       = "hash";
     constexpr const char* kNotesRead   = "notes_read";
     constexpr const char* kNotesAppend = "notes_append";
     constexpr const char* kProjectNotesRead   = "project_notes_read";

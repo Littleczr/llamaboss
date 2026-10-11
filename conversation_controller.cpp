@@ -163,6 +163,8 @@ static std::string ToolNameFromTag(const std::string& tag)
     if (t == "edit")       return "Edit";
     if (t == "mkdir")      return "Mkdir";
     if (t == "delete")     return "Delete";
+    if (t == "copy")       return "Copy";
+    if (t == "hash")       return "Hash";
 
     if (tag.empty()) return "Tool";
     std::string out = tag;
@@ -189,6 +191,8 @@ static std::string ToolIconFromTag(const std::string& tag)
     if (t == "edit")       return "\xE2\x9C\x8E";           // ✎
     if (t == "mkdir")      return "\xF0\x9F\x93\x81";       // 📁
     if (t == "delete")     return "\xF0\x9F\x97\x91";       // 🗑
+    if (t == "copy")       return "\xF0\x9F\x93\x8B";       // 📋
+    if (t == "hash")       return "\xF0\x9F\x94\x91";       // 🔑
     return "\xF0\x9F\x9B\xA0";                              // 🛠
 }
 

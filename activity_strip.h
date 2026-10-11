@@ -45,7 +45,11 @@ public:
 
     wxPanel* GetPanel() const { return m_panel; }
 
-    // Show the strip and start the 1 Hz clock.
+    // Start tracking a task.  The strip itself appears only once the task
+    // has run for kRevealDelayMs: every async tool in an agent loop is
+    // bracketed by Begin/End, and showing a 24 px row for a 200 ms
+    // PowerShell call resized the transcript twice per tool (the
+    // up/down bounce while LlamaBoss works).  Then a 1 Hz clock.
     //   title      — e.g. "Running powershell", "Waiting"
     //   limitSec   — 0 for none; otherwise rendered as "elapsed / limit"
     //   countdown  — true for the wait tool (progress = elapsed/limit and
@@ -67,6 +71,9 @@ public:
     // not active.  Short tool calls in an agent loop must not nag.
     static constexpr double kAttentionAfterSec = 20.0;
 
+    // How long a task must run before the strip is shown at all.
+    static constexpr int kRevealDelayMs = 750;
+
     void ApplyTheme(const ThemeData& theme);
 
 private:
@@ -79,6 +86,7 @@ private:
     };
 
     void OnTick();
+    void Reveal();
     void Render();
     void UpdateTaskbar();
 
@@ -89,6 +97,7 @@ private:
     Ticker        m_ticker;
 
     bool        m_active     = false;
+    bool        m_shown      = false;  // panel visible (past the reveal delay)
     bool        m_countdown  = false;
     int         m_limitSec   = 0;
     int         m_percent    = -1;     // -1 = unknown → indeterminate

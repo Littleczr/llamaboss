@@ -129,9 +129,19 @@ void ActivityStrip::Begin(const std::string& title, int limitSec,
     m_liveLine.clear();
     m_startedAt = std::chrono::steady_clock::now();
 
+    // Back-to-back tasks: a strip that is already up stays up (no
+    // hide/show flicker).  Otherwise wait out the reveal delay; quick
+    // tools finish first and never touch the layout.
+    Render();
+    m_ticker.Start(m_shown ? 1000 : kRevealDelayMs);
+}
+
+void ActivityStrip::Reveal()
+{
+    if (!m_active || m_shown) return;
+    m_shown = true;
     m_panel->Show();
     if (auto* parent = m_panel->GetParent()) parent->Layout();
-
     Render();
     m_ticker.Start(1000);
 }
@@ -153,8 +163,11 @@ void ActivityStrip::End()
     m_ticker.Stop();
     m_active = false;
 
-    m_panel->Hide();
-    if (auto* parent = m_panel->GetParent()) parent->Layout();
+    if (m_shown) {
+        m_shown = false;
+        m_panel->Hide();
+        if (auto* parent = m_panel->GetParent()) parent->Layout();
+    }
 
     // Taskbar: clear progress; nudge if the user is elsewhere.  A 15-minute
     // download finishing while the window is buried is exactly the moment
@@ -182,6 +195,7 @@ double ActivityStrip::ElapsedSec() const
 void ActivityStrip::OnTick()
 {
     if (!m_active) return;
+    if (!m_shown) { Reveal(); return; }
     Render();
 }
 
@@ -228,7 +242,9 @@ void ActivityStrip::Render()
 void ActivityStrip::UpdateTaskbar()
 {
 #if defined(__WXMSW__) && wxUSE_TASKBARBUTTON
-    if (!m_frame) return;
+    // Same reveal rule as the strip: no taskbar progress flash for tools
+    // that finish before the strip would have appeared.
+    if (!m_frame || !m_shown) return;
     auto* tb = m_frame->MSWGetTaskBarButton();
     if (!tb) return;
 

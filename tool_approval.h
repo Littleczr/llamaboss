@@ -22,6 +22,7 @@
 #include "tool_path.h"
 #include "tool_path_safety.h"
 #include "tool_router.h"     // GetGlobalRouter() for ClassifyTier lookup
+#include "tool_copy.h"       // tool_copy::ParseArgs (destination for grants)
 #include "server_manager.h"
 
 #include <algorithm>
@@ -144,6 +145,27 @@ inline std::string CommandEcho(const ToolInvocation& inv)
     if (inv.name == tool_names::kPythonInstallPackage)
         return Trim(inv.args).empty() ? std::string("/python_install_package")
                                       : ("/python_install_package " + Trim(inv.args));
+    if (inv.name == tool_names::kGrep) {
+        // Native projection: "@context=N\n<pattern>\n<path>".  Render it the
+        // way a user would type it so pending/failed cards show the pattern.
+        std::string flat = inv.args;
+        if (flat.rfind("@context=", 0) == 0) {
+            const size_t nl = flat.find('\n');
+            const std::string n = flat.substr(9, nl == std::string::npos ? std::string::npos : nl - 9);
+            flat = (nl == std::string::npos) ? std::string() : flat.substr(nl + 1);
+            if (!n.empty() && n != "0") flat = "-C " + n + "\n" + flat;
+        }
+        for (char& c : flat) if (c == '\n' || c == '\r') c = ' ';
+        flat = Trim(flat);
+        return flat.empty() ? std::string("/grep") : ("/grep " + flat);
+    }
+    if (inv.name == tool_names::kCopy) {
+        const tool_copy::Args a = tool_copy::ParseArgs(inv.args);
+        if (a.error.empty())
+            return "/copy " + a.source + " -> " + a.destination +
+                   (a.overwrite ? " (overwrite)" : "");
+        return "/copy " + FirstLine(Trim(inv.args));
+    }
     if (inv.name == tool_names::kWrite || inv.name == tool_names::kOverwriteFile || inv.name == tool_names::kWritePowerShellScript || inv.name == tool_names::kEdit) {
         std::string first = FirstLine(inv.args);
         return first.empty() ? ("/" + inv.name) : ("/" + inv.name + " " + first);
@@ -355,6 +377,17 @@ inline std::string PreviewForInvocation(const ToolInvocation& inv,
         return p.str();
     }
 
+    if (inv.name == tool_names::kCopy) {
+        const tool_copy::Args a = tool_copy::ParseArgs(inv.args);
+        targetOut = ResolveTargetForPreview(a.destination, ctx);
+        p << "Source: " << a.source << "\n"
+          << "Destination: " << targetOut << "\n"
+          << (a.overwrite ? "Replaces the destination if it exists.\n"
+                          : "Refuses an existing destination.\n")
+          << "Copies bytes unchanged and verifies the SHA-256 afterwards.";
+        return p.str();
+    }
+
     if (inv.name == tool_names::kPowerShell) {
         targetOut = "PowerShell";
         p << "Command:\n" << inv.args;
@@ -449,7 +482,7 @@ inline std::string PreviewForInvocation(const ToolInvocation& inv,
           << "Conversation Scripts fallback: " << ScriptPreviewPath(inv.args, ctx.cwd) << "\n"
           << "Working directory: " << ctx.cwd << "\n"
           << "Runs one existing .py script from the conversation Scripts folder, the active project's Workflows folder, or the LlamaBoss Skills folder (bare names are looked up in that order). "
-          << "Configured Connection API keys are injected as environment variables. "
+          << "Only the Connection keys declared in the script's own SKILL.md or WORKFLOW.md (## Connections) are passed as environment variables; scripts in this chat's Scripts folder get none. "
           << "Captures stdout, stderr, exit code, runtime, and attaches newly created files under the LlamaBoss root as artifact cards.\n\n"
           << "Request:\n" << LimitText(Trim(inv.args), 600);
         return p.str();
@@ -467,6 +500,7 @@ inline std::string ApprovalActionVerb(const ToolInvocation& inv)
     if (inv.name == tool_names::kOverwriteFile) return "overwrite it";
     if (inv.name == tool_names::kWritePowerShellScript) return "write it";
     if (inv.name == tool_names::kMkdir) return "create it";
+    if (inv.name == tool_names::kCopy) return "copy it";
     if (inv.name == tool_names::kEdit) return "edit it";
     if (inv.name == tool_names::kDelete) return "delete it";
     return "run it";
@@ -479,7 +513,8 @@ inline bool IsNativePathMutation(const std::string& name)
            name == tool_names::kWritePowerShellScript ||
            name == tool_names::kEdit ||
            name == tool_names::kMkdir ||
-           name == tool_names::kDelete;
+           name == tool_names::kDelete ||
+           name == tool_names::kCopy;
 }
 
 inline bool RequestedMutationPath(const ToolInvocation& inv,
@@ -504,6 +539,15 @@ inline bool RequestedMutationPath(const ToolInvocation& inv,
     if (inv.name == tool_names::kMkdir ||
         inv.name == tool_names::kDelete) {
         requestedOut = Trim(inv.args);
+        return !requestedOut.empty();
+    }
+
+    // copy: the grant is about WHERE bytes land, so only the destination
+    // matters; the source is read-style and may be anywhere readable.
+    if (inv.name == tool_names::kCopy) {
+        const tool_copy::Args a = tool_copy::ParseArgs(inv.args);
+        if (!a.error.empty()) return false;
+        requestedOut = a.destination;
         return !requestedOut.empty();
     }
 
@@ -650,7 +694,7 @@ inline bool RequiresApproval(const ToolInvocation& inv,
     }
     else if (inv.name == tool_names::kPythonRunScript) {
         out.required = true;
-        out.reason = "Runs a Python script with full local file and network access. Every configured Connection API key is injected into its environment. Scripts in the project Workflows and Skills folders can be changed by write/overwrite_file/edit without approval, so review the script before approving.";
+        out.reason = "Runs a Python script with full local file and network access. It receives only the Connection keys its own SKILL.md or WORKFLOW.md declares (## Connections); scripts in this chat's Scripts folder receive none. Scripts in the project Workflows and Skills folders can be changed by write/overwrite_file/edit without approval, so review the script before approving.";
     }
     else if (inv.name == tool_names::kPy) {
         out.required = true;

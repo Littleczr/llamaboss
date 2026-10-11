@@ -23,6 +23,7 @@
 #include "tool_router.h"       // BuildToolsArrayJson, GetGlobalRouter
 #include "tool_approval.h"     // approval cards
 #include "tool_call_elision.h"  // copied-elision-marker guard
+#include "lb_sha256.h"          // standalone-write repeat key
 
 #include "lb_windows.h"
 
@@ -346,6 +347,48 @@ bool AgentReadNativePowerShellTimeout(const std::string& argsJson,
         errorOut = "PowerShell timeout_seconds could not be parsed.";
         return false;
     }
+}
+
+// grep matches one line at a time, so a native pattern that carries a line
+// break can never match as written.  Worse, the legacy projection is
+// line-delimited ("@context=N\n<pattern>\n<path>"), so an embedded newline
+// would silently split one pattern into pattern + path and search for the
+// wrong thing.  Reject it before projection with a reason the model can act
+// on.  The arguments are valid JSON, so the native sidecar stays safe to
+// persist, exactly like the PowerShell timeout rejection above.
+bool AgentNativeGrepHasLineBreak(const std::string& argsJson,
+                                 std::string&       errorOut)
+{
+    errorOut.clear();
+    try {
+        Poco::JSON::Parser parser;
+        auto var = parser.parse(argsJson.empty() ? std::string("{}") : argsJson);
+        Poco::JSON::Object::Ptr obj = var.extract<Poco::JSON::Object::Ptr>();
+        if (!obj) return false;
+        for (const char* key : { "pattern", "path" }) {
+            if (!obj->has(key)) continue;
+            std::string value;
+            try { value = obj->getValue<std::string>(key); }
+            catch (...) { continue; }
+            // Leading/trailing line breaks are harmless (the grep parser
+            // trims them), so only an interior break is rejected.
+            value = AgentTrimAsciiWhitespace(value);
+            if (value.find_first_of("\r\n") == std::string::npos) continue;
+            if (std::string(key) == "pattern") {
+                errorOut = "grep pattern contains a line break; no tool was "
+                           "executed. grep matches one line at a time, so a "
+                           "multi-line pattern can never match. Search for one "
+                           "distinctive line of the text, or run one grep per line.";
+            } else {
+                errorOut = "grep path contains a line break; no tool was "
+                           "executed. Pass a single file or folder path.";
+            }
+            return true;
+        }
+    } catch (...) {
+        // Unparseable JSON is already rejected earlier in the pipeline.
+    }
+    return false;
 }
 
 // XML/local models use a transport that has no named argument fields.  Allow
@@ -971,11 +1014,16 @@ ToolInvocationResult MakeAsyncLaunchErrorResult(const ToolInvocation& inv,
 // then running a workflow script. Project chats can still terminate normally
 // when the model emits final prose after the write result.
 //
-// Stop only on the SECOND successful write of the same artifact in one turn.
-// Stopping after the first write would cut capable models' multi-step plans
-// short (a solo overwrite followed by a planned ZIP step).  The loop this
-// guards against is a re-write of the same file, so the repeat is the signal.
-// `writtenThisTurn` records each first successful write (lowercased: Windows
+// Stop only on the SECOND successful write of the same artifact WITH THE SAME
+// CONTENT in one turn.  Stopping after the first write would cut capable
+// models' multi-step plans short (a solo overwrite followed by a planned ZIP
+// step).  The loop this guards against re-writes identical bytes, so that
+// repeat is the signal.  A second write with DIFFERENT content is a
+// correction and must not end the turn: GPT-6 Luna overwrote a staging
+// version.json with the wrong copy, immediately corrected it, and this stop
+// fired on the correction -- replacing the rest of a two-step request with a
+// synthetic "I have updated version.json."  `writtenThisTurn` records
+// "<lowercased path>|<content sha256>" for each successful write (Windows
 // paths are case-insensitive).
 bool IsSuccessfulStandaloneWrite(const ToolInvocation& inv,
                                  const ToolInvocationResult& r,
@@ -1004,6 +1052,13 @@ bool ShouldStopAfterStandaloneWriteArtifact(const ToolInvocation& inv,
     std::string key = f.diskPath.empty() ? f.displayName : f.diskPath;
     std::transform(key.begin(), key.end(), key.begin(),
                    [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+    {
+        // write/overwrite_file args: path on line 1, content after it.
+        const size_t nl = inv.args.find('\n');
+        const std::string content = nl == std::string::npos ? std::string()
+                                                            : inv.args.substr(nl + 1);
+        key += "|" + lb_sha256::HexOf(content);
+    }
 
     if (std::find(writtenThisTurn.begin(), writtenThisTurn.end(), key) !=
         writtenThisTurn.end()) {
@@ -2761,6 +2816,17 @@ std::vector<ToolInvocation> AgentController::ParseStructuredToolCalls(
             }
         }
 
+        if (inv.name == tool_names::kGrep) {
+            std::string grepError;
+            if (AgentNativeGrepHasLineBreak(argsRaw, grepError)) {
+                inv.args.clear();
+                inv.valid = false;
+                inv.invalidReason = grepError;
+                out.push_back(std::move(inv));
+                continue;
+            }
+        }
+
         // Copied elision marker: checked on the RAW arguments so a
         // marker in any field -- projected or not -- is caught before
         // projection, approval or execution.  Routed as an ordinary
@@ -3003,6 +3069,39 @@ std::string AgentController::ProjectStructuredArgs(
         toolName == tool_names::kDelete) {
         std::string path = getPathLike();
         if (!path.empty()) return path;
+    }
+
+    // ── copy: {source, destination, overwrite?} → "src\ndst[\noverwrite]"
+    // Common aliases (src/dst, from/to) are accepted so a reasonable
+    // first attempt does not burn a malformed-call strike.
+    if (toolName == tool_names::kCopy) {
+        std::string src = getStr("source");
+        if (src.empty()) src = getStr("src");
+        if (src.empty()) src = getStr("from");
+        std::string dst = getStr("destination");
+        if (dst.empty()) dst = getStr("dest");
+        if (dst.empty()) dst = getStr("dst");
+        if (dst.empty()) dst = getStr("to");
+        if (!src.empty() && !dst.empty()) {
+            bool overwrite = false;
+            if (obj->has("overwrite")) {
+                try { overwrite = obj->getValue<bool>("overwrite"); }
+                catch (...) {
+                    const std::string v = getStr("overwrite");
+                    overwrite = (v == "true" || v == "True" || v == "1");
+                }
+            }
+            return src + "\n" + dst + (overwrite ? "\noverwrite" : "");
+        }
+    }
+
+    // ── hash: {path, expected?} → "path[\nexpected]" ─────────────
+    if (toolName == tool_names::kHash) {
+        std::string path = getPathLike();
+        std::string expected = getStr("expected");
+        if (expected.empty()) expected = getStr("sha256");
+        if (expected.empty()) expected = getStr("compare_to");
+        if (!path.empty()) return expected.empty() ? path : path + "\n" + expected;
     }
 
     // ── view_image: {paths:[...]} / {path} / {paths:"a"} → one per line
@@ -3555,6 +3654,12 @@ bool AgentController::HandlePythonComplete(const PythonRunResult& pythonResult)
     if (!pythonResult.pythonCommand.empty())
         chips.push_back(pythonResult.pythonCommand);
     if (pythonResult.truncated) chips.push_back("truncated");
+    if (!pythonResult.connectionsPassed.empty()) {
+        std::string keys = "keys: ";
+        for (size_t i = 0; i < pythonResult.connectionsPassed.size(); ++i)
+            keys += (i ? ", " : "") + pythonResult.connectionsPassed[i];
+        chips.push_back(keys);
+    }
 
     // Presentation comes from the spec's kPresentation row via the
     // router-backed tool_approval helpers.  This replaces the
