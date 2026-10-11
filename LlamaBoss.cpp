@@ -78,6 +78,7 @@
 #include "project_context_builder.h"
 #include "tool_result_controller.h"
 #include "reminder_store.h"
+#include "tool_notes.h"        // GetNotesRootDir
 #include "skill_draft_controller.h"
 #include "project_controller.h"
 #include "ascii_animation.h"
@@ -87,7 +88,7 @@
 #include "chat_folders.h"
 
 // ─── Application version ─────────────────────────────────────
-static const char* LLAMABOSS_VERSION = "0.1.22";
+static const char* LLAMABOSS_VERSION = "0.1.23";
 
 // Native menu command ids. Keep above wxID_HIGHEST to avoid collisions
 // with stock wxWidgets commands.
@@ -3856,6 +3857,9 @@ private:
         // helper scripts in place instead of being forced to create stray
         // one-off workspace scripts.
         ctx.skillsRoot = ProjectManager::GetSkillsDir();
+        // Notes folder: not a write root, but folder grants targeting it
+        // cover the whole folder (see RequiresWriteRootGrant).
+        ctx.notesRoot = GetNotesRootDir();
         ctx.additionalWriteRoots = m_chatHistory->GetChatWriteRoots();
         return ctx;
     }

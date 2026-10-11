@@ -52,8 +52,8 @@ enum class RiskTier {
     // directory; python_run_script runs a .py whose source was
     // already reviewed when python_create_script's approval card was
     // rendered, or lives as an optional helper in an active project
-    // Workflows folder; notes_append / project_notes_append append
-    // one entry to a fixed user-owned NOTES.md.
+    // Workflows folder; notes_append appends one short capped fact
+    // to a file inside the fixed user-owned Notes folder.
     Moderate,
 
     // Irreversible, or carries arbitrary code-execution risk that

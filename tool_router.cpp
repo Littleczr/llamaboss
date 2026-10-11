@@ -2783,22 +2783,6 @@ DispatchOutcome DoHash(const ToolInvocation& inv,
     return out;
 }
 
-DispatchOutcome DoNotesRead(const ToolInvocation& inv,
-                            const ToolContext&    ctx,
-                            const DispatchDeps&   /*deps*/)
-{
-    DispatchOutcome out = PreFill(inv, tool_names::kNotesRead, "Notes");
-    out.result.iconUtf8    = "\xF0\x9F\x93\x92";   // 📒
-    out.result.commandEcho = "notes_read";
-
-    NotesResult r = NotesRead(ctx);
-    out.result.chips     = r.chips;
-    out.result.body      = r.body;
-    out.result.errorBody = r.errorBody;
-    out.result.bodyLang  = r.bodyLang;
-    return out;
-}
-
 DispatchOutcome DoNotesAppend(const ToolInvocation& inv,
                               const ToolContext&    ctx,
                               const DispatchDeps&   /*deps*/)
@@ -2870,38 +2854,6 @@ DispatchOutcome DoReminderCancel(const ToolInvocation& inv,
     return out;
 }
 
-
-DispatchOutcome DoProjectNotesRead(const ToolInvocation& inv,
-                                   const ToolContext&    ctx,
-                                   const DispatchDeps&   /*deps*/)
-{
-    DispatchOutcome out = PreFill(inv, tool_names::kProjectNotesRead, "Project Notes");
-    out.result.iconUtf8    = "\xF0\x9F\x93\x93";   // Project notes icon
-    out.result.commandEcho = "project_notes_read";
-
-    NotesResult r = ProjectNotesRead(ctx);
-    out.result.chips     = r.chips;
-    out.result.body      = r.body;
-    out.result.errorBody = r.errorBody;
-    out.result.bodyLang  = r.bodyLang;
-    return out;
-}
-
-DispatchOutcome DoProjectNotesAppend(const ToolInvocation& inv,
-                                     const ToolContext&    ctx,
-                                     const DispatchDeps&   /*deps*/)
-{
-    DispatchOutcome out = PreFill(inv, tool_names::kProjectNotesAppend, "Project Notes");
-    out.result.iconUtf8    = "\xF0\x9F\x93\x93";   // Project notes icon
-    out.result.commandEcho = FirstLineEcho("project_notes_append", inv.args);
-
-    NotesResult r = ProjectNotesAppend(inv.args, ctx);
-    out.result.chips     = r.chips;
-    out.result.body      = r.body;
-    out.result.errorBody = r.errorBody;
-    out.result.bodyLang  = r.bodyLang;
-    return out;
-}
 
 // ─── Per-tool validators ────────────────────────────────────────
 // Mirror the old ValidateToolArgs branches.  Shape-only; the heavy
@@ -3322,14 +3274,6 @@ bool ValHash(const std::string& a, std::string& r) {
     return true;
 }
 
-bool ValNotesRead(const std::string& a, std::string& r) {
-    if (!Trim(a).empty()) {
-        r = "notes_read does not accept args; it returns the full NOTES.md contents";
-        return false;
-    }
-    return true;
-}
-
 bool ValNotesAppend(const std::string& a, std::string& r) {
     return ValRequireNonEmpty(a, r,
         "notes_append requires the entry text in args");
@@ -3354,19 +3298,6 @@ bool ValReminderCancel(const std::string& a, std::string& r) {
         "reminder_cancel requires a reminder ID such as rem_123456789_1");
 }
 
-
-bool ValProjectNotesRead(const std::string& a, std::string& r) {
-    if (!Trim(a).empty()) {
-        r = "project_notes_read does not accept args; it returns the active project's Notes/NOTES.md contents";
-        return false;
-    }
-    return true;
-}
-
-bool ValProjectNotesAppend(const std::string& a, std::string& r) {
-    return ValRequireNonEmpty(a, r,
-        "project_notes_append requires the entry text in args");
-}
 
 bool ValWebFetchUrl(const std::string& a, std::string& r) {
     if (!ValRequireNonEmpty(a, r,
@@ -3696,14 +3627,9 @@ constexpr const char* kSchemaDelete = R"({
 "required":["args"]
 })";
 
-constexpr const char* kSchemaNotesRead = R"({
-"type":"object",
-"properties":{}
-})";
-
 constexpr const char* kSchemaNotesAppend = R"({
 "type":"object",
-"properties":{"args":{"type":"string","description":"Entry text to append to the user's NOTES.md. One short fact, path, preference, or named workflow in the user's own voice. Multi-line entries are allowed; an automatic dated header is added. Examples: 'Music library: D:\\Music', 'Mac mini share: \\\\\\\\macmini\\\\notes', 'When I say my LISA workflow I mean: 1) launch playwright, 2) ...'"}},
+"properties":{"args":{"type":"string","description":"One short fact to save in the user's notes: at most 300 characters and 3 lines (a path, name, handle, or preference), saved as a bullet in paths.md. To append to a different EXISTING notes file, put 'file: <name>.md' on the first line (relative to the Notes folder, e.g. 'file: mac-mini\\setup-log.md') and the fact on the next line. Longer text is refused: create a subject file with write instead. Examples: 'Music library: D:\\Music', 'Mac mini share: \\\\\\\\macmini\\\\notes'"}},
 "required":["args"]
 })";
 
@@ -3721,17 +3647,6 @@ constexpr const char* kSchemaReminderList = R"({
 constexpr const char* kSchemaReminderCancel = R"({
 "type":"object",
 "properties":{"args":{"type":"string","description":"Reminder ID returned by reminder_create or reminder_list, for example rem_1786061234567_1."}},
-"required":["args"]
-})";
-
-constexpr const char* kSchemaProjectNotesRead = R"({
-"type":"object",
-"properties":{}
-})";
-
-constexpr const char* kSchemaProjectNotesAppend = R"({
-"type":"object",
-"properties":{"args":{"type":"string","description":"Entry text to append to the active project's Notes/NOTES.md. Use for project-specific durable instructions, preferences, client/site facts, workflow decisions, and reusable project guidance. Requires an active project."}},
 "required":["args"]
 })";
 
@@ -4234,50 +4149,32 @@ std::vector<ToolSpec> BuildBuiltinSpecs()
             ValDelete, DoDelete);
     }
 
-    // ── notes_read / notes_append ────────────────────────────────
-    // Cross-conversation memory layer. Both target the single fixed
-    // path %USERPROFILE%\LlamaBoss\NOTES.md and never touch the cwd or
-    // any other location, so they are not subject to cwd-scoping rules
-    // — read is treated as a read-only inspection, append is treated
-    // as a low-risk fixed-target write that does not need an approval
-    // card (the target path is user-owned and the body is plain text).
-    {
-        ToolSafetyProfile notesReadSafety;
-        notesReadSafety.tier                 = RiskTier::Safe;
-        notesReadSafety.readOnly             = true;
-        notesReadSafety.mayInspectOutsideCwd = true;
-        notesReadSafety.summary =
-            "Read-only access to the user's NOTES.md (a single fixed file at "
-            "%USERPROFILE%\\LlamaBoss\\NOTES.md). Returns the full markdown body; "
-            "does not touch any other path.";
-        addBatchSafe(tool_names::kNotesRead,
-            "Read the user's NOTES.md (cross-conversation facts, paths, preferences, "
-            "and named workflows the user has saved). Use when the user references "
-            "their notes, when they ask if you remember something, or when prior "
-            "guesses about a path or preference have not worked.",
-            kSchemaNotesRead,
-            std::move(notesReadSafety),
-            ValNotesRead, DoNotesRead);
-    }
-
+    // ── notes_append ─────────────────────────────────────────────
+    // Notes are a folder of small markdown files under
+    // %USERPROFILE%\LlamaBoss\Notes (see tool_notes.h).  The index is
+    // injected into the prompt by ProjectContextBuilder and files are
+    // opened with the normal read tool, so the only notes-specific tool
+    // is this capped, append-only fast path for one-line facts.  It is a
+    // fixed-root write that needs no approval card; longer notes go
+    // through write/edit and the Notes folder-access grant.
     {
         ToolSafetyProfile notesAppendSafety;
         notesAppendSafety.tier         = RiskTier::Moderate;
         notesAppendSafety.mutatesFiles = true;
-        // The target is a single fixed user-owned file; not the cwd.
+        // The target is always inside the fixed Notes folder; not the cwd.
         // writesInsideCwdOnly stays false so cwd-scope checks don't try
         // to re-anchor it.
         notesAppendSafety.writesInsideCwdOnly = false;
         notesAppendSafety.summary =
-            "Append-only write to the user's NOTES.md. Single fixed target path; "
-            "never overwrites or deletes prior entries; never touches any other "
-            "location. Each call adds one dated entry.";
+            "Append-only write of one short fact (max 300 characters, 3 lines) to a "
+            "file inside the user's Notes folder (paths.md by default). Never "
+            "overwrites or deletes; never writes outside the Notes folder; only "
+            "appends to existing files other than paths.md.";
         add(tool_names::kNotesAppend,
-            "Append a new entry to notes. If no project is active, this appends the full "
-            "entry to global NOTES.md. If a project is active, this appends the full entry "
-            "to the active project's Notes/NOTES.md and writes only a compact pointer/index "
-            "entry to global NOTES.md. Use ONLY when the user explicitly asks you to save, "
-            "remember, or note something for later. One entry per call.",
+            "Save one short fact (path, name, handle, preference; max 300 characters, 3 lines) "
+            "to the user's notes -- paths.md by default, or an existing notes file named on a "
+            "first 'file: <name>.md' line. Use ONLY when the user explicitly asks you to save "
+            "or remember something. Longer material goes in its own notes file created with write.",
             kSchemaNotesAppend,
             std::move(notesAppendSafety),
             ValNotesAppend, DoNotesAppend);
@@ -4331,38 +4228,6 @@ std::vector<ToolSpec> BuildBuiltinSpecs()
             ValReminderCancel, DoReminderCancel);
     }
 
-    {
-        ToolSafetyProfile projectNotesReadSafety;
-        projectNotesReadSafety.tier                 = RiskTier::Safe;
-        projectNotesReadSafety.readOnly             = true;
-        projectNotesReadSafety.mayInspectOutsideCwd = true;
-        projectNotesReadSafety.summary =
-            "Read-only access to the active project's Notes\\NOTES.md. "
-            "Requires an active project and does not touch any other path.";
-        addBatchSafe(tool_names::kProjectNotesRead,
-            "Read the active project's Notes/NOTES.md. Use when the user asks for "
-            "project notes, notes for this project, project memory, or saved project-specific guidance.",
-            kSchemaProjectNotesRead,
-            std::move(projectNotesReadSafety),
-            ValProjectNotesRead, DoProjectNotesRead);
-    }
-
-    {
-        ToolSafetyProfile projectNotesAppendSafety;
-        projectNotesAppendSafety.tier                = RiskTier::Moderate;
-        projectNotesAppendSafety.mutatesFiles        = true;
-        projectNotesAppendSafety.writesInsideCwdOnly = false;
-        projectNotesAppendSafety.summary =
-            "Append-only write to the active project's Notes\\NOTES.md. "
-            "Requires an active project; no global NOTES.md pointer is created by this tool.";
-        add(tool_names::kProjectNotesAppend,
-            "Append a new entry directly to the active project's Notes/NOTES.md. Use when "
-            "the user explicitly says to save something to project notes, this project's notes, "
-            "or this project memory. Do not use speculatively. One entry per call.",
-            kSchemaProjectNotesAppend,
-            std::move(projectNotesAppendSafety),
-            ValProjectNotesAppend, DoProjectNotesAppend);
-    }
 
 
     {
@@ -4430,13 +4295,10 @@ std::vector<ToolSpec> BuildBuiltinSpecs()
         { tool_names::kDelete,               "\xF0\x9F\x97\x91", "Delete" },                  // 🗑
         { tool_names::kCopy,                 "\xF0\x9F\x93\x8B", "Copy" },                    // 📋
         { tool_names::kHash,                 "\xF0\x9F\x94\x91", "Hash" },                    // 🔑
-        { tool_names::kNotesRead,            "\xF0\x9F\x93\x92", "Notes" },                   // 📒
         { tool_names::kNotesAppend,          "\xF0\x9F\x93\x92", "Notes" },                   // 📒
         { tool_names::kReminderCreate,       "\xE2\x8F\xB0",     "Reminder" },                  // ⏰
         { tool_names::kReminderList,         "\xE2\x8F\xB0",     "Reminders" },                 // ⏰
         { tool_names::kReminderCancel,       "\xE2\x8F\xB0",     "Reminder" },                  // ⏰
-        { tool_names::kProjectNotesRead,     "\xF0\x9F\x93\x93", "Project Notes" },           // 📓
-        { tool_names::kProjectNotesAppend,   "\xF0\x9F\x93\x93", "Project Notes" },           // 📓
         { tool_names::kWebFetchUrl,          "\xF0\x9F\x8C\x90", "Web Page Inspect" },        // 🌐
     };
 

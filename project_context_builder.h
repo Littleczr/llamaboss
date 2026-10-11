@@ -1,6 +1,6 @@
 // project_context_builder.h
 // Builds the "active project" context block injected into the system prompt,
-// plus the cross-project Skills section, and caches both against a content
+// plus the cross-project Skills and User notes sections, and caches both against a content
 // fingerprint so rapid agent iterations do not re-stat the project tree every
 // turn.  Extracted from MyFrame; the only live frame state it reads is the
 // current ChatHistory's project identity.
@@ -61,6 +61,9 @@ private:
         long long   skillsDirMTime = 0;
         unsigned long long skillsListHash = 0;
         unsigned long long skillScriptsListHash = 0;
+        long long   notesDirMTime = 0;
+        unsigned long long notesListHash = 0;
+        long long   legacyNotesMTime = 0;
         long long   projectJsonMTime = 0;
         long long   projectMdMTime = 0;
         long long   sourcesDirMTime = 0;
@@ -77,6 +80,9 @@ private:
                    skillsDirMTime == o.skillsDirMTime &&
                    skillsListHash == o.skillsListHash &&
                    skillScriptsListHash == o.skillScriptsListHash &&
+                   notesDirMTime == o.notesDirMTime &&
+                   notesListHash == o.notesListHash &&
+                   legacyNotesMTime == o.legacyNotesMTime &&
                    projectJsonMTime == o.projectJsonMTime &&
                    projectMdMTime == o.projectMdMTime &&
                    sourcesDirMTime == o.sourcesDirMTime &&

@@ -56,10 +56,7 @@ namespace tool_names {
     constexpr const char* kDelete     = "delete";
     constexpr const char* kCopy       = "copy";
     constexpr const char* kHash       = "hash";
-    constexpr const char* kNotesRead   = "notes_read";
     constexpr const char* kNotesAppend = "notes_append";
-    constexpr const char* kProjectNotesRead   = "project_notes_read";
-    constexpr const char* kProjectNotesAppend = "project_notes_append";
     constexpr const char* kReminderCreate = "reminder_create";
     constexpr const char* kReminderList   = "reminder_list";
     constexpr const char* kReminderCancel = "reminder_cancel";
