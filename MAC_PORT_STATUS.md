@@ -36,6 +36,55 @@ All are intended to be behavior-identical on Windows, but none has been compiled
 - `server_manager.cpp` `StartServer`: the whole-function `#ifdef __WXMSW__` was narrowed to the spawn section;
   the Windows statement sequence is unchanged.
 
+## Design principle: Mac identity, shared behavior
+
+The macOS build should feel like a Mac app, not a copy of the Windows app.
+Same features and the same safety guarantees; platform-native implementation and feel.
+
+**Shared (must match Windows):**
+- Features, agent behavior, tool semantics, approval and safety rules
+- File formats: chats, notes, projects, settings JSON
+- Error handling: honest "not available on macOS yet", never fake success
+
+**Mac-native (do it the Mac way, don't imitate Windows):**
+- Shell: zsh, not a PowerShell port
+- Secrets: Keychain; data in ~/Library/Application Support
+- UI: Cocoa conventions. Native controls, the menu bar (About/Settings
+  under the app menu, Cmd+, for Settings), Cmd shortcuts, standard
+  window and sheet behavior. Don't fight native widgets to copy Windows
+  styling; when a Windows look can't be reproduced cleanly, design the
+  Mac equivalent.
+- Wording: "unified memory", not "VRAM"; Finder, not Explorer
+- Packaging: .app bundle, .icns, signing/notarization, a Mac-style updater
+
+**Rules:**
+- Never change Windows behavior or text to accommodate the Mac. Mac
+  differences go in #ifdef/platform files; `unifdef -D_WIN32` of
+  touched files must still match the Windows view.
+- When unsure whether something should match Windows or be Mac-native,
+  ask: is it behavior (match) or look/feel/convention (Mac-native)?
+- Record each deliberate Mac divergence in a "Mac differences" list in
+  this file, so it's clear what's intended versus not yet ported.
+
+## Mac differences (deliberate)
+
+Intended divergences from Windows. Features that are simply not ported yet are listed under
+"Stubbed or unavailable on macOS" instead.
+
+| Area | Windows | macOS | Why |
+| --- | --- | --- | --- |
+| Shell tool | `powershell` tool, PowerShell 5.1/7 | `shell` tool, `/bin/zsh -f`; read-only allowlist of BSD tools (`command_policy_zsh.cpp`) | Native shell; no PowerShell install needed |
+| .ps1 scripts | `write_powershell_script` tool | not registered | No PowerShell on macOS |
+| Agent prompt | PowerShell rules, backslash paths | zsh/BSD rules, forward-slash paths, `~` (under `#else`) | Same rules, Mac wording |
+| Secrets at rest | DPAPI | AES-256-GCM, key in the login Keychain | Platform key store |
+| App data | `%LOCALAPPDATA%\LlamaBoss` | `~/Library/Application Support/LlamaBoss` | Mac convention |
+| Python packages | `pip install --user` | LlamaBoss environment in the data folder (`--system-site-packages`) | Homebrew Python refuses `--user` (PEP 668) |
+| Python helpers | RCDATA in the .exe | files in `Contents/Resources/python` | App-bundle resources |
+| llama.cpp | CPU/CUDA builds | Metal build in `Contents/Resources/llama.cpp` | Apple silicon GPU |
+| Fonts | Consolas / Cascadia Code, Windows point sizes | Menlo, sizes x4/3 (`lb_ui_font.h`) | Same physical size; built-in Mac face |
+| App icon | `app_icon.ico` | `macos/app_icon.icns` (generated from the .ico) | Bundle icon format |
+| Missing `.ico` at startup | file fallback | icon comes from the bundle; no file lookup | Avoids a modal error on launch |
+
 ## Toolchain (verified 2026-10-09)
 
 | Item | Version |
