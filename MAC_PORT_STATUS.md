@@ -112,6 +112,8 @@ open build_macos/LlamaBoss.app
 
 CMake copies `llama-server` and its dylibs into
 `LlamaBoss.app/Contents/Resources/llama.cpp/` (override with `-DLLAMABOSS_LLAMA_DIR=...`).
+When the login keychain has a "LlamaBoss Development" code-signing identity, the build
+signs the bundle with it (see "Keychain prompt on every launch" below).
 
 ## Data locations on macOS
 
@@ -336,19 +338,27 @@ large icons. macOS 26 may show a full-bleed square icon inside its standard roun
 - The user compared against PC screenshots: the chat, composer and top bar now match.
   Check that the sidebar's fixed-size badge ("13") and "TODAY" header are not clipped.
 
-## Known issue: Keychain prompt on every launch
+## Keychain prompt on every launch — fixed 2026-10-12
 
-- The build is ad-hoc signed, so every rebuild changes the code signature and the Keychain
-  ACL on the `secrets-file-key` item no longer matches. macOS then asks for the login
-  password; "Always Allow" lasts only until the next rebuild.
-- Planned fix (waiting for the user, since it needs their password once): a self-signed
-  "LlamaBoss Development" code-signing certificate in the login keychain, and a CMake
-  post-build `codesign --sign` with it. Developer ID signing for a public download is
-  Phase 4.
+- Cause: the linker's ad-hoc signature changes on every rebuild, and the Keychain ACL on
+  the `secrets-file-key` item no longer matched, so macOS asked for the login password
+  each time ("Always Allow" lasted only until the next rebuild).
+- Fix: a self-signed "LlamaBoss Development" code-signing certificate (10 years, RSA-2048,
+  codeSigning EKU) in the user's login keychain, trusted for code signing only, with
+  key access limited to `/usr/bin/codesign`. CMake detects it at configure time and
+  adds a post-build `codesign --force --sign "LlamaBoss Development"` after the
+  llama-server bundling step. Override with `-DLLAMABOSS_CODESIGN_IDENTITY=...`; with no
+  identity the build stays ad-hoc signed.
+- Designated requirement is now
+  `identifier "com.llamaboss.app" and certificate leaf = H"9feba90c…dc8a2efd3a4"`,
+  identical across builds.
+- Verified with UI automation: launch, chat via OpenRouter (key read from Keychain), then
+  a forced relink (CDHash changed), relaunch and chat again. No Keychain prompt.
+- The certificate is local to this Mac and not a distribution signature: Developer ID
+  signing and notarization for a public download remain Phase 4.
 
 ## Next task
 
-1. Set up stable local code signing (Keychain prompt fix), with the user present.
-2. Persistent `py` session on macOS.
-3. Themed buttons readable on macOS (dark text on accent, as on Windows).
-4. Mac wording ("fits in VRAM" -> unified memory), web fetch port, then Phase 4 packaging.
+1. Persistent `py` session on macOS.
+2. Themed buttons readable on macOS (Mac-native design, per the Mac identity principle).
+3. Mac wording ("fits in VRAM" -> unified memory), web fetch port, then Phase 4 packaging.

@@ -163,6 +163,36 @@ if(APPLE)
     endif()
 endif()
 
+# ── Stable local code signature (macOS) ──
+# The linker's ad-hoc signature changes on every build, and Keychain ties a
+# stored secret's access to the signature, so each rebuild asks for the login
+# password again.  Signing with one fixed identity keeps the signature's
+# designated requirement stable.  Create a self-signed "LlamaBoss Development"
+# code-signing certificate in the login keychain (trusted for code signing)
+# to enable this; without it the build keeps the ad-hoc signature.
+# Must stay after the llama-server bundling step: POST_BUILD commands run in order.
+if(APPLE)
+    set(LLAMABOSS_CODESIGN_IDENTITY "" CACHE STRING
+        "Code-signing identity for local builds (empty = auto-detect 'LlamaBoss Development')")
+    set(_lb_sign_id "${LLAMABOSS_CODESIGN_IDENTITY}")
+    if(NOT _lb_sign_id)
+        execute_process(COMMAND security find-identity -v -p codesigning
+            OUTPUT_VARIABLE _lb_identities ERROR_QUIET)
+        if(_lb_identities MATCHES "\"LlamaBoss Development\"")
+            set(_lb_sign_id "LlamaBoss Development")
+        endif()
+    endif()
+    if(_lb_sign_id)
+        message(STATUS "Signing LlamaBoss.app with '${_lb_sign_id}'")
+        add_custom_command(TARGET LlamaBoss POST_BUILD
+            COMMAND codesign --force --sign "${_lb_sign_id}" --timestamp=none
+                    "$<TARGET_BUNDLE_DIR:LlamaBoss>"
+            COMMENT "Signing LlamaBoss.app")
+    else()
+        message(STATUS "No 'LlamaBoss Development' signing identity; LlamaBoss.app stays ad-hoc signed")
+    endif()
+endif()
+
 install(TARGETS LlamaBoss RUNTIME DESTINATION bin BUNDLE DESTINATION .)
 
 # ── macOS shell-policy checks (no wx; run directly) ──
