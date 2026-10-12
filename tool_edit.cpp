@@ -378,16 +378,36 @@ std::string MakeDiff(const std::string& fileLf,
                      size_t*            oldLineCountOut,
                      size_t*            newLineCountOut)
 {
-    // Locate the line containing the match start.
-    size_t lineStart = (matchPos == 0)
-                           ? 0
-                           : fileLf.rfind('\n', matchPos - 1);
-    lineStart = (lineStart == std::string::npos) ? 0 : lineStart + 1;
+    // Locate the line containing the match start.  A match at byte 0
+    // starts the first line.  (The old form mapped matchPos==0 to 0 and
+    // then added 1 as if 0 were a newline position, so every edit of a
+    // file's FIRST line rendered a corrupt diff -- the rest of the file
+    // shown as "+" lines, "lpha" for "alpha" -- even though the bytes
+    // written to disk were correct.  Models read that diff as the result.)
+    size_t lineStart = 0;
+    if (matchPos > 0) {
+        const size_t nl = fileLf.rfind('\n', matchPos - 1);
+        lineStart = (nl == std::string::npos) ? 0 : nl + 1;
+    }
 
-    // Locate the line containing the match end.
+    // Locate the line containing the match end.  When OLD ends exactly at
+    // a line boundary (its last byte is '\n') and NEW does too (or is
+    // empty), the change stops there: the following line is untouched and
+    // belongs in the context, not in both the "-" and "+" blocks.  A NEW
+    // that drops the newline joins lines, so it keeps the wider region to
+    // show the joined result faithfully.
     const size_t matchEnd = matchPos + oldLen;
-    size_t lineEnd = fileLf.find('\n', matchEnd);
-    if (lineEnd == std::string::npos) lineEnd = fileLf.size();
+    size_t lineEnd;
+    bool   lineEndIsTerminator;   // lineEnd indexes the '\n' ending the region
+    if (oldLen > 0 && fileLf[matchEnd - 1] == '\n' &&
+        (newStringLf.empty() || newStringLf.back() == '\n')) {
+        lineEnd = matchEnd;
+        lineEndIsTerminator = false;
+    } else {
+        lineEnd = fileLf.find('\n', matchEnd);
+        if (lineEnd == std::string::npos) lineEnd = fileLf.size();
+        lineEndIsTerminator = lineEnd < fileLf.size();
+    }
 
     // The OLD lines: full lines covering [lineStart, lineEnd).
     std::string oldLines = fileLf.substr(lineStart, lineEnd - lineStart);
@@ -428,7 +448,7 @@ std::string MakeDiff(const std::string& fileLf,
     std::string belowCtx;
     {
         size_t start = lineEnd;
-        if (start < fileLf.size() && fileLf[start] == '\n') ++start;
+        if (lineEndIsTerminator) ++start;
         size_t ctxEnd = start;
         for (size_t i = 0; i < kDiffContextLines; ++i) {
             if (ctxEnd >= fileLf.size()) break;
@@ -459,6 +479,10 @@ std::string MakeDiff(const std::string& fileLf,
             v.push_back(s.substr(i, nl - i));
             i = nl + 1;
         }
+        // A final newline terminates the last line; it is not an extra
+        // empty line (an OLD/NEW block ending in "\n" otherwise showed a
+        // phantom "-" / "+" blank line in the diff and in the counts).
+        if (v.size() > 1 && v.back().empty() && s.back() == '\n') v.pop_back();
         return v;
     };
 

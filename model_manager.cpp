@@ -15,6 +15,7 @@
 #include "model_downloader.h"   // DownloadThread, ProbeModelUrl, download events
 #include "model_url.h"          // pasted-link parsing (pure, unit-tested)
 #include "ui_event_post.h"
+#include "background_work.h"   // lb::BeginBackgroundWork (drained in MyApp::OnExit)
 
 #include <wx/msgdlg.h>
 
@@ -785,7 +786,7 @@ void ModelManagerDialog::OnUrlButton(wxCommandEvent&)
     wxEvtHandler* target = this;
     std::weak_ptr<std::atomic<bool>> alive = m_alive;
     const std::string url = parsed.url;
-    std::thread([target, alive, url, gen]() {
+    std::thread([work = lb::BeginBackgroundWork(), target, alive, url, gen]() {
         ModelUrlProbe result = ProbeModelUrl(url);
         auto* ev = new wxThreadEvent(wxEVT_MM_PROBE_DONE);
         ev->SetInt(static_cast<int>(gen));

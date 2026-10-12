@@ -41,5 +41,17 @@ int main(){
  auto m=TurnStats::ParseTsv(std::string(TurnStats::TsvHeader())+"\nt\tm\tabc\n",10); T(m.empty());
  // live stats unaffected by the new field
  TurnStats c; c.completionTokens=101; c.firstTokenMs=0; c.lastTokenMs=1000; T(Near(c.GenerationTokensPerSec(),100));
+ // 2026-10-11 columns: cache writes, cost, finish reason, reply shape round-trip
+ TurnStats d; d.totalMs=3400; d.promptTokens=32204; d.completionTokens=568; d.cachedPromptTokens=31800;
+ d.cacheWriteTokens=400; d.costUsd=0.0035; d.finishReason="stop"; d.thinkBytes=0; d.replyBytes=1890; d.toolCalls=0;
+ auto dr=TurnStats::ParseTsv(std::string(TurnStats::TsvHeader())+"\n"+d.TsvRow("t","anthropic/claude-haiku-5.5")+"\n",10);
+ T(dr.size()==1 && dr[0].cacheWriteTokens==400 && Near(dr[0].costUsd,0.0035) && dr[0].finishReason=="stop"
+   && dr[0].thinkBytes==0 && dr[0].replyBytes==1890 && dr[0].toolCalls==0);
+ T(d.OneLineSummary().find("400 cache write")!=std::string::npos);
+ // unset new fields stay blank and read back as unset
+ T(x.cacheWriteTokens==-1 && x.costUsd<0 && x.finishReason.empty() && x.toolCalls==-1);
+ // a tab inside finish_reason cannot break the row
+ TurnStats e=d; e.finishReason="a\tb"; auto er=TurnStats::ParseTsv(std::string(TurnStats::TsvHeader())+"\n"+e.TsvRow("t","m")+"\n",10);
+ T(er.size()==1 && er[0].finishReason=="a b" && er[0].toolCalls==0);
  printf(fails?"%d failures\n":"all passed\n",fails); return fails;
 }

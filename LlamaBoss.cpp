@@ -5992,7 +5992,7 @@ private:
                 "\tbytes_per_token\test_error_pct\telided"
                 "\targs_elided\tsystem_bytes\ttools_bytes\tuser_bytes"
                 "\tassistant_bytes\ttool_result_bytes\timage_bytes"
-                "\treasoning_replay_bytes";
+                "\treasoning_replay_bytes\tprefix_hash\tcache_control";
             const std::string pathKey = p.string();
             if (pathKey != m_ctxCalibHeaderCheckedPath ||
                 !std::filesystem::exists(p)) {
@@ -6038,7 +6038,14 @@ private:
               << b.assistantBytes  << '\t'
               << b.toolResultBytes << '\t'
               << b.imageBytes      << '\t'
-              << b.replayBytes
+              << b.replayBytes     << '\t';
+            // Cache-prefix fingerprint (system prompt + tools array) and
+            // whether Anthropic cache_control was on the request.
+            char prefixHex[16];
+            snprintf(prefixHex, sizeof(prefixHex), "%08x",
+                     static_cast<unsigned>(b.prefixHash));
+            f << (b.prefixHash ? prefixHex : "") << '\t'
+              << (b.cacheControl ? "1" : "0")
               << '\n';
         } catch (...) {
             // best-effort only
@@ -6737,7 +6744,12 @@ private:
         wxTheClipboard->Close();
         if (!gotText) return false;
 
-        const wxScopedCharBuffer utf8 = clipboardText.GetText().ToUTF8();
+        // Keep the wxString alive for as long as the UTF-8 buffer is used:
+        // under wx 3.3 ToUTF8() may return a buffer that points into the
+        // string itself, so taking it from the GetText() temporary left a
+        // dangling buffer (garbage bytes in the saved paste and the card).
+        const wxString clipboardString = clipboardText.GetText();
+        const wxScopedCharBuffer utf8 = clipboardString.ToUTF8();
         if (!utf8.data()) return false;
         const size_t byteCount = utf8.length();
         if (byteCount <= varstore::DemotionConfig{}.thresholdBytes)

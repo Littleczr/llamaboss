@@ -18,7 +18,11 @@ namespace {
 // Cache schema version.  Bump when changing how cache values are
 // formatted or what protocols are stored.  Older entries with a
 // different version prefix are treated as cache misses.
-constexpr const char* kCacheSchema = "v2";
+// v3: the smoke test now disables thinking and allows 512 tokens.  v2
+// verdicts for reasoning models (Qwen3.8: thinks first by default) were
+// mostly "xml" because 64 tokens ran out inside the thinking block before
+// any tool call -- so every cached v2 result is re-probed once.
+constexpr const char* kCacheSchema = "v3";
 
 // Cache entries older than this (in seconds) are treated as misses
 // and re-probed.  Long enough that a typical user never re-probes
@@ -196,9 +200,20 @@ bool RunSmokeTest(const std::string& baseUrl,
     // Build the request body.
     Poco::JSON::Object::Ptr body = new Poco::JSON::Object;
     body->set("model", "any");          // llama-server ignores this
-    body->set("max_tokens", 64);
+    // Reasoning models think before answering, and a 64-token budget was
+    // spent entirely inside <think>: no tool call, smoke test failed, model
+    // cached as XML for 30 days.  The probe asks whether the server+template
+    // can emit native tool_calls, not whether the model reasons, so thinking
+    // is switched off (templates that do not read the flag ignore it) and
+    // the budget leaves room for a model that thinks anyway.
+    body->set("max_tokens", 512);
     body->set("temperature", 0.0);
     body->set("tool_choice", "required");
+    {
+        Poco::JSON::Object::Ptr kwargs = new Poco::JSON::Object;
+        kwargs->set("enable_thinking", false);
+        body->set("chat_template_kwargs", kwargs);
+    }
 
     // messages: [{role:"user", content:"What working directory am I in?"}]
     Poco::JSON::Array::Ptr messages = new Poco::JSON::Array;
@@ -243,10 +258,10 @@ bool RunSmokeTest(const std::string& baseUrl,
     try {
         Poco::URI uri(baseUrl + "/v1/chat/completions");
         Poco::Net::HTTPClientSession sess(uri.getHost(), uri.getPort());
-        // 30 seconds is plenty — the request is ~250 bytes and the
-        // model only needs to emit a tool_call object, ~30 tokens.
-        // If it takes longer than 30s on a 5090, something is off.
-        sess.setTimeout(Poco::Timespan(30, 0));
+        // 60 seconds: the request is ~300 bytes and a tool_call object is
+        // ~30 tokens, but a model that ignores enable_thinking may spend up
+        // to the 512-token budget first.
+        sess.setTimeout(Poco::Timespan(60, 0));
 
         Poco::Net::HTTPRequest req(Poco::Net::HTTPRequest::HTTP_POST,
                                    uri.getPathAndQuery(),

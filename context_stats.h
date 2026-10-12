@@ -16,6 +16,7 @@
 #include "turn_stats.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -37,6 +38,9 @@ struct RequestBreakdown
     int    imageCount      = 0;
     int    messageCount    = 0;  // wire messages, system included
     int    elidedCount     = 0;  // tool-result bodies trimmed by the budget pass
+    uint32_t prefixHash    = 0;  // FNV-1a of leading system prompt + tools array
+                                 // (cache-prefix fingerprint; 0 = not computed)
+    bool   cacheControl    = false;  // Anthropic cache_control was sent
 
     size_t TextBytes() const
     {

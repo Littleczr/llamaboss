@@ -47,6 +47,19 @@ struct TurnStats
     long completionTokens   = -1;  // includes reasoning tokens when reported
     long cachedPromptTokens = -1;  // prompt tokens served from the provider's cache
     long reasoningTokens    = -1;  // hidden/visible thinking tokens (OpenAI-style detail)
+    long cacheWriteTokens   = -1;  // prompt tokens WRITTEN to the cache this request
+                                   // (OpenRouter prompt_tokens_details.cache_write_tokens;
+                                   // Anthropic bills these at 1.25x input)
+    double costUsd          = -1;  // provider-reported request cost (OpenRouter usage.cost)
+
+    // ── What the reply was (diagnostics for the agent loop) ──
+    // finishReason: the provider's finish_reason ("stop", "tool_calls",
+    // "length", ...).  The Responses lane has none, so it records
+    // "tool_calls" when the reply carried function calls, else "stop".
+    std::string finishReason;
+    long thinkBytes  = -1;  // bytes inside <think>...</think> in the streamed reply
+    long replyBytes  = -1;  // visible reply bytes (think blocks and tags excluded)
+    int  toolCalls   = -1;  // native tool_calls in the reply, or XML <tool_call> openers
 
     // ── llama-server "timings" (only local llama-server lanes) ──
     bool   hasServerTimings     = false;
@@ -165,6 +178,8 @@ struct TurnStats
                 s += " (" + FormatCount(cachedPromptTokens) + " cached)";
             else if (hasServerTimings && serverCacheN > 0)
                 s += " (" + FormatCount(serverCacheN) + " cached)";
+            if (cacheWriteTokens > 0)
+                s += dot + FormatCount(cacheWriteTokens) + " cache write";
             if (reasoningTokens > 0)
                 s += dot + FormatCount(reasoningTokens) + " reasoning";
         }
@@ -178,7 +193,9 @@ struct TurnStats
                "\treasoning_tokens\tfirst_byte_ms\tfirst_token_ms\ttotal_ms"
                "\tgen_tok_s\tprompt_tok_s\tserver_timings"
                "\tserver_prompt_n\tserver_cache_n\tserver_predicted_n"
-               "\tserver_prompt_ms\tserver_predicted_ms\tmodel_remote";
+               "\tserver_prompt_ms\tserver_predicted_ms\tmodel_remote"
+               "\tcache_write_tokens\tcost_usd\tfinish_reason"
+               "\tthink_bytes\treply_bytes\ttool_calls";
     }
 
     std::string TsvRow(const std::string& time, const std::string& model) const
@@ -193,6 +210,8 @@ struct TurnStats
 
         std::string m = modelId.empty() ? model : modelId;
         for (char& c : m) if (c == '\t' || c == '\n' || c == '\r') c = ' ';
+        std::string fin = finishReason;
+        for (char& c : fin) if (c == '\t' || c == '\n' || c == '\r') c = ' ';
 
         return time + '\t' + m + '\t' +
                cnt(promptTokens) + '\t' + cnt(completionTokens) + '\t' +
@@ -205,7 +224,10 @@ struct TurnStats
                cnt(serverPromptN) + '\t' + cnt(serverCacheN) + '\t' +
                cnt(serverPredictedN) + '\t' +
                num(serverPromptMs, "%.1f") + '\t' + num(serverPredictedMs, "%.1f") + '\t' +
-               (modelRemote == 0 ? "0" : modelRemote == 1 ? "1" : "");
+               (modelRemote == 0 ? "0" : modelRemote == 1 ? "1" : "") + '\t' +
+               cnt(cacheWriteTokens) + '\t' + num(costUsd, "%.6f") + '\t' +
+               fin + '\t' + cnt(thinkBytes) + '\t' + cnt(replyBytes) + '\t' +
+               (toolCalls < 0 ? std::string() : std::to_string(toolCalls));
     }
 
     // ── Reading turn_stats.tsv back (HUD after loading an old chat) ──
@@ -258,6 +280,12 @@ struct TurnStats
         out.completionTokens   = L("completion_tokens");
         out.cachedPromptTokens = L("cached_tokens");
         out.reasoningTokens    = L("reasoning_tokens");
+        out.cacheWriteTokens   = L("cache_write_tokens");
+        out.costUsd            = D("cost_usd");
+        if (const std::string* fr = col("finish_reason")) out.finishReason = *fr;
+        out.thinkBytes         = L("think_bytes");
+        out.replyBytes         = L("reply_bytes");
+        out.toolCalls          = static_cast<int>(L("tool_calls"));
         out.firstByteMs        = D("first_byte_ms");
         out.firstTokenMs       = D("first_token_ms");
         out.totalMs            = D("total_ms");

@@ -4411,16 +4411,21 @@ std::vector<const ToolSpec*> ToolRouter::All() const
 // race-free on the off chance two threads request the router at
 // startup.  After init the router is read-only and shared across
 // callers without further locking.
+//
+// Intentionally never destroyed.  Detached tool workers can still be
+// running when the process exits; a function-local static router would be
+// destroyed during static teardown while such a worker reads its spec
+// (use-after-free).  A leaked process-lifetime registry cannot dangle.
 ToolRouter& GetGlobalRouter()
 {
-    static ToolRouter      router;
+    static ToolRouter*     router = new ToolRouter();
     static std::once_flag  initFlag;
     std::call_once(initFlag, []() {
         for (ToolSpec& s : BuildBuiltinSpecs()) {
-            router.Register(std::move(s));
+            router->Register(std::move(s));
         }
     });
-    return router;
+    return *router;
 }
 
 // ─── Native tool catalog ────────────────────────────────────────

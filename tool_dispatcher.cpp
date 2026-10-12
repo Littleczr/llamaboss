@@ -10,6 +10,7 @@
 #include "tool_dispatcher.h"
 #include "tool_router.h"
 #include "ui_event_post.h"
+#include "background_work.h"   // lb::BeginBackgroundWork (drained in MyApp::OnExit)
 
 #include <cassert>
 #include <exception>
@@ -111,7 +112,8 @@ bool ToolWorkerExecutor::Start(const ToolInvocation& inv,
     ctxCopy.history = nullptr;
 
     try {
-        std::thread([invCopy = std::move(invCopy),
+        std::thread([work = lb::BeginBackgroundWork(),
+                     invCopy = std::move(invCopy),
                      ctxCopy = std::move(ctxCopy),
                      cancelFlag,
                      running,

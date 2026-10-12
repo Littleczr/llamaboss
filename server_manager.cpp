@@ -1,5 +1,6 @@
 // server_manager.cpp
 #include "server_manager.h"
+#include "background_work.h"   // lb::BeginBackgroundWork (drained in MyApp::OnExit)
 #include "server_log_hints.h"   // plain-language startup failure hints
 #include "path_safety.h"
 #include "gguf_metadata.h"
@@ -1217,7 +1218,7 @@ void ServerManager::EnqueueSlotAction(const std::string& action,
     }
 
     if (spawnWorker) {
-        std::thread([q]() {
+        std::thread([work = lb::BeginBackgroundWork(), q]() {
             for (;;) {
                 SlotAction a;
                 ServerLaunchGeneration live = kInvalidServerLaunchGeneration;

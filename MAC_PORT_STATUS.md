@@ -264,6 +264,20 @@ old author email and must stay local.
 - In-app chat test of notes (save, then recall in a new chat) still needs a person at the
   keyboard: this terminal has no Accessibility permission to type into the app.
 
+## Merge of `main` dc9d27b — 2026-10-12
+
+- dc9d27b "Fix agent harness, prompt caching, metrics, paste and shutdown safety" (29 files).
+  One conflict, `agent_prompt_builder.cpp` (two places): main added a Windows-only `py -3`
+  launcher tip to the "Host OS: Windows" line, which the Mac branch keeps inside an
+  `#ifdef _WIN32 / #else` split. Resolved with the user's OK: the Windows branch takes
+  main's line verbatim, the Mac branch keeps the macOS line.
+- Every file the merge touched has the same Windows-view differences from main as before
+  the merge (no new ones). The Mac build compiles unchanged; new code scanned for
+  Windows-only behavior (the batch-write path check normalizes '/' to '\' only for
+  comparison, so Mac absolute and `~` paths are handled).
+- Verified: the app starts, llama-server ready with Gemma 3 1B, prompt prewarm primed
+  12,046 tokens in 6.8 s. In-app agent tool test pending (the Mac was locked).
+
 ## Startup error path — verified 2026-10-11
 
 Both cases use shared code (`model_switcher.cpp`, `server_manager.cpp`), so the behavior matches Windows.

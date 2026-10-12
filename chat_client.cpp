@@ -825,6 +825,7 @@ wxThread::ExitCode ChatWorkerThread::Entry()
                     }
                     if (!update.summary.empty()) markToken(false);
                     if (!update.text.empty())    markToken(true);
+                    if (update.toolActivity)     markToken(true);
                     // Thinking and visible text are appended separately so
                     // each is checked under its own repetition policy.
                     if (!update.summary.empty()) {
@@ -854,6 +855,9 @@ wxThread::ExitCode ChatWorkerThread::Entry()
                         stats.reasoningTokens    = update.reasoningTokens;
                         responsesToolCallsJson = update.toolCallsJson;
                         responsesOutputJson = update.outputJson;
+                        // Responses has no finish_reason; record the shape.
+                        stats.finishReason =
+                            update.toolCallsJson.empty() ? "stop" : "tool_calls";
                         sawTerminalEvent = true;
                         break;
                     }
@@ -937,6 +941,18 @@ wxThread::ExitCode ChatWorkerThread::Entry()
                                     usage->getObject("prompt_tokens_details"),
                                     "cached_tokens");
                                 if (v >= 0) stats.cachedPromptTokens = (long)v;
+                                // OpenRouter: tokens written to the cache
+                                // (Anthropic bills them at 1.25x input).
+                                const double w = readNumber(
+                                    usage->getObject("prompt_tokens_details"),
+                                    "cache_write_tokens");
+                                if (w >= 0) stats.cacheWriteTokens = (long)w;
+                            }
+                            // OpenRouter reports the request's cost in
+                            // credits (USD) on the usage object.
+                            {
+                                const double c = readNumber(usage, "cost");
+                                if (c >= 0) stats.costUsd = c;
                             }
                             if (usage->has("completion_tokens_details") &&
                                 !usage->isNull("completion_tokens_details")) {
@@ -1184,6 +1200,7 @@ wxThread::ExitCode ChatWorkerThread::Entry()
                         reason = choice->getValue<std::string>("finish_reason");
                     } catch (...) { /* non-string finish_reason — ignore */ }
                     if (!reason.empty()) {
+                        stats.finishReason = reason;
                         sawTerminalEvent = true;
                         // llama-server reports usage on this same final
                         // chunk — captured above — so the common local
@@ -1316,6 +1333,68 @@ wxThread::ExitCode ChatWorkerThread::Entry()
             // treats COMPLETE as "everything has arrived". Anything
             // still buffered here has to go out first.
             flushDelta(true);
+
+            // Reply shape for turn_stats.tsv: how much was thinking vs
+            // visible text, and how many tool calls the model emitted.
+            // A visible reply that announces a step ("Now step 9:") with
+            // tool_calls=0 and finish_reason=stop is the model ending
+            // the turn; tool_calls>0 with no dispatch would be a parser
+            // miss -- the two look identical in the chat transcript.
+            {
+                long think = 0, visibleBytes = 0;
+                std::string visibleText;
+                size_t pos = 0;
+                static const std::string kOpen = "<think>", kClose = "</think>";
+                while (pos < fullReply.size()) {
+                    const size_t o = fullReply.find(kOpen, pos);
+                    if (o == std::string::npos) {
+                        visibleText.append(fullReply, pos, std::string::npos);
+                        break;
+                    }
+                    visibleText.append(fullReply, pos, o - pos);
+                    const size_t bodyStart = o + kOpen.size();
+                    const size_t c = fullReply.find(kClose, bodyStart);
+                    if (c == std::string::npos) {
+                        think += (long)(fullReply.size() - bodyStart);
+                        break;
+                    }
+                    think += (long)(c - bodyStart);
+                    pos = c + kClose.size();
+                }
+                const size_t first = visibleText.find_first_not_of(" \t\r\n");
+                visibleBytes = first == std::string::npos
+                    ? 0 : (long)(visibleText.size() - first);
+                stats.thinkBytes = think;
+                stats.replyBytes = visibleBytes;
+
+                int calls = 0;
+                if (!toolCallsJson.empty()) {
+                    try {
+                        Poco::JSON::Parser p;
+                        auto a = p.parse(toolCallsJson)
+                                     .extract<Poco::JSON::Array::Ptr>();
+                        if (a) calls = (int)a->size();
+                    } catch (...) { /* count stays 0 */ }
+                } else {
+                    // XML protocol: count call openers in the visible
+                    // text (standard and Gemma forms) that start a line.
+                    // Prose that merely mentions `<tool_call>` mid-line
+                    // (a model discussing its own malformed call) is not
+                    // a call.
+                    for (const char* opener : { "<tool_call>", "<|tool_call>" }) {
+                        const std::string o(opener);
+                        for (size_t k = visibleText.find(o); k != std::string::npos;
+                             k = visibleText.find(o, k + o.size())) {
+                            size_t b = k;
+                            while (b > 0 && (visibleText[b - 1] == ' ' ||
+                                             visibleText[b - 1] == '\t'))
+                                --b;
+                            if (b == 0 || visibleText[b - 1] == '\n') ++calls;
+                        }
+                    }
+                }
+                stats.toolCalls = calls;
+            }
 
             stats.totalMs          = msSinceSend();
             stats.promptTokens     = usagePromptTokens;

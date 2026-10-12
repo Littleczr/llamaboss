@@ -1003,8 +1003,22 @@ std::string BuildConversationMarkdown(const ChatHistory& history,
                     }
                     if (!TrimCopy(tool.body).empty())
                         ExportAppendCollapsible(md, "Output", tool.body, tool.bodyLang);
-                    if (!TrimCopy(tool.errorBody).empty())
-                        ExportAppendCollapsible(md, "Error", tool.errorBody, "");
+                    if (!TrimCopy(tool.errorBody).empty()) {
+                        // A command that exited 0 can still write to stderr
+                        // (unittest's report, progress lines); label it as
+                        // stderr rather than an error.  Mirrors
+                        // ChatDisplay::IsStderrFailure.
+                        bool exitZero = false, failed = false;
+                        for (const std::string& chip : tool.statusChips) {
+                            if (chip == "exit 0") exitZero = true;
+                            else if (chip == "blocked" || chip == "cancelled" ||
+                                     chip == "timed out" || chip == "error" ||
+                                     (chip.size() > 5 && chip.compare(0, 5, "exit ") == 0))
+                                failed = true;
+                        }
+                        ExportAppendCollapsible(md, (exitZero && !failed) ? "Stderr" : "Error",
+                                                tool.errorBody, "");
+                    }
                     // Short file lists inline; long ones (test runs can
                     // attach dozens) folded so they don't flood the page.
                     const size_t nFiles = tool.presentedFiles.size();

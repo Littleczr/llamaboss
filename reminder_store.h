@@ -89,7 +89,9 @@ inline wxString StoragePathWx()
 
 inline std::string StoragePathUtf8()
 {
-    const wxScopedCharBuffer b = StoragePathWx().ToUTF8();
+    // The wxString must outlive the buffer (ToUTF8 may not own its bytes).
+    const wxString path = StoragePathWx();
+    const wxScopedCharBuffer b = path.ToUTF8();
     return b.data() ? std::string(b.data()) : std::string();
 }
 

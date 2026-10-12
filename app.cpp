@@ -7,6 +7,7 @@
 #include "server_manager.h"   // EnsureDataDirs
 #include "chat_history.h"     // MigrateLegacyChatFolders
 #include "update_installer.h"   // CleanupStaleDownloads
+#include "background_work.h"    // DrainBackgroundWork
 
 #ifdef __WXMAC__
 #include "lb_mac_native.h"
@@ -327,6 +328,20 @@ int MyApp::OnExit()
     // finishes the job: service before AppState.
     if (m_modelService)
         m_modelService->Shutdown();
+
+    // Give detached background threads (tool workers, HTTPS probes, the
+    // ChatGPT token revoke, slot actions) a bounded chance to finish before
+    // static teardown destroys objects they may still touch.  Runs after
+    // the server stop above so slot actions against it fail fast.  Capped:
+    // a synchronous tool such as a hash of a huge file cannot be
+    // interrupted, and exit must never hang on it.
+    const int stillRunning =
+        lb::DrainBackgroundWork(std::chrono::milliseconds(3000));
+    if (stillRunning > 0 && m_appState) {
+        if (auto* logger = m_appState->GetLogger())
+            logger->warning("Exit: " + std::to_string(stillRunning) +
+                " background thread(s) still running after 3 s drain.");
+    }
 
     return wxApp::OnExit();
 }
