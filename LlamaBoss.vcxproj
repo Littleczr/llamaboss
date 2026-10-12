@@ -240,6 +240,7 @@
     <ClInclude Include="pch.h" />
     <ClInclude Include="lb_windows.h" />
     <ClInclude Include="lb_utf.h" />
+    <ClInclude Include="lb_ui_font.h" />
     <ClInclude Include="app_state.h" />
     <ClInclude Include="app.h" />
     <ClInclude Include="conversation_registry.h" />

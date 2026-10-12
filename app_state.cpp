@@ -1,5 +1,6 @@
 ﻿// app_state.cpp
 #include "app_state.h"
+#include "lb_ui_font.h"   // LbUiPt: macOS point-size parity
 #include "secrets_store.h"
 #include "endpoint_store.h"
 #include "server_manager.h"   // for ServerConfig (MakeServerConfig)
@@ -364,7 +365,7 @@ void AppState::SaveSettings()
 
 wxFont AppState::CreateMonospaceFont(int size) const
 {
-    return wxFont(size, wxFONTFAMILY_TELETYPE,
+    return wxFont(LbUiPt(size), wxFONTFAMILY_TELETYPE,
         wxFONTSTYLE_NORMAL, wxFONTWEIGHT_NORMAL,
         false, "Cascadia Code");
 }

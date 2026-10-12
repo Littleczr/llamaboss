@@ -3,6 +3,7 @@
 // Models are sourced from bartowski on HuggingFace — no account required.
 
 #include "model_downloader.h"
+#include "lb_ui_font.h"   // LbUiPt: macOS point-size parity
 #include "server_manager.h"
 #include "theme.h"
 #include "path_safety.h"
@@ -50,7 +51,7 @@ wxButton* MakeAccentButton(wxWindow* parent, wxWindowID id,
                              wxDefaultPosition, wxSize(-1, height),
                              wxBORDER_NONE);
     wxFont bf = btn->GetFont();
-    bf.SetPointSize(10);
+    bf.SetPointSize(LbUiPt(10));
     bf.SetWeight(wxFONTWEIGHT_SEMIBOLD);
     btn->SetFont(bf);
     btn->SetBackgroundColour(t.accentButton);
@@ -66,7 +67,7 @@ wxButton* MakeFlatButton(wxWindow* parent, wxWindowID id,
                              wxDefaultPosition, wxSize(-1, height),
                              wxBORDER_NONE);
     wxFont bf = btn->GetFont();
-    bf.SetPointSize(10);
+    bf.SetPointSize(LbUiPt(10));
     bf.SetWeight(wxFONTWEIGHT_SEMIBOLD);
     btn->SetFont(bf);
     btn->SetBackgroundColour(t.bgDialogSurface);
@@ -950,7 +951,7 @@ void ModelDownloaderDialog::BuildUI()
         : "Download Models";
     auto* titleLbl = new wxStaticText(hdrPanel, wxID_ANY, titleText);
     wxFont tf = titleLbl->GetFont();
-    tf.SetPointSize(11); tf.SetWeight(wxFONTWEIGHT_BOLD);
+    tf.SetPointSize(LbUiPt(11)); tf.SetWeight(wxFONTWEIGHT_BOLD);
     titleLbl->SetFont(tf);
     titleLbl->SetForegroundColour(textPri);
 

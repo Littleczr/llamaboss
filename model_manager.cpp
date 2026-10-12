@@ -6,6 +6,7 @@
 // downloading a model from a pasted link.
 
 #include "model_manager.h"
+#include "lb_ui_font.h"   // LbUiPt: macOS point-size parity
 #include "server_manager.h"
 #include "theme.h"
 #include "widgets.h"   // ApplyDialogThemeRecursive, ApplyDarkTitleBar
@@ -42,7 +43,7 @@ wxButton* MakeAccentButton(wxWindow* parent, wxWindowID id,
                              wxDefaultPosition, wxSize(-1, height),
                              wxBORDER_NONE);
     wxFont bf = btn->GetFont();
-    bf.SetPointSize(10);
+    bf.SetPointSize(LbUiPt(10));
     bf.SetWeight(wxFONTWEIGHT_SEMIBOLD);
     btn->SetFont(bf);
     btn->SetBackgroundColour(t.accentButton);
@@ -58,7 +59,7 @@ wxButton* MakeFlatButton(wxWindow* parent, wxWindowID id,
                              wxDefaultPosition, wxSize(-1, height),
                              wxBORDER_NONE);
     wxFont bf = btn->GetFont();
-    bf.SetPointSize(10);
+    bf.SetPointSize(LbUiPt(10));
     bf.SetWeight(wxFONTWEIGHT_SEMIBOLD);
     btn->SetFont(bf);
     btn->SetBackgroundColour(t.bgDialogSurface);
@@ -116,7 +117,7 @@ ModelManagerDialog::ModelManagerDialog(wxWindow* parent,
 {
     // Bump dialog default font to match the rest of the dialog family.
     wxFont f = GetFont();
-    f.SetPointSize(11);
+    f.SetPointSize(LbUiPt(11));
     f.SetWeight(wxFONTWEIGHT_NORMAL);
     SetFont(f);
 
@@ -164,7 +165,7 @@ void ModelManagerDialog::CreateControls()
     auto* headerLabel = new wxStaticText(body, wxID_ANY,
         "Models folder: " + wxString::FromUTF8(ServerManager::GetModelsDir()));
     wxFont hf = headerLabel->GetFont();
-    hf.SetPointSize(10);
+    hf.SetPointSize(LbUiPt(10));
     headerLabel->SetFont(hf);
     headerLabel->SetForegroundColour(t.textMuted);
     bodySizer->Add(headerLabel, 0, wxBOTTOM, 12);
@@ -193,7 +194,7 @@ void ModelManagerDialog::CreateControls()
         "Press Del or right-click to delete");
     {
         wxFont hf = deleteHint->GetFont();
-        hf.SetPointSize(10);
+        hf.SetPointSize(LbUiPt(10));
         hf.SetStyle(wxFONTSTYLE_ITALIC);
         deleteHint->SetFont(hf);
         deleteHint->SetForegroundColour(t.textMuted);
@@ -208,7 +209,7 @@ void ModelManagerDialog::CreateControls()
     // ── Status line ──────────────────────────────────────────────
     m_statusText = new wxStaticText(body, wxID_ANY, "");
     wxFont sf = m_statusText->GetFont();
-    sf.SetPointSize(10);
+    sf.SetPointSize(LbUiPt(10));
     m_statusText->SetFont(sf);
     m_statusText->SetForegroundColour(t.textMuted);
     bodySizer->Add(m_statusText, 0, wxBOTTOM, 4);
@@ -219,7 +220,7 @@ void ModelManagerDialog::CreateControls()
     auto* urlLabel = new wxStaticText(body, wxID_ANY, "Add a model from a link");
     {
         wxFont lf = urlLabel->GetFont();
-        lf.SetPointSize(10);
+        lf.SetPointSize(LbUiPt(10));
         lf.SetWeight(wxFONTWEIGHT_SEMIBOLD);
         urlLabel->SetFont(lf);
     }
@@ -246,7 +247,7 @@ void ModelManagerDialog::CreateControls()
         "The file is saved to the models folder above.");
     {
         wxFont uf = m_urlStatus->GetFont();
-        uf.SetPointSize(10);
+        uf.SetPointSize(LbUiPt(10));
         m_urlStatus->SetFont(uf);
     }
     m_urlStatus->SetForegroundColour(t.textMuted);

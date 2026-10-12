@@ -1,6 +1,7 @@
 // connections_dialog.cpp
 
 #include "connections_dialog.h"
+#include "lb_ui_font.h"   // LbUiPt: macOS point-size parity
 #include "secrets_store.h"
 #include "theme.h"
 #include "widgets.h"   // ApplyDialogThemeRecursive, ApplyDarkTitleBar
@@ -45,7 +46,7 @@ wxButton* MakeAccentButton(wxWindow* parent, wxWindowID id,
                              wxDefaultPosition, wxSize(-1, height),
                              wxBORDER_NONE);
     wxFont bf = btn->GetFont();
-    bf.SetPointSize(10);
+    bf.SetPointSize(LbUiPt(10));
     bf.SetWeight(wxFONTWEIGHT_SEMIBOLD);
     btn->SetFont(bf);
     btn->SetBackgroundColour(t.accentButton);
@@ -61,7 +62,7 @@ wxButton* MakeDestructiveButton(wxWindow* parent, wxWindowID id,
                              wxDefaultPosition, wxSize(-1, height),
                              wxBORDER_NONE);
     wxFont bf = btn->GetFont();
-    bf.SetPointSize(10);
+    bf.SetPointSize(LbUiPt(10));
     bf.SetWeight(wxFONTWEIGHT_SEMIBOLD);
     btn->SetFont(bf);
     btn->SetBackgroundColour(t.stopButton);
@@ -77,7 +78,7 @@ wxButton* MakeFlatButton(wxWindow* parent, wxWindowID id,
                              wxDefaultPosition, wxSize(-1, height),
                              wxBORDER_NONE);
     wxFont bf = btn->GetFont();
-    bf.SetPointSize(10);
+    bf.SetPointSize(LbUiPt(10));
     bf.SetWeight(wxFONTWEIGHT_SEMIBOLD);
     btn->SetFont(bf);
     btn->SetBackgroundColour(t.bgDialogSurface);
@@ -168,7 +169,7 @@ public:
 
         // Bump the dialog default font to match settings.cpp (11pt body).
         wxFont base = GetFont();
-        base.SetPointSize(11);
+        base.SetPointSize(LbUiPt(11));
         SetFont(base);
 
         auto* root = new wxBoxSizer(wxVERTICAL);
@@ -189,7 +190,7 @@ public:
         auto* providerHint = new wxStaticText(this, wxID_ANY,
             "Lowercase letters, numbers, and underscores. "
             "Examples: gmail, smartsheet, runpod.");
-        { wxFont f = providerHint->GetFont(); f.SetPointSize(10);
+        { wxFont f = providerHint->GetFont(); f.SetPointSize(LbUiPt(10));
           providerHint->SetFont(f); }
         providerHint->SetForegroundColour(theme.textMuted);
         providerHint->Wrap(kHintWrapWidth);
@@ -211,7 +212,7 @@ public:
         auto* keyHint = new wxStaticText(this, wxID_ANY,
             "Lowercase identifier. Becomes the suffix of the injected "
             "env var, e.g. 'api_key' \xE2\x86\x92 GMAIL_API_KEY.");
-        { wxFont f = keyHint->GetFont(); f.SetPointSize(10);
+        { wxFont f = keyHint->GetFont(); f.SetPointSize(LbUiPt(10));
           keyHint->SetFont(f); }
         keyHint->SetForegroundColour(theme.textMuted);
         keyHint->Wrap(kHintWrapWidth);
@@ -249,7 +250,7 @@ public:
         root->Add(valueRow, 0, wxEXPAND | wxLEFT | wxRIGHT, 12);
 
         m_valueHint = new wxStaticText(this, wxID_ANY, wxEmptyString);
-        { wxFont f = m_valueHint->GetFont(); f.SetPointSize(10);
+        { wxFont f = m_valueHint->GetFont(); f.SetPointSize(LbUiPt(10));
           m_valueHint->SetFont(f); }
         m_valueHint->SetForegroundColour(theme.textMuted);
         root->Add(m_valueHint, 0, wxLEFT | wxRIGHT | wxBOTTOM, 12);
@@ -441,7 +442,7 @@ ConnectionsDialog::ConnectionsDialog(wxWindow* parent,
 {
     // Bump the dialog default font to match settings.cpp (11pt body).
     wxFont base = GetFont();
-    base.SetPointSize(11);
+    base.SetPointSize(LbUiPt(11));
     SetFont(base);
 
     auto* root = new wxBoxSizer(wxVERTICAL);

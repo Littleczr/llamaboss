@@ -1,4 +1,5 @@
 #include "lb_themed_dialogs.h"
+#include "lb_ui_font.h"   // LbUiPt: macOS point-size parity
 
 #include "widgets.h"   // ApplyDarkTitleBar
 
@@ -20,7 +21,7 @@ wxButton* LbMakeThemedAccentButton(wxWindow* parent, wxWindowID id,
                                 wxDefaultPosition, wxSize(-1, height),
                                 wxBORDER_NONE);
     wxFont font = button->GetFont();
-    font.SetPointSize(10);
+    font.SetPointSize(LbUiPt(10));
     font.SetWeight(wxFONTWEIGHT_SEMIBOLD);
     button->SetFont(font);
     button->SetBackgroundColour(theme.accentButton);
@@ -36,7 +37,7 @@ wxButton* LbMakeThemedFlatButton(wxWindow* parent, wxWindowID id,
                                 wxDefaultPosition, wxSize(-1, height),
                                 wxBORDER_NONE);
     wxFont font = button->GetFont();
-    font.SetPointSize(10);
+    font.SetPointSize(LbUiPt(10));
     font.SetWeight(wxFONTWEIGHT_SEMIBOLD);
     button->SetFont(font);
     button->SetBackgroundColour(theme.bgDialogSurface);
@@ -59,7 +60,7 @@ LbThemedTextEntryDialog::LbThemedTextEntryDialog(wxWindow* parent,
     SetBackgroundColour(m_theme.bgDialogSurface);
 
     wxFont base = GetFont();
-    base.SetPointSize(11);
+    base.SetPointSize(LbUiPt(11));
     SetFont(base);
 
     auto* top = new wxBoxSizer(wxVERTICAL);
@@ -161,7 +162,7 @@ LbThemedSingleChoiceDialog::LbThemedSingleChoiceDialog(wxWindow* parent,
     SetBackgroundColour(m_theme.bgDialogSurface);
 
     wxFont base = GetFont();
-    base.SetPointSize(11);
+    base.SetPointSize(LbUiPt(11));
     SetFont(base);
 
     auto* top = new wxBoxSizer(wxVERTICAL);

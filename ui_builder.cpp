@@ -1,5 +1,6 @@
 // ui_builder.cpp
 #include "ui_builder.h"
+#include "lb_ui_font.h"   // LbUiPt: macOS point-size parity
 #include "widgets.h"
 #include "chat_input_ctrl.h"
 #include "theme.h"
@@ -32,7 +33,7 @@ TopBarWidgets BuildTopBar(wxWindow* parent, wxBoxSizer* mainSizer,
     w.sidebarToggle->SetForegroundColour(theme.textMuted);
     w.sidebarToggle->SetToolTip("Toggle sidebar");
     wxFont hamburgerFont = w.sidebarToggle->GetFont();
-    hamburgerFont.SetPointSize(18);
+    hamburgerFont.SetPointSize(LbUiPt(18));
     w.sidebarToggle->SetFont(hamburgerFont);
     w.sidebarToggle->SetCursor(wxCURSOR_HAND);
     leftSizer->Add(w.sidebarToggle, 0, wxALIGN_CENTER_VERTICAL | wxLEFT, 4);
@@ -40,7 +41,7 @@ TopBarWidgets BuildTopBar(wxWindow* parent, wxBoxSizer* mainSizer,
     w.titleLabel = new wxStaticText(w.toolbarPanel, wxID_ANY, "LlamaBoss");
     w.titleLabel->SetForegroundColour(theme.textPrimary);
     wxFont titleFont = w.titleLabel->GetFont();
-    titleFont.SetPointSize(15);
+    titleFont.SetPointSize(LbUiPt(15));
     titleFont.SetWeight(wxFONTWEIGHT_BOLD);
     w.titleLabel->SetFont(titleFont);
     leftSizer->Add(w.titleLabel, 0, wxALIGN_CENTER_VERTICAL | wxLEFT, 4);
@@ -58,8 +59,8 @@ TopBarWidgets BuildTopBar(wxWindow* parent, wxBoxSizer* mainSizer,
 
     // Monospace font for the model label so the top bar keeps the
     // same terminal-like visual language as the status strip below.
-    wxFont pillMonoFont(12, wxFONTFAMILY_TELETYPE, wxFONTSTYLE_NORMAL,
-                        wxFONTWEIGHT_NORMAL, false, "Consolas");
+    wxFont pillMonoFont(LbUiPt(12), wxFONTFAMILY_TELETYPE, wxFONTSTYLE_NORMAL,
+                        wxFONTWEIGHT_NORMAL, false, LbMonoFaceName());
 
     // Opening bracket of the [ ... ] affordance, matching the bracket
     // language used elsewhere in the chrome ([ + attach ]).
@@ -109,7 +110,7 @@ TopBarWidgets BuildTopBar(wxWindow* parent, wxBoxSizer* mainSizer,
     );
     w.protocolChip->SetForegroundColour(theme.textMuted);
     wxFont chipFont = w.protocolChip->GetFont();
-    chipFont.SetPointSize(10);
+    chipFont.SetPointSize(LbUiPt(10));
     chipFont.SetWeight(wxFONTWEIGHT_NORMAL);
     w.protocolChip->SetFont(chipFont);
     w.protocolChip->SetMinSize(wxSize(64, -1));
@@ -171,8 +172,8 @@ TopBarWidgets BuildTopBar(wxWindow* parent, wxBoxSizer* mainSizer,
     w.ctxMeter->SetForegroundColour(theme.textMuted);
     w.ctxMeter->SetBackgroundColour(theme.bgToolbar);
     {
-        wxFont meterFont(10, wxFONTFAMILY_TELETYPE, wxFONTSTYLE_NORMAL,
-                         wxFONTWEIGHT_NORMAL, false, "Consolas");
+        wxFont meterFont(LbUiPt(10), wxFONTFAMILY_TELETYPE, wxFONTSTYLE_NORMAL,
+                         wxFONTWEIGHT_NORMAL, false, LbMonoFaceName());
         w.ctxMeter->SetFont(meterFont);
     }
     w.ctxMeter->SetMinSize(wxSize(190, -1));
@@ -187,7 +188,7 @@ TopBarWidgets BuildTopBar(wxWindow* parent, wxBoxSizer* mainSizer,
     w.newChatButton->SetForegroundColour(theme.textMuted);
     w.newChatButton->SetToolTip("New Chat (Ctrl+N)");
     wxFont newChatFont = w.newChatButton->GetFont();
-    newChatFont.SetPointSize(22);
+    newChatFont.SetPointSize(LbUiPt(22));
     w.newChatButton->SetFont(newChatFont);
     w.newChatButton->SetCursor(wxCURSOR_HAND);
     rightSizer->Add(w.newChatButton, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
@@ -212,7 +213,7 @@ TopBarWidgets BuildTopBar(wxWindow* parent, wxBoxSizer* mainSizer,
     w.aboutButton->SetForegroundColour(theme.textMuted);
     w.aboutButton->SetToolTip("About LlamaBoss");
     wxFont aboutFont = w.aboutButton->GetFont();
-    aboutFont.SetPointSize(18);
+    aboutFont.SetPointSize(LbUiPt(18));
     w.aboutButton->SetFont(aboutFont);
     w.aboutButton->SetCursor(wxCURSOR_HAND);
     rightSizer->Add(w.aboutButton, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 8);
@@ -291,7 +292,7 @@ InputAreaWidgets BuildInputArea(wxWindow* parent, wxBoxSizer* parentSizer,
     w.sendButton->SetBackgroundColour(theme.accentButton);
     w.sendButton->SetForegroundColour(theme.accentButtonText);
     wxFont btnFont = w.sendButton->GetFont();
-    btnFont.SetPointSize(11);
+    btnFont.SetPointSize(LbUiPt(11));
     btnFont.SetWeight(wxFONTWEIGHT_MEDIUM);
     w.sendButton->SetFont(btnFont);
     w.inputSizer->Add(w.sendButton, 0, wxALIGN_CENTER_VERTICAL | wxLEFT | wxRIGHT, 6);

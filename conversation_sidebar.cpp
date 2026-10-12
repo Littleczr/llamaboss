@@ -3,6 +3,7 @@
 // Supports multi-select (Ctrl+Click, Shift+Click) and batch delete.
 
 #include "conversation_sidebar.h"
+#include "lb_ui_font.h"   // LbUiPt: macOS point-size parity
 #include "chat_history.h"
 #include "theme.h"
 #include "lb_hover_tile.h"
@@ -274,7 +275,7 @@ wxFont SidebarMonoFont(int pointSize,
     if (!font.IsOk() || font.GetFaceName().empty())
         font = wxFont(pointSize, wxFONTFAMILY_TELETYPE,
                       italic ? wxFONTSTYLE_ITALIC : wxFONTSTYLE_NORMAL,
-                      weight, false, "Consolas");
+                      weight, false, LbMonoFaceName());
     return font;
 }
 

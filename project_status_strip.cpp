@@ -1,5 +1,6 @@
 // project_status_strip.cpp
 #include "project_status_strip.h"
+#include "lb_ui_font.h"   // LbUiPt: macOS point-size parity
 #include "theme.h"
 
 #include <wx/sizer.h>
@@ -103,8 +104,8 @@ void ProjectStatusStrip::BuildContent()
 
     // Monospace "Consolas" matches the LlamaBoss terminal-status idiom
     // used by chat_display tool cards and command echoes.
-    wxFont monoFont(11, wxFONTFAMILY_TELETYPE, wxFONTSTYLE_NORMAL,
-                    wxFONTWEIGHT_NORMAL, false, "Consolas");
+    wxFont monoFont(LbUiPt(11), wxFONTFAMILY_TELETYPE, wxFONTSTYLE_NORMAL,
+                    wxFONTWEIGHT_NORMAL, false, LbMonoFaceName());
 
     // Padding constants for the row.  Tight (4 px) between a state
     // label and its own action chip.  In the no-project state, the

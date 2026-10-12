@@ -26,6 +26,7 @@
 // crisp, terminal-like) but felt out of place for a settings sheet.
 
 #include "settings.h"
+#include "lb_ui_font.h"   // LbUiPt: macOS point-size parity
 #include "connections_dialog.h"
 #include "endpoints_dialog.h"
 #include "endpoint_store.h"
@@ -120,7 +121,7 @@ SettingsDialog::SettingsDialog(wxWindow* parent,
     m_endpointStore = endpointStore;
 
     wxFont f = GetFont();
-    f.SetPointSize(11);
+    f.SetPointSize(LbUiPt(11));
     f.SetWeight(wxFONTWEIGHT_NORMAL);
     SetFont(f);
 
@@ -176,7 +177,7 @@ wxStaticText* SettingsDialog::MakeSectionHeader(wxWindow* parent, const wxString
 {
     auto* lbl = new wxStaticText(parent, wxID_ANY, text);
     wxFont hf = lbl->GetFont();
-    hf.SetPointSize(12);
+    hf.SetPointSize(LbUiPt(12));
     hf.SetWeight(wxFONTWEIGHT_SEMIBOLD);
     lbl->SetFont(hf);
     return lbl;
@@ -206,7 +207,7 @@ wxButton* SettingsDialog::MakeAccentButton(wxWindow* parent,
                              wxSize(-1, height),
                              wxBORDER_NONE);
     wxFont bf = btn->GetFont();
-    bf.SetPointSize(10);
+    bf.SetPointSize(LbUiPt(10));
     bf.SetWeight(wxFONTWEIGHT_SEMIBOLD);
     btn->SetFont(bf);
     m_accentBtns.push_back(btn);
@@ -272,12 +273,12 @@ void SettingsDialog::CreateControls()
     auto* locRow = new wxBoxSizer(wxHORIZONTAL);
 
     auto* locLabel = new wxStaticText(body, wxID_ANY, "Location:");
-    { wxFont lf = locLabel->GetFont(); lf.SetPointSize(10); locLabel->SetFont(lf); }
+    { wxFont lf = locLabel->GetFont(); lf.SetPointSize(LbUiPt(10)); locLabel->SetFont(lf); }
     locRow->Add(locLabel, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 6);
 
     m_locationPath = new wxStaticText(body, wxID_ANY, "",
         wxDefaultPosition, wxDefaultSize, wxST_ELLIPSIZE_MIDDLE);
-    { wxFont pf = m_locationPath->GetFont(); pf.SetPointSize(10); m_locationPath->SetFont(pf); }
+    { wxFont pf = m_locationPath->GetFont(); pf.SetPointSize(LbUiPt(10)); m_locationPath->SetFont(pf); }
     // Critical for long Windows paths: wxST_ELLIPSIZE_MIDDLE only
     // affects painting, not the label's best/min size. If we let the
     // full path report its natural width, the scrolled-window virtual
@@ -299,7 +300,7 @@ void SettingsDialog::CreateControls()
     // Muted "Default: <path>" row — hidden when no override is active.
     m_defaultPathRow = new wxStaticText(body, wxID_ANY, "",
         wxDefaultPosition, wxDefaultSize, wxST_ELLIPSIZE_MIDDLE);
-    { wxFont df = m_defaultPathRow->GetFont(); df.SetPointSize(10); m_defaultPathRow->SetFont(df); }
+    { wxFont df = m_defaultPathRow->GetFont(); df.SetPointSize(LbUiPt(10)); m_defaultPathRow->SetFont(df); }
     // Same shrinkability issue as the active Location path above.
     // This row is usually hidden, but custom model-folder users may
     // show a long default path; never let it widen the scroll body.
@@ -309,7 +310,7 @@ void SettingsDialog::CreateControls()
     // Status line (muted)
     m_statusText = new wxStaticText(body, wxID_ANY, "");
     wxFont sf = m_statusText->GetFont();
-    sf.SetPointSize(10);
+    sf.SetPointSize(LbUiPt(10));
     m_statusText->SetFont(sf);
     bodySizer->Add(m_statusText, 0, wxBOTTOM, 14);
 
@@ -324,7 +325,7 @@ void SettingsDialog::CreateControls()
     auto* ctxValueLabel = new wxStaticText(body, wxID_ANY,
         wxString::FromUTF8(FormatCtxSize(m_selectedCtxSize)));
     wxFont cvf = ctxValueLabel->GetFont();
-    cvf.SetPointSize(10);
+    cvf.SetPointSize(LbUiPt(10));
     cvf.SetWeight(wxFONTWEIGHT_SEMIBOLD);
     ctxValueLabel->SetFont(cvf);
     ctxHeaderRow->Add(ctxValueLabel, 0, wxALIGN_CENTER_VERTICAL);
@@ -333,7 +334,7 @@ void SettingsDialog::CreateControls()
     auto* ctxHint = new wxStaticText(body, wxID_ANY,
         "How much of the conversation the model can keep in memory.");
     wxFont chf = ctxHint->GetFont();
-    chf.SetPointSize(10);
+    chf.SetPointSize(LbUiPt(10));
     ctxHint->SetFont(chf);
     bodySizer->Add(ctxHint, 0, wxBOTTOM, 8);
 
@@ -354,7 +355,7 @@ void SettingsDialog::CreateControls()
     m_kvCacheQ8CheckBox = new wxCheckBox(
         body, wxID_ANY, "8-bit KV cache (recommended)");
     { wxFont kvf = m_kvCacheQ8CheckBox->GetFont();
-      kvf.SetPointSize(11);
+      kvf.SetPointSize(LbUiPt(11));
       m_kvCacheQ8CheckBox->SetFont(kvf); }
     m_kvCacheQ8CheckBox->SetValue(m_selectedKvCacheQ8);
     bodySizer->Add(m_kvCacheQ8CheckBox, 0, wxBOTTOM, 4);
@@ -362,7 +363,7 @@ void SettingsDialog::CreateControls()
     auto* kvHint = new wxStaticText(body, wxID_ANY,
         "Halves context memory use, so about twice the context fits in "
         "VRAM. Changing this reloads the model.");
-    { wxFont kh = kvHint->GetFont(); kh.SetPointSize(10); kvHint->SetFont(kh); }
+    { wxFont kh = kvHint->GetFont(); kh.SetPointSize(LbUiPt(10)); kvHint->SetFont(kh); }
     bodySizer->Add(kvHint, 0, wxBOTTOM, 14);
 
     // Multi-token prediction lives in the Context section with the
@@ -371,7 +372,7 @@ void SettingsDialog::CreateControls()
     m_mtpCheckBox = new wxCheckBox(
         body, wxID_ANY, "Multi-token prediction (auto)");
     { wxFont mf = m_mtpCheckBox->GetFont();
-      mf.SetPointSize(11);
+      mf.SetPointSize(LbUiPt(11));
       m_mtpCheckBox->SetFont(mf); }
     m_mtpCheckBox->SetValue(m_selectedMtpEnabled);
     bodySizer->Add(m_mtpCheckBox, 0, wxBOTTOM, 4);
@@ -380,7 +381,7 @@ void SettingsDialog::CreateControls()
         "Speeds up generation on models with built-in MTP heads "
         "(GLM 4.5/4.6, Qwen MTP builds). Detected automatically; has "
         "no effect on other models. Changing this reloads the model.");
-    { wxFont mh = mtpHint->GetFont(); mh.SetPointSize(10); mtpHint->SetFont(mh); }
+    { wxFont mh = mtpHint->GetFont(); mh.SetPointSize(LbUiPt(10)); mtpHint->SetFont(mh); }
     // Keep this long hint from widening the vertical-only scrolled body.
     // Without wrapping, FitInside() uses the text's full best width and
     // pushes right-aligned Manage buttons outside the visible viewport.
@@ -399,27 +400,27 @@ void SettingsDialog::CreateControls()
     m_agentDefaultCheckBox = new wxCheckBox(
         body, wxID_ANY, "Start new chats with agent mode enabled");
     { wxFont acf = m_agentDefaultCheckBox->GetFont();
-      acf.SetPointSize(11);
+      acf.SetPointSize(LbUiPt(11));
       m_agentDefaultCheckBox->SetFont(acf); }
     m_agentDefaultCheckBox->SetValue(m_selectedAgentDefault);
     bodySizer->Add(m_agentDefaultCheckBox, 0, wxBOTTOM, 4);
 
     auto* agentHint = new wxStaticText(body, wxID_ANY,
         "The robot button toggles agent mode for the current chat.");
-    { wxFont ah = agentHint->GetFont(); ah.SetPointSize(10); agentHint->SetFont(ah); }
+    { wxFont ah = agentHint->GetFont(); ah.SetPointSize(LbUiPt(10)); agentHint->SetFont(ah); }
     bodySizer->Add(agentHint, 0, wxBOTTOM, 14);
 
     m_contextMeterCheckBox = new wxCheckBox(
         body, wxID_ANY, "Show context meter in the top bar");
     { wxFont cmf = m_contextMeterCheckBox->GetFont();
-      cmf.SetPointSize(11);
+      cmf.SetPointSize(LbUiPt(11));
       m_contextMeterCheckBox->SetFont(cmf); }
     m_contextMeterCheckBox->SetValue(m_selectedContextMeter);
     bodySizer->Add(m_contextMeterCheckBox, 0, wxBOTTOM, 4);
 
     auto* meterHint = new wxStaticText(body, wxID_ANY,
         "Shows how full the model's context window is (tokens used / total).");
-    { wxFont mh = meterHint->GetFont(); mh.SetPointSize(10); meterHint->SetFont(mh); }
+    { wxFont mh = meterHint->GetFont(); mh.SetPointSize(LbUiPt(10)); meterHint->SetFont(mh); }
     bodySizer->Add(meterHint, 0, wxBOTTOM, 14);
 
     // ─────────────────────────────────────────────────────────────
@@ -435,7 +436,7 @@ void SettingsDialog::CreateControls()
     auto* connRow = new wxBoxSizer(wxHORIZONTAL);
     m_connectionsLabel = new wxStaticText(body, wxID_ANY,
         "No AI providers configured");
-    { wxFont cf = m_connectionsLabel->GetFont(); cf.SetPointSize(11);
+    { wxFont cf = m_connectionsLabel->GetFont(); cf.SetPointSize(LbUiPt(11));
       m_connectionsLabel->SetFont(cf); }
     // Keep the right-side Manage button visible even if this text grows
     // in a future build (or localization makes it longer).
@@ -450,7 +451,7 @@ void SettingsDialog::CreateControls()
 
     auto* connHint = new wxStaticText(body, wxID_ANY,
         "Add OpenRouter, OpenAI, or another AI provider. Manage other service keys here too.");
-    { wxFont ch = connHint->GetFont(); ch.SetPointSize(10); connHint->SetFont(ch); }
+    { wxFont ch = connHint->GetFont(); ch.SetPointSize(LbUiPt(10)); connHint->SetFont(ch); }
     connHint->Wrap(520);
     bodySizer->Add(connHint, 0, wxBOTTOM, 14);
 
@@ -501,7 +502,7 @@ void SettingsDialog::CreateControls()
     auto* fontValueLabel = new wxStaticText(body, wxID_ANY,
         wxString::Format("%dpt", m_selectedFontSize));
     wxFont fvf = fontValueLabel->GetFont();
-    fvf.SetPointSize(10);
+    fvf.SetPointSize(LbUiPt(10));
     fvf.SetWeight(wxFONTWEIGHT_SEMIBOLD);
     fontValueLabel->SetFont(fvf);
     fontHeaderRow->Add(fontValueLabel, 0, wxALIGN_CENTER_VERTICAL);
@@ -538,7 +539,7 @@ void SettingsDialog::CreateControls()
                                wxDefaultPosition, wxSize(-1, 32),
                                wxBORDER_NONE);
     { wxFont cbf = m_cancelBtn->GetFont();
-      cbf.SetPointSize(10);
+      cbf.SetPointSize(LbUiPt(10));
       cbf.SetWeight(wxFONTWEIGHT_SEMIBOLD);
       m_cancelBtn->SetFont(cbf); }
 

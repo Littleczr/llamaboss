@@ -261,6 +261,9 @@
     <ClInclude Include="lb_utf.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="lb_ui_font.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="app_state.h">
       <Filter>Header Files</Filter>
     </ClInclude>

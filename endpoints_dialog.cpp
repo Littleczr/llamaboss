@@ -1,6 +1,7 @@
 // endpoints_dialog.cpp
 
 #include "endpoints_dialog.h"
+#include "lb_ui_font.h"   // LbUiPt: macOS point-size parity
 #include "reasoning_policy.h"
 #include "openai_responses.h"
 #include "endpoint_store.h"
@@ -55,7 +56,7 @@ wxButton* MakeAccentButton(wxWindow* parent, wxWindowID id,
                              wxDefaultPosition, wxSize(-1, height),
                              wxBORDER_NONE);
     wxFont bf = btn->GetFont();
-    bf.SetPointSize(10);
+    bf.SetPointSize(LbUiPt(10));
     bf.SetWeight(wxFONTWEIGHT_SEMIBOLD);
     btn->SetFont(bf);
     btn->SetBackgroundColour(t.accentButton);
@@ -71,7 +72,7 @@ wxButton* MakeDestructiveButton(wxWindow* parent, wxWindowID id,
                              wxDefaultPosition, wxSize(-1, height),
                              wxBORDER_NONE);
     wxFont bf = btn->GetFont();
-    bf.SetPointSize(10);
+    bf.SetPointSize(LbUiPt(10));
     bf.SetWeight(wxFONTWEIGHT_SEMIBOLD);
     btn->SetFont(bf);
     btn->SetBackgroundColour(t.stopButton);
@@ -87,7 +88,7 @@ wxButton* MakeFlatButton(wxWindow* parent, wxWindowID id,
                              wxDefaultPosition, wxSize(-1, height),
                              wxBORDER_NONE);
     wxFont bf = btn->GetFont();
-    bf.SetPointSize(10);
+    bf.SetPointSize(LbUiPt(10));
     bf.SetWeight(wxFONTWEIGHT_SEMIBOLD);
     btn->SetFont(bf);
     btn->SetBackgroundColour(t.bgDialogSurface);
@@ -913,7 +914,7 @@ public:
         if (m_endpointStore && m_endpointStore->FindEndpoint(seed.id)) m_seededExistingId = seed.id;
 
         wxFont base = GetFont();
-        base.SetPointSize(11);
+        base.SetPointSize(LbUiPt(11));
         SetFont(base);
 
         // Two steps share the same underlying editor and persistence path.
@@ -2868,7 +2869,7 @@ EndpointsDialog::EndpointsDialog(wxWindow* parent,
     , m_theme(&theme)
 {
     wxFont base = GetFont();
-    base.SetPointSize(11);
+    base.SetPointSize(LbUiPt(11));
     SetFont(base);
 
     auto* root = new wxBoxSizer(wxVERTICAL);

@@ -1,6 +1,7 @@
 // project_attach_dialog.cpp
 
 #include "project_attach_dialog.h"
+#include "lb_ui_font.h"   // LbUiPt: macOS point-size parity
 
 #include "widgets.h"   // ApplyDarkTitleBar
 
@@ -49,7 +50,7 @@ wxButton* MakeAccentButton(wxWindow* parent, wxWindowID id,
                              wxDefaultPosition, wxSize(-1, height),
                              wxBORDER_NONE);
     wxFont bf = btn->GetFont();
-    bf.SetPointSize(10);
+    bf.SetPointSize(LbUiPt(10));
     bf.SetWeight(wxFONTWEIGHT_SEMIBOLD);
     btn->SetFont(bf);
     btn->SetBackgroundColour(t.accentButton);
@@ -65,7 +66,7 @@ wxButton* MakeFlatButton(wxWindow* parent, wxWindowID id,
                              wxDefaultPosition, wxSize(-1, height),
                              wxBORDER_NONE);
     wxFont bf = btn->GetFont();
-    bf.SetPointSize(10);
+    bf.SetPointSize(LbUiPt(10));
     bf.SetWeight(wxFONTWEIGHT_SEMIBOLD);
     btn->SetFont(bf);
     btn->SetBackgroundColour(t.bgDialogSurface);
@@ -141,7 +142,7 @@ void ProjectAttachDialog::BuildUi()
     // (11pt body, 12pt headers, 10pt buttons). Picker dialogs lean on
     // the same hierarchy.
     wxFont base = GetFont();
-    base.SetPointSize(11);
+    base.SetPointSize(LbUiPt(11));
     SetFont(base);
 
     auto* top = new wxBoxSizer(wxVERTICAL);
@@ -160,7 +161,7 @@ void ProjectAttachDialog::BuildUi()
     subtitle->SetForegroundColour(m_theme.textMuted);
     {
         wxFont sf = subtitle->GetFont();
-        sf.SetPointSize(10);
+        sf.SetPointSize(LbUiPt(10));
         subtitle->SetFont(sf);
     }
     top->Add(subtitle, 0, wxLEFT | wxRIGHT | wxTOP | wxBOTTOM, 12);

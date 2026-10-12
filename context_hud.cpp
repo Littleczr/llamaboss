@@ -1,6 +1,7 @@
 // context_hud.cpp -- see context_hud.h.
 
 #include "context_hud.h"
+#include "lb_ui_font.h"   // LbUiPt: macOS point-size parity
 
 #include <wx/control.h>
 #include <wx/display.h>
@@ -41,8 +42,8 @@ ContextHud::ContextHud(wxWindow* parent, const ThemeData& theme, HudModel model,
     SetBackgroundColour(m_theme.bgDialogSurface);
 
     // Same monospace family as the ctx meter and the Project/Skills strip.
-    m_font = wxFont(10, wxFONTFAMILY_TELETYPE, wxFONTSTYLE_NORMAL,
-                    wxFONTWEIGHT_NORMAL, false, "Consolas");
+    m_font = wxFont(LbUiPt(10), wxFONTFAMILY_TELETYPE, wxFONTSTYLE_NORMAL,
+                    wxFONTWEIGHT_NORMAL, false, LbMonoFaceName());
     m_bold = m_font.Bold();
 
     RebuildButtons();

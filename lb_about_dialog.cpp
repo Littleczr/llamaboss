@@ -2,6 +2,7 @@
 // lb_about_dialog.cpp — see lb_about_dialog.h.
 //
 #include "lb_about_dialog.h"
+#include "lb_ui_font.h"   // LbUiPt: macOS point-size parity
 
 #include "lb_background_threads.h"
 #include "lb_update_ui.h"          // LbIsTrustedUpdateUrl, LbUpdateFallbackUrl
@@ -27,7 +28,7 @@ wxButton* MakeButton(wxWindow* parent, const wxString& label,
     auto* b = new wxButton(parent, wxID_ANY, label, wxDefaultPosition,
                            wxSize(-1, 32), wxBORDER_NONE);
     wxFont f = b->GetFont();
-    f.SetPointSize(10);
+    f.SetPointSize(LbUiPt(10));
     f.SetWeight(wxFONTWEIGHT_SEMIBOLD);
     b->SetFont(f);
     b->SetBackgroundColour(accent ? theme.accentButton : theme.bgDialogSurface);
@@ -134,7 +135,7 @@ void LbAboutDialog::BuildUi(const std::string& modelDisplayName,
         auto* v = new wxStaticText(this, wxID_ANY, wxString::FromUTF8(value),
                                    wxDefaultPosition, wxSize(380, -1),
                                    wxST_ELLIPSIZE_MIDDLE | wxST_NO_AUTORESIZE);
-        wxFont f = v->GetFont(); f.SetPointSize(9); v->SetFont(f);
+        wxFont f = v->GetFont(); f.SetPointSize(LbUiPt(9)); v->SetFont(f);
         v->SetForegroundColour(m_theme.textPrimary);
         v->SetToolTip(wxString::FromUTF8(value));
         grid->Add(v, 1, wxEXPAND);

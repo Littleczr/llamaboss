@@ -1,5 +1,6 @@
 // chat_display.cpp
 #include "chat_display.h"
+#include "lb_ui_font.h"   // LbUiPt: macOS point-size parity
 #include "chat_display_ctrl.h"
 #include "markdown_renderer.h"
 #include "ascii_animation.h"
@@ -385,7 +386,7 @@ wxRichTextAttr MakeMonoAttr(const wxColour& color, int size,
     a.SetTextColour(color);
     a.SetFontStyle(style);
     a.SetFontSize(size);
-    a.SetFontFaceName("Consolas");
+    a.SetFontFaceName(LbMonoFaceName());
     return a;
 }
 
@@ -2679,7 +2680,7 @@ void ChatDisplay::WriteAnimationLine(const std::vector<ColoredChar>& line)
     if (sz <= 0) sz = 11;
     wxFont monoFont(sz - 1, wxFONTFAMILY_TELETYPE,
                     wxFONTSTYLE_NORMAL, wxFONTWEIGHT_NORMAL,
-                    false, "Consolas");
+                    false, LbMonoFaceName());
 
     // Batch consecutive chars of the same color into one WriteText call
     // to avoid per-character style overhead (huge perf win on wxRichTextCtrl)
