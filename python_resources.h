@@ -101,4 +101,53 @@ inline bool Load(const std::string& name,
 }
 
 } // namespace lb_pyres
+#else  // !_WIN32
+#include <fstream>
+#include <map>
+#include <mutex>
+#include <sstream>
+#include <wx/filename.h>
+#include <wx/stdpaths.h>
+
+namespace lb_pyres {
+
+// macOS: the scripts ship as files in LlamaBoss.app/Contents/Resources/python
+// (copied there by CMake from assets/python).  Each is read once and cached
+// for the life of the process, matching the RCDATA contract above.
+inline bool Load(const std::string& name,
+                 const char*&       data,
+                 std::size_t&       size,
+                 std::string&       errorOut)
+{
+    data = nullptr;
+    size = 0;
+    static std::mutex s_mutex;
+    static std::map<std::string, std::string> s_cache;
+    std::lock_guard<std::mutex> lock(s_mutex);
+
+    auto it = s_cache.find(name);
+    if (it == s_cache.end()) {
+        wxFileName fn(wxStandardPaths::Get().GetResourcesDir(), wxString::FromUTF8(name) + ".py");
+        fn.AppendDir("python");
+        const std::string p = fn.GetFullPath().ToStdString(wxConvUTF8);
+        std::ifstream in(p, std::ios::binary);
+        if (!in) {
+            errorOut = "Built-in Python script '" + name + "' is missing from the app bundle (" +
+                       p + "). Rebuild LlamaBoss.";
+            return false;
+        }
+        std::ostringstream ss;
+        ss << in.rdbuf();
+        it = s_cache.emplace(name, ss.str()).first;
+    }
+    if (it->second.empty()) {
+        errorOut = "Built-in Python script '" + name + "' in the app bundle is empty.";
+        return false;
+    }
+    data = it->second.data();
+    size = it->second.size();
+    return true;
+}
+
+} // namespace lb_pyres
 #endif // _WIN32

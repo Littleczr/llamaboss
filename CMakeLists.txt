@@ -127,6 +127,12 @@ if(APPLE)
     target_sources(LlamaBoss PRIVATE ${_lb_icns})
     set_source_files_properties(${_lb_icns} PROPERTIES
         MACOSX_PACKAGE_LOCATION Resources)
+    # Built-in Python helpers and the py kernel (RCDATA on Windows); read by
+    # lb_pyres::Load from Contents/Resources/python.
+    file(GLOB _lb_pyfiles CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/assets/python/*.py)
+    target_sources(LlamaBoss PRIVATE ${_lb_pyfiles})
+    set_source_files_properties(${_lb_pyfiles} PROPERTIES
+        MACOSX_PACKAGE_LOCATION Resources/python)
 endif()
 
 # ── Bundle llama-server (macOS) ──

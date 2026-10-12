@@ -26,11 +26,21 @@
 #include "python_resources.h"     // built-in helper scripts (RCDATA)
 
 #include "lb_windows.h"
+#ifndef _WIN32
+#include "lb_process.h"   // python launcher (process group, timeout, cancel)
+#include "lb_python_posix.h" // which python3, LlamaBoss environment
+#include <cerrno>
+#include <cstring>
+#include <dirent.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 wxDEFINE_EVENT(wxEVT_PYTHON_COMPLETE, wxCommandEvent);
 wxDEFINE_EVENT(wxEVT_PYTHON_ERROR,    wxCommandEvent);
 
-#ifdef _WIN32
+// (portable worker: Win32-only pieces are fenced individually below)
 namespace {
 
 std::wstring Utf8ToWide(const std::string& s)
@@ -47,6 +57,31 @@ std::string WideToUtf8(const std::wstring& s)
 bool IsStrictUtf8(const std::string& bytes)
 {
     if (bytes.empty()) return true;
+#ifndef _WIN32
+    // Same acceptance as MB_ERR_INVALID_CHARS: well-formed UTF-8 only
+    // (no overlongs, surrogates, or values above U+10FFFF).
+    size_t i = 0;
+    const size_t n = bytes.size();
+    while (i < n) {
+        const unsigned char c0 = static_cast<unsigned char>(bytes[i]);
+        if (c0 < 0x80) { ++i; continue; }
+        size_t len = 0;
+        if (c0 >= 0xC2 && c0 <= 0xDF) len = 2;
+        else if (c0 >= 0xE0 && c0 <= 0xEF) len = 3;
+        else if (c0 >= 0xF0 && c0 <= 0xF4) len = 4;
+        else return false;
+        if (i + len > n) return false;
+        for (size_t k = 1; k < len; ++k)
+            if ((static_cast<unsigned char>(bytes[i + k]) & 0xC0) != 0x80) return false;
+        const unsigned char c1 = static_cast<unsigned char>(bytes[i + 1]);
+        if (c0 == 0xE0 && c1 < 0xA0) return false;
+        if (c0 == 0xED && c1 >= 0xA0) return false;
+        if (c0 == 0xF0 && c1 < 0x90) return false;
+        if (c0 == 0xF4 && c1 > 0x8F) return false;
+        i += len;
+    }
+    return true;
+#else
     const int inputLen = static_cast<int>(bytes.size());
     return ::MultiByteToWideChar(CP_UTF8,
                                  MB_ERR_INVALID_CHARS,
@@ -54,6 +89,7 @@ bool IsStrictUtf8(const std::string& bytes)
                                  inputLen,
                                  nullptr,
                                  0) > 0;
+#endif
 }
 
 size_t CountValidUtf8MultibyteSequences(const std::string& bytes)
@@ -115,6 +151,7 @@ size_t CountValidUtf8MultibyteSequences(const std::string& bytes)
     return count;
 }
 
+#ifdef _WIN32
 std::string DecodeWithCodePageToUtf8(UINT codePage,
                                      DWORD flags,
                                      const std::string& bytes)
@@ -142,6 +179,7 @@ std::string DecodeWithCodePageToUtf8(UINT codePage,
 
     return WideToUtf8(wide);
 }
+#endif
 
 std::string DropTrailingIncompleteUtf8Codepoint(const std::string& bytes)
 {
@@ -198,6 +236,26 @@ std::string NormalizeProcessOutputUtf8(const std::string& bytes)
         return trimmed;
     }
 
+#ifndef _WIN32
+    // macOS: no legacy ANSI code page to fall back to.  Keep valid UTF-8
+    // sequences and replace each invalid byte with U+FFFD, so the JSON sent
+    // to the model is always well-formed.
+    std::string fixed;
+    fixed.reserve(trimmed.size());
+    size_t i = 0;
+    while (i < trimmed.size()) {
+        size_t len = 1;
+        const unsigned char c0 = static_cast<unsigned char>(trimmed[i]);
+        if (c0 >= 0xC2 && c0 <= 0xDF) len = 2;
+        else if (c0 >= 0xE0 && c0 <= 0xEF) len = 3;
+        else if (c0 >= 0xF0 && c0 <= 0xF4) len = 4;
+        const std::string seq = trimmed.substr(i, len);
+        if (c0 < 0x80) { fixed.push_back(trimmed[i]); i += 1; }
+        else if (len > 1 && seq.size() == len && IsStrictUtf8(seq)) { fixed += seq; i += len; }
+        else { fixed += "\xEF\xBF\xBD"; i += 1; }
+    }
+    return fixed;
+#else
     const bool looksLikeDamagedUtf8 = CountValidUtf8MultibyteSequences(bytes) > 0;
 
     if (looksLikeDamagedUtf8) {
@@ -220,6 +278,7 @@ std::string NormalizeProcessOutputUtf8(const std::string& bytes)
         safe.push_back(ch < 0x80 ? static_cast<char>(ch) : '?');
     }
     return safe;
+#endif
 }
 double NowSec()
 {
@@ -342,6 +401,7 @@ std::string ScanRootForCwd(const std::string& cwd)
     return chatFolder.empty() ? SharedLanesRootDir() : chatFolder;
 }
 
+#ifdef _WIN32
 bool FileExistsRegular(const std::string& path)
 {
     DWORD attrs = GetFileAttributesW(Utf8ToWide(path).c_str());
@@ -528,6 +588,152 @@ bool WriteUtf8ArgTempFile(const std::string& prefix,
     return true;
 }
 
+#else
+bool FileExistsRegular(const std::string& path)
+{
+    struct stat st {};
+    return ::stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode);
+}
+
+std::string UniqueSidecarPathNear(const std::string& targetPath,
+                                  const std::string& suffix)
+{
+    static std::atomic<unsigned long> s_counter{0};
+
+    std::string dir = ParentDirOf(targetPath);
+    std::string base = PathBaseNameLocal(targetPath);
+    if (dir.empty() || base.empty()) return std::string();
+
+    for (int i = 0; i < 100; ++i) {
+        unsigned long n = ++s_counter;
+        std::ostringstream name;
+        name << base << ".tmp."
+             << ::getpid() << "."
+             << static_cast<unsigned long long>(NowSec() * 1000.0) << "."
+             << n << suffix;
+        std::string candidate = JoinPath(dir, name.str());
+        if (!FileExistsRegular(candidate))
+            return candidate;
+    }
+    return std::string();
+}
+
+// O_EXCL creation is the CREATE_NEW equivalent: a racing file with the
+// same name makes us pick another sidecar name instead of clobbering it.
+bool CreateUniqueSidecarForWrite(const std::string& targetPath,
+                                 const std::string& suffix,
+                                 const std::string& purpose,
+                                 std::string& pathOut,
+                                 int& fdOut,
+                                 std::string& errorOut)
+{
+    pathOut.clear();
+    fdOut = -1;
+    for (int attempt = 0; attempt < 100; ++attempt) {
+        std::string candidate = UniqueSidecarPathNear(targetPath, suffix);
+        if (candidate.empty()) {
+            errorOut = "Could not allocate temporary path for " + purpose + ": " + targetPath;
+            return false;
+        }
+        const int fd = ::open(candidate.c_str(),
+                              O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+        if (fd >= 0) {
+            pathOut = std::move(candidate);
+            fdOut = fd;
+            return true;
+        }
+        if (errno == EEXIST) continue;
+        errorOut = "Could not create temporary file for " + purpose + ": " +
+                   targetPath + ", error=" + std::strerror(errno);
+        return false;
+    }
+    errorOut = "Could not create a unique temporary file for " + purpose +
+               " after multiple attempts: " + targetPath;
+    return false;
+}
+
+bool WriteAllFd(int fd, const char* data, size_t size)
+{
+    size_t offset = 0;
+    while (offset < size) {
+        const ssize_t w = ::write(fd, data + offset, size - offset);
+        if (w < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        offset += static_cast<size_t>(w);
+    }
+    return true;
+}
+
+bool WriteBytesAtomic(const std::string& targetPath,
+                      const char* data,
+                      size_t size,
+                      std::string& errorOut)
+{
+    std::string tmpPath;
+    int fd = -1;
+    if (!CreateUniqueSidecarForWrite(targetPath, ".tmp", "atomic write",
+                                     tmpPath, fd, errorOut)) {
+        return false;
+    }
+    bool ok = WriteAllFd(fd, data, size);
+    if (!ok) {
+        errorOut = "Failed while writing temporary file for: " + targetPath +
+                   ", error=" + std::strerror(errno);
+    } else if (::fsync(fd) != 0) {
+        ok = false;
+        errorOut = "Failed to flush temporary file for: " + targetPath +
+                   ", error=" + std::strerror(errno);
+    }
+    ::close(fd);
+    if (!ok) {
+        ::unlink(tmpPath.c_str());
+        return false;
+    }
+    if (::rename(tmpPath.c_str(), targetPath.c_str()) != 0) {
+        const int err = errno;
+        ::unlink(tmpPath.c_str());
+        errorOut = "Could not install file atomically: " + targetPath +
+                   ", error=" + std::strerror(err);
+        return false;
+    }
+    return true;
+}
+
+bool WriteUtf8ArgTempFile(const std::string& prefix,
+                          const std::string& content,
+                          std::string& pathOut,
+                          std::string& errorOut)
+{
+    std::string argDir = JoinPath(BuiltInHelperScriptsDir(), "Args");
+    wxFileName::Mkdir(wxString::FromUTF8(argDir.c_str()),
+                      wxS_DIR_DEFAULT,
+                      wxPATH_MKDIR_FULL);
+
+    std::string target = JoinPath(argDir, prefix + ".json");
+    int fd = -1;
+    if (!CreateUniqueSidecarForWrite(target, ".json", "helper-argument file",
+                                     pathOut, fd, errorOut)) {
+        pathOut.clear();
+        return false;
+    }
+    const bool ok = WriteAllFd(fd, content.data(), content.size());
+    if (!ok) {
+        errorOut = "Failed while writing helper-argument file: " + pathOut +
+                   ", error=" + std::strerror(errno);
+    }
+    ::close(fd);
+    if (!ok) {
+        ::unlink(pathOut.c_str());
+        pathOut.clear();
+        return false;
+    }
+    return true;
+}
+
+#endif
+
 std::string LowerLocal(std::string s)
 {
     std::transform(s.begin(), s.end(), s.begin(),
@@ -575,6 +781,18 @@ std::string NormalizePathForCompare(std::string path)
     // under the LlamaBoss root during prefix checks.  GetFullPathNameW
     // collapses . and .. segments before we do the case-insensitive
     // boundary comparison.
+#ifndef _WIN32
+    // macOS: collapse . and .. against the cwd, as GetFullPathNameW does.
+    // No case folding and no separator rewrite: '/' is the separator.
+    if (!path.empty()) {
+        wxFileName fn(wxString::FromUTF8(path.c_str()));
+        fn.Normalize(wxPATH_NORM_DOTS | wxPATH_NORM_ABSOLUTE);
+        const std::string full = fn.GetFullPath().ToStdString(wxConvUTF8);
+        if (!full.empty()) path = full;
+    }
+    while (path.size() > 1 && path.back() == '/') path.pop_back();
+    return path;
+#else
     if (!path.empty()) {
         std::wstring w = Utf8ToWide(path);
         DWORD needed = GetFullPathNameW(w.c_str(), 0, nullptr, nullptr);
@@ -595,10 +813,14 @@ std::string NormalizePathForCompare(std::string path)
     std::transform(path.begin(), path.end(), path.begin(),
                    [](unsigned char c){ return static_cast<char>(std::tolower(c)); });
     return path;
+#endif
 }
 
 bool IsAbsoluteWindowsPath(const std::string& path)
 {
+#ifndef _WIN32
+    return !path.empty() && path[0] == '/';   // macOS absolute path
+#endif
     if (path.size() >= 3 && std::isalpha(static_cast<unsigned char>(path[0])) &&
         path[1] == ':' && (path[2] == '\\' || path[2] == '/')) {
         return true;
@@ -617,7 +839,11 @@ bool IsPathUnderRootForCompare(const std::string& path, const std::string& root)
     if (p == r) return true;
     if (r.empty()) return false;
 
+#ifdef _WIN32
     const char sep = '\\';
+#else
+    const char sep = '/';
+#endif
     if (r.back() != sep) r.push_back(sep);
     return p.size() > r.size() && p.compare(0, r.size(), r) == 0;
 }
@@ -1000,8 +1226,13 @@ std::string UniqueToolOutputPath(const std::string& dir,
             ? (safeStem + suffix)
             : (safeStem + "_" + std::to_string(i + 1) + suffix);
         std::string path = JoinPath(dir, displayNameOut);
+#ifndef _WIN32
+        struct stat st {};
+        if (::lstat(path.c_str(), &st) != 0) return path;
+#else
         DWORD attrs = GetFileAttributesW(Utf8ToWide(path).c_str());
         if (attrs == INVALID_FILE_ATTRIBUTES) return path;
+#endif
     }
     displayNameOut.clear();
     return std::string();
@@ -1816,6 +2047,27 @@ void CollectFilesRecursive(const std::string& dir,
 {
     if (dir.empty() || seenCount >= maxSeen) return;
 
+#ifndef _WIN32
+    // Symlinked folders are not descended (no loops, no escaping the root).
+    DIR* d = ::opendir(dir.c_str());
+    if (!d) return;
+    while (struct dirent* e = ::readdir(d)) {
+        if (seenCount >= maxSeen) break;
+        const std::string name = e->d_name;
+        if (name == "." || name == "..") continue;
+        const std::string path = JoinPath(dir, name);
+        struct stat st {};
+        if (::lstat(path.c_str(), &st) != 0) continue;
+        if (S_ISDIR(st.st_mode)) {
+            if (ShouldSkipPythonArtifactScanDir(name)) continue;
+            CollectFilesRecursive(path, out, seenCount, maxSeen);
+        } else if (S_ISREG(st.st_mode)) {
+            ++seenCount;
+            out.push_back(path);
+        }
+    }
+    ::closedir(d);
+#else
     std::wstring pattern = Utf8ToWide(JoinPath(dir, "*"));
     WIN32_FIND_DATAW fd = {};
     HANDLE h = FindFirstFileW(pattern.c_str(), &fd);
@@ -1840,6 +2092,7 @@ void CollectFilesRecursive(const std::string& dir,
     } while (FindNextFileW(h, &fd));
 
     FindClose(h);
+#endif
 }
 
 std::set<std::string> SnapshotPythonRunArtifactFiles(const std::string& cwd,
@@ -1929,6 +2182,7 @@ void AttachNewFilesUnderLlamaBoss(PythonRunResult& result,
     }
 }
 
+#ifdef _WIN32
 struct HandleGuard {
     HANDLE h = nullptr;
     HandleGuard() = default;
@@ -2016,6 +2270,9 @@ std::wstring QuoteArg(const std::wstring& arg)
     return out;
 }
 
+#endif // _WIN32
+
+#ifdef _WIN32
 struct PythonCandidate {
     std::string label;
     std::wstring commandLine;
@@ -2076,6 +2333,37 @@ std::vector<PythonCandidate> BuildPipInstallCandidates(const std::string& packag
     };
 }
 
+#else
+// macOS: one interpreter (lb_python_posix.h) instead of the py/python/
+// python3 probe, launched by argv so no command-line quoting is involved.
+struct PythonCandidate {
+    std::string label;
+    std::vector<std::string> argv;
+};
+
+std::vector<PythonCandidate> BuildCandidates(const std::string& scriptPath,
+                                             const std::vector<std::string>& helperArgs)
+{
+    const std::string py = lb_python::RunInterpreter();
+    if (py.empty()) return {};
+    // Same flags as Windows: -X utf8 (UTF-8 stdio), -B (no .pyc), -u
+    // (unbuffered, so a timeout keeps the latest output).
+    std::vector<std::string> argv = { py, "-X", "utf8", "-B", "-u", scriptPath };
+    argv.insert(argv.end(), helperArgs.begin(), helperArgs.end());
+    return { { "python3", std::move(argv) } };
+}
+
+// Installs into LlamaBoss's environment (created by the caller first), not
+// --user: Homebrew's Python refuses user-site installs.
+std::vector<PythonCandidate> BuildPipInstallCandidates(const std::string& packageName)
+{
+    return { { "python3 (LlamaBoss environment)",
+               { lb_python::VenvPython(), "-X", "utf8", "-B", "-m", "pip", "install",
+                 "--disable-pip-version-check", packageName } } };
+}
+
+#endif
+
 class PythonWorkerThread : public wxThread {
 public:
     PythonWorkerThread(wxEvtHandler* evtHandler,
@@ -2132,7 +2420,11 @@ private:
         std::vector<std::string> tempArgFiles;
         auto cleanupTempArgFiles = [&]() {
             for (const auto& path : tempArgFiles) {
+#ifdef _WIN32
                 DeleteFileW(Utf8ToWide(path).c_str());
+#else
+                ::unlink(path.c_str());
+#endif
             }
             tempArgFiles.clear();
         };
@@ -2323,8 +2615,20 @@ private:
         }
 
         std::string cwd = m_cwd.empty() ? ServerManager::GetWorkspaceDir() : m_cwd;
+#ifdef _WIN32
         std::wstring wCwd = Utf8ToWide(cwd);
         LPCWSTR cwdArg = wCwd.empty() ? nullptr : wCwd.c_str();
+#else
+        if (isPackageInstall) {
+            std::string venvError;
+            if (!lb_python::EnsureVenv(venvError)) {
+                cleanupTempArgFiles();
+                result.stderrText = venvError;
+                result.exitCode = -1;
+                return;
+            }
+        }
+#endif
 
         std::vector<PythonCandidate> candidates = isPackageInstall
             ? BuildPipInstallCandidates(helperArgs.empty() ? std::string() : helperArgs.front())
@@ -2335,11 +2639,15 @@ private:
             PythonRunResult attempt = result;
             attempt.pythonCommand = c.label;
 
+#ifdef _WIN32
             std::wstring mutableCmd = c.commandLine;
             std::vector<wchar_t> cmdBuf(mutableCmd.begin(), mutableCmd.end());
             cmdBuf.push_back(L'\0');
 
             if (RunProcess(cmdBuf.data(), cwdArg, attempt, startErrors)) {
+#else
+            if (RunProcess(c, cwd, attempt, startErrors)) {
+#endif
                 if (m_helperName == "csv_report") {
                     AttachCsvReportArtifact(attempt);
                 } else if (m_helperName == "csv_to_xlsx" ||
@@ -2402,12 +2710,19 @@ private:
         }
 
         cleanupTempArgFiles();
+#ifdef _WIN32
         result.stderrText =
             "Could not start Python. Tried py -3, python, and python3.\n" +
             startErrors.str();
+#else
+        result.stderrText = candidates.empty()
+            ? lb_python::NoPythonMessage()
+            : "Could not start Python.\n" + startErrors.str();
+#endif
         result.exitCode = -1;
     }
 
+#ifdef _WIN32
     bool RunProcess(wchar_t* cmdLine,
                     LPCWSTR cwdArg,
                     PythonRunResult& result,
@@ -2727,6 +3042,60 @@ private:
 
         return true;
     }
+#else
+    // macOS: argv launch in its own process group via lb_process (the Job
+    // Object equivalent: timeout and Stop kill the whole tree, and anything
+    // still running when Python exits is stopped).  Only the Connections
+    // selected for this script are added to the environment.
+    bool RunProcess(const PythonCandidate& candidate,
+                    const std::string& cwd,
+                    PythonRunResult& result,
+                    std::ostringstream& startErrors)
+    {
+        lb_process::Options opt;
+        opt.argv = candidate.argv;
+        opt.cwd = cwd;
+        opt.envSet = { "PATH=" + lb_python::ChildPath(), "PYTHONIOENCODING=utf-8" };
+        if (!std::getenv("LANG")) opt.envSet.push_back("LANG=en_US.UTF-8");
+        for (const auto& kv : m_envInjections)
+            opt.envSet.push_back(kv.first + "=" + kv.second);
+        opt.timeoutMs = m_timeoutMs;
+        opt.cancel = m_cancelFlag.get();
+        opt.maxCaptureBytes = PythonRunner::kMaxOutputBytes;
+
+        lb_process::Result pr = lb_process::Run(opt);
+        if (!pr.started) {
+            startErrors << result.pythonCommand << ": could not start "
+                        << (candidate.argv.empty() ? std::string("python3") : candidate.argv[0])
+                        << " (" << std::strerror(pr.spawnError) << ")\n";
+            return false;   // try next launcher candidate
+        }
+
+        result.stdoutText = NormalizeProcessOutputUtf8(pr.out);
+        result.stderrText = NormalizeProcessOutputUtf8(pr.err);
+        lb_progressfold::TidyCapturedStreams(result.stdoutText, result.stderrText);
+        result.exitCode  = pr.exitCode;
+        result.timedOut  = pr.timedOut;
+        result.cancelled = pr.cancelled;
+        result.truncated = pr.truncated;
+
+        if (result.cancelled && result.stderrText.empty())
+            result.stderrText = "[cancelled by user]\n";
+        else if (result.timedOut && result.stderrText.empty())
+            result.stderrText =
+                "[timed out after " + std::to_string(m_timeoutMs / 1000) +
+                "s" +
+                (result.stdoutText.empty()
+                     ? " with no output. The script printed nothing before "
+                       "the deadline. When scanning or zipping directories, "
+                       "exclude build/IDE folders such as .git, build, "
+                       "node_modules, __pycache__, and print progress as the "
+                       "script works so partial output survives a timeout"
+                     : "") +
+                "]\n";
+        return true;
+    }
+#endif
 
     void PostCompletion(PythonRunResult result)
     {
@@ -2867,7 +3236,7 @@ private:
 };
 
 } // namespace
-#endif // _WIN32
+// (end of worker namespace)
 
 PythonRunner::PythonRunner(wxEvtHandler* eventHandler,
                            std::weak_ptr<std::atomic<bool>> aliveToken)
@@ -2889,25 +3258,6 @@ bool PythonRunner::StartWorker(const std::string& helperName,
                                unsigned long      defaultTimeoutMs,
                                const std::string& activeProjectRoot)
 {
-#ifndef _WIN32
-    // macOS: Python helpers arrive in Phase 3.  Complete asynchronously
-    // with a clear message so the tool card and agent loop finish normally.
-    // No secrets are read here.  When the real Mac runner lands, it must use
-    // the same Connections scoping as Windows: BuildEnvInjectionSnapshot()
-    // on the UI thread, then SelectDeclaredConnections() (skill_connections.h)
-    // so python_run_script sees only the Connections declared in its owning
-    // SKILL.md / WORKFLOW.md -- never every stored secret.
-    (void)helperArg; (void)cwd; (void)timeoutMs; (void)defaultTimeoutMs; (void)activeProjectRoot;
-    PythonRunResult r;
-    r.toolName = helperName;
-    r.helperName = helperName;
-    r.stderrText = "Python tools are not available on macOS yet.";
-    r.exitCode = -1;
-    auto* ev = new wxCommandEvent(wxEVT_PYTHON_COMPLETE);
-    ev->SetClientObject(new PythonRunResultClientData(std::move(r)));
-    LbQueueEventIfAlive(m_eventHandler, m_aliveToken, ev);
-    return true;
-#else
     bool expected = false;
     if (!m_isRunning->compare_exchange_strong(expected, true)) {
         return false;
@@ -2954,7 +3304,6 @@ bool PythonRunner::StartWorker(const std::string& helperName,
     }
 
     return true;
-#endif
 }
 
 bool PythonRunner::StartHealth(const std::string& cwd,
