@@ -44,8 +44,36 @@ echo "Signing identity: $IDENTITY"
 cmake -S $ROOT -B $BUILD -G Ninja -DCMAKE_BUILD_TYPE=Release \
       -DLLAMABOSS_DEPS_PREFIX=$DEPS_PREFIX -DLLAMABOSS_CODESIGN_IDENTITY="$IDENTITY"
 cmake --build $BUILD
-APP=$BUILD/LlamaBoss.app
-VERSION=$(/usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' $APP/Contents/Info.plist)
+BUILT=$BUILD/LlamaBoss.app
+VERSION=$(/usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' $BUILT/Contents/Info.plist)
+
+# ── Stage the app, keeping only the llama.cpp files llama-server loads ──
+# The llama.cpp release ships every tool's libraries (bench, batched, ...).
+# Copy the app without Helpers, then copy into Helpers/llama just the
+# closure of llama-server's @rpath references (its rpath is @loader_path),
+# plus the version symlinks among them.  The build output is not modified.
+STAGE=$(mktemp -d)
+APP=$STAGE/LlamaBoss.app
+rsync -a --exclude 'Contents/Helpers/' $BUILT/ $APP/
+SRCH=$BUILT/Contents/Helpers/llama
+H=$APP/Contents/Helpers/llama
+mkdir -p $H
+typeset -A need
+queue=(llama-server)
+while (( ${#queue} )); do
+    cur=${queue[1]}; queue=(${queue[2,-1]})
+    [[ -n ${need[$cur]:-} ]] && continue
+    need[$cur]=1
+    if [[ -L $SRCH/$cur ]]; then
+        queue+=($(readlink $SRCH/$cur))
+        continue
+    fi
+    for dep in $(otool -L $SRCH/$cur | tail -n +2 | awk '{print $1}' | sed -n 's|^@rpath/||p'); do
+        queue+=($dep)
+    done
+done
+for name in ${(k)need}; do cp -a $SRCH/$name $H/; done
+echo "llama.cpp files kept: ${(ok)need}"
 
 # ── Self-containment check: only system libraries may be referenced ──
 bad=0
@@ -66,13 +94,11 @@ $ROOT/macos/sign_bundle.sh "$IDENTITY" $APP --release
 
 # ── DMG: the app plus an Applications shortcut ──────────────────────
 mkdir -p $DIST
-STAGE=$(mktemp -d)
-cp -R $APP $STAGE/
 ln -s /Applications $STAGE/Applications
 DMG=$DIST/LlamaBoss-$VERSION-macOS.dmg
 rm -f $DMG
 hdiutil create -volname "LlamaBoss $VERSION" -srcfolder $STAGE -ov -format UDZO $DMG
-rm -rf $STAGE
+[[ $STAGE == ${TMPDIR:-/tmp}* && -d $STAGE/LlamaBoss.app ]] && rm -rf -- "$STAGE"   # our mktemp dir only
 codesign --force --sign "$IDENTITY" --timestamp $DMG
 
 # ── Notarize + staple ───────────────────────────────────────────────

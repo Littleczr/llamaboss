@@ -428,6 +428,16 @@ large icons. macOS 26 may show a full-bleed square icon inside its standard roun
 - `macos/package.sh [--identity ...] [--notarize <profile>]`: release build, a check that
   only system libraries are referenced, release signing, DMG with an Applications link,
   optional notarization + stapling. Output `dist/LlamaBoss-<version>-macOS.dmg`.
+- First package run, 2026-10-12, with the Apple Development identity (local test only):
+  `dist/LlamaBoss-0.1.23-macOS.dmg`, 25 MB (app 93 MB before trimming). The app links
+  only system libraries, minimum macOS 13.3, hardened runtime + timestamp, Team ID
+  5QV7H398ZS. package.sh stages a copy and keeps only the 11 llama.cpp files
+  llama-server loads (of 35). Run from the mounted DMG: llama-server `--version` loads,
+  the app starts with TLS verifying, the remote model activates. A static-OpenSSL HTTPS
+  test reached llamaboss.com and openrouter.ai (200) and rejected an expired certificate.
+- The bundle version now comes from `LLAMABOSS_VERSION` in LlamaBoss.cpp (the one place
+  the Windows side updates); Info.plist had a stale 0.1.2. The CMake signing step is
+  `VERBATIM` (identity names contain parentheses).
 - Waiting on Apple: the Developer ID Application certificate (membership approval), then a
   one-time `xcrun notarytool store-credentials` (app-specific password).
 - Still to design: the Mac entry in the update feed (`version.json`) and the website button.

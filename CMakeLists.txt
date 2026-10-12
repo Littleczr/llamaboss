@@ -18,7 +18,16 @@ if(LLAMABOSS_DEPS_PREFIX)
     set(CMAKE_OSX_ARCHITECTURES "arm64" CACHE STRING "" FORCE)
 endif()
 
-project(LlamaBoss VERSION 0.1.21 LANGUAGES C CXX OBJCXX)
+# The app version lives in one place, LlamaBoss.cpp (LLAMABOSS_VERSION, kept
+# by the Windows side); the Mac bundle's Info.plist takes it from there.
+file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/LlamaBoss.cpp" _lb_version_line
+     REGEX "LLAMABOSS_VERSION = \"[0-9.]+\"" LIMIT_COUNT 1)
+string(REGEX MATCH "[0-9]+(\\.[0-9]+)*" LLAMABOSS_APP_VERSION "${_lb_version_line}")
+if(NOT LLAMABOSS_APP_VERSION)
+    message(FATAL_ERROR "Could not read LLAMABOSS_VERSION from LlamaBoss.cpp")
+endif()
+
+project(LlamaBoss VERSION ${LLAMABOSS_APP_VERSION} LANGUAGES C CXX OBJCXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -143,6 +152,7 @@ if(APPLE)
         MACOSX_BUNDLE_GUI_IDENTIFIER "com.llamaboss.app"
         MACOSX_BUNDLE_LONG_VERSION_STRING "${PROJECT_VERSION}"
         MACOSX_BUNDLE_SHORT_VERSION_STRING "${PROJECT_VERSION}"
+        MACOSX_BUNDLE_BUNDLE_VERSION "${PROJECT_VERSION}"
         MACOSX_BUNDLE_COPYRIGHT "Copyright © 2026"
     )
     # Info.plist names app_icon.icns (CFBundleIconFile); regenerate it from
@@ -229,7 +239,8 @@ if(APPLE)
         add_custom_command(TARGET LlamaBoss POST_BUILD
             COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/macos/sign_bundle.sh
                     "${_lb_sign_id}" "$<TARGET_BUNDLE_DIR:LlamaBoss>"
-            COMMENT "Signing LlamaBoss.app")
+            COMMENT "Signing LlamaBoss.app"
+            VERBATIM)   # identity names contain spaces and parentheses
     else()
         message(STATUS "No code-signing identity found; LlamaBoss.app stays ad-hoc signed")
     endif()
