@@ -12,6 +12,97 @@
 
 #include <initializer_list>
 #include "ui_event_post.h"
+#ifndef __WXMSW__
+#include <cerrno>
+#include <climits>
+#include <cstdlib>
+#include <fstream>
+#include <libproc.h>
+#include <signal.h>
+#include <unistd.h>
+
+namespace {
+
+// ── Orphaned llama-server cleanup (macOS) ────────────────────────
+// Windows puts llama-server in a KILL_ON_JOB_CLOSE job, so it dies with
+// LlamaBoss even on a crash.  macOS has no equivalent, so a crashed
+// LlamaBoss leaves the server running and the next launch's foreign-server
+// guard refuses to start.  Each launch records the server's PID and path;
+// a normal stop removes the record.  At the next start a leftover record is
+// acted on only when that PID is still our bundled llama-server AND its
+// parent is gone (it was re-parented to launchd), so another live LlamaBoss's
+// server or an unrelated process that reused the PID is never touched.
+std::string ServerPidFilePath()
+{
+    return ServerManager::GetDataDir() + "/llama-server.pid";
+}
+
+void WriteServerPidFile(pid_t pid, const std::string& exe)
+{
+    std::ofstream f(ServerPidFilePath(), std::ios::trunc);
+    if (f) f << pid << "\n" << exe << "\n";
+}
+
+void RemoveServerPidFile()
+{
+    ::unlink(ServerPidFilePath().c_str());
+}
+
+std::string RealPathOf(const std::string& p)
+{
+    char buf[PATH_MAX];
+    return ::realpath(p.c_str(), buf) ? std::string(buf) : p;
+}
+
+// Returns a log line when an orphan was stopped, empty otherwise.
+std::string ReapOrphanedServer()
+{
+    std::ifstream f(ServerPidFilePath());
+    if (!f) return std::string();
+    long pidValue = 0;
+    std::string exe;
+    f >> pidValue;
+    f.ignore(1);
+    std::getline(f, exe);
+    f.close();
+    const pid_t pid = static_cast<pid_t>(pidValue);
+
+    if (pid <= 1 || exe.empty() || ::kill(pid, 0) != 0) {
+        RemoveServerPidFile();   // stale record: the process is gone
+        return std::string();
+    }
+
+    char path[PROC_PIDPATHINFO_MAXSIZE] = {};
+    if (::proc_pidpath(pid, path, sizeof(path)) <= 0 ||
+        RealPathOf(path) != RealPathOf(exe)) {
+        RemoveServerPidFile();   // PID reused by something else
+        return std::string();
+    }
+
+    proc_bsdinfo info {};
+    if (::proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, sizeof(info)) !=
+            static_cast<int>(sizeof(info)) ||
+        info.pbi_ppid != 1) {
+        return std::string();    // its LlamaBoss is still alive: leave it
+    }
+
+    // LlamaBoss starts the server as its own process-group leader; the
+    // group signal also reaches anything it spawned, the direct one covers
+    // a server that is not a group leader.
+    ::kill(-pid, SIGTERM);
+    ::kill(pid, SIGTERM);
+    for (int i = 0; i < 50 && ::kill(pid, 0) == 0; ++i) ::usleep(100000);
+    if (::kill(pid, 0) == 0) {
+        ::kill(-pid, SIGKILL);
+        ::kill(pid, SIGKILL);
+    }
+    RemoveServerPidFile();
+    return "Stopped llama-server PID=" + std::to_string(pid) +
+           " left running by a LlamaBoss that exited unexpectedly";
+}
+
+} // namespace
+#endif
 
 // ── Event definitions ────────────────────────────────────────────
 wxDEFINE_EVENT(wxEVT_SERVER_READY, wxCommandEvent);
@@ -2337,6 +2428,12 @@ bool ServerManager::StartServer(const std::string& ggufPath, const ServerConfig&
     // IsProcessRunning() distinguishes "our own server from a prior
     // load" (normal switch path — StopServer below handles it) from
     // "a server we never launched" (foreign).
+#ifndef __WXMSW__
+    if (!IsProcessRunning()) {
+        const std::string reaped = ReapOrphanedServer();
+        if (!reaped.empty() && m_logger) m_logger->warning(reaped);
+    }
+#endif
     if (!IsProcessRunning() && IsPortAnswering(config.port)) {
         const std::string msg =
             "Another LlamaBoss instance is already running a local "
@@ -2857,6 +2954,7 @@ bool ServerManager::StartServer(const std::string& ggufPath, const ServerConfig&
         return false;
     }
     m_child = child;
+    WriteServerPidFile(child->Pid(), serverBin);
     // Local stand-in for the Win32 member so the shared log line below
     // reports the PID on both platforms.
     const long m_processId = static_cast<long>(child->Pid());
@@ -3192,6 +3290,7 @@ void ServerManager::KillProcess()
             m_logger->error("llama-server PID=" + std::to_string(m_child->Pid()) +
                             " still appears to be running after SIGKILL");
         m_child.reset();
+        RemoveServerPidFile();
     }
 #endif
 }

@@ -175,16 +175,19 @@ When the login keychain has an "Apple Development" (or, failing that, a self-sig
 
 | Feature | File | Planned |
 | --- | --- | --- |
-| Shell tool | `cmd_executor.cpp` `RunOne` | Phase 3, after choosing pwsh vs zsh |
-| Python helpers + `python_run_script` | `python_runner.cpp` `StartWorker` | Phase 3, needs a Mac `lb_pyres::Load` from the bundle |
 | In-app update install | `update_installer.cpp` | Phase 4, Mac package |
 | Sign in with ChatGPT | `chatgpt_auth.cpp` | Later: Keychain storage + RS256 verification. Never base64 storage |
 
 ## Known gaps and risks
 
-- Orphan protection: Windows puts llama-server in a KILL_ON_JOB_CLOSE job. On Mac, a
-  LlamaBoss crash leaves llama-server running; the next launch then sees the port busy
-  and refuses (the existing foreign-server guard). Planned: a PID file with cleanup at startup.
+- Orphan protection (fixed 2026-10-12): Windows puts llama-server in a KILL_ON_JOB_CLOSE
+  job. On the Mac, each launch writes `<data dir>/llama-server.pid` (PID + binary path)
+  and a normal stop removes it. Before the foreign-server guard, a leftover record is acted
+  on only if that PID is still our llama-server binary AND its parent is launchd (its
+  LlamaBoss is gone); then its process group is stopped (SIGTERM, SIGKILL after 5 s).
+  Verified with a ServerManager harness: an orphaned server (parent exited) is stopped and
+  the start proceeds; a server whose parent is alive is left alone and the guard refuses
+  as before. `server_manager.cpp`, Mac-only; Windows view identical.
 - `tool_path_safety.h` compares paths ASCII-case-insensitively. That is correct for the default
   case-insensitive APFS volume, but slightly permissive on a case-sensitive volume.
 - About 150 places still join paths with `\`. The ones on the chat, agent and approval paths
@@ -449,6 +452,9 @@ large icons. macOS 26 may show a full-bleed square icon inside its standard roun
 
 ## Next task
 
-1. Remaining UI checks: project attach, message boxes, light themes.
-2. Mac menu bar conventions: About and Settings (Cmd+,) in the LlamaBoss menu.
+1. Mac menu bar: built and listed correctly through Accessibility (LlamaBoss menu with
+   About and Settings..., File, Edit, View, Window, Help). Still to do: test Cmd+, and
+   Ctrl+Cmd+S (sidebar, must not trigger Cmd+S save), use the "…" character in labels,
+   commit. The keystroke test needs the user at the Mac (approval prompt).
+2. Remaining UI checks: project attach, message boxes, light themes.
 3. Phase 4: packaging (Developer ID signing, notarization, DMG, updater).
