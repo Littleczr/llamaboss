@@ -27,7 +27,12 @@ namespace tool_names {
     constexpr const char* kGrep       = "grep";
     constexpr const char* kSetupConnection = "setup_connection";
     constexpr const char* kPwd        = "pwd";
+#ifdef _WIN32
     constexpr const char* kPowerShell = "powershell";
+#else
+    // macOS: the same tool runs zsh, so the model sees it as "shell".
+    constexpr const char* kPowerShell = "shell";
+#endif
     constexpr const char* kPythonHealth = "python_health";
     constexpr const char* kCsvInspect   = "csv_inspect";
     constexpr const char* kCsvReport    = "csv_report";

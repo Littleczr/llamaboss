@@ -148,6 +148,9 @@ static std::string ToolNameFromTag(const std::string& tag)
 {
     const std::string t = LowerCopy(tag);
     if (t == "powershell") return "PowerShell";
+#ifndef _WIN32
+    if (t == "shell")      return "Shell";
+#endif
     if (t == "read")       return "Read";
     if (t == "grep")       return "Grep";
     if (t == "pdf_extract_text")  return "PDF Extract Text";
@@ -176,6 +179,9 @@ static std::string ToolIconFromTag(const std::string& tag)
 {
     const std::string t = LowerCopy(tag);
     if (t == "powershell") return "\xE2\x9A\x99";           // ⚙
+#ifndef _WIN32
+    if (t == "shell")      return "\xE2\x9A\x99";           // ⚙
+#endif
     if (t == "read")       return "\xF0\x9F\x93\x84";       // 📄
     if (t == "grep")       return "\xF0\x9F\x94\x8D";       // 🔍
     if (t == "pdf_extract_text")  return "\xF0\x9F\x93\x84"; // 📄

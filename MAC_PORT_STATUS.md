@@ -232,6 +232,26 @@ largest frame is 256 px, so the 512 and 1024 slots are upscaled. CMake copies th
 `Contents/Resources`, and Info.plist already names it. A 1024 px source would give sharper
 large icons. macOS 26 may show a full-bleed square icon inside its standard rounded frame.
 
+## Phase 3a: shell tool (zsh), 2026-10-11
+
+- **Runner** (`cmd_executor.cpp` `RunOnePosix`): `/bin/zsh -f -c` via `lb_process::Run` in its own
+  process group. cwd comes from /cd (home when unset), the Homebrew prefixes are added to
+  launchd's PATH, `PAGER/GIT_PAGER=cat`, and stdin is `/dev/null`. Timeout and Stop kill the group;
+  survivors are killed and reported (`background stopped` chip). It has live last-line progress,
+  workspace delta, file cards, ARTIFACT_FILE markers and large-output files.
+- **Policy** (`command_policy_zsh.cpp`, reached from `EvaluatePowerShellCommand` under
+  `#ifndef _WIN32`): read-only allowlist with write-flag checks; everything else needs approval;
+  malformed input is rejected. Tests: `cmake --build build_macos --target
+  command_policy_zsh_tests && build_macos/command_policy_zsh_tests` (65 checks).
+- **Model-facing:** the tool is named `shell` on macOS (`tool_names::kPowerShell`), with a zsh
+  description and schema. `write_powershell_script` is not registered. The agent prompts (XML and
+  native) have Mac lines for every PowerShell-specific rule under `#ifdef _WIN32 / #else`.
+  `unifdef -D_WIN32` of every touched file matches the pre-change Windows view.
+- **Display:** "Shell" cards with `bash` highlighting, and the Agent Mode banner lists `shell`.
+- Open decision: `RiskyExtensions()` (blocks write/edit/delete of executable types) has no Mac
+  script types (.command, .sh, .app, .scpt, .webloc ...). `open` can't launch them anyway, because
+  launching is allowlisted. Adding them would also stop the agent writing ordinary `.sh` files.
+
 ## Next task
 
 Phase 3 tool ports (shell: zsh vs pwsh decision pending), then the macOS themed-button fix.

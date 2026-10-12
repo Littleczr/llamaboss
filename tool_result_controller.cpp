@@ -221,11 +221,19 @@ void ToolResultController::OnCmdComplete(wxCommandEvent& evt)
     tir.toolTag       = tool_names::kPowerShell;
     tir.invocationRaw.clear();
     tir.iconUtf8      = "\xE2\x9A\x99";       // ⚙
+#ifdef _WIN32
     tir.toolName      = "PowerShell";
+#else
+    tir.toolName      = "Shell";
+#endif
     tir.commandEcho   = r.command;
     tir.body          = r.stdoutText;
     tir.errorBody     = r.stderrText;
+#ifdef _WIN32
     tir.bodyLang      = "powershell";
+#else
+    tir.bodyLang      = "bash";
+#endif
     tir.presentedFiles = r.presentedFiles;
 
     // Status chip (cancelled / timed out / exit N) — mutually

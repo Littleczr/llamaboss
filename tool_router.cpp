@@ -1022,9 +1022,15 @@ DispatchOutcome DoPowerShell(const ToolInvocation& inv,
     out.result.toolTag       = tool_names::kPowerShell;
     out.result.invocationRaw = inv.rawBlock;
     out.result.iconUtf8      = "\xE2\x9A\x99";   // ⚙
+#ifdef _WIN32
     out.result.toolName      = "PowerShell";
     out.result.commandEcho   = inv.args;
     out.result.bodyLang      = "powershell";
+#else
+    out.result.toolName      = "Shell";
+    out.result.commandEcho   = inv.args;
+    out.result.bodyLang      = "bash";
+#endif
 
     if (!deps.cmdExec) {
         out.status            = DispatchStatus::Invalid;
@@ -1044,6 +1050,7 @@ DispatchOutcome DoPowerShell(const ToolInvocation& inv,
         // the user approves them.
         std::string body = "Command rejected by policy: " + decision.reason;
 
+#ifdef _WIN32
         const std::string hint = PowerShellRejectionHint(inv.args);
         if (!hint.empty()) {
             body += hint;
@@ -1051,6 +1058,7 @@ DispatchOutcome DoPowerShell(const ToolInvocation& inv,
         if (RejectionLooksLikeAllowlistMiss(decision.reason)) {
             body += kPowerShellAllowedShapeSummary;
         }
+#endif
 
         out.result.errorBody  = body;
         out.result.chips      = { "blocked" };
@@ -3406,6 +3414,7 @@ constexpr const char* kSchemaGrep = R"({
 "required":["pattern"]
 })";
 
+#ifdef _WIN32
 constexpr const char* kSchemaPowerShell = R"({
 "type":"object",
 "properties":{
@@ -3414,6 +3423,16 @@ constexpr const char* kSchemaPowerShell = R"({
 },
 "required":["args"]
 })";
+#else
+constexpr const char* kSchemaPowerShell = R"({
+"type":"object",
+"properties":{
+"args":{"type":"string","description":"One finite foreground zsh command line (macOS). Clearly read-only inspection commands may run immediately; broader commands pause for approval before execution. Background jobs (&, nohup, disown) are unsupported: every process the command started is stopped when zsh exits."},
+"timeout_seconds":{"type":"integer","minimum":15,"maximum":1800,"description":"Optional timeout for this command in seconds. Defaults to 300 (five minutes). Use a longer value only for finite foreground work such as compilation or dependency installation."}
+},
+"required":["args"]
+})";
+#endif
 
 constexpr const char* kSchemaPythonHealth = R"({
 "type":"object",
@@ -3787,6 +3806,7 @@ std::vector<ToolSpec> BuildBuiltinSpecs()
     }
 
     {
+#ifdef _WIN32
         ToolSafetyProfile psSafety = ReadOnlySafety("Auto-runs clearly read-only PowerShell inspection commands; broader syntactically usable PowerShell commands pause for approval before execution. Execution is foreground-only; remaining descendants are terminated when the top-level PowerShell process exits.", true, true);
         psSafety.isAsync = true;
         add(tool_names::kPowerShell,
@@ -3794,6 +3814,15 @@ std::vector<ToolSpec> BuildBuiltinSpecs()
             kSchemaPowerShell,
             std::move(psSafety),
             ValPowerShell, DoPowerShell);
+#else
+        ToolSafetyProfile psSafety = ReadOnlySafety("Auto-runs clearly read-only zsh inspection commands; broader commands pause for approval before execution. Execution is foreground-only; every process the command started is stopped when zsh exits.", true, true);
+        psSafety.isAsync = true;
+        add(tool_names::kPowerShell,
+            "Run one finite foreground zsh command (macOS) for local inspection or developer automation. The default timeout is five minutes; timeout_seconds may request 15-1800 seconds for this call. Clearly read-only commands run immediately; broader commands require approval before execution. Do not use &, nohup, disown, setsid, launchctl or another detached launcher: every process the command started is stopped when zsh exits. stdin is closed, so pass non-interactive flags. The user sees the command's most recent output line live while it runs, so for long downloads or builds prefer tools that print line-based progress (yt-dlp --newline, pip --progress-bar on, python3 -u) rather than silent flags.",
+            kSchemaPowerShell,
+            std::move(psSafety),
+            ValPowerShell, DoPowerShell);
+#endif
     }
 
     {
@@ -4105,11 +4134,16 @@ std::vector<ToolSpec> BuildBuiltinSpecs()
         ValWrite, DoWrite);
 
     add(tool_names::kOverwriteFile,
+#ifdef _WIN32
         "Create or replace a whole file inside the working directory or active project root. Prefer this over edit for full-file replacement and project setup files. Executable/scriptable extensions are blocked; use write_powershell_script for approved .ps1 project scripts.",
+#else
+        "Create or replace a whole file inside the working directory or active project root. Prefer this over edit for full-file replacement and project setup files. Executable/scriptable extensions are blocked.",
+#endif
         kSchemaOverwriteFile,
         MutatingCwdSafety("Creates or atomically replaces one whole non-executable file. Controlled write scoped to trusted write roots. Python files are syntax-checked before commit when Python is available."),
         ValOverwriteFile, DoOverwriteFile);
 
+#ifdef _WIN32   // .ps1 scripts; macOS has no PowerShell
     {
         ToolSafetyProfile psScriptSafety = MutatingCwdSafety("Creates or atomically replaces one PowerShell .ps1 script inside trusted write roots. Requires approval and does not execute the script.");
         psScriptSafety.tier = RiskTier::Dangerous;
@@ -4119,6 +4153,7 @@ std::vector<ToolSpec> BuildBuiltinSpecs()
             std::move(psScriptSafety),
             ValWritePowerShellScript, DoWritePowerShellScript);
     }
+#endif
 
     add(tool_names::kMkdir,
         "Create a directory inside the working directory or active project root, including missing intermediate directories.",
@@ -4266,7 +4301,11 @@ std::vector<ToolSpec> BuildBuiltinSpecs()
         { tool_names::kPwd,                  "\xE2\x9E\xA4",     "Pwd" },                     // ➤
         { tool_names::kGrep,                 "\xF0\x9F\x94\x8D", "Grep" },                    // 🔍
         { tool_names::kOpen,                 "\xE2\x96\xB6",     "Open" },                    // ▶
+#ifdef _WIN32
         { tool_names::kPowerShell,           "\xE2\x9A\x99",     "PowerShell" },              // ⚙
+#else
+        { tool_names::kPowerShell,           "\xE2\x9A\x99",     "Shell" },                   // ⚙
+#endif
         { tool_names::kWait,                 "\xE2\x8F\xB3",     "Wait" },                    // ⏳
         { tool_names::kPythonHealth,         "\xF0\x9F\x90\x8D", "Python Health" },           // 🐍
         { tool_names::kCsvInspect,           "\xF0\x9F\x93\x8A", "CSV Inspect" },             // 📊

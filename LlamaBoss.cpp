@@ -2733,8 +2733,7 @@ private:
 #ifdef _WIN32
               ? "\xF0\x9F\xA4\x96 Agent mode ON. The model can use read/ls/open/grep/pwd/powershell."
 #else
-              // No shell tool on macOS yet (cmd_executor is stubbed).
-              ? "\xF0\x9F\xA4\x96 Agent mode ON. The model can use read/ls/open/grep/pwd."
+              ? "\xF0\x9F\xA4\x96 Agent mode ON. The model can use read/ls/open/grep/pwd/shell."
 #endif
               : "\xF0\x9F\xA4\x96 Agent mode OFF.");
         if (m_agentModeEnabled) SchedulePromptPrewarm("agent mode on");
@@ -3556,8 +3555,13 @@ private:
         // Keep the command echo for PowerShell; it is the one async slash
         // indicator where the raw args are the useful status text.
         if (toolName == tool_names::kPowerShell && !args.empty()) {
+#ifdef _WIN32
             m_chatDisplay->DisplaySystemMessage(
                 spec->iconUtf8 + " PowerShell: " + args);
+#else
+            m_chatDisplay->DisplaySystemMessage(
+                spec->iconUtf8 + " Shell: " + args);
+#endif
             return;
         }
 

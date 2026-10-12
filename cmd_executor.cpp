@@ -1832,6 +1832,7 @@ private:
             if (!s.empty() && s.back() != '\n') s += "\n";
             s += line + "\n";
         };
+        result.descendantsTerminated = pr.survivorsKilled;
         if (pr.survivorsKilled) {
             appendLine(result.stderrText,
                 "[background process stopped] zsh exited, but processes it "
@@ -1907,7 +1908,11 @@ bool LbToolUsesPowerShell7()
 std::string LbPowerShellPromptNote()
 {
 #ifndef _WIN32
-    return "The powershell tool is not available on macOS yet; do not call it.";
+    return "The shell tool runs /bin/zsh -f (no startup files) on macOS with the BSD "
+           "command-line tools, not GNU: sed -i needs an argument (sed -i '' ...), "
+           "stat uses -f, date uses -v. Homebrew tools in /opt/homebrew/bin are on PATH. "
+           "stdin is closed, so anything that prompts (sudo, y/n, a pager) waits until "
+           "the timeout.";
 #endif
     if (LbToolUsesPowerShell7()) {
         return "The powershell tool runs PowerShell 7 (pwsh.exe, modern .NET), "

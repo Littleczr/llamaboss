@@ -3395,7 +3395,11 @@ bool AgentController::HandleCmdComplete(const CmdResult& cmdResult)
     r.chips         = chips;
     r.body          = cmdResult.stdoutText;
     r.errorBody     = cmdResult.stderrText;
+#ifdef _WIN32
     r.bodyLang      = "powershell";
+#else
+    r.bodyLang      = "bash";
+#endif
     r.presentedFiles = cmdResult.presentedFiles;
 
     return FinishAsyncToolResult(inv, r, m_cancelled || cmdResult.cancelled);
