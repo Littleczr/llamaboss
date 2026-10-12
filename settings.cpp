@@ -361,8 +361,13 @@ void SettingsDialog::CreateControls()
     bodySizer->Add(m_kvCacheQ8CheckBox, 0, wxBOTTOM, 4);
 
     auto* kvHint = new wxStaticText(body, wxID_ANY,
+#ifdef __WXMAC__
+        "Halves context memory use, so about twice the context fits in "
+        "memory. Changing this reloads the model.");
+#else
         "Halves context memory use, so about twice the context fits in "
         "VRAM. Changing this reloads the model.");
+#endif
     { wxFont kh = kvHint->GetFont(); kh.SetPointSize(LbUiPt(10)); kvHint->SetFont(kh); }
     bodySizer->Add(kvHint, 0, wxBOTTOM, 14);
 

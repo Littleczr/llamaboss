@@ -16,6 +16,9 @@
 #include "ui_event_post.h"
 
 #include "lb_windows.h"
+#ifdef __WXMAC__
+#include "lb_mac_wording.h"
+#endif
 
 // ── Events ──────────────────────────────────────────────────────
 wxDEFINE_EVENT(wxEVT_DOWNLOAD_PROGRESS, wxCommandEvent);
@@ -1135,7 +1138,11 @@ void ModelDownloaderDialog::BuildModelRow(wxSizer* listSizer,
         wxString::FromUTF8(visionMissing
             ? "Model downloaded; vision component missing (" +
               model.mmprojSizeDisplay + "). Text chat works now."
+#ifdef __WXMAC__
+            : LbMacWording(model.description)),
+#else
             : model.description),
+#endif
         wxDefaultPosition, wxDefaultSize, wxST_ELLIPSIZE_END);
     row.statusLabel->SetForegroundColour(textMuted);
     rowSizer->Add(row.statusLabel, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 14);
@@ -1353,7 +1360,11 @@ void ModelDownloaderDialog::OnCancelClicked()
 
     row.downloading = false;
     row.gauge->Hide();
+#ifdef __WXMAC__
+    row.statusLabel->SetLabel(wxString::FromUTF8(LbMacWording(kModels[idx].description)));
+#else
     row.statusLabel->SetLabel(wxString::FromUTF8(kModels[idx].description));
+#endif
     row.statusLabel->SetForegroundColour(t.textMuted);
     row.actionBtn->SetLabel("Download");
     row.actionBtn->Enable(true);

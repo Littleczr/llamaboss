@@ -85,6 +85,7 @@ Intended divergences from Windows. Features that are simply not ported yet are l
 | App icon | `app_icon.ico` | `macos/app_icon.icns` (generated from the .ico) | Bundle icon format |
 | Missing `.ico` at startup | file fallback | icon comes from the bundle; no file lookup | Avoids a modal error on launch |
 | Buttons | flat buttons filled with theme colours | native push buttons (`lb_mac_native.mm`): one accent-tinted button per dialog (default/OK), Send and New Chat accent in the main window, stop-red stays red, the rest plain; widened to fit | NSButton ignores theme fills; Mac convention is one default button per window |
+| GPU memory wording | "Needs 10+ GB VRAM", "fits in VRAM" | "Needs a Mac with 16 GB+ of memory" (GPU GB x 4/3, rounded up to a Mac memory size), "fits in memory" (`lb_mac_wording.h`) | Apple silicon has unified memory; the GPU can use about 3/4 of it |
 | Control appearance | n/a | app appearance (dark/light Aqua) set from the theme's background at startup | Native controls match the theme on a system in the other mode |
 
 ## Toolchain (verified 2026-10-09)
@@ -379,4 +380,4 @@ large icons. macOS 26 may show a full-bleed square icon inside its standard roun
 ## Next task
 
 1. Persistent `py` session on macOS.
-2. Mac wording ("fits in VRAM" -> unified memory), web fetch port, then Phase 4 packaging.
+2. Web fetch port, then Phase 4 packaging.
