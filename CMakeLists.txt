@@ -135,6 +135,8 @@ if(APPLE)
         MACOSX_PACKAGE_LOCATION Resources/python)
     # Native controls (lb_mac_native.h); Objective-C++, outside the glob.
     target_sources(LlamaBoss PRIVATE lb_mac_native.mm)
+    # Legacy page encodings in web fetch (tool_web_fetch.cpp); part of macOS.
+    target_link_libraries(LlamaBoss PRIVATE iconv)
     set_source_files_properties(lb_mac_native.mm PROPERTIES SKIP_PRECOMPILE_HEADERS ON)
 endif()
 

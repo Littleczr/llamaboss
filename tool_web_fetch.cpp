@@ -17,6 +17,33 @@
 #include <winhttp.h>
 #pragma comment(lib, "winhttp.lib")
 #pragma comment(lib, "ws2_32.lib")
+#else
+#include <arpa/inet.h>
+#include <iconv.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <Poco/Exception.h>
+#include <Poco/InflatingStream.h>
+#include <Poco/Net/HTTPClientSession.h>
+#include <Poco/Net/HTTPRequest.h>
+#include <Poco/Net/HTTPResponse.h>
+#include <Poco/Net/HTTPSClientSession.h>
+#include "lb_ssl.h"
+
+// macOS: the request runs on Poco::Net (the TLS context is lb_ssl's, the
+// same one the model clients use) instead of WinHTTP.  These names let the
+// shared code below keep its Windows types; the Win32-only pieces have
+// POSIX alternatives next to them under #else.
+namespace {
+using DWORD = unsigned int;
+using UINT = unsigned int;
+using INTERNET_PORT = unsigned short;
+using HINTERNET = Poco::Net::HTTPClientSession*;   // cancel = session->abort()
+constexpr UINT CP_UTF8 = 65001;
+constexpr INTERNET_PORT INTERNET_DEFAULT_HTTP_PORT = 80;
+constexpr INTERNET_PORT INTERNET_DEFAULT_HTTPS_PORT = 443;
+}
 #endif
 
 wxDEFINE_EVENT(wxEVT_WEB_FETCH_COMPLETE, wxCommandEvent);
@@ -44,7 +71,6 @@ wxDEFINE_EVENT(wxEVT_WEB_FETCH_ERROR,    wxCommandEvent);
 
 #include <array>
 
-#ifdef _WIN32
 namespace {
 
 constexpr std::size_t kMaxDownloadBytes        = 10u * 1024u * 1024u; // 10 MB
@@ -101,9 +127,15 @@ constexpr DWORD       kMaxReceiveTimeoutMs = 15000u;
 // dramatically raises fetch success rates on real-world sites. The LlamaBoss
 // token stays appended for transparency to server operators — drop it if a
 // specific site still blocks on it.
+#ifdef _WIN32
 constexpr const wchar_t* kUserAgent =
     L"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     L"(KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36 LlamaBoss/0.1";
+#else
+constexpr const char* kUserAgent =
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36 LlamaBoss/0.1";
+#endif
 
 std::string Trim(std::string s)
 {
@@ -188,6 +220,7 @@ std::string WideToUtf8(const std::wstring& s)
 #endif
 }
 
+#ifdef _WIN32
 std::string WinErr(DWORD err)
 {
     if (err == 0) return "0";
@@ -206,6 +239,7 @@ std::string WinErr(DWORD err)
     }
     return oss.str();
 }
+#endif
 
 std::string HumanBytes(std::size_t n)
 {
@@ -284,7 +318,13 @@ void CloseTrackedRequest(const std::shared_ptr<RequestAbortState>& state)
         state->handle = nullptr;
     }
 
+#ifdef _WIN32
     if (handle) ::WinHttpCloseHandle(handle);
+#else
+    if (handle) {
+        try { handle->abort(); } catch (...) {}
+    }
+#endif
 }
 
 void AbortActiveWebFetch(const std::shared_ptr<std::atomic<bool>>& cancelFlag)
@@ -329,7 +369,11 @@ std::string JoinPath(const std::string& a, const std::string& b)
     if (a.empty()) return b;
     char last = a.back();
     if (last == '\\' || last == '/') return a + b;
+#ifdef _WIN32
     return a + "\\" + b;
+#else
+    return a + "/" + b;
+#endif
 }
 
 std::string ParentDir(std::string path)
@@ -471,6 +515,7 @@ void StripFragmentInPlace(std::wstring& extra)
     if (hash != std::wstring::npos) extra.resize(hash);
 }
 
+#ifdef _WIN32
 bool EnsureWinsock(std::string& reason)
 {
     static std::once_flag once;
@@ -487,6 +532,7 @@ bool EnsureWinsock(std::string& reason)
     }
     return true;
 }
+#endif
 
 bool IsIpv4InRange(uint32_t ipHostOrder, uint32_t networkHostOrder, unsigned prefixBits)
 {
@@ -548,9 +594,15 @@ bool IsAllZero(const unsigned char* bytes, std::size_t n)
     return true;
 }
 
+#ifdef _WIN32
 bool IsBlockedIpv6(const IN6_ADDR& addr, std::string& reason)
 {
     const unsigned char* b = addr.u.Byte;
+#else
+bool IsBlockedIpv6(const in6_addr& addr, std::string& reason)
+{
+    const unsigned char* b = addr.s6_addr;
+#endif
 
     if (IsAllZero(b, 16)) {
         reason = "IPv6 unspecified addresses are blocked by the webpage inspector guardrail.";
@@ -641,7 +693,11 @@ bool IsBlockedSockAddr(const sockaddr* sa, std::string& reason)
 
     if (sa->sa_family == AF_INET) {
         const auto* in = reinterpret_cast<const sockaddr_in*>(sa);
+#ifdef _WIN32
         uint32_t ipHostOrder = ntohl(in->sin_addr.S_un.S_addr);
+#else
+        uint32_t ipHostOrder = ntohl(in->sin_addr.s_addr);
+#endif
         return IsBlockedIpv4(ipHostOrder, reason);
     }
 
@@ -668,6 +724,7 @@ bool IsBlockedHost(const std::wstring& hostW, std::string& reason)
         return true;
     }
 
+#ifdef _WIN32
     if (!EnsureWinsock(reason)) return true;
 
     ADDRINFOW hints{};
@@ -694,6 +751,34 @@ bool IsBlockedHost(const std::wstring& hostW, std::string& reason)
         if (IsBlockedSockAddr(ai->ai_addr, reason)) return true;
     }
     return false;
+#else
+    addrinfo hints{};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_TCP;
+
+    addrinfo* results = nullptr;
+    const std::string hostUtf8 = WideToUtf8(host);
+    int rc = ::getaddrinfo(hostUtf8.c_str(), nullptr, &hints, &results);
+    if (rc != 0 || !results) {
+        reason = "Could not resolve host for webpage guardrail validation: " +
+                 std::string(rc != 0 ? ::gai_strerror(rc) : "no addresses");
+        if (results) ::freeaddrinfo(results);
+        return true; // fail closed, as on Windows
+    }
+
+    struct AddrInfoGuard {
+        addrinfo* p = nullptr;
+        ~AddrInfoGuard() { if (p) ::freeaddrinfo(p); }
+    } guard{results};
+
+    // Same note as the WinHTTP path: Poco resolves again when it connects;
+    // a tiny DNS rebinding window remains acceptable for this local tool.
+    for (addrinfo* ai = results; ai; ai = ai->ai_next) {
+        if (IsBlockedSockAddr(ai->ai_addr, reason)) return true;
+    }
+    return false;
+#endif
 }
 
 // Parses and normalizes the URL (scheme allowlist, fragment stripping) WITHOUT
@@ -719,6 +804,7 @@ bool ParseUrlOnly(const std::string& input, ParsedUrl& out, std::string& error)
         return false;
     }
 
+#ifdef _WIN32
     out.originalW = Utf8ToWide(url);
     if (out.originalW.empty()) {
         error = "Could not convert URL to Windows Unicode form.";
@@ -743,6 +829,73 @@ bool ParseUrlOnly(const std::string& input, ParsedUrl& out, std::string& error)
     out.extraW.assign(uc.lpszExtraInfo, uc.dwExtraInfoLength);
     StripFragmentInPlace(out.extraW);
     out.port = uc.nPort;
+#else
+    // The WinHttpCrackUrl split: scheme, host (IPv6 keeps its brackets),
+    // port (scheme default when absent), path, and extra = "?query#frag".
+    // User info ("user:pass@") is dropped from the host, as WinHTTP does.
+    out.originalW = Utf8ToWide(url);
+    const std::size_t schemeEnd = url.find("://");
+    std::size_t authStart = schemeEnd + 3;
+    std::size_t authEnd = url.find_first_of("/?#", authStart);
+    if (authEnd == std::string::npos) authEnd = url.size();
+    std::string authority = url.substr(authStart, authEnd - authStart);
+    const std::size_t at = authority.rfind('@');
+    if (at != std::string::npos) authority = authority.substr(at + 1);
+
+    std::string host = authority;
+    std::string portText;
+    if (!authority.empty() && authority.front() == '[') {
+        const std::size_t close = authority.find(']');
+        if (close == std::string::npos) {
+            error = "Could not parse URL (unterminated IPv6 address).";
+            return false;
+        }
+        host = authority.substr(0, close + 1);
+        if (close + 1 < authority.size()) {
+            if (authority[close + 1] != ':') {
+                error = "Could not parse URL (bad text after the IPv6 address).";
+                return false;
+            }
+            portText = authority.substr(close + 2);
+        }
+    } else {
+        const std::size_t colon = authority.rfind(':');
+        if (colon != std::string::npos) {
+            host = authority.substr(0, colon);
+            portText = authority.substr(colon + 1);
+        }
+    }
+    if (host.empty() || host == "[]") {
+        error = "Could not parse URL (no host).";
+        return false;
+    }
+
+    const std::string schemeText = url.substr(0, schemeEnd);
+    out.schemeW = Utf8ToWide(schemeText);
+    out.hostW = Utf8ToWide(host);
+    out.port = (Lower(schemeText) == "https") ? INTERNET_DEFAULT_HTTPS_PORT
+                                              : INTERNET_DEFAULT_HTTP_PORT;
+    if (!portText.empty()) {
+        if (portText.size() > 5 ||
+            portText.find_first_not_of("0123456789") != std::string::npos) {
+            error = "Could not parse URL (invalid port).";
+            return false;
+        }
+        const unsigned long port = std::strtoul(portText.c_str(), nullptr, 10);
+        if (port == 0 || port > 65535) {
+            error = "Could not parse URL (invalid port).";
+            return false;
+        }
+        out.port = static_cast<INTERNET_PORT>(port);
+    }
+
+    const std::string rest = url.substr(authEnd);
+    const std::size_t extraPos = rest.find_first_of("?#");
+    out.pathW = Utf8ToWide(rest.substr(0, extraPos));
+    out.extraW = (extraPos == std::string::npos) ? std::wstring()
+                                                 : Utf8ToWide(rest.substr(extraPos));
+    StripFragmentInPlace(out.extraW);
+#endif
 
     std::string scheme = Lower(WideToUtf8(out.schemeW));
     out.secure = (scheme == "https");
@@ -767,6 +920,7 @@ bool ParseAndValidateUrl(const std::string& input, ParsedUrl& out, std::string& 
     return true;
 }
 
+#ifdef _WIN32
 std::string QueryHeaderString(HINTERNET request, DWORD query)
 {
     DWORD size = 0;
@@ -782,6 +936,7 @@ std::string QueryHeaderString(HINTERNET request, DWORD query)
     if (!buf.empty() && buf.back() == L'\0') buf.pop_back();
     return WideToUtf8(buf);
 }
+#endif
 
 std::string StripBom(const std::string& s)
 {
@@ -807,6 +962,33 @@ int Utf16BomKind(const std::string& bytes)
 
 std::string DecodeUtf16Bytes(const std::string& bytes, std::size_t offset, bool le)
 {
+#ifndef _WIN32
+    // wchar_t is UTF-32 here: combine surrogate pairs, and replace lone
+    // surrogates with U+FFFD as WideCharToMultiByte does on Windows.
+    std::wstring codepoints;
+    if (bytes.size() <= offset) return std::string();
+    std::vector<unsigned> units;
+    units.reserve((bytes.size() - offset) / 2);
+    for (std::size_t i = offset; i + 1 < bytes.size(); i += 2) {
+        unsigned char lo = static_cast<unsigned char>(bytes[le ? i : i + 1]);
+        unsigned char hi = static_cast<unsigned char>(bytes[le ? i + 1 : i]);
+        units.push_back(static_cast<unsigned>(lo | (hi << 8)));
+    }
+    for (std::size_t i = 0; i < units.size(); ++i) {
+        const unsigned u = units[i];
+        if (u >= 0xD800 && u <= 0xDBFF && i + 1 < units.size() &&
+            units[i + 1] >= 0xDC00 && units[i + 1] <= 0xDFFF) {
+            codepoints.push_back(static_cast<wchar_t>(
+                0x10000 + ((u - 0xD800) << 10) + (units[i + 1] - 0xDC00)));
+            ++i;
+        } else if (u >= 0xD800 && u <= 0xDFFF) {
+            codepoints.push_back(static_cast<wchar_t>(0xFFFD));
+        } else {
+            codepoints.push_back(static_cast<wchar_t>(u));
+        }
+    }
+    return WideToUtf8(codepoints);
+#else
     std::wstring wide;
     if (bytes.size() <= offset) return std::string();
     wide.reserve((bytes.size() - offset) / 2);
@@ -818,6 +1000,7 @@ std::string DecodeUtf16Bytes(const std::string& bytes, std::size_t offset, bool 
     // WideCharToMultiByte without WC_ERR_INVALID_CHARS replaces lone
     // surrogates with U+FFFD, so the result is always valid UTF-8.
     return WideToUtf8(wide);
+#endif
 }
 
 std::string DecodeUtf16WithBom(const std::string& bytes, int bomKind)
@@ -825,6 +1008,7 @@ std::string DecodeUtf16WithBom(const std::string& bytes, int bomKind)
     return DecodeUtf16Bytes(bytes, 2, bomKind == 1);
 }
 
+#ifdef _WIN32
 std::string DecodeWithCodePage(const std::string& bytes, UINT codePage)
 {
     if (bytes.empty()) return std::string();
@@ -858,6 +1042,124 @@ std::string DecodeWithCodePage(const std::string& bytes, UINT codePage)
     }
     return WideToUtf8(wide);
 }
+#else
+// Strict UTF-8 check (no overlongs, no surrogates, nothing past U+10FFFF):
+// the MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS) test.
+bool IsValidUtf8(const std::string& s)
+{
+    std::size_t i = 0;
+    const std::size_t n = s.size();
+    while (i < n) {
+        const unsigned char c = static_cast<unsigned char>(s[i]);
+        std::size_t len = 0;
+        unsigned cp = 0;
+        if (c < 0x80) { ++i; continue; }
+        else if ((c & 0xE0) == 0xC0) { len = 2; cp = c & 0x1F; }
+        else if ((c & 0xF0) == 0xE0) { len = 3; cp = c & 0x0F; }
+        else if ((c & 0xF8) == 0xF0) { len = 4; cp = c & 0x07; }
+        else return false;
+        if (i + len > n) return false;
+        for (std::size_t k = 1; k < len; ++k) {
+            const unsigned char cc = static_cast<unsigned char>(s[i + k]);
+            if ((cc & 0xC0) != 0x80) return false;
+            cp = (cp << 6) | (cc & 0x3F);
+        }
+        if ((len == 2 && cp < 0x80) || (len == 3 && cp < 0x800) ||
+            (len == 4 && cp < 0x10000) || cp > 0x10FFFF ||
+            (cp >= 0xD800 && cp <= 0xDFFF))
+            return false;
+        i += len;
+    }
+    return true;
+}
+
+const char* IconvNameForCodePage(UINT codePage)
+{
+    switch (codePage) {
+    case 20127: return "US-ASCII";
+    case 1250: return "WINDOWS-1250";
+    case 1251: return "WINDOWS-1251";
+    case 1252: return "WINDOWS-1252";
+    case 1253: return "WINDOWS-1253";
+    case 1254: return "WINDOWS-1254";
+    case 1255: return "WINDOWS-1255";
+    case 1256: return "WINDOWS-1256";
+    case 1257: return "WINDOWS-1257";
+    case 1258: return "WINDOWS-1258";
+    case 28591: return "ISO-8859-1";
+    case 28592: return "ISO-8859-2";
+    case 28593: return "ISO-8859-3";
+    case 28594: return "ISO-8859-4";
+    case 28595: return "ISO-8859-5";
+    case 28596: return "ISO-8859-6";
+    case 28597: return "ISO-8859-7";
+    case 28598: return "ISO-8859-8";
+    case 28599: return "ISO-8859-9";
+    case 28603: return "ISO-8859-13";
+    case 28605: return "ISO-8859-15";
+    case 932: return "CP932";
+    case 51932: return "EUC-JP";
+    case 54936: return "GB18030";
+    case 950: return "CP950";
+    case 949: return "CP949";
+    case 20866: return "KOI8-R";
+    case 21866: return "KOI8-U";
+    default: return nullptr;
+    }
+}
+
+// iconv equivalent of MultiByteToWideChar(codePage) + WideToUtf8: bytes
+// the code page cannot map become U+FFFD instead of failing the decode.
+std::string DecodeWithCodePage(const std::string& bytes, UINT codePage)
+{
+    if (bytes.empty()) return std::string();
+    if (codePage == CP_UTF8) {
+        if (IsValidUtf8(bytes)) return bytes;
+        std::string out;
+        out.reserve(bytes.size());
+        std::size_t i = 0;
+        while (i < bytes.size()) {
+            const unsigned char c = static_cast<unsigned char>(bytes[i]);
+            std::size_t len = c < 0x80 ? 1 : (c & 0xE0) == 0xC0 ? 2
+                            : (c & 0xF0) == 0xE0 ? 3 : (c & 0xF8) == 0xF0 ? 4 : 0;
+            if (len && i + len <= bytes.size() && IsValidUtf8(bytes.substr(i, len))) {
+                out.append(bytes, i, len);
+                i += len;
+            } else {
+                out += "\xEF\xBF\xBD";
+                ++i;
+            }
+        }
+        return out;
+    }
+    const char* name = IconvNameForCodePage(codePage);
+    if (!name) return std::string();
+    iconv_t cd = ::iconv_open("UTF-8", name);
+    if (cd == reinterpret_cast<iconv_t>(-1)) return std::string();
+
+    std::string out;
+    out.reserve(bytes.size() * 2);
+    char* in = const_cast<char*>(bytes.data());
+    std::size_t inLeft = bytes.size();
+    char buf[16384];
+    while (inLeft > 0) {
+        char* o = buf;
+        std::size_t oLeft = sizeof(buf);
+        const std::size_t rc = ::iconv(cd, &in, &inLeft, &o, &oLeft);
+        out.append(buf, sizeof(buf) - oLeft);
+        if (rc == static_cast<std::size_t>(-1)) {
+            if (errno == E2BIG) continue;
+            // EILSEQ / EINVAL: one unmappable or truncated byte.
+            out += "\xEF\xBF\xBD";
+            ++in;
+            --inLeft;
+            ::iconv(cd, nullptr, nullptr, nullptr, nullptr);
+        }
+    }
+    ::iconv_close(cd);
+    return out;
+}
+#endif
 
 std::string ExtractCharsetFromContentType(const std::string& contentType)
 {
@@ -1019,6 +1321,7 @@ std::string NormalizeDownloadedTextUtf8(const std::string& bytes,
         if (!decoded.empty()) return StripBom(decoded);
     }
 
+#ifdef _WIN32
     int utf8WideLen = ::MultiByteToWideChar(CP_UTF8,
                                             MB_ERR_INVALID_CHARS,
                                             bytes.data(),
@@ -1047,6 +1350,17 @@ std::string NormalizeDownloadedTextUtf8(const std::string& bytes,
             if (!recoded.empty()) return StripBom(recoded);
         }
     }
+#else
+    if (IsValidUtf8(bytes)) {
+        return StripBom(bytes);
+    }
+    // Windows falls back to the system ANSI code page, which is 1252 on
+    // Western installs; macOS has no such setting, so use 1252 directly.
+    {
+        std::string recoded = DecodeWithCodePage(bytes, 1252);
+        if (!recoded.empty()) return StripBom(recoded);
+    }
+#endif
 
     // Last-resort safety: never let malformed page bytes poison the
     // markdown artifact or the model request that receives its preview.
@@ -1802,6 +2116,7 @@ std::string ResolveRedirectUrl(const ParsedUrl& current,
     return origin.str() + normalized.str() + extra;
 }
 
+#ifdef _WIN32
 std::string FetchUrlWithWinHttp(const ParsedUrl& initialUrl,
                                 unsigned long timeoutMs,
                                 DWORD& statusCode,
@@ -2056,6 +2371,205 @@ std::string FetchUrlWithWinHttp(const ParsedUrl& initialUrl,
     error = "Too many redirects while fetching webpage.";
     return std::string();
 }
+#else
+// The WinHTTP loop above on Poco::Net: same timeouts, overall wall-clock
+// budget, manual redirects re-validated hop by hop, 10 MB cap on the
+// decoded body, gzip/deflate, and cancel by aborting the session's socket.
+std::string FetchUrlWithPoco(const ParsedUrl& initialUrl,
+                             unsigned long timeoutMs,
+                             DWORD& statusCode,
+                             std::string& contentType,
+                             std::string& finalUrl,
+                             std::string& error,
+                             const std::shared_ptr<std::atomic<bool>>& cancelFlag = nullptr)
+{
+    statusCode = 0;
+    contentType.clear();
+    finalUrl.clear();
+    error.clear();
+
+    if (IsCancelled(cancelFlag)) {
+        error = kCancelledMessage;
+        return std::string();
+    }
+    lb::EnsureSSLInitialized();
+
+    DWORD t = timeoutMs ? static_cast<DWORD>(std::min<unsigned long>(timeoutMs, 120000ul)) : kDefaultTimeoutMs;
+    // Poco has no separate resolve timeout; name resolution happens inside
+    // the connect, so the two budgets are combined.
+    DWORD connectTimeout = std::min<DWORD>(t, kMaxResolveTimeoutMs + kMaxConnectTimeoutMs);
+    DWORD sendTimeout    = std::min<DWORD>(t, kMaxSendTimeoutMs);
+    DWORD receiveTimeout = std::min<DWORD>(t, kMaxReceiveTimeoutMs);
+
+    const auto fetchDeadline = std::chrono::steady_clock::now() +
+                               std::chrono::milliseconds(static_cast<long long>(t) * 4);
+    auto pastDeadline = [&fetchDeadline]() {
+        return std::chrono::steady_clock::now() >= fetchDeadline;
+    };
+    const std::string deadlineMessage =
+        "Web fetch exceeded its overall time budget (" +
+        std::to_string((static_cast<unsigned long>(t) * 4ul) / 1000ul) +
+        "s); the server was responding too slowly.";
+
+    ParsedUrl current = initialUrl;
+    constexpr int kMaxRedirects = 5;
+
+    for (int redirectCount = 0; redirectCount <= kMaxRedirects; ++redirectCount) {
+        if (IsCancelled(cancelFlag)) {
+            error = kCancelledMessage;
+            return std::string();
+        }
+        if (pastDeadline()) {
+            error = deadlineMessage;
+            return std::string();
+        }
+
+        std::wstring hostW = current.hostW;
+        StripBracketsInPlace(hostW);
+        const std::string host = WideToUtf8(hostW);
+
+        std::unique_ptr<Poco::Net::HTTPClientSession> session;
+        try {
+            if (current.secure)
+                session.reset(new Poco::Net::HTTPSClientSession(host, current.port));
+            else
+                session.reset(new Poco::Net::HTTPClientSession(host, current.port));
+        } catch (const Poco::Exception& e) {
+            error = "Could not open a connection to " + host + ": " + e.displayText();
+            return std::string();
+        }
+        session->setTimeout(Poco::Timespan(static_cast<long>(connectTimeout) * 1000),
+                            Poco::Timespan(static_cast<long>(sendTimeout) * 1000),
+                            Poco::Timespan(static_cast<long>(receiveTimeout) * 1000));
+        session->setKeepAlive(false);
+
+        ScopedActiveRequest activeRequest(cancelFlag, session.get());
+        if (IsCancelled(cancelFlag)) {
+            error = kCancelledMessage;
+            return std::string();
+        }
+
+        Poco::Net::HTTPRequest request(Poco::Net::HTTPRequest::HTTP_GET,
+                                       WideToUtf8(current.pathW + current.extraW),
+                                       Poco::Net::HTTPMessage::HTTP_1_1);
+        request.set("User-Agent", kUserAgent);
+        request.set("Accept", "text/html, text/plain, application/xhtml+xml, application/json, application/xml, */*;q=0.8");
+        request.set("Accept-Language", "en-US,en;q=0.9");
+        request.set("Accept-Encoding", "gzip, deflate");
+
+        Poco::Net::HTTPResponse response;
+        std::istream* rs = nullptr;
+        try {
+            session->sendRequest(request);
+            rs = &session->receiveResponse(response);
+        } catch (const Poco::Exception& e) {
+            error = IsCancelled(cancelFlag) ? kCancelledMessage
+                                            : ("HTTP request failed: " + e.displayText());
+            return std::string();
+        } catch (const std::exception& e) {
+            error = IsCancelled(cancelFlag) ? kCancelledMessage
+                                            : (std::string("HTTP request failed: ") + e.what());
+            return std::string();
+        }
+
+        statusCode = static_cast<DWORD>(response.getStatus());
+        contentType = response.get("Content-Type", "");
+
+        if (statusCode >= 300 && statusCode < 400) {
+            std::string location = response.get("Location", "");
+            activeRequest.Close();
+
+            if (location.empty()) {
+                error = "HTTP redirect did not include a Location header.";
+                return std::string();
+            }
+            if (redirectCount >= kMaxRedirects) {
+                error = "Too many redirects while fetching webpage.";
+                return std::string();
+            }
+
+            std::string nextUrl = ResolveRedirectUrl(current, location);
+            ParsedUrl next;
+            std::string validationError;
+            if (!ParseAndValidateUrl(nextUrl, next, validationError)) {
+                error = "Redirect blocked: " + validationError;
+                return std::string();
+            }
+
+            current = std::move(next);
+            continue;
+        }
+
+        std::string data;
+        {
+            std::string cl = Trim(response.get("Content-Length", ""));
+            if (!cl.empty() && cl.find_first_not_of("0123456789") == std::string::npos) {
+                unsigned long long declared = std::strtoull(cl.c_str(), nullptr, 10);
+                if (declared > kMaxDownloadBytes) {
+                    error = "Response declares Content-Length " +
+                            HumanBytes(static_cast<std::size_t>(
+                                std::min<unsigned long long>(declared, SIZE_MAX))) +
+                            ", which exceeds the 10 MB webpage inspector limit.";
+                } else {
+                    data.reserve(static_cast<std::size_t>(declared));
+                }
+            }
+        }
+
+        const std::string encoding = Lower(Trim(response.get("Content-Encoding", "")));
+        std::unique_ptr<std::istream> inflater;
+        if (encoding == "gzip" || encoding == "x-gzip") {
+            inflater.reset(new Poco::InflatingInputStream(*rs, Poco::InflatingStreamBuf::STREAM_GZIP));
+        } else if (encoding == "deflate") {
+            inflater.reset(new Poco::InflatingInputStream(*rs, Poco::InflatingStreamBuf::STREAM_ZLIB));
+        } else if (!encoding.empty() && encoding != "identity") {
+            error = "The server used an unsupported Content-Encoding (" + encoding + ").";
+        }
+        std::istream& in = inflater ? *inflater : *rs;
+
+        char chunk[65536];
+        while (error.empty()) {
+            if (IsCancelled(cancelFlag)) {
+                error = kCancelledMessage;
+                break;
+            }
+            if (pastDeadline()) {
+                error = deadlineMessage;
+                break;
+            }
+            std::streamsize got = 0;
+            try {
+                in.read(chunk, sizeof(chunk));
+                got = in.gcount();
+            } catch (const std::exception& e) {
+                error = IsCancelled(cancelFlag) ? kCancelledMessage
+                                                : (std::string("Reading the response failed: ") + e.what());
+                break;
+            }
+            if (got > 0) {
+                if (data.size() + static_cast<std::size_t>(got) > kMaxDownloadBytes) {
+                    error = "Download exceeded the 10 MB webpage inspector limit.";
+                    break;
+                }
+                data.append(chunk, static_cast<std::size_t>(got));
+            }
+            if (in.bad()) {
+                error = IsCancelled(cancelFlag) ? kCancelledMessage
+                                                : "Reading the response failed (connection error or timeout).";
+                break;
+            }
+            if (!in) break;   // end of body
+        }
+
+        finalUrl = ParsedUrlToText(current);
+        activeRequest.Close();
+        return data;
+    }
+
+    error = "Too many redirects while fetching webpage.";
+    return std::string();
+}
+#endif
 
 std::string ContentTypeMediaType(const std::string& contentType)
 {
@@ -2287,7 +2801,11 @@ WebFetchResult FetchWebPageUrlImpl(const std::string& urlArg,
     DWORD statusCode = 0;
     std::string contentType;
     std::string finalUrl;
+#ifdef _WIN32
     std::string html = FetchUrlWithWinHttp(parsed, ctx.timeoutMs, statusCode, contentType, finalUrl, error, cancelFlag);
+#else
+    std::string html = FetchUrlWithPoco(parsed, ctx.timeoutMs, statusCode, contentType, finalUrl, error, cancelFlag);
+#endif
     if (!error.empty()) {
         if (IsCancelled(cancelFlag) || error == kCancelledMessage) {
             r.cancelled = true;
@@ -2612,32 +3130,6 @@ WebFetchResult FetchWebPageUrlImpl(const std::string& urlArg,
     return r;
 }
 
-#else  // ── macOS: web fetch (with its SSRF guard) is ported in Phase 3 ──
-
-namespace {
-void AbortActiveWebFetch(const std::shared_ptr<std::atomic<bool>>&) {}
-
-std::string Trim(std::string s)
-{
-    auto isWs = [](unsigned char c) { return std::isspace(c) != 0; };
-    while (!s.empty() && isWs(static_cast<unsigned char>(s.front()))) s.erase(s.begin());
-    while (!s.empty() && isWs(static_cast<unsigned char>(s.back()))) s.pop_back();
-    return s;
-}
-}
-
-WebFetchResult FetchWebPageUrlImpl(const std::string& urlArg,
-                                   const ToolContext& /*ctx*/,
-                                   const std::shared_ptr<std::atomic<bool>>& /*cancelFlag*/)
-{
-    WebFetchResult r;
-    r.commandEcho = "/web_fetch_url " + urlArg;
-    r.chips = { "unavailable" };
-    r.errorBody = "Web fetch is not available on macOS yet.";
-    return r;
-}
-
-#endif  // _WIN32
 
 WebFetchResult FetchWebPageUrl(const std::string& urlArg,
                                const ToolContext& ctx)

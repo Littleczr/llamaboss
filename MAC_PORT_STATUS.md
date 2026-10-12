@@ -87,6 +87,7 @@ Intended divergences from Windows. Features that are simply not ported yet are l
 | Buttons | flat buttons filled with theme colours | native push buttons (`lb_mac_native.mm`): one accent-tinted button per dialog (default/OK), Send and New Chat accent in the main window, stop-red stays red, the rest plain; widened to fit | NSButton ignores theme fills; Mac convention is one default button per window |
 | GPU memory wording | "Needs 10+ GB VRAM", "fits in VRAM" | "Needs a Mac with 16 GB+ of memory" (GPU GB x 4/3, rounded up to a Mac memory size), "fits in memory" (`lb_mac_wording.h`) | Apple silicon has unified memory; the GPU can use about 3/4 of it |
 | `py` session memory cap | Job Object: 2 GiB per process; allocations fail with `MemoryError` and the session survives | watchdog stops the kernel when its physical footprint passes 2 GiB; the session is lost and the card says why | macOS refuses `RLIMIT_AS`/`RLIMIT_DATA`, so a failing-allocation cap is not available |
+| Web fetch transport | WinHTTP, system proxy settings | Poco::Net with lb_ssl's verified TLS context; no system proxy; Mac browser user-agent | No WinHTTP on macOS; the UA names the platform it runs on |
 | Control appearance | n/a | app appearance (dark/light Aqua) set from the theme's background at startup | Native controls match the theme on a system in the other mode |
 
 ## Toolchain (verified 2026-10-09)
@@ -167,7 +168,6 @@ When the login keychain has an "Apple Development" (or, failing that, a self-sig
 | --- | --- | --- |
 | Shell tool | `cmd_executor.cpp` `RunOne` | Phase 3, after choosing pwsh vs zsh |
 | Python helpers + `python_run_script` | `python_runner.cpp` `StartWorker` | Phase 3, needs a Mac `lb_pyres::Load` from the bundle |
-| Web fetch (incl. SSRF guard) | `tool_web_fetch.cpp` | Phase 3, Poco transport + getaddrinfo checks |
 | In-app update install | `update_installer.cpp` | Phase 4, Mac package |
 | Sign in with ChatGPT | `chatgpt_auth.cpp` | Later: Keychain storage + RS256 verification. Never base64 storage |
 
@@ -351,6 +351,26 @@ large icons. macOS 26 may show a full-bleed square icon inside its standard roun
   calls with approval cards, `x` kept, Python 3.14.3; quitting the app stops the kernel
   and removes its temp dir.
 
+## Web fetch, 2026-10-12
+
+- `tool_web_fetch.cpp`: the one big `#ifdef _WIN32` around the tool is gone; the shared
+  logic (URL rules, SSRF guard, redirect resolution, charset sniffing, HTML to Markdown,
+  artifacts, previews) now builds on both. Win32-only pieces have POSIX alternatives next
+  to them: WinHTTP loop -> `FetchUrlWithPoco` (same timeouts, 4x wall-clock budget,
+  manual redirects re-validated every hop, 10 MB cap on the decoded body, gzip/deflate,
+  cancel via `HTTPSession::abort()`); `WinHttpCrackUrl` -> a parser with the same split;
+  `GetAddrInfoW` -> `getaddrinfo`; `MultiByteToWideChar` code pages -> iconv (all 28
+  mapped charsets checked; unmappable bytes become U+FFFD); UTF-16 surrogates paired
+  explicitly (wchar_t is 32-bit); artifact paths joined with '/'. Small type aliases
+  (`DWORD`, `UINT`, `INTERNET_PORT`, `HINTERNET` = Poco session) keep the shared code
+  unchanged. Windows view identical (`unifdef`). Links the system `iconv`.
+- Verified with a harness (20 cases): example.com (title + text artifact), JSON,
+  gzip, deflate, PNG, 404, UTF-8 page, redirects, explicit port + fragment; blocked:
+  localhost, 127.0.0.1, 192.168.x, [::1], 169.254.169.254, `file://`, a public redirect to
+  127.0.0.1; 100 MB file refused by Content-Length; unresolvable host fails closed;
+  timeout; cancel mid-request (about 0.5 s).
+- Not yet verified in the app (the Mac locked during the test).
+
 ## UI fonts, 2026-10-11
 
 - `lb_ui_font.h`: `LbUiPt(n)` (identity on Windows, n*4/3 on macOS, because Windows draws
@@ -397,6 +417,6 @@ large icons. macOS 26 may show a full-bleed square icon inside its standard roun
 
 ## Next task
 
-1. Web fetch port.
+1. In-app web fetch check (agent fetches a page, approval and result cards).
 2. Remaining UI checks: Model manager, About, project attach, message boxes, light themes.
 3. Phase 4: packaging (Developer ID signing, notarization, DMG, updater).
