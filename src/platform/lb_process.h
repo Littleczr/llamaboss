@@ -62,6 +62,7 @@ struct SpawnOptions {
     std::vector<std::string> argv;
     std::string cwd;          // empty = inherit
     std::string logPath;      // stdout+stderr, truncated; empty = /dev/null
+    std::vector<std::string> envSet;   // "NAME=value" added/overriding the parent env
 };
 
 class Child {
@@ -82,6 +83,18 @@ private:
 
 // Returns null on failure with errno-style code in `error`.
 std::shared_ptr<Child> Spawn(const SpawnOptions& options, int& error);
+
+// A long-running child whose stdin/stdout/stderr are pipes the caller
+// keeps (the persistent Python session's frame and crash channels).
+// `logPath` is ignored.  The parent ends are close-on-exec, the write end
+// never raises SIGPIPE (F_SETNOSIGPIPE), and all three are blocking; the
+// caller owns and closes them.
+struct PipeEnds {
+    int stdinW = -1;
+    int stdoutR = -1;
+    int stderrR = -1;
+};
+std::shared_ptr<Child> SpawnPiped(const SpawnOptions& options, PipeEnds& ends, int& error);
 
 // Resolve a program name on PATH (or return it unchanged when it already
 // contains a '/'). Empty when not found or not executable.

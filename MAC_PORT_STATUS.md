@@ -86,6 +86,7 @@ Intended divergences from Windows. Features that are simply not ported yet are l
 | Missing `.ico` at startup | file fallback | icon comes from the bundle; no file lookup | Avoids a modal error on launch |
 | Buttons | flat buttons filled with theme colours | native push buttons (`lb_mac_native.mm`): one accent-tinted button per dialog (default/OK), Send and New Chat accent in the main window, stop-red stays red, the rest plain; widened to fit | NSButton ignores theme fills; Mac convention is one default button per window |
 | GPU memory wording | "Needs 10+ GB VRAM", "fits in VRAM" | "Needs a Mac with 16 GB+ of memory" (GPU GB x 4/3, rounded up to a Mac memory size), "fits in memory" (`lb_mac_wording.h`) | Apple silicon has unified memory; the GPU can use about 3/4 of it |
+| `py` session memory cap | Job Object: 2 GiB per process; allocations fail with `MemoryError` and the session survives | watchdog stops the kernel when its physical footprint passes 2 GiB; the session is lost and the card says why | macOS refuses `RLIMIT_AS`/`RLIMIT_DATA`, so a failing-allocation cap is not available |
 | Control appearance | n/a | app appearance (dark/light Aqua) set from the theme's background at startup | Native controls match the theme on a system in the other mode |
 
 ## Toolchain (verified 2026-10-09)
@@ -166,7 +167,6 @@ When the login keychain has an "Apple Development" (or, failing that, a self-sig
 | --- | --- | --- |
 | Shell tool | `cmd_executor.cpp` `RunOne` | Phase 3, after choosing pwsh vs zsh |
 | Python helpers + `python_run_script` | `python_runner.cpp` `StartWorker` | Phase 3, needs a Mac `lb_pyres::Load` from the bundle |
-| Persistent `py` session | `python_session.cpp` | Phase 3 |
 | Web fetch (incl. SSRF guard) | `tool_web_fetch.cpp` | Phase 3, Poco transport + getaddrinfo checks |
 | In-app update install | `update_installer.cpp` | Phase 4, Mac package |
 | Sign in with ChatGPT | `chatgpt_auth.cpp` | Later: Keychain storage + RS256 verification. Never base64 storage |
@@ -330,8 +330,26 @@ large icons. macOS 26 may show a full-bleed square icon inside its standard roun
 - **Verified** (harness and in-app): health check, csv_inspect, csv_to_xlsx with file card,
   python_run_script (bare name, Skills/..., absolute path, argv, ARTIFACT_FILE), and package
   install.
-- **Not yet done:** the persistent `py` session (`python_session.cpp`, about 1,000 lines of
-  pipes and Job Object code; it needs a long-lived piped spawn in lb_process).
+- The persistent `py` session followed on 2026-10-12 (next section).
+
+## Persistent `py` session, 2026-10-12
+
+- `python_session.cpp`: the session manager, idle reaping, restart notes and `StartExec`
+  are now shared; only the process layer differs. The Mac layer sits in the `#else` of
+  the existing `#ifdef _WIN32` helper block: `lb_process::SpawnPiped` (new: a child in
+  its own process group with stdin/stdout/stderr pipes, `F_SETNOSIGPIPE` on the write
+  end), `poll()`-gated frame reads and a deadline on frame writes (a frame can exceed
+  the 64 KiB pipe buffer), SIGKILL to the group as the Job Object kill, temp dirs in
+  `$TMPDIR/LlamaBoss/PySessions`, interpreter from `lb_python::RunInterpreter()`.
+  The Windows view of the file is identical (`unifdef`).
+- Memory cap: see the Mac differences table. The crash-channel drain thread checks the
+  kernel's physical footprint every 0.5 s.
+- Verified with a harness driving `PythonSessionManager` (11 cases): state kept across
+  calls, exception keeps the session, timeout with salvaged partial output and a restart
+  note, memory stop (exit 137, explained), cancel, subprocess (`sw_vers`), reset via
+  `CloseSessionFor`, shutdown; no stray kernels or temp dirs. In-app: two agent `py`
+  calls with approval cards, `x` kept, Python 3.14.3; quitting the app stops the kernel
+  and removes its temp dir.
 
 ## UI fonts, 2026-10-11
 
@@ -379,5 +397,6 @@ large icons. macOS 26 may show a full-bleed square icon inside its standard roun
 
 ## Next task
 
-1. Persistent `py` session on macOS.
-2. Web fetch port, then Phase 4 packaging.
+1. Web fetch port.
+2. Remaining UI checks: Model manager, About, project attach, message boxes, light themes.
+3. Phase 4: packaging (Developer ID signing, notarization, DMG, updater).

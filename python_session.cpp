@@ -809,6 +809,554 @@ std::shared_ptr<PySession> SpawnSession(
 }
 
 }  // namespace
+#else  // ── macOS / POSIX process layer ───────────────────────────────
+//
+// Same contract as the Win32 layer above, so the session manager and
+// StartExec below are shared.  Differences, all in this block:
+//   * lb_process::SpawnPiped starts the kernel in its own process group;
+//     Kill() is SIGKILL to the group, the Job Object's whole-tree kill.
+//   * The interpreter is lb_python::RunInterpreter() (LlamaBoss's Python
+//     environment, else Homebrew / python.org / Command Line Tools).
+//   * Paths stay std::wstring like the Win32 code, and the shared code's
+//     "\\out.log" joins are turned into '/' by PosixPath().
+//   * macOS refuses RLIMIT_AS / RLIMIT_DATA, so the Job Object's 2 GiB
+//     MemoryError cap cannot be reproduced; the drain thread instead stops
+//     a kernel whose physical footprint passes kSessionMemoryCapBytes and
+//     says so on the crash channel (the session is lost, not kept).
+
+#include <algorithm>
+#include <cerrno>
+#include <climits>
+#include <cstring>
+#include <filesystem>
+#include <fcntl.h>
+#include <libproc.h>
+#include <poll.h>
+#include <signal.h>
+#include <sys/resource.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#include "lb_process.h"
+#include "lb_python_posix.h"
+
+namespace {
+
+using DWORD = unsigned int;
+
+double NowSec()
+{
+    using namespace std::chrono;
+    return duration<double>(steady_clock::now().time_since_epoch()).count();
+}
+
+std::string PosixPath(const std::wstring& w)
+{
+    std::string p = lb_utf::WideToUtf8(w);
+    std::replace(p.begin(), p.end(), '\\', '/');
+    return p;
+}
+
+std::string SanitizeUtf8Lossy(const std::string& in)
+{
+    std::string out;
+    out.reserve(in.size());
+    size_t i = 0;
+    const size_t n = in.size();
+    while (i < n) {
+        const unsigned char c = static_cast<unsigned char>(in[i]);
+        size_t len = 0;
+        if      (c < 0x80)           len = 1;
+        else if ((c & 0xE0) == 0xC0) len = 2;
+        else if ((c & 0xF0) == 0xE0) len = 3;
+        else if ((c & 0xF8) == 0xF0) len = 4;
+        if (len == 0 || i + len > n) { out.push_back('?'); ++i; continue; }
+        bool okSeq = true;
+        for (size_t k = 1; k < len; ++k) {
+            if ((static_cast<unsigned char>(in[i + k]) & 0xC0) != 0x80) {
+                okSeq = false;
+                break;
+            }
+        }
+        if (!okSeq) { out.push_back('?'); ++i; continue; }
+        out.append(in, i, len);
+        i += len;
+    }
+    return out;
+}
+
+// Absolute, normalized, no trailing '/'.  Case is kept: macOS volumes can
+// be case-sensitive, and the conversation registry hands us stable paths.
+std::string NormalizeKey(const std::string& cwdUtf8)
+{
+    if (cwdUtf8.empty()) return std::string();
+    std::error_code ec;
+    std::filesystem::path p = std::filesystem::absolute(cwdUtf8, ec);
+    if (ec) p = cwdUtf8;
+    std::string full = p.lexically_normal().string();
+    while (full.size() > 1 && full.back() == '/') full.pop_back();
+    return full;
+}
+
+std::string ErrnoString(const char* what, int err)
+{
+    return std::string(what) + " failed: " + std::strerror(err);
+}
+
+std::wstring MakeSessionTempDir(std::string& errorOut)
+{
+    std::string base;
+    char buf[PATH_MAX] = {};
+    if (::confstr(_CS_DARWIN_USER_TEMP_DIR, buf, sizeof(buf)) > 0) base = buf;
+    else if (const char* t = std::getenv("TMPDIR")) base = t;
+    else base = "/tmp/";
+    if (base.back() != '/') base.push_back('/');
+
+    static std::atomic<unsigned> s_counter{0};
+    const std::string parent = base + "LlamaBoss/PySessions";
+    std::error_code ec;
+    std::filesystem::create_directories(parent, ec);
+    const std::string path = parent + "/s" + std::to_string(::getpid()) + "_" +
+        std::to_string(s_counter.fetch_add(1)) + "_" +
+        std::to_string(static_cast<unsigned long long>(NowSec() * 1000.0));
+    if (::mkdir(path.c_str(), 0700) != 0 && errno != EEXIST) {
+        errorOut = "could not create session temp dir " + path + ": " +
+                   std::strerror(errno);
+        return std::wstring();
+    }
+    return lb_utf::Utf8ToWide(path);
+}
+
+bool WriteKernelFile(const std::wstring& path, std::string& errorOut)
+{
+    const char* src  = nullptr;
+    size_t      size = 0;
+    if (!lb_pyres::Load(lb_pyres::kKernelName, src, size, errorOut))
+        return false;
+    const std::string p = PosixPath(path);
+    const int fd = ::open(p.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    if (fd < 0) {
+        errorOut = ErrnoString("open(lb_kernel.py)", errno);
+        return false;
+    }
+    size_t done = 0;
+    while (done < size) {
+        const ssize_t w = ::write(fd, src + done, size - done);
+        if (w < 0) {
+            if (errno == EINTR) continue;
+            errorOut = ErrnoString("write(lb_kernel.py)", errno);
+            ::close(fd);
+            return false;
+        }
+        done += static_cast<size_t>(w);
+    }
+    ::close(fd);
+    return true;
+}
+
+void CleanupSessionTempDir(const std::wstring& dir)
+{
+    if (dir.empty()) return;
+    const std::string d = PosixPath(dir);
+    ::unlink((d + "/lb_kernel.py").c_str());
+    ::unlink((d + "/out.log").c_str());
+    ::unlink((d + "/err.log").c_str());
+    ::rmdir(d.c_str());
+}
+
+std::string ReadFileCapped(const std::wstring& path, size_t cap,
+                           bool& truncatedOut)
+{
+    truncatedOut = false;
+    const int fd = ::open(PosixPath(path).c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return std::string();
+    std::string out;
+    char buf[8192];
+    while (out.size() < cap) {
+        const ssize_t got = ::read(fd, buf, std::min(sizeof(buf), cap - out.size()));
+        if (got < 0 && errno == EINTR) continue;
+        if (got <= 0) break;
+        out.append(buf, static_cast<size_t>(got));
+    }
+    if (out.size() >= cap) {
+        char one;
+        if (::read(fd, &one, 1) == 1) truncatedOut = true;
+    }
+    ::close(fd);
+    return SanitizeUtf8Lossy(out);
+}
+
+// Must match CAP in the embedded kernel.
+constexpr unsigned long long kKernelCaptureCapBytes = 4ull * 1024 * 1024;
+
+// See the Win32 CapCaptureFile: shrink-only, re-checked through the fd.
+void CapCaptureFile(const std::wstring& path)
+{
+    const unsigned long long keep = kKernelCaptureCapBytes + 1;
+    const std::string p = PosixPath(path);
+    struct stat st {};
+    if (::stat(p.c_str(), &st) != 0 ||
+        static_cast<unsigned long long>(st.st_size) <= keep)
+        return;
+    const int fd = ::open(p.c_str(), O_WRONLY | O_CLOEXEC);
+    if (fd < 0) return;
+    if (::fstat(fd, &st) == 0 &&
+        static_cast<unsigned long long>(st.st_size) > keep)
+        ::ftruncate(fd, static_cast<off_t>(keep));
+    ::close(fd);
+}
+
+constexpr size_t kStderrDrainCapBytes = 64 * 1024;
+
+struct PySession {
+    std::shared_ptr<lb_process::Child> child;
+    int    stdinW  = -1;   // frame channel out (we write requests)
+    int    stdoutR = -1;   // frame channel in  (we read responses)
+    int    stderrR = -1;   // crash channel     (drain thread reads)
+    pid_t  pid     = 0;
+
+    std::thread       drainThread;
+    std::atomic<bool> drainStop{false};
+    std::string       drainBuf;
+    std::mutex        drainMutex;
+
+    std::wstring tempDir;       // holds lb_kernel.py, out.log, err.log
+    std::string  pythonCommand; // launcher label
+    std::string  pythonVersion; // from the spawn ping
+    std::string  key;           // normalized cwd this session belongs to
+
+    unsigned              nextRequestId = 1;  // worker-thread only
+    std::atomic<unsigned> execCount{0};
+    std::atomic<double>   lastUsedSec{0.0};
+    std::atomic<bool>     dead{false};
+
+    void Kill()
+    {
+        bool expected = false;
+        if (!dead.compare_exchange_strong(expected, true)) return;
+        if (pid > 0) ::kill(-pid, SIGKILL);
+    }
+
+    std::string DrainedStderr()
+    {
+        std::lock_guard<std::mutex> lk(drainMutex);
+        return SanitizeUtf8Lossy(drainBuf);
+    }
+
+    bool ProcExited(DWORD* exitCodeOut) const
+    {
+        if (!child) return true;
+        int code = -1;
+        if (!child->Exited(&code)) return false;
+        if (exitCodeOut) *exitCodeOut = static_cast<DWORD>(code);
+        return true;
+    }
+
+    void AppendCrashNote(const std::string& note)
+    {
+        std::lock_guard<std::mutex> lk(drainMutex);
+        if (!drainBuf.empty() && drainBuf.back() != '\n') drainBuf.push_back('\n');
+        drainBuf += note;
+    }
+
+    // Crash-channel drain plus the memory watchdog.  poll() with a short
+    // tick instead of a blocking read, so the destructor can always stop
+    // it even if a detached grandchild kept the pipe's write end open.
+    void DrainLoop()
+    {
+        constexpr int kTickMs = 100;
+        int ticks = 0;
+        char buf[4096];
+        for (;;) {
+            if (drainStop.load()) break;
+            pollfd pfd { stderrR, POLLIN, 0 };
+            const int pr = ::poll(&pfd, 1, kTickMs);
+            if (pr > 0) {
+                const ssize_t got = ::read(stderrR, buf, sizeof(buf));
+                if (got < 0 && errno == EINTR) continue;
+                if (got <= 0) break;   // EOF: the kernel and its group are gone
+                std::lock_guard<std::mutex> lk(drainMutex);
+                if (drainBuf.size() < kStderrDrainCapBytes) {
+                    const size_t room = kStderrDrainCapBytes - drainBuf.size();
+                    drainBuf.append(buf, std::min<size_t>(static_cast<size_t>(got), room));
+                }
+            } else if (pr < 0 && errno != EINTR) {
+                break;
+            }
+            if (++ticks % 5 == 0 && !dead.load() && pid > 0) {
+                rusage_info_v2 ri {};
+                if (::proc_pid_rusage(pid, RUSAGE_INFO_V2,
+                                      reinterpret_cast<rusage_info_t*>(&ri)) == 0 &&
+                    ri.ri_phys_footprint >
+                        PythonSessionManager::kSessionMemoryCapBytes) {
+                    AppendCrashNote(
+                        "[LlamaBoss stopped the session: it used more than " +
+                        std::to_string(PythonSessionManager::kSessionMemoryCapBytes >> 30) +
+                        " GiB of memory]");
+                    Kill();
+                }
+            }
+        }
+    }
+
+    ~PySession()
+    {
+        Kill();
+        if (stdinW >= 0) { ::close(stdinW); stdinW = -1; }
+        if (child) {
+            for (int i = 0; i < 40 && !child->Exited(); ++i) ::usleep(50000);
+        }
+        drainStop.store(true);
+        if (drainThread.joinable()) drainThread.join();
+        if (stdoutR >= 0) { ::close(stdoutR); stdoutR = -1; }
+        if (stderrR >= 0) { ::close(stderrR); stderrR = -1; }
+        CleanupSessionTempDir(tempDir);
+    }
+};
+
+enum class FrameReadStatus { Ok, TimedOut, Cancelled, Broken, Desync };
+
+bool WriteFrame(PySession& s, const std::string& jsonPayload,
+                std::string& errorOut)
+{
+    const std::string wire =
+        "LBPY1 " + std::to_string(jsonPayload.size()) + "\n" + jsonPayload;
+    // A frame can exceed the 64 KiB pipe buffer; write with a deadline so a
+    // wedged kernel cannot park this thread (Windows sizes the pipe instead).
+    const double deadline = NowSec() + 10.0;
+    size_t done = 0;
+    while (done < wire.size()) {
+        pollfd pfd { s.stdinW, POLLOUT, 0 };
+        const int pr = ::poll(&pfd, 1, 50);
+        if (pr < 0 && errno != EINTR) {
+            errorOut = ErrnoString("poll(frame)", errno);
+            return false;
+        }
+        if (pr > 0) {
+            if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
+                errorOut = "frame write failed: kernel stdin closed";
+                return false;
+            }
+            const ssize_t w = ::write(s.stdinW, wire.data() + done,
+                                      std::min<size_t>(wire.size() - done, 16384));
+            if (w < 0) {
+                if (errno == EINTR || errno == EAGAIN) continue;
+                errorOut = ErrnoString("write(frame)", errno);
+                return false;
+            }
+            done += static_cast<size_t>(w);
+        }
+        if (done < wire.size() && NowSec() >= deadline) {
+            errorOut = "frame write timed out";
+            return false;
+        }
+    }
+    return true;
+}
+
+// Same loop as the Win32 ReadFrame; poll() gates every read so the
+// timeout and cancel paths are always reachable.
+FrameReadStatus ReadFrame(PySession& s,
+                          const std::shared_ptr<std::atomic<bool>>& cancelFlag,
+                          double deadlineSec,
+                          std::string& payloadOut,
+                          std::string& errorOut)
+{
+    constexpr int    kTickMs        = 50;
+    constexpr size_t kMaxFrameBytes = 32 * 1024 * 1024;
+
+    std::string buf;
+    size_t headerEnd  = std::string::npos;
+    size_t payloadLen = 0;
+    bool   eof        = false;
+
+    for (;;) {
+        // Drain whatever is available right now.
+        while (!eof) {
+            pollfd pfd { s.stdoutR, POLLIN, 0 };
+            const int pr = ::poll(&pfd, 1, 0);
+            if (pr < 0) {
+                if (errno == EINTR) continue;
+                errorOut = ErrnoString("poll(frame)", errno);
+                return FrameReadStatus::Broken;
+            }
+            if (pr == 0) break;
+            char chunk[8192];
+            const ssize_t got = ::read(s.stdoutR, chunk, sizeof(chunk));
+            if (got < 0) {
+                if (errno == EINTR) continue;
+                errorOut = ErrnoString("read(frame)", errno);
+                return FrameReadStatus::Broken;
+            }
+            if (got == 0) { eof = true; break; }
+            buf.append(chunk, static_cast<size_t>(got));
+        }
+
+        if (headerEnd == std::string::npos) {
+            const size_t nl = buf.find('\n');
+            if (nl != std::string::npos) {
+                if (nl > 32 || buf.compare(0, 6, "LBPY1 ") != 0) {
+                    errorOut = "protocol desync: bad frame header";
+                    return FrameReadStatus::Desync;
+                }
+                const std::string lenText = buf.substr(6, nl - 6);
+                char* end = nullptr;
+                const unsigned long long len =
+                    std::strtoull(lenText.c_str(), &end, 10);
+                if (!end || *end != '\0' || lenText.empty() ||
+                    len > kMaxFrameBytes) {
+                    errorOut = "protocol desync: bad frame length '" +
+                               lenText + "'";
+                    return FrameReadStatus::Desync;
+                }
+                headerEnd  = nl + 1;
+                payloadLen = static_cast<size_t>(len);
+            } else if (buf.size() > 64) {
+                errorOut =
+                    "protocol desync: no frame header in first 64 bytes";
+                return FrameReadStatus::Desync;
+            }
+        }
+
+        if (headerEnd != std::string::npos &&
+            buf.size() >= headerEnd + payloadLen) {
+            payloadOut = buf.substr(headerEnd, payloadLen);
+            if (!s.tempDir.empty()) {
+                CapCaptureFile(s.tempDir + L"/out.log");
+                CapCaptureFile(s.tempDir + L"/err.log");
+            }
+            return FrameReadStatus::Ok;
+        }
+
+        if (eof) {
+            // The pipe closes while the process is still being torn down;
+            // give it a moment to become reapable so the caller reports
+            // the real exit status (Windows waits on the process handle).
+            for (int i = 0; i < 20 && !s.ProcExited(nullptr); ++i) ::usleep(25000);
+            errorOut = "kernel process exited mid-request";
+            return FrameReadStatus::Broken;
+        }
+        if (cancelFlag && cancelFlag->load())
+            return FrameReadStatus::Cancelled;
+        if (NowSec() >= deadlineSec)
+            return FrameReadStatus::TimedOut;
+
+        if (!s.tempDir.empty()) {
+            CapCaptureFile(s.tempDir + L"/out.log");
+            CapCaptureFile(s.tempDir + L"/err.log");
+        }
+
+        pollfd pfd { s.stdoutR, POLLIN, 0 };
+        ::poll(&pfd, 1, kTickMs);
+    }
+}
+
+// Spawns a kernel for `cwd` and validates it with a handshake ping.  One
+// interpreter (see lb_python_posix.h) instead of the Windows launcher list.
+std::shared_ptr<PySession> SpawnSession(
+    const std::string& cwdUtf8,
+    const std::string& key,
+    const std::shared_ptr<std::atomic<bool>>& cancelFlag,
+    std::string& errorOut)
+{
+    if (cancelFlag && cancelFlag->load()) {
+        errorOut = "cancelled before the session could start";
+        return nullptr;
+    }
+    const std::string interpreter = lb_python::RunInterpreter();
+    if (interpreter.empty()) {
+        errorOut = lb_python::NoPythonMessage();
+        return nullptr;
+    }
+
+    std::string dirError;
+    const std::wstring tempDir = MakeSessionTempDir(dirError);
+    if (tempDir.empty()) {
+        errorOut = dirError;
+        return nullptr;
+    }
+    const std::wstring kernelPath = tempDir + L"/lb_kernel.py";
+    std::string writeError;
+    if (!WriteKernelFile(kernelPath, writeError)) {
+        errorOut = writeError;
+        CleanupSessionTempDir(tempDir);
+        return nullptr;
+    }
+
+    // Flags as on Windows: -X utf8, -B (no .pyc in the temp dir), -u
+    // (unbuffered crash channel); no -I, so installed packages import.
+    lb_process::SpawnOptions so;
+    so.argv = { interpreter, "-X", "utf8", "-B", "-u",
+                PosixPath(kernelPath), PosixPath(tempDir) };
+    so.cwd = cwdUtf8;
+    so.envSet = { "PATH=" + lb_python::ChildPath() };
+    lb_process::PipeEnds ends;
+    int spawnErr = 0;
+    std::shared_ptr<lb_process::Child> child =
+        lb_process::SpawnPiped(so, ends, spawnErr);
+    if (!child) {
+        errorOut = "Could not start a Python session with " + interpreter +
+                   ": " + std::strerror(spawnErr);
+        CleanupSessionTempDir(tempDir);
+        return nullptr;
+    }
+
+    auto session = std::make_shared<PySession>();
+    session->child   = child;
+    session->pid     = child->Pid();
+    session->stdinW  = ends.stdinW;
+    session->stdoutR = ends.stdoutR;
+    session->stderrR = ends.stderrR;
+    session->tempDir = tempDir;
+    session->pythonCommand = "python3";
+    session->key     = key;
+    session->lastUsedSec.store(NowSec());
+    PySession* raw = session.get();
+    session->drainThread = std::thread([raw]() { raw->DrainLoop(); });
+
+    Poco::JSON::Object ping;
+    ping.set("id", 0);
+    ping.set("op", "ping");
+    std::ostringstream pingJson;
+    ping.stringify(pingJson);
+
+    std::string ioError;
+    if (WriteFrame(*session, pingJson.str(), ioError)) {
+        std::string payload;
+        const double deadline =
+            NowSec() + PythonSessionManager::kSpawnPingTimeoutMs / 1000.0;
+        const FrameReadStatus st =
+            ReadFrame(*session, cancelFlag, deadline, payload, ioError);
+        if (st == FrameReadStatus::Ok) {
+            try {
+                Poco::JSON::Parser parser;
+                auto obj = parser.parse(payload).extract<Poco::JSON::Object::Ptr>();
+                if (obj && obj->optValue<bool>("ok", false)) {
+                    session->pythonVersion = obj->optValue<std::string>("python", "");
+                    return session;
+                }
+                ioError = "handshake ping was rejected by the kernel";
+            } catch (const std::exception& e) {
+                ioError = std::string("handshake parse error: ") + e.what();
+            }
+        } else if (st == FrameReadStatus::Cancelled) {
+            errorOut = "cancelled during session startup";
+            return nullptr;
+        } else if (ioError.empty()) {
+            ioError = (st == FrameReadStatus::TimedOut) ? "handshake timed out"
+                                                        : "handshake failed";
+        }
+    }
+
+    const std::string drained = session->DrainedStderr();
+    errorOut = "Could not start a Python session with " + interpreter + ": " + ioError;
+    if (!drained.empty()) errorOut += " | stderr: " + drained;
+    return nullptr;  // session destructor: kill + drain-join + cleanup
+}
+
+}  // namespace
+
+#endif  // _WIN32
 
 // ═══════════════════════════════════════════════════════════════════
 //  PythonSessionManager::Impl
@@ -1009,46 +1557,6 @@ size_t PythonSessionManager::ReapIdle(unsigned long maxIdleMs)
     return n;
 }
 
-#else  // ── macOS: persistent py sessions arrive in Phase 3 ─────────────
-
-struct PythonSessionManager::Impl {
-    wxEvtHandler*                    eventHandler = nullptr;
-    std::weak_ptr<std::atomic<bool>> aliveToken;
-};
-
-PythonSessionManager::PythonSessionManager(wxEvtHandler* eventHandler,
-                                           std::weak_ptr<std::atomic<bool>> aliveToken)
-    : m_impl(std::make_shared<Impl>())
-{
-    m_impl->eventHandler = eventHandler;
-    m_impl->aliveToken = std::move(aliveToken);
-}
-
-PythonSessionManager::~PythonSessionManager() = default;
-
-bool PythonSessionManager::StartExec(const std::string& code,
-                                     const std::string& /*cwd*/,
-                                     unsigned long      /*timeoutMs*/)
-{
-    // Complete asynchronously, like a real exec, so the caller's flow is unchanged.
-    PySessionResult r;
-    r.code = code;
-    r.ok = false;
-    r.excType = "NotAvailable";
-    r.excMessage = "The py tool is not available on macOS yet.";
-    auto* ev = new wxCommandEvent(wxEVT_PY_SESSION_COMPLETE);
-    ev->SetClientObject(new PySessionResultClientData(std::move(r)));
-    LbQueueEventIfAlive(m_impl->eventHandler, m_impl->aliveToken, ev);
-    return true;
-}
-
-void PythonSessionManager::Cancel() {}
-bool PythonSessionManager::IsRunning() const { return false; }
-size_t PythonSessionManager::ReapIdle(unsigned long) { return 0; }
-bool PythonSessionManager::CloseSessionFor(const std::string&) { return false; }
-void PythonSessionManager::Shutdown() {}
-
-#endif  // _WIN32
 
 // ═══════════════════════════════════════════════════════════════════
 //  Shared card presentation
@@ -1094,7 +1602,6 @@ void BuildPySessionCardParts(const PySessionResult&    r,
     if (r.truncated)              chipsOut.push_back("truncated");
 }
 
-#ifdef _WIN32
 
 bool PythonSessionManager::StartExec(const std::string& code,
                                      const std::string& cwd,
@@ -1401,4 +1908,3 @@ bool PythonSessionManager::StartExec(const std::string& code,
     return true;
 }
 
-#endif  // _WIN32

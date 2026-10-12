@@ -39,21 +39,27 @@ void CloseFd(int& fd)
     fd = -1;
 }
 
-std::vector<std::string> BuildEnv(const Options& o)
+std::vector<std::string> BuildEnv(const std::vector<std::string>& envSet,
+                                  const std::vector<std::string>& envUnset)
 {
     std::vector<std::string> env;
     auto nameOf = [](const std::string& kv) { return kv.substr(0, kv.find('=')); };
     auto overridden = [&](const std::string& name) {
-        for (const auto& u : o.envUnset) if (u == name) return true;
-        for (const auto& s : o.envSet) if (nameOf(s) == name) return true;
+        for (const auto& u : envUnset) if (u == name) return true;
+        for (const auto& s : envSet) if (nameOf(s) == name) return true;
         return false;
     };
     for (char** e = environ; e && *e; ++e) {
         std::string kv(*e);
         if (!overridden(nameOf(kv))) env.push_back(std::move(kv));
     }
-    for (const auto& s : o.envSet) env.push_back(s);
+    for (const auto& s : envSet) env.push_back(s);
     return env;
+}
+
+std::vector<std::string> BuildEnv(const Options& o)
+{
+    return BuildEnv(o.envSet, o.envUnset);
 }
 
 void KillGroup(pid_t pgid)
@@ -326,6 +332,73 @@ std::shared_ptr<Child> Spawn(const SpawnOptions& o, int& error)
     posix_spawn_file_actions_destroy(&fa);
     posix_spawnattr_destroy(&attr);
     if (rc != 0) { error = rc; return nullptr; }
+    return std::make_shared<Child>(pid);
+}
+
+std::shared_ptr<Child> SpawnPiped(const SpawnOptions& o, PipeEnds& ends, int& error)
+{
+    error = 0;
+    ends = PipeEnds{};
+    if (o.argv.empty()) { error = EINVAL; return nullptr; }
+    const std::string exe = FindExecutable(o.argv[0]);
+    if (exe.empty()) { error = ENOENT; return nullptr; }
+
+    int inPipe[2] = {-1, -1}, outPipe[2] = {-1, -1}, errPipe[2] = {-1, -1};
+    auto closeAll = [&] {
+        CloseFd(inPipe[0]); CloseFd(inPipe[1]);
+        CloseFd(outPipe[0]); CloseFd(outPipe[1]);
+        CloseFd(errPipe[0]); CloseFd(errPipe[1]);
+    };
+    if (!MakePipe(inPipe) || !MakePipe(outPipe) || !MakePipe(errPipe)) {
+        error = errno;
+        closeAll();
+        return nullptr;
+    }
+    ::fcntl(inPipe[1], F_SETNOSIGPIPE, 1);
+
+    posix_spawn_file_actions_t fa;
+    posix_spawn_file_actions_init(&fa);
+    posix_spawn_file_actions_adddup2(&fa, inPipe[0], STDIN_FILENO);
+    posix_spawn_file_actions_adddup2(&fa, outPipe[1], STDOUT_FILENO);
+    posix_spawn_file_actions_adddup2(&fa, errPipe[1], STDERR_FILENO);
+    if (!o.cwd.empty()) posix_spawn_file_actions_addchdir_np(&fa, o.cwd.c_str());
+
+    posix_spawnattr_t attr;
+    posix_spawnattr_init(&attr);
+    sigset_t none, all;
+    sigemptyset(&none);
+    sigfillset(&all);
+    posix_spawnattr_setsigmask(&attr, &none);
+    posix_spawnattr_setsigdefault(&attr, &all);
+    posix_spawnattr_setpgroup(&attr, 0);
+    posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETPGROUP | POSIX_SPAWN_SETSIGMASK |
+                                     POSIX_SPAWN_SETSIGDEF | POSIX_SPAWN_CLOEXEC_DEFAULT);
+
+    std::vector<std::string> args = o.argv;
+    std::vector<char*> argv;
+    for (auto& a : args) argv.push_back(a.data());
+    argv.push_back(nullptr);
+    std::vector<std::string> envStore = BuildEnv(o.envSet, {});
+    std::vector<char*> envp;
+    for (auto& e : envStore) envp.push_back(e.data());
+    envp.push_back(nullptr);
+
+    pid_t pid = -1;
+    const int rc = ::posix_spawn(&pid, exe.c_str(), &fa, &attr, argv.data(), envp.data());
+    posix_spawn_file_actions_destroy(&fa);
+    posix_spawnattr_destroy(&attr);
+    // Child-side ends close now: only the child may hold them, or EOF breaks.
+    CloseFd(inPipe[0]);
+    CloseFd(outPipe[1]);
+    CloseFd(errPipe[1]);
+    if (rc != 0) {
+        error = rc;
+        closeAll();
+        return nullptr;
+    }
+    ends.stdinW = inPipe[1];
+    ends.stdoutR = outPipe[0];
+    ends.stderrR = errPipe[0];
     return std::make_shared<Child>(pid);
 }
 
