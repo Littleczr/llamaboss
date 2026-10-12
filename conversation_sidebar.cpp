@@ -269,6 +269,7 @@ wxFont SidebarMonoFont(int pointSize,
                        wxFontWeight weight = wxFONTWEIGHT_NORMAL,
                        bool italic = false)
 {
+    pointSize = LbUiPt(pointSize);   // Windows point sizes; scaled on macOS
     wxFont font(pointSize, wxFONTFAMILY_TELETYPE,
                 italic ? wxFONTSTYLE_ITALIC : wxFONTSTYLE_NORMAL,
                 weight, false, LbFace("Cascadia Mono"));
