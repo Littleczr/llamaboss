@@ -168,31 +168,40 @@ endif()
 
 # ── Stable local code signature (macOS) ──
 # The linker's ad-hoc signature changes on every build, and Keychain ties a
-# stored secret's access to the signature, so each rebuild asks for the login
-# password again.  Signing with one fixed identity keeps the signature's
-# designated requirement stable.  Create a self-signed "LlamaBoss Development"
-# code-signing certificate in the login keychain (trusted for code signing)
-# to enable this; without it the build keeps the ad-hoc signature.
+# stored secret's "Always Allow" to the signer: an app with a Team ID is
+# matched by that ID, an app without one by its exact build, so every
+# rebuild asked for the login password again.  Sign with an "Apple
+# Development" certificate (free with an Apple ID: Xcode > Settings >
+# Accounts > Manage Certificates), which carries a Team ID.  A self-signed
+# "LlamaBoss Development" identity is the fallback (stable signature, but no
+# Team ID, so Keychain still asks after a rebuild); with neither, the build
+# keeps the ad-hoc signature.
 # Must stay after the llama-server bundling step: POST_BUILD commands run in order.
 if(APPLE)
     set(LLAMABOSS_CODESIGN_IDENTITY "" CACHE STRING
-        "Code-signing identity for local builds (empty = auto-detect 'LlamaBoss Development')")
+        "Code-signing identity for local builds (empty = auto-detect Apple Development, then 'LlamaBoss Development')")
     set(_lb_sign_id "${LLAMABOSS_CODESIGN_IDENTITY}")
     if(NOT _lb_sign_id)
         execute_process(COMMAND security find-identity -v -p codesigning
             OUTPUT_VARIABLE _lb_identities ERROR_QUIET)
-        if(_lb_identities MATCHES "\"LlamaBoss Development\"")
+        if(_lb_identities MATCHES "([0-9A-F]+) \"Apple Development: ([^\"]+)\"")
+            set(_lb_sign_id "${CMAKE_MATCH_1}")
+            set(_lb_sign_name "Apple Development: ${CMAKE_MATCH_2}")
+        elseif(_lb_identities MATCHES "\"LlamaBoss Development\"")
             set(_lb_sign_id "LlamaBoss Development")
         endif()
     endif()
+    if(NOT _lb_sign_name)
+        set(_lb_sign_name "${_lb_sign_id}")
+    endif()
     if(_lb_sign_id)
-        message(STATUS "Signing LlamaBoss.app with '${_lb_sign_id}'")
+        message(STATUS "Signing LlamaBoss.app with '${_lb_sign_name}'")
         add_custom_command(TARGET LlamaBoss POST_BUILD
             COMMAND codesign --force --sign "${_lb_sign_id}" --timestamp=none
                     "$<TARGET_BUNDLE_DIR:LlamaBoss>"
             COMMENT "Signing LlamaBoss.app")
     else()
-        message(STATUS "No 'LlamaBoss Development' signing identity; LlamaBoss.app stays ad-hoc signed")
+        message(STATUS "No code-signing identity found; LlamaBoss.app stays ad-hoc signed")
     endif()
 endif()
 

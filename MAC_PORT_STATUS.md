@@ -114,8 +114,9 @@ open build_macos/LlamaBoss.app
 
 CMake copies `llama-server` and its dylibs into
 `LlamaBoss.app/Contents/Resources/llama.cpp/` (override with `-DLLAMABOSS_LLAMA_DIR=...`).
-When the login keychain has a "LlamaBoss Development" code-signing identity, the build
-signs the bundle with it (see "Keychain prompt after every rebuild" below).
+When the login keychain has an "Apple Development" (or, failing that, a self-signed
+"LlamaBoss Development") code-signing identity, the build signs the bundle with it (see
+"Keychain prompt after every rebuild" below).
 
 ## Data locations on macOS
 
@@ -356,26 +357,26 @@ large icons. macOS 26 may show a full-bleed square icon inside its standard roun
   sidebar. Not yet looked at: Model manager, About, project attach, themed message boxes,
   light themes.
 
-## Keychain prompt after every rebuild — open (development only)
+## Keychain prompt after every rebuild — fixed 2026-10-12
 
 - Cause: Keychain records an "Always Allow" against the app's partition ID. For an app
   with a Team ID that is `teamid:<ID>`, the same for every build; for an app without one
-  it is tied to the exact build (cdhash), so every rebuild asks again. (Not inspected
-  directly: reading the item's ACL was blocked by the session's safety check. Consistent
-  with every test.)
-- Done 2026-10-12: a self-signed "LlamaBoss Development" code-signing certificate in the
-  login keychain (trusted for code signing only, key usable by `/usr/bin/codesign`), and a
-  CMake post-build `codesign --force --sign` after the llama-server bundling step,
-  auto-detected at configure time (override with `-DLLAMABOSS_CODESIGN_IDENTITY=...`;
-  no identity keeps the ad-hoc signature). The designated requirement is now stable
-  (`identifier "com.llamaboss.app" and certificate leaf = H"9feba90c…"`), but a
-  self-signed certificate has no Team ID, so the prompt still returns after a rebuild.
-- Next: the user is installing Xcode. Create a free "Apple Development" certificate
-  (personal team, has a Team ID) and set `LLAMABOSS_CODESIGN_IDENTITY` to it.
-- Released builds are not affected: Developer ID signing (Phase 4) carries a Team ID.
+  it is tied to the exact build (cdhash), so every rebuild asked again. Ad-hoc and
+  self-signed signatures have no Team ID.
+- Fix: the build signs with the user's free **Apple Development** certificate (Xcode >
+  Settings > Accounts, personal team, Team ID `5QV7H398ZS`, expires 2027-10-12; renew
+  from the same screen). CMake auto-detects it at configure time (`security
+  find-identity`), falls back to the self-signed "LlamaBoss Development" certificate,
+  then to ad-hoc; override with `-DLLAMABOSS_CODESIGN_IDENTITY=...`. The codesign step
+  runs after the llama-server bundling step.
+- The Apple WWDR G3 intermediate certificate was added to the login keychain (the new
+  certificate showed as invalid without it).
+- Verified: one last "Always Allow", then a forced relink (CDHash changed), relaunch and an
+  OpenRouter chat (key read from Keychain) with no prompt.
+- Released builds will use Developer ID signing and notarization (Phase 4); that also
+  carries a Team ID, so users' updates will not prompt either.
 
 ## Next task
 
-1. Apple Development signing once Xcode is installed (ends the rebuild Keychain prompt).
-2. Persistent `py` session on macOS.
-3. Mac wording ("fits in VRAM" -> unified memory), web fetch port, then Phase 4 packaging.
+1. Persistent `py` session on macOS.
+2. Mac wording ("fits in VRAM" -> unified memory), web fetch port, then Phase 4 packaging.
