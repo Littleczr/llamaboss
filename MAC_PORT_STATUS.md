@@ -498,7 +498,7 @@ large icons. macOS 26 may show a full-bleed square icon inside its standard roun
 ## Next task
 
 1. Remaining UI checks: project attach, message boxes, light themes.
-3. Phase 4: test the notarized DMG on another Mac or a fresh user account; host the DMG;
+2. Phase 4: test the notarized DMG on another Mac or a fresh user account; host the DMG;
    Mac entry in the update feed (`version.json`); "Download for Mac" + Mac wording on
    llamaboss.com (preview first, publish only with the user's approval).
-4. Skipped: the `Tests/` suite is for the Windows side (user decision 2026-10-12).
+3. Skipped: the `Tests/` suite is for the Windows side (user decision 2026-10-12).
