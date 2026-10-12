@@ -1,4 +1,13 @@
-﻿# LlamaBoss Beta v0.1.21
+﻿# LlamaBoss Beta v0.1.23
+
+- Improved prompt caching with Anthropic breakpoints on OpenRouter and stable agent step instructions.
+- Expanded usage metrics with cache-write tokens, cost, finish reason, response byte split, tool calls, and prompt-prefix hash.
+- Improved native tool detection and agent-loop handling for reasoning models, stalled steps, and independent file writes.
+- Fixed first-line edit diffs, truncated-read cards, clipboard paste corruption, and reminder text lifetime.
+- Improved shutdown safety by draining background work and preserving the tool router.
+- Retained the existing llama.cpp b11146 CPU and CUDA 12.4 binaries.
+
+# LlamaBoss Beta v0.1.21
 
 - Added ChatGPT account sign-in, add-by-ID provider/model setup, and exportable usage metrics.
 - Improved conversation history and navigation.
