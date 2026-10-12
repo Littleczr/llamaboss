@@ -1584,12 +1584,17 @@ std::string ServerManager::FindServerBinary(Backend backend)
     // backend argument does not pick a folder here.
     (void)backend;
     wxFileName exeFn(wxStandardPaths::Get().GetExecutablePath());
-    // 1. Bundled: LlamaBoss.app/Contents/Resources/llama.cpp/llama-server
-    {
+    // 1. Bundled: LlamaBoss.app/Contents/Helpers/llama/llama-server
+    //    (Helpers is where signed nested code belongs, and the folder has no
+    //    dot in its name or codesign takes it for a bundle).
+    //    Resources/llama.cpp is the older dev-build layout and still works.
+    static const char* const kBundledDirs[][2] = {
+        { "Helpers", "llama" }, { "Resources", "llama.cpp" } };
+    for (const auto& dir : kBundledDirs) {
         wxFileName bundled = wxFileName::DirName(exeFn.GetPath());
         bundled.RemoveLastDir();                       // Contents/MacOS -> Contents
-        bundled.AppendDir("Resources");
-        bundled.AppendDir("llama.cpp");
+        bundled.AppendDir(dir[0]);
+        bundled.AppendDir(dir[1]);
         bundled.SetFullName("llama-server");
         if (wxFileExists(bundled.GetFullPath())) return bundled.GetFullPath().ToUTF8().data();
     }
@@ -2496,7 +2501,7 @@ bool ServerManager::StartServer(const std::string& ggufPath, const ServerConfig&
 #else
         ev->SetString("llama-server not found.\n\n"
                       "It is normally bundled inside LlamaBoss.app "
-                      "(Contents/Resources/llama.cpp). For a development build, "
+                      "(Contents/Helpers/llama). For a development build, "
                       "install it with 'brew install llama.cpp' or place the "
                       "macOS release from https://github.com/ggml-org/llama.cpp/releases "
                       "in a 'bin' folder next to the app.\n\n"

@@ -86,6 +86,8 @@ desktop.ini
 
 # macOS build output
 build_macos/
+build_release/
+dist/
 .DS_Store
 *.o
 *.o.tmp

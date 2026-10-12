@@ -88,7 +88,7 @@ Intended divergences from Windows. Features that are simply not ported yet are l
 | App data | `%LOCALAPPDATA%\LlamaBoss` | `~/Library/Application Support/LlamaBoss` | Mac convention |
 | Python packages | `pip install --user` | LlamaBoss environment in the data folder (`--system-site-packages`) | Homebrew Python refuses `--user` (PEP 668) |
 | Python helpers | RCDATA in the .exe | files in `Contents/Resources/python` | App-bundle resources |
-| llama.cpp | CPU/CUDA builds | Metal build in `Contents/Resources/llama.cpp` | Apple silicon GPU |
+| llama.cpp | CPU/CUDA builds | Metal build in `Contents/Helpers/llama` | Apple silicon GPU |
 | Fonts | Consolas / Cascadia Code, Windows point sizes | Menlo, sizes x4/3 (`lb_ui_font.h`) | Same physical size; built-in Mac face |
 | App icon | `app_icon.ico` | `macos/app_icon.icns` (generated from the .ico) | Bundle icon format |
 | Missing `.ico` at startup | file fallback | icon comes from the bundle; no file lookup | Avoids a modal error on launch |
@@ -125,7 +125,7 @@ open build_macos/LlamaBoss.app
 ```
 
 CMake copies `llama-server` and its dylibs into
-`LlamaBoss.app/Contents/Resources/llama.cpp/` (override with `-DLLAMABOSS_LLAMA_DIR=...`).
+`LlamaBoss.app/Contents/Helpers/llama/` (override with `-DLLAMABOSS_LLAMA_DIR=...`).
 When the login keychain has an "Apple Development" (or, failing that, a self-signed
 "LlamaBoss Development") code-signing identity, the build signs the bundle with it (see
 "Keychain prompt after every rebuild" below).
@@ -406,6 +406,32 @@ large icons. macOS 26 may show a full-bleed square icon inside its standard roun
   `wxNO_DEFAULT` on those prompts. The model-switch "interrupt it?" prompts, Skill import,
   reminders and save recovery lose no data and stay as they are on both.
 
+## Release packaging groundwork, 2026-10-12
+
+- Target: Apple silicon, **macOS 13.3+** (llama.cpp's minimum; user decision). Homebrew's
+  wxWidgets/OpenSSL are built for macOS 26 only, so a release links static libraries.
+- `macos/build_deps.sh [dir]`: builds OpenSSL 3.6.2, Poco 1.15.4, wxWidgets 3.2.11 as static
+  libraries for macOS 13.3 into `~/LlamaBossDeps/prefix` (sources pinned by SHA-256:
+  OpenSSL's published checksum, Homebrew's recorded ones for Poco and wx; patch releases
+  newer than the dev build's 1.15.3 / 3.2.10). OpenSSL's openssldir is `/private/etc/ssl`,
+  so the default CA bundle is macOS's own `/etc/ssl/cert.pem`.
+- CMake `-DLLAMABOSS_DEPS_PREFIX=<prefix>` switches to those libraries and sets the
+  deployment target 13.3 / arm64; empty keeps the Homebrew dev build.
+  `LSMinimumSystemVersion` is now 13.3 (was 11.0, which was never true).
+- llama-server and its dylibs moved to `Contents/Helpers/llama` (nested code belongs there
+  for signing; a folder named `llama.cpp` is mistaken for a bundle by codesign).
+  `FindServerBinary` tries Helpers first, then the old `Resources/llama.cpp`. Its license
+  is `Resources/LICENSE-llama.cpp.txt`. Verified: a server harness in a mock bundle found,
+  started (ready) and stopped llama-server from Helpers.
+- `macos/sign_bundle.sh <identity> <app> [--release]`: signs inside-out (Helpers, then the
+  app); `--release` adds hardened runtime + secure timestamp. Used by the CMake post-build.
+- `macos/package.sh [--identity ...] [--notarize <profile>]`: release build, a check that
+  only system libraries are referenced, release signing, DMG with an Applications link,
+  optional notarization + stapling. Output `dist/LlamaBoss-<version>-macOS.dmg`.
+- Waiting on Apple: the Developer ID Application certificate (membership approval), then a
+  one-time `xcrun notarytool store-credentials` (app-specific password).
+- Still to design: the Mac entry in the update feed (`version.json`) and the website button.
+
 ## UI fonts, 2026-10-11
 
 - `lb_ui_font.h`: `LbUiPt(n)` (identity on Windows, n*4/3 on macOS, because Windows draws
@@ -457,4 +483,7 @@ large icons. macOS 26 may show a full-bleed square icon inside its standard roun
    Ctrl+Cmd+S (sidebar, must not trigger Cmd+S save), use the "…" character in labels,
    commit. The keystroke test needs the user at the Mac (approval prompt).
 2. Remaining UI checks: project attach, message boxes, light themes.
-3. Phase 4: packaging (Developer ID signing, notarization, DMG, updater).
+3. Phase 4: first release build with `macos/package.sh` once the static deps finish; then
+   Developer ID signing and notarization when Apple approves the membership; Mac update
+   feed; "Download for Mac" on llamaboss.com.
+4. Skipped: the `Tests/` suite is for the Windows side (user decision 2026-10-12).

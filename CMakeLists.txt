@@ -5,6 +5,19 @@
 #   cmake --build build_macos
 
 cmake_minimum_required(VERSION 3.20)
+
+# Release builds for distribution link static wxWidgets/Poco/OpenSSL built by
+# macos/build_deps.sh (Homebrew's libraries target the newest macOS only):
+#   cmake -S . -B build_release -G Ninja -DCMAKE_BUILD_TYPE=Release \
+#         -DLLAMABOSS_DEPS_PREFIX=$HOME/LlamaBossDeps/prefix
+# Empty (the default) keeps the Homebrew-linked dev build.
+set(LLAMABOSS_DEPS_PREFIX "" CACHE PATH "Prefix from macos/build_deps.sh (release builds)")
+if(LLAMABOSS_DEPS_PREFIX)
+    # Must be set before project(); matches llama.cpp's own minimum.
+    set(CMAKE_OSX_DEPLOYMENT_TARGET "13.3" CACHE STRING "Minimum macOS" FORCE)
+    set(CMAKE_OSX_ARCHITECTURES "arm64" CACHE STRING "" FORCE)
+endif()
+
 project(LlamaBoss VERSION 0.1.21 LANGUAGES C CXX OBJCXX)
 
 set(CMAKE_CXX_STANDARD 17)
@@ -17,8 +30,19 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 # ── wxWidgets (via wx-config) ──
-find_program(WX_CONFIG NAMES wx-config-3.2 wx-config
-    HINTS /opt/homebrew/bin /usr/local/bin REQUIRED)
+if(LLAMABOSS_DEPS_PREFIX)
+    set(WX_CONFIG "${LLAMABOSS_DEPS_PREFIX}/bin/wx-config")
+    if(NOT EXISTS "${WX_CONFIG}")
+        message(FATAL_ERROR "No wx-config in ${LLAMABOSS_DEPS_PREFIX}; run macos/build_deps.sh")
+    endif()
+    list(PREPEND CMAKE_PREFIX_PATH "${LLAMABOSS_DEPS_PREFIX}")
+    set(OPENSSL_ROOT_DIR "${LLAMABOSS_DEPS_PREFIX}")
+    set(OPENSSL_USE_STATIC_LIBS TRUE)
+    message(STATUS "Release dependencies from ${LLAMABOSS_DEPS_PREFIX} (macOS ${CMAKE_OSX_DEPLOYMENT_TARGET}+)")
+else()
+    find_program(WX_CONFIG NAMES wx-config-3.2 wx-config
+        HINTS /opt/homebrew/bin /usr/local/bin REQUIRED)
+endif()
 execute_process(COMMAND ${WX_CONFIG} --cxxflags
     OUTPUT_VARIABLE WX_CXXFLAGS OUTPUT_STRIP_TRAILING_WHITESPACE)
 execute_process(COMMAND ${WX_CONFIG} --libs std,aui,html,richtext
@@ -143,8 +167,10 @@ endif()
 # ── Bundle llama-server (macOS) ──
 # Point LLAMABOSS_LLAMA_DIR at an unpacked llama.cpp macOS release
 # (https://github.com/ggml-org/llama.cpp/releases, llama-bNNNN-bin-macos-arm64).
-# llama-server and its dylibs are copied to Contents/Resources/llama.cpp,
-# where ServerManager::FindServerBinary looks first.
+# llama-server and its dylibs are copied to Contents/Helpers/llama
+# (where nested code belongs for signing; no dot in the folder name, or
+# codesign treats it as a bundle), which ServerManager::FindServerBinary
+# looks at first; its license goes to Contents/Resources.
 if(APPLE)
     file(GLOB _llama_default_dirs "${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp/llama-b*")
     list(SORT _llama_default_dirs)
@@ -154,13 +180,14 @@ if(APPLE)
     if(LLAMABOSS_LLAMA_DIR AND EXISTS "${LLAMABOSS_LLAMA_DIR}/llama-server")
         message(STATUS "Bundling llama-server from ${LLAMABOSS_LLAMA_DIR}")
         file(GLOB _llama_dylibs "${LLAMABOSS_LLAMA_DIR}/*.dylib")
-        set(_llama_dest "$<TARGET_BUNDLE_CONTENT_DIR:LlamaBoss>/Resources/llama.cpp")
+        set(_llama_dest "$<TARGET_BUNDLE_CONTENT_DIR:LlamaBoss>/Helpers/llama")
         add_custom_command(TARGET LlamaBoss POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E make_directory "${_llama_dest}"
             COMMAND ${CMAKE_COMMAND} -E copy_if_different
                     "${LLAMABOSS_LLAMA_DIR}/llama-server" ${_llama_dylibs} "${_llama_dest}"
             COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                    "${LLAMABOSS_LLAMA_DIR}/LICENSE" "${_llama_dest}/LICENSE-llama.cpp"
+                    "${LLAMABOSS_LLAMA_DIR}/LICENSE"
+                    "$<TARGET_BUNDLE_CONTENT_DIR:LlamaBoss>/Resources/LICENSE-llama.cpp.txt"
             COMMENT "Bundling llama-server")
     else()
         message(WARNING "llama-server not bundled: set LLAMABOSS_LLAMA_DIR to an unpacked "
@@ -198,9 +225,10 @@ if(APPLE)
     endif()
     if(_lb_sign_id)
         message(STATUS "Signing LlamaBoss.app with '${_lb_sign_name}'")
+        # Inside-out: the bundled llama-server and dylibs first, then the app.
         add_custom_command(TARGET LlamaBoss POST_BUILD
-            COMMAND codesign --force --sign "${_lb_sign_id}" --timestamp=none
-                    "$<TARGET_BUNDLE_DIR:LlamaBoss>"
+            COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/macos/sign_bundle.sh
+                    "${_lb_sign_id}" "$<TARGET_BUNDLE_DIR:LlamaBoss>"
             COMMENT "Signing LlamaBoss.app")
     else()
         message(STATUS "No code-signing identity found; LlamaBoss.app stays ad-hoc signed")
