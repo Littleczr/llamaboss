@@ -523,10 +523,15 @@ void ModelManagerDialog::OnDeleteClicked(wxCommandEvent&)
     }
     confirm += "This cannot be undone.";
 
-    // Irreversible: the safe button is the default, so a stray Enter
-    // cannot confirm the delete.
+#ifdef __WXMAC__
+    // Mac convention for an irreversible action: the safe button is the
+    // default, so a stray Return cannot confirm the delete.
     if (wxMessageBox(confirm, "Confirm Delete",
                      wxYES_NO | wxNO_DEFAULT | wxICON_WARNING, this) != wxYES) {
+#else
+    if (wxMessageBox(confirm, "Confirm Delete",
+                     wxYES_NO | wxICON_WARNING, this) != wxYES) {
+#endif
         return;
     }
 
@@ -575,7 +580,11 @@ bool ModelManagerDialog::ConfirmLeaveDuringDownload()
     const int answer = wxMessageBox(
         "A model is still downloading. Closing this window cancels the "
         "download.\n\nCancel the download and close?",
+#ifdef __WXMAC__
         "Download in Progress", wxYES_NO | wxNO_DEFAULT | wxICON_WARNING, this);
+#else
+        "Download in Progress", wxYES_NO | wxICON_WARNING, this);
+#endif
     if (answer != wxYES) return false;
     CancelUrlDownload();
     return true;

@@ -66,6 +66,14 @@ Same features and the same safety guarantees; platform-native implementation and
 - Record each deliberate Mac divergence in a "Mac differences" list in
   this file, so it's clear what's intended versus not yet ported.
 
+## Workflow
+
+The user develops the Windows version on the PC. Work on this branch is the Mac version
+only: Mac code lives in `#ifdef __WXMAC__` / `#ifndef _WIN32` blocks or Mac-only files, and
+the Windows view of every touched file stays identical to main (checked with `unifdef`).
+The Mac may behave differently from Windows where that suits Mac users; ideas for the
+Windows version go into this file as suggestions, not code.
+
 ## Mac differences (deliberate)
 
 Intended divergences from Windows. Features that are simply not ported yet are listed under
@@ -85,6 +93,7 @@ Intended divergences from Windows. Features that are simply not ported yet are l
 | App icon | `app_icon.ico` | `macos/app_icon.icns` (generated from the .ico) | Bundle icon format |
 | Missing `.ico` at startup | file fallback | icon comes from the bundle; no file lookup | Avoids a modal error on launch |
 | Buttons | flat buttons filled with theme colours | native push buttons (`lb_mac_native.mm`): one accent-tinted button per dialog (default/OK), Send and New Chat accent in the main window, stop-red stays red, the rest plain; widened to fit | NSButton ignores theme fills; Mac convention is one default button per window |
+| Data-losing confirmations | Yes is the default button | No is the default (deletes, replace, cancel download) | macOS convention; a stray Return cannot destroy data |
 | GPU memory wording | "Needs 10+ GB VRAM", "fits in VRAM" | "Needs a Mac with 16 GB+ of memory" (GPU GB x 4/3, rounded up to a Mac memory size), "fits in memory" (`lb_mac_wording.h`) | Apple silicon has unified memory; the GPU can use about 3/4 of it |
 | `py` session memory cap | Job Object: 2 GiB per process; allocations fail with `MemoryError` and the session survives | watchdog stops the kernel when its physical footprint passes 2 GiB; the session is lost and the card says why | macOS refuses `RLIMIT_AS`/`RLIMIT_DATA`, so a failing-allocation cap is not available |
 | Web fetch transport | WinHTTP, system proxy settings | Poco::Net with lb_ssl's verified TLS context; no system proxy; Mac browser user-agent | No WinHTTP on macOS; the UA names the platform it runs on |
@@ -380,17 +389,19 @@ large icons. macOS 26 may show a full-bleed square icon inside its standard roun
   A Mac entry in `version.json` belongs to Phase 4.
 - Manage Models: the Mac "delete" key (Backspace) deletes the selected model too, and the
   hint reads "Press Delete or Control-click to delete". The irreversible-delete
-  confirmation defaults to **No** (now on both platforms, below).
+  confirmation defaults to **No** (see below).
 - Incident while testing: before that change, a delete-key test confirmed the dialog's
   default **Yes** (a Return reached it while a macOS permission prompt was on screen) and
   removed the user's Gemma 3 1B model. It was re-downloaded from Download Models at once.
-- **Shared change, approved by the user 2026-10-12 (changes Windows behavior):** the
-  confirmations that lose data now default to **No** on both platforms: model delete and
+- On the Mac, the confirmations that lose data default to **No**: model delete and
   cancel-download (`model_manager.cpp`), conversation delete
   (`conversation_controller.cpp`), connection delete and replace
-  (`connections_dialog.cpp`), endpoint delete (`endpoints_dialog.cpp`). Left as they were
-  (no data loss): the "another window is generating" model-switch prompts, Skill import,
-  reminders, and the save-recovery dialog.
+  (`connections_dialog.cpp`), endpoint delete (`endpoints_dialog.cpp`). Mac-only; the
+  Windows code is unchanged (a brief shared version in 0129720 was reverted to Mac-only
+  per the workflow below).
+- **Suggestion for the Windows version (the user's call, on the PC):** the same
+  `wxNO_DEFAULT` on those prompts. The model-switch "interrupt it?" prompts, Skill import,
+  reminders and save recovery lose no data and stay as they are on both.
 
 ## UI fonts, 2026-10-11
 
