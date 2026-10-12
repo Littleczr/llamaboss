@@ -208,7 +208,23 @@ Both cases use shared code (`model_switcher.cpp`, `server_manager.cpp`), so the 
   --jinja retry, because the error isn't template-related. There is no respawn loop, no
   zombie process, and no modal popup. Quit with no server running is clean.
 
+## OpenRouter and in-app notes — verified 2026-10-11
+
+- The user added OpenRouter through Settings → Connections → Add AI provider.
+  `secrets.json` is `keychain-aes256gcm` with no plaintext key, and `endpoints.json` holds no key.
+- Chat with `openai/gpt-6-luna` worked: "Activated remote model ... via openrouter",
+  the local llama-server stopped on the switch, and the context meter showed the 262.1k remote
+  budget. With Agent Mode off, the model correctly said it can't save. With Agent Mode on, it
+  sent a native structured `notes_append`, which created `~/LlamaBoss/Notes/paths.md` with the
+  description header. No errors in the log.
+- Found while testing:
+  - Fixed: the Agent Mode ON banner listed `powershell`, which is unavailable on macOS.
+    The Mac build now omits it; Windows text is unchanged.
+  - Open (UI polish): themed `wxButton`s (accent, flat and destructive helpers in 11 files)
+    show light text on light accent backgrounds on macOS, because Cocoa ignores
+    `SetForegroundColour` on native buttons. Needs one shared Mac-drawn themed button.
+  - Minor: the Settings help text says "fits in VRAM"; on Apple silicon it is unified memory.
+
 ## Next task
 
-OpenRouter endpoint (milestone 5): needs an API key entered in the Mac app's
-Add AI provider dialog. Then the in-app notes test, then the Phase 3 tool ports.
+Phase 3 tool ports (shell: zsh vs pwsh decision pending), then the macOS themed-button fix.

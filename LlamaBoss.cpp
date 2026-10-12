@@ -2730,7 +2730,12 @@ private:
         LbIcons::ApplyAgentToggle(_agentToggleButton, m_appState->GetTheme(), m_agentModeEnabled);
         m_chatDisplay->DisplaySystemMessage(
             m_agentModeEnabled
+#ifdef _WIN32
               ? "\xF0\x9F\xA4\x96 Agent mode ON. The model can use read/ls/open/grep/pwd/powershell."
+#else
+              // No shell tool on macOS yet (cmd_executor is stubbed).
+              ? "\xF0\x9F\xA4\x96 Agent mode ON. The model can use read/ls/open/grep/pwd."
+#endif
               : "\xF0\x9F\xA4\x96 Agent mode OFF.");
         if (m_agentModeEnabled) SchedulePromptPrewarm("agent mode on");
     }
