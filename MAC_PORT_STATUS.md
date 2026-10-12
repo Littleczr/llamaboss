@@ -369,7 +369,9 @@ large icons. macOS 26 may show a full-bleed square icon inside its standard roun
   localhost, 127.0.0.1, 192.168.x, [::1], 169.254.169.254, `file://`, a public redirect to
   127.0.0.1; 100 MB file refused by Content-Length; unresolvable host fails closed;
   timeout; cancel mid-request (about 0.5 s).
-- Not yet verified in the app (the Mac locked during the test).
+- In-app, 2026-10-12: the agent fetched https://llamaboss.com (http 200, 17.8 KB, 0.75 s);
+  Markdown and raw HTML file cards with Open / Save As / Open Folder; correct title and
+  first heading in the answer.
 
 ## UI fonts, 2026-10-11
 
@@ -417,6 +419,6 @@ large icons. macOS 26 may show a full-bleed square icon inside its standard roun
 
 ## Next task
 
-1. In-app web fetch check (agent fetches a page, approval and result cards).
-2. Remaining UI checks: Model manager, About, project attach, message boxes, light themes.
+1. Remaining UI checks: Model manager, About, project attach, message boxes, light themes.
+2. Mac menu bar conventions: About and Settings (Cmd+,) in the LlamaBoss menu.
 3. Phase 4: packaging (Developer ID signing, notarization, DMG, updater).
