@@ -463,6 +463,12 @@ large icons. macOS 26 may show a full-bleed square icon inside its standard roun
   Developer ID". SHA-256 bc2c59d6f65e82c28b4c10c346f12b5e9d9fd3a45d67b45a41702108163b37cf.
   Built from commit 02d126a (the untested menu bar / Dock work was set aside).
   Copy on the share: `Releases/Mac/`.
+- **Release build matching Windows Beta 0.1.23, 2026-10-12:** built from 34f2193 (merge of
+  main 9e8b3d3, the Windows 0.1.23 release metadata). Notarization 27f05ea9-f884-4b73-9308-
+  a0295bb87ecd Accepted, stapled, `spctl` accepted. SHA-256
+  e9ecf29daeeaf8fbd20e5b6ba09ce64672009f0f43eb6c5175fc8ef9b0c8d6b8. Replaces the earlier
+  test DMG on the share (`Releases/Mac/`, with a `_SHA256.txt`). The Windows installer is
+  hosted on Cloudflare R2 (version.json `url`); the Mac DMG is not hosted yet.
 - Notary credentials: keychain profile `LlamaBoss-notary` (Apple ID + app-specific
   password, entered by the user). Release command: `macos/package.sh --notarize LlamaBoss-notary`.
 - Still to design: the Mac entry in the update feed (`version.json`) and the website button.
