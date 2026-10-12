@@ -248,6 +248,15 @@ large icons. macOS 26 may show a full-bleed square icon inside its standard roun
   native) have Mac lines for every PowerShell-specific rule under `#ifdef _WIN32 / #else`.
   `unifdef -D_WIN32` of every touched file matches the pre-change Windows view.
 - **Display:** "Shell" cards with `bash` highlighting, and the Agent Mode banner lists `shell`.
+- **Verified in-app 2026-10-11** with GPT 6 Luna via OpenRouter, Agent Mode on:
+  - `sw_vers` and `df -h /` auto-ran without a card and gave a correct answer
+    (macOS 26.6.2, 147 GiB free).
+  - `mkdir -p "$HOME/Desktop/shell-test"` showed an Approval Required card, ran after Allow,
+    and the folder exists. The model then checked it with `ls -ld` (auto-ran).
+  - The Deny path has not been exercised in-app.
+- Seen while testing (not Mac-specific): with Agent Mode on, the prompt is about 12.4k tokens,
+  so an 8k local context fails with a raw llama-server 400 "exceeds the available context
+  size". Use 16k+ for agent work; a friendlier message belongs in main.
 - Open decision: `RiskyExtensions()` (blocks write/edit/delete of executable types) has no Mac
   script types (.command, .sh, .app, .scpt, .webloc ...). `open` can't launch them anyway, because
   launching is allowlisted. Adding them would also stop the agent writing ordinary `.sh` files.
