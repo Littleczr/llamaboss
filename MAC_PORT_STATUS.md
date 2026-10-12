@@ -276,7 +276,9 @@ old author email and must stay local.
   Windows-only behavior (the batch-write path check normalizes '/' to '\' only for
   comparison, so Mac absolute and `~` paths are handled).
 - Verified: the app starts, llama-server ready with Gemma 3 1B, prompt prewarm primed
-  12,046 tokens in 6.8 s. In-app agent tool test pending (the Mac was locked).
+  12,046 tokens in 6.8 s. In-app with GPT 6 Luna: shell `sw_vers` (exit 0), then `write`
+  version.txt with a file card, correct answer. (Gemma 3 1B printed the command as text
+  instead of calling the tool: a 1B model's limit, not the merge.)
 
 ## Startup error path — verified 2026-10-11
 
