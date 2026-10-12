@@ -33,6 +33,11 @@
 // Win32
 #include "lb_windows.h"
 #include "lb_utf.h"
+#ifndef _WIN32
+#include "lb_process.h"   // zsh runner (process group, timeout, cancel)
+#include <cstdlib>
+#include <cstring>
+#endif
 #ifdef _WIN32
 #include <shlobj.h>       // SHGetKnownFolderPath (PowerShell 7 location)
 #include <knownfolders.h>
@@ -1268,9 +1273,7 @@ private:
     // Fills `result` with stdout/stderr/exit/flags.  Never throws.
     void RunOne(CmdResult& result) {
 #ifndef _WIN32
-        // macOS: the shell tool is ported in Phase 3 (shell choice pending).
-        result.stderrText = "The command tool is not available on macOS yet.";
-        result.exitCode = -1;
+        RunOnePosix(result);
 #else
         // 1. Build the command line:
         //    powershell.exe -NoProfile -NonInteractive
@@ -1731,6 +1734,144 @@ private:
         }
 #endif
     }
+
+#ifndef _WIN32
+    // macOS: the shell tool runs one zsh command.  Same contract as the
+    // Win32 path: foreground only, fresh process per call, stdout/stderr
+    // captured separately under the per-stream cap, timeout and Stop kill
+    // the whole process group (the Job Object equivalent), live last-line
+    // progress, workspace delta, artifact markers, large-output files.
+    void RunOnePosix(CmdResult& result) {
+        // zsh -f: no startup files (the -NoProfile equivalent).  GUI apps
+        // inherit launchd's minimal PATH, so add the Homebrew prefixes the
+        // user's own Terminal would have.
+        lb_process::Options opt;
+        opt.argv = { "/bin/zsh", "-f", "-c", m_command };
+        opt.cwd = m_cwd.empty() ? WxToUtf8Local(wxGetHomeDir()) : m_cwd;
+        const char* envPath = std::getenv("PATH");
+        opt.envSet = {
+            std::string("PATH=/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:") +
+                (envPath && *envPath ? envPath : "/usr/bin:/bin:/usr/sbin:/sbin"),
+            "PAGER=cat", "GIT_PAGER=cat", "TERM=dumb", "NO_COLOR=1",
+        };
+        if (!std::getenv("LANG")) opt.envSet.push_back("LANG=en_US.UTF-8");
+        opt.timeoutMs = m_timeoutMs;
+        opt.cancel = m_cancelFlag.get();
+        opt.maxCaptureBytes = CmdExecutor::kMaxOutputBytes;
+
+        // Live progress: the most recent complete line from either stream
+        // ('\r' redraws count as line ends), posted at most every
+        // kLiveTailIntervalMs.  Runs on this worker thread.
+        std::string partial, lastLine;
+        bool dirty = false;
+        double nextLivePost = 0.0;
+        opt.onOutput = [&](const char* data, size_t len, bool) {
+            for (size_t i = 0; i < len; ++i) {
+                const char c = data[i];
+                if (c == '\n' || c == '\r') {
+                    const size_t end = partial.find_last_not_of(" \t");
+                    if (end != std::string::npos) {
+                        lastLine.assign(partial, 0, end + 1);
+                        dirty = true;
+                    }
+                    partial.clear();
+                } else if (partial.size() < 512) {
+                    partial.push_back(c);
+                }
+            }
+            const double now = NowSec();
+            if (dirty && now >= nextLivePost) {
+                dirty = false;
+                nextLivePost = now + CmdExecutor::kLiveTailIntervalMs / 1000.0;
+                auto* ev = new wxCommandEvent(wxEVT_CMD_OUTPUT);
+                ev->SetString(wxString::FromUTF8(lastLine));
+                LbQueueEventIfAlive(m_evtHandler, m_aliveToken, ev);
+            }
+        };
+
+        workspace_delta::Snapshot wsBefore;
+        const bool trackWorkspace = !m_cwd.empty();
+        if (trackWorkspace) wsBefore = workspace_delta::TakeSnapshot(m_cwd);
+
+        lb_process::Result pr = lb_process::Run(opt);
+        if (!pr.started) {
+            result.stderrText = "Could not start /bin/zsh: " +
+                                std::string(std::strerror(pr.spawnError));
+            result.exitCode = -1;
+            return;
+        }
+
+        result.stdoutText = std::move(pr.out);
+        result.stderrText = std::move(pr.err);
+        result.exitCode   = pr.exitCode;
+        result.timedOut   = pr.timedOut;
+        result.cancelled  = pr.cancelled;
+        // lb_process caps each stream but reports one flag; mark whichever
+        // stream actually reached the cap.
+        result.stdoutTruncated = pr.truncated &&
+            result.stdoutText.size() >= CmdExecutor::kMaxOutputBytes;
+        result.stderrTruncated = pr.truncated &&
+            result.stderrText.size() >= CmdExecutor::kMaxOutputBytes;
+        result.truncated = pr.truncated;
+        auto trimUtf8Tail = [](std::string& s) {
+            size_t i = s.size();
+            size_t back = 0;
+            while (i > 0 && back < 4 &&
+                   (static_cast<unsigned char>(s[i - 1]) & 0xC0) == 0x80) { --i; ++back; }
+            if (i == 0) return;
+            const unsigned char lead = static_cast<unsigned char>(s[i - 1]);
+            const size_t need = lead >= 0xF0 ? 4 : lead >= 0xE0 ? 3 : lead >= 0xC0 ? 2 : 1;
+            if (need > 1 && back + 1 < need) s.resize(i - 1);
+        };
+        if (result.stdoutTruncated) trimUtf8Tail(result.stdoutText);
+        if (result.stderrTruncated) trimUtf8Tail(result.stderrText);
+
+        lb_progressfold::TidyCapturedStreams(result.stdoutText, result.stderrText);
+
+        auto appendLine = [](std::string& s, const std::string& line) {
+            if (!s.empty() && s.back() != '\n') s += "\n";
+            s += line + "\n";
+        };
+        if (pr.survivorsKilled) {
+            appendLine(result.stderrText,
+                "[background process stopped] zsh exited, but processes it "
+                "started were still running. LlamaBoss stopped them: this "
+                "tool is foreground-only. This warning alone does not mean "
+                "the command failed; check its exit code, output and "
+                "expected files.");
+        }
+        if (result.cancelled && result.stderrText.empty()) {
+            result.stderrText = "[cancelled by user]\n";
+        } else if (result.timedOut) {
+            const bool noOutput = IsBlankTextLocal(result.stdoutText) &&
+                                  IsBlankTextLocal(result.stderrText);
+            appendLine(result.stderrText,
+                "[timed out after " + std::to_string(m_timeoutMs / 1000) + "s" +
+                (noOutput ? " with no output" : "") +
+                "; LlamaBoss killed the process group. Likely causes: "
+                "(1) it was waiting for input this tool cannot see or answer "
+                "(stdin is /dev/null): a prompt such as y/n, a password, sudo, "
+                "or a pager. Run it non-interactively (-y, --batch, "
+                "--no-pager) and do not rerun the same command unchanged. "
+                "(2) it did far more work than intended" +
+                (noOutput
+                     ? ": if it scans directories, exclude build folders such "
+                       "as .git, build, node_modules and __pycache__"
+                     : "; the last output above shows where it stopped") +
+                ".]");
+        }
+
+        std::string wsManifest;
+        if (trackWorkspace)
+            wsManifest = ApplyWorkspaceDeltaLocal(result, wsBefore, m_cwd);
+        AttachExplicitPowerShellArtifactsLocal(result, m_cwd, m_activeProjectRoot);
+        ApplyLargeOutputHandlingLocal(result, m_cwd);
+        if (!wsManifest.empty()) {
+            if (!result.stdoutText.empty()) appendLine(result.stdoutText, "");
+            result.stdoutText += wsManifest;
+        }
+    }
+#endif
 
     // Post the completion event back to the UI thread iff the frame
     // is still alive.  We intentionally don't deliver on destruction

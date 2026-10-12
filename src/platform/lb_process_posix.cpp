@@ -183,6 +183,7 @@ Result Run(const Options& o)
         // only hold the pipes open; take the tree down as a job close does.
         if (!reaped && ::waitpid(pid, &status, WNOHANG) == pid) {
             reaped = true;
+            if (!killed && ::kill(-pid, 0) == 0) r.survivorsKilled = true;
             ::kill(-pid, SIGKILL);
         }
         if (!killed && !reaped) {
@@ -241,6 +242,7 @@ Result Run(const Options& o)
     ::sigaction(SIGPIPE, &oldPipe, nullptr);
     // Grandchildren that kept running after the child exited are part of
     // the tree too; a Job Object would have taken them down on close.
+    if (!killed && ::kill(-pid, 0) == 0) r.survivorsKilled = true;
     ::kill(-pid, SIGKILL);
 
     if (WIFEXITED(status)) r.exitCode = WEXITSTATUS(status);

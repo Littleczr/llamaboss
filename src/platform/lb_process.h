@@ -44,6 +44,7 @@ struct Result {
     bool timedOut = false;
     bool cancelled = false;
     bool truncated = false;
+    bool survivorsKilled = false;   // the child exited but its group still had members
     std::string out;
     std::string err;
     double elapsedSec = 0.0;
