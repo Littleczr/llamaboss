@@ -4,12 +4,17 @@
 // conversation, built from the chat folder's two per-request logs:
 //
 //   turn_stats.tsv       one row per completed reply (turn_stats.h): tokens,
-//                        cached / reasoning tokens, first-token and total time.
+//                        cached / reasoning tokens, first-token and total time;
+//                        from the 2026-10-11 build also cache writes, cost,
+//                        finish_reason, think/reply bytes and tool-call count.
 //   ctx_calibration.tsv  one row per reply with an exact usage report: wire
 //                        request bytes, prompt tokens, bytes/token, elided
 //                        count and what the request was made of -- system
 //                        prompt, tool definitions, messages by role, images,
-//                        replayed reasoning.
+//                        replayed reasoning; later builds add prefix_hash (a
+//                        fingerprint of system prompt + tools, the bytes every
+//                        provider cache keys on) and cache_control (Anthropic
+//                        caching requested).
 //
 // Both logs are written from the same completion handler, in the same order,
 // so rows are paired by order + equal prompt_tokens (a short look-ahead skips
@@ -73,6 +78,11 @@ struct Request {
     long long reqBytes = -1, elided = -1, argsElided = -1;
     long long sysBytes = -1, toolsBytes = -1, userBytes = -1, asstBytes = -1,
               resultBytes = -1, imageBytes = -1, replayBytes = -1;
+    // Newer columns (blank in older logs).
+    long long cacheWrite = -1, thinkBytes = -1, replyBytes = -1, toolCalls = -1;
+    double cost = -1;
+    std::string finish, prefix;
+    int cacheCtl = -1;   // -1 not logged, 0 off, 1 Anthropic cache_control sent
 
     bool HasBreakdown() const { return sysBytes >= 0; }
     double Bpt() const { return (reqBytes > 0 && prompt > 0) ? (double)reqBytes / (double)prompt : -1; }
@@ -115,6 +125,9 @@ inline void FillFromCalibration(Request& q, const Row& c)
     q.resultBytes = L(c, "tool_result_bytes");
     q.imageBytes  = L(c, "image_bytes");
     q.replayBytes = L(c, "reasoning_replay_bytes");
+    q.prefix      = S(c, "prefix_hash");
+    const std::string cc = S(c, "cache_control");
+    if (cc == "1") q.cacheCtl = 1; else if (cc == "0") q.cacheCtl = 0;
 }
 
 // Pair the two logs.  *unpairedCalibration counts calibration rows that
@@ -137,6 +150,12 @@ inline std::vector<Request> MergeLogs(const std::vector<Row>& turns,
         q.reasoning    = L(t, "reasoning_tokens");
         q.firstTokenMs = D(t, "first_token_ms");
         q.totalMs      = D(t, "total_ms");
+        q.cacheWrite   = L(t, "cache_write_tokens");
+        q.cost         = D(t, "cost_usd");
+        q.finish       = S(t, "finish_reason");
+        q.thinkBytes   = L(t, "think_bytes");
+        q.replyBytes   = L(t, "reply_bytes");
+        q.toolCalls    = L(t, "tool_calls");
         if (q.prompt > 0) {
             for (size_t k = j; k < calib.size() && k < j + kLookAhead; ++k) {
                 if (!used[k] && L(calib[k], "prompt_tokens") == q.prompt) {
@@ -233,6 +252,12 @@ inline std::string BuildMetricsMarkdown(const std::string& turnStatsTsv,
     std::map<std::string, int> modelCount;
     std::map<std::string, std::vector<double>> bptByModel;
     bool anyBreakdown = false, multiModel = false, multiDay = false;
+    bool anyCacheWrite = false, anyCost = false, anyFinish = false, anyShape = false,
+         anyPrefix = false;
+    long long sumCacheWrite = 0, cacheCtlOn = 0, cacheCtlLogged = 0;
+    double sumCost = 0;
+    std::map<std::string, int> finishCount;
+    std::map<std::string, std::vector<std::string>> prefixByModel;   // distinct, in order
     const std::string firstDay = reqs.front().time.substr(0, 10);
     for (const Request& q : reqs) {
         if (!q.model.empty()) ++modelCount[q.model];
@@ -250,6 +275,16 @@ inline std::string BuildMetricsMarkdown(const std::string& turnStatsTsv,
         if (q.totalMs > 0) sumTotalMs += q.totalMs;
         if (q.Bpt() > 0 && !q.model.empty()) bptByModel[q.model].push_back(q.Bpt());
         anyBreakdown |= q.HasBreakdown();
+        if (q.cacheWrite >= 0) { anyCacheWrite = true; sumCacheWrite += q.cacheWrite; }
+        if (q.cost >= 0)       { anyCost = true; sumCost += q.cost; }
+        if (!q.finish.empty()) { anyFinish = true; ++finishCount[q.finish]; }
+        if (q.toolCalls >= 0 || q.thinkBytes >= 0 || q.replyBytes >= 0) anyShape = true;
+        if (!q.prefix.empty()) {
+            anyPrefix = true;
+            auto& v = prefixByModel[q.model];
+            if (std::find(v.begin(), v.end(), q.prefix) == v.end()) v.push_back(q.prefix);
+        }
+        if (q.cacheCtl >= 0) { ++cacheCtlLogged; if (q.cacheCtl == 1) ++cacheCtlOn; }
         if (q.time.size() >= 10 && q.time.substr(0, 10) != firstDay) multiDay = true;
     }
     multiModel = modelCount.size() > 1;
@@ -272,6 +307,37 @@ inline std::string BuildMetricsMarkdown(const std::string& turnStatsTsv,
     }
     md += "| Prompt tokens, all requests | " + Thousands(sumPrompt) +
           (sumCached > 0 ? " (" + Thousands(sumCached) + " cached, " + Pct((double)sumCached, (double)sumPrompt) + ")" : "") + " |\n";
+    if (sumCached > 0 || anyCacheWrite || cacheCtlOn > 0)
+        md += "| Uncached prompt tokens | " + Thousands(sumPrompt - sumCached) + " (" +
+              Pct((double)(sumPrompt - sumCached), (double)sumPrompt) +
+              " of prompt tokens, billed at the full input rate) |\n";
+    if (anyCacheWrite)
+        md += "| Cache writes | " + Thousands(sumCacheWrite) + " tokens"
+              + (sumCacheWrite > 0 ? " (Anthropic bills writes at 1.25x input)" : "") + " |\n";
+    if (cacheCtlLogged > 0 && cacheCtlOn > 0)
+        md += "| Anthropic cache_control | sent on " + Thousands(cacheCtlOn) + " of " +
+              Thousands(cacheCtlLogged) + " requests |\n";
+    if (anyCost)
+        md += "| Cost, provider-reported | $" + Fixed(sumCost, "%.4f") + " total, $" +
+              Fixed(sumCost / (double)reqs.size(), "%.4f") + " per request |\n";
+    if (anyPrefix) {
+        for (const auto& [name, v] : prefixByModel) {
+            md += "| Cacheable prefix (system + tools)";
+            if (multiModel) md += ", " + Cell(name);
+            md += " | " + std::to_string(v.size()) + (v.size() == 1 ? " version" : " versions");
+            if (v.size() > 1)
+                md += " **changed mid-chat: every change is a full cache miss**";
+            md += " |\n";
+        }
+    }
+    if (anyFinish) {
+        std::string f;
+        for (const auto& [why, n] : finishCount) {
+            if (!f.empty()) f += ", ";
+            f += Cell(why) + " " + std::to_string(n);
+        }
+        md += "| Finish reasons | " + f + " |\n";
+    }
     md += "| Output tokens, all requests | " + Thousands(sumOut) +
           (sumReason > 0 ? " (" + Thousands(sumReason) + " reasoning)" : "") + " |\n";
     md += "| Requests with elision | " + Thousands(elidedReqs) +
@@ -324,11 +390,23 @@ inline std::string BuildMetricsMarkdown(const std::string& turnStatsTsv,
     // ── Per-request table ──
     md += "### Requests\n\n| # | Time |";
     if (multiModel) md += " Model |";
-    md += " Prompt | Cached | Out | Reasoning | Sent KB | B/tok | Elided | First token s | Total s |";
+    md += " Prompt | Cached |";
+    if (anyCacheWrite) md += " Cache write |";
+    md += " Out | Reasoning | Sent KB | B/tok | Elided | First token s | Total s |";
+    if (anyFinish) md += " Finish |";
+    if (anyShape)  md += " Calls | Think KB | Reply KB |";
+    if (anyCost)   md += " Cost $ |";
+    if (anyPrefix) md += " Prefix |";
     if (anyBreakdown) md += " System KB | Tools KB | User KB | Replies KB | Results KB | Replay KB |";
     md += "\n|---:|---|";
     if (multiModel) md += "---|";
-    md += "---:|---:|---:|---:|---:|---:|---:|---:|---:|";
+    md += "---:|---:|";
+    if (anyCacheWrite) md += "---:|";
+    md += "---:|---:|---:|---:|---:|---:|---:|";
+    if (anyFinish) md += "---|";
+    if (anyShape)  md += "---:|---:|---:|";
+    if (anyCost)   md += "---:|";
+    if (anyPrefix) md += "---|";
     if (anyBreakdown) md += "---:|---:|---:|---:|---:|---:|";
     md += "\n";
     int n = 0;
@@ -342,10 +420,17 @@ inline std::string BuildMetricsMarkdown(const std::string& turnStatsTsv,
         }
         md += "| " + std::to_string(++n) + " | " + Cell(t) + " |";
         if (multiModel) md += " " + Cell(q.model) + " |";
-        md += " " + Thousands(q.prompt) + " | " + Thousands(q.cached) + " | " + Thousands(q.completion) +
+        md += " " + Thousands(q.prompt) + " | " + Thousands(q.cached) + " |";
+        if (anyCacheWrite) md += " " + Thousands(q.cacheWrite) + " |";
+        md += " " + Thousands(q.completion) +
               " | " + Thousands(q.reasoning) + " | " + Kb(q.reqBytes) + " | " + Fixed(q.Bpt(), "%.2f") +
               " | " + el + " | " + Fixed(q.firstTokenMs / 1000.0, "%.1f") +
               " | " + Fixed(q.totalMs / 1000.0, "%.1f") + " |";
+        if (anyFinish) md += " " + Cell(q.finish) + " |";
+        if (anyShape)
+            md += " " + Thousands(q.toolCalls) + " | " + Kb(q.thinkBytes) + " | " + Kb(q.replyBytes) + " |";
+        if (anyCost)   md += " " + Fixed(q.cost, "%.5f") + " |";
+        if (anyPrefix) md += " " + Cell(q.prefix) + " |";
         if (anyBreakdown)
             md += " " + Kb(q.sysBytes) + " | " + Kb(q.toolsBytes) + " | " + Kb(q.userBytes) + " | " +
                   Kb(q.asstBytes) + " | " + Kb(q.resultBytes) + " | " + Kb(q.replayBytes) + " |";

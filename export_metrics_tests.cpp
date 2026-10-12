@@ -105,6 +105,38 @@ int main()
         const std::string md = BuildMetricsMarkdown("", "");
         check(Has(md, "No per-request metrics"), "no logs -> explicit note");
     }
+    {
+        // 2026-10-11 schema: turn_stats gains cache writes, cost, finish
+        // reason and reply shape; calibration gains prefix_hash and
+        // cache_control.  Shaped like the Haiku/Qwen Test 1 runs.
+        const std::string th = std::string(kTurnHeader).substr(0, std::string(kTurnHeader).size() - 1) +
+            "\tcache_write_tokens\tcost_usd\tfinish_reason\tthink_bytes\treply_bytes\ttool_calls\n";
+        const std::string turns = th +
+            "2026-10-11 20:34:00\tanthropic/claude-haiku-5.5\t29771\t88\t0\t36\t1900\t2000\t2000\t\t\t0\t\t\t\t\t\t1\t29500\t0.037500\ttool_calls\t120\t0\t1\n"
+            "2026-10-11 20:34:02\tanthropic/claude-haiku-5.5\t29947\t90\t29500\t0\t1100\t1200\t1400\t\t\t0\t\t\t\t\t\t1\t400\t0.003500\ttool_calls\t0\t0\t1\n"
+            "2026-10-11 20:34:21\tanthropic/claude-haiku-5.5\t32204\t568\t31800\t0\t1300\t1400\t3400\t\t\t0\t\t\t\t\t\t1\t0\t0.005000\tstop\t0\t1890\t0\n";
+        const std::string ch = std::string(kCalNew).substr(0, std::string(kCalNew).size() - 1) +
+            "\tprefix_hash\tcache_control\n";
+        const std::string cal = ch +
+            "2026-10-11 20:34:00\tanthropic/claude-haiku-5.5\t85500\t29771\t20000\t2.872\t-30\t0\t0\t41984\t41984\t900\t0\t0\t0\t0\t1a2b3c4d\t1\n"
+            "2026-10-11 20:34:02\tanthropic/claude-haiku-5.5\t85900\t29947\t20000\t2.868\t-30\t0\t0\t41984\t41984\t900\t100\t200\t0\t0\t1a2b3c4d\t1\n"
+            "2026-10-11 20:34:21\tanthropic/claude-haiku-5.5\t91300\t32204\t21000\t2.835\t-30\t0\t0\t41984\t41984\t900\t1500\t3000\t0\t0\tdeadbeef\t1\n";
+        const std::string md = BuildMetricsMarkdown(turns, cal);
+        check(Has(md, "| Uncached prompt tokens | 30,622 ("), "uncached prompt tokens");
+        check(Has(md, "| Cache writes | 29,900 tokens"), "cache writes summed");
+        check(Has(md, "| Anthropic cache_control | sent on 3 of 3 requests |"), "cache_control tally");
+        check(Has(md, "| Cost, provider-reported | $0.0460 total"), "cost total");
+        check(Has(md, "2 versions **changed mid-chat"), "prefix change flagged");
+        check(Has(md, "| Finish reasons | stop 1, tool_calls 2 |"), "finish tally");
+        check(Has(md, " Cache write |") && Has(md, " Finish |") && Has(md, " Calls | Think KB | Reply KB |") &&
+              Has(md, " Cost $ |") && Has(md, " Prefix |"), "new conditional columns");
+        check(Has(md, "| stop | 0 | 0.0 | 1.8 | 0.00500 | deadbeef |"), "row carries finish/shape/cost/prefix");
+        check(Has(md, "| 29,771 | 0 | 29,500 | 88 |"), "cache write sits after cached");
+        const std::string oldMd = BuildMetricsMarkdown("", std::string(kCalOld) +
+            "2026-10-04 10:00:00\tm\t500000\t80000\t166666\t6.250\t+108.3\t0\n");
+        check(!Has(oldMd, " Finish |") && !Has(oldMd, " Prefix |") && !Has(oldMd, "Uncached"),
+              "old logs: no new columns or rows");
+    }
 
     std::printf("\n%d/%d passed\n", passes, passes + fails);
     return fails ? 1 : 0;

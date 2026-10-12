@@ -96,6 +96,14 @@ public:
     // blank once; a second consecutive blank ends explicitly instead of
     // leaving an empty assistant row or spinning forever.
     static constexpr int kMaxEmptyAssistantRetries = 1;
+    // A reply that announces its next step but carries no tool call
+    // ("Now step 9:") is nudged to continue instead of ending the turn.
+    // Never twice in a row (a nudge must be followed by a real tool call
+    // before another is allowed), so the tool-step cap already bounds the
+    // total; this per-turn ceiling is a second backstop.  2 and then 8
+    // were too low: narrating Qwen3.8-27B (XML protocol) stalled 8 times
+    // in 12 steps and the ninth stall ended a 14-step task at step 12.
+    static constexpr int kMaxAnnouncedStepRecoveries = 24;
 
     // wait tool bounds.  Per-call range enforced at validation and
     // again at dispatch; the per-turn budget caps cumulative wait
@@ -512,6 +520,19 @@ private:
     // request and then cleared, so recovery guidance never pollutes saved
     // conversation history or replays after restart.
     std::string   m_nextRequestSystemNudge;
+
+    // Announced-step recovery state (kMaxAnnouncedStepRecoveries).  The
+    // note rides the NEXT request only, as a trailing user message
+    // (ChatHistory::SetOneShotTrailingNote), so the cached prompt prefix
+    // is untouched.
+    int           m_announcedStepRecoveries = 0;
+    // Every dispatch attempt this turn, malformed ones included.  A turn
+    // whose only call so far was malformed ("mkdir requires a directory
+    // path") is still mid-task, but m_iterationsUsed counts only valid,
+    // dispatched results and stayed 0, so the nudge never fired.
+    int           m_toolAttemptsThisTurn = 0;
+    bool          m_lastRequestWasAnnouncedRecovery = false;
+    std::string   m_nextRequestTrailingNote;
 
     // Rolling window of recently DISPATCHED tool signatures, used by
     // the exact-repeat and cycle guards.

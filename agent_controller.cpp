@@ -24,6 +24,7 @@
 #include "tool_approval.h"     // approval cards
 #include "tool_call_elision.h"  // copied-elision-marker guard
 #include "lb_sha256.h"          // standalone-write repeat key
+#include "announced_step.h"     // announced-next-step-without-a-call detector
 
 #include "lb_windows.h"
 
@@ -930,6 +931,42 @@ bool IsNativeBatchSafeTool(const std::string& name)
            !spec->safety.requiresApproval();
 }
 
+// A native batch made ONLY of write/mkdir calls to distinct, relative
+// (workspace-local) paths may run as a batch.  The calls still execute in
+// the order listed, one result per call, so "mkdir x" then "write x/a.py"
+// works; they cannot depend on each other's *results* (no call reads what
+// another returns), and a relative path never needs a Folder Access card
+// mid-batch.  Without this, a model writing code + tests in one reply had
+// the second file dropped and had to regenerate it in full (3.1 KB and
+// ~16 s for Qwen3.8 on the lbtodo spec).  Absolute paths, "..", repeated
+// paths, overwrite_file and every other tool keep the one-at-a-time rule.
+bool IsNativeBatchSafeWriteSet(const std::vector<ToolInvocation>& invocations)
+{
+    if (invocations.size() < 2) return false;
+    std::vector<std::string> seen;
+    for (const ToolInvocation& inv : invocations) {
+        if (inv.name != tool_names::kWrite && inv.name != tool_names::kMkdir)
+            return false;
+        const size_t nl = inv.args.find('\n');
+        std::string path = inv.args.substr(0, nl);
+        const size_t a = path.find_first_not_of(" \t\r");
+        const size_t b = path.find_last_not_of(" \t\r");
+        if (a == std::string::npos) return false;
+        path = path.substr(a, b - a + 1);
+        for (char& c : path) {
+            if (c == '/') c = '\\';
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        }
+        if (path.size() >= 2 && path[1] == ':') return false;      // C:\...
+        if (path[0] == '\\' || path[0] == '%' || path[0] == '~') return false;
+        if (("\\" + path + "\\").find("\\..\\") != std::string::npos) return false;
+        while (!path.empty() && path.back() == '\\') path.pop_back();
+        if (std::find(seen.begin(), seen.end(), path) != seen.end()) return false;
+        seen.push_back(path);
+    }
+    return true;
+}
+
 bool IsAgentPySessionToolName(const std::string& name)
 {
     return name == tool_names::kPy;
@@ -1057,6 +1094,14 @@ bool ShouldStopAfterStandaloneWriteArtifact(const ToolInvocation& inv,
 
     if (std::find(writtenThisTurn.begin(), writtenThisTurn.end(), key) !=
         writtenThisTurn.end()) {
+        // The loop re-writes a file that still EXISTS (write reports
+        // "exists", the model switches to overwrite_file -> "overwritten").
+        // A repeat that reports "created" means the file was gone -- the
+        // model deleted it and is recreating it, a deliberate step.  Qwen3.8
+        // did exactly that (write n1.txt, delete it, write it again) and
+        // this stop ended a 14-step task at step 2 with a synthetic
+        // "I have created n1.txt."
+        if (HasChip(r, "created")) return false;
         return true;   // same artifact written again this turn: the loop
     }
     writtenThisTurn.push_back(std::move(key));
@@ -1132,6 +1177,10 @@ void AgentController::Begin()
     m_consecutiveMalformed = 0;
     m_consecutiveEmptyAssistant = 0;
     m_nextRequestSystemNudge.clear();
+    m_announcedStepRecoveries = 0;
+    m_toolAttemptsThisTurn = 0;
+    m_lastRequestWasAnnouncedRecovery = false;
+    m_nextRequestTrailingNote.clear();
     m_awaitingAsyncResult    = false;
     m_pendingAsyncInvocation = ToolInvocation{};
     m_pendingAsyncContext    = ToolContext{};
@@ -1239,6 +1288,10 @@ void AgentController::EndLoop(AgentEndReason     reason,
     m_pendingSoftHint.clear();
     m_consecutiveEmptyAssistant = 0;
     m_nextRequestSystemNudge.clear();
+    m_announcedStepRecoveries = 0;
+    m_toolAttemptsThisTurn = 0;
+    m_lastRequestWasAnnouncedRecovery = false;
+    m_nextRequestTrailingNote.clear();
     m_challengedLoopGuardSignature.clear();   // loop-guard checkpoint state
     m_cycleGuardChallenged = false;
     // Safety net: call sites that abandon a partially-executed batch
@@ -1673,10 +1726,19 @@ std::string AgentController::BuildRequestBody()
     if (m_cb.buildToolContext)
         m_history->SetElisionSpoolWorkspace(m_cb.buildToolContext().cwd);
 
-    return m_history->BuildChatRequestJson(model, /*stream*/ true,
-                                           sysPrompt, ctxTokens,
-                                           tools, native,
-                                           true);
+    // One-request loop note (announced-step recovery) rides at the END of
+    // the wire, never in the system prompt; cleared right after the build
+    // so no other request (estimates, prewarm, the next step) can see it.
+    if (!m_nextRequestTrailingNote.empty()) {
+        m_history->SetOneShotTrailingNote(m_nextRequestTrailingNote);
+        m_nextRequestTrailingNote.clear();
+    }
+    std::string body = m_history->BuildChatRequestJson(model, /*stream*/ true,
+                                                       sysPrompt, ctxTokens,
+                                                       tools, native,
+                                                       true);
+    m_history->SetOneShotTrailingNote(std::string());
+    return body;
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -1778,6 +1840,7 @@ bool AgentController::DispatchAndContinue(const ToolInvocation& inv)
     // Empty for XML-protocol invocations and for malformed/missing
     // invocations — both are stored as plain user messages.
     m_currentToolCallId = inv.toolCallId;
+    ++m_toolAttemptsThisTurn;   // valid or not: the turn is mid-task
 
     if (!inv.valid) {
         // Malformed / unknown tool.  Feed the reason back to the
@@ -2427,6 +2490,11 @@ bool AgentController::HandleAssistantComplete(const std::string& fullResponse,
         return true;
     }
 
+    // Was the request that produced THIS reply an announced-step nudge?
+    // Consumed here so a second announcement in a row ends the turn.
+    const bool replyFollowsAnnouncedRecovery = m_lastRequestWasAnnouncedRecovery;
+    m_lastRequestWasAnnouncedRecovery = false;
+
     const bool hasVisibleAssistantText =
         fullResponse.find_first_not_of(" \t\r\n") != std::string::npos;
 
@@ -2537,7 +2605,8 @@ bool AgentController::HandleAssistantComplete(const std::string& fullResponse,
 
             bool batchMode = invocations.size() > 1 &&
                              !hasUnsafeNativeArgs &&
-                             allCallsBatchSafe;
+                             (allCallsBatchSafe ||
+                              IsNativeBatchSafeWriteSet(invocations));
             std::string sidecarJson;
             if (batchMode) {
                 sidecarJson =
@@ -2698,6 +2767,39 @@ bool AgentController::HandleAssistantComplete(const std::string& fullResponse,
     // MyFrame already rendered the streamed prose; we just exit
     // the loop and let normal completion flow through.
     if (!parsed.hasInvocation) {
+        // Announced-step recovery: mid-task (at least one tool step this
+        // turn), the reply only promises the next step ("Now step 9:")
+        // with no call.  Ending here leaves the task half done, so give
+        // the model one more request with a trailing control note.
+        // Bounded per turn and never twice in a row; the prose stays in
+        // history and on screen exactly as streamed.
+        // A complete call written inside leaked reasoning (before a stray
+        // </think>) is never executed -- correctly -- but the model then
+        // reports it as done.  Nudge it to re-issue the call properly.
+        // Checked first and on any reply, including a turn's first.
+        const bool callInLeakedReasoning =
+            lb_announced_step::HasCallInsideLeakedReasoning(fullResponse);
+        const bool midTask = m_iterationsUsed > 0 || m_toolAttemptsThisTurn > 0;
+        if (!replyFollowsAnnouncedRecovery &&
+            m_announcedStepRecoveries < kMaxAnnouncedStepRecoveries &&
+            (callInLeakedReasoning ||
+             (midTask && lb_announced_step::LooksLikeAnnouncedNextStep(parsed.prose)))) {
+            ++m_announcedStepRecoveries;
+            m_lastRequestWasAnnouncedRecovery = true;
+            m_nextRequestTrailingNote = callInLeakedReasoning
+                ? "[LlamaBoss loop note, not from the user] Your previous reply "
+                  "wrote a tool call inside your reasoning (before </think>), so "
+                  "it did NOT run and no tool result exists for it. Do not report "
+                  "it as done. If you still need it, emit the tool call now, "
+                  "outside your reasoning."
+                : "[LlamaBoss loop note, not from the user] Your previous reply "
+                  "described a next step but contained no tool call, so nothing "
+                  "ran. If every requested step is complete, give the final "
+                  "answer now. Otherwise call the tool for that step now.";
+            ContinueLoop();
+            return true;
+        }
+
         // Normal end of loop — no user message needed.
         EndLoop(AgentEndReason::Normal, "");
         return false;   // let MyFrame do normal completion handling

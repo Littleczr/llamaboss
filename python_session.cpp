@@ -11,6 +11,7 @@
 // (PeekNamedPipe tick loop), not process exit.
 
 #include "python_session.h"
+#include "background_work.h"   // lb::BeginBackgroundWork (drained in MyApp::OnExit)
 
 #include "path_safety.h"
 #include "lb_string_utils.h"   // LbUtf8SafeTruncate
@@ -1064,7 +1065,7 @@ bool PythonSessionManager::StartExec(const std::string& code,
     const unsigned long effTimeout =
         (timeoutMs == 0) ? kDefaultExecTimeoutMs : timeoutMs;
 
-    std::thread([impl, code, cwd, effTimeout]() {
+    std::thread([work = lb::BeginBackgroundWork(), impl, code, cwd, effTimeout]() {
         auto running = impl->isRunning;
         auto cancel  = impl->cancelFlag;
 

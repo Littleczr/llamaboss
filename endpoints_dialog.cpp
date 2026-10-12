@@ -15,6 +15,7 @@
 #include <wx/checkbox.h>
 #include "lb_windows.h"
 #include "ui_event_post.h"   // LbQueueEventIfAlive (fetch-models worker)
+#include "background_work.h"   // lb::BeginBackgroundWork (drained in MyApp::OnExit)
 
 #include <wx/checklst.h>
 #include <wx/choice.h>
@@ -1631,7 +1632,7 @@ private:
 
         wxEvtHandler* target = this;
         std::weak_ptr<std::atomic<bool>> alive = m_alive;
-        std::thread([target, alive, attempt, gen]() {
+        std::thread([work = lb::BeginBackgroundWork(), target, alive, attempt, gen]() {
             lb_chatgpt::SignInResult r = lb_chatgpt::Auth::Get().CompleteSignIn(attempt);
             auto* ev = new wxThreadEvent(wxEVT_EP_CHATGPT_SIGNED_IN);
             ev->SetPayload(r);
@@ -1899,7 +1900,7 @@ private:
                 SetFetchStatus(m_connectPending ? "Loading your ChatGPT models..." : "Refreshing models...");
             wxEvtHandler* target = this;
             std::weak_ptr<std::atomic<bool>> alive = m_alive;
-            std::thread([target, alive, account, gen]() {
+            std::thread([work = lb::BeginBackgroundWork(), target, alive, account, gen]() {
                 FetchModelsResult r = FetchChatGptCatalog(account);
                 auto* ev = new wxThreadEvent(wxEVT_EP_MODELS_FETCHED);
                 ev->SetPayload(r);
@@ -1953,7 +1954,7 @@ private:
         // LlamaBoss.cpp and not reachable from here.)
         wxEvtHandler* target = this;
         std::weak_ptr<std::atomic<bool>> alive = m_alive;
-        std::thread([target, alive, url, headerName, headerValue, extra,
+        std::thread([work = lb::BeginBackgroundWork(), target, alive, url, headerName, headerValue, extra,
                      gen, key, base, noAuth]() {
             FetchModelsResult r = FetchConnectionCatalog(base, url, headerName, headerValue, extra, noAuth);
             RedactProbeError(r.error, key);
@@ -2108,7 +2109,7 @@ private:
 
         wxEvtHandler* target = this;
         std::weak_ptr<std::atomic<bool>> alive = m_alive;
-        std::thread([target, alive, url, model, headerName, headerValue,
+        std::thread([work = lb::BeginBackgroundWork(), target, alive, url, model, headerName, headerValue,
                      extra, gen, effort, dialect, testTools, skipReason, key]() {
             TestConnectionResult r;
             r.model = model; r.effort = effort; r.skipReason = skipReason;

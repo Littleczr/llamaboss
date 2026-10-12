@@ -100,6 +100,42 @@ bool LooksLikeLocalGgufModel(const std::string& model)
     return EndsWithAsciiNoCase(model, ".gguf");
 }
 
+// Anthropic prompt caching is opt-in: unlike OpenAI (automatic) and
+// llama-server (KV prefix reuse), a Claude request with no cache_control
+// pays full input price for the whole ~30k-token system prompt + tool
+// catalog on EVERY agent step.  OpenRouter forwards cache_control to
+// every Claude provider it routes to (Anthropic, Bedrock, Vertex).
+//
+// Matches OpenRouter model ids "anthropic/claude-..." (and the "~"
+// alias form).  Chat Completions only: the Responses adapter whitelists
+// its fields and has no per-block cache_control.  Endpoints configured
+// with the OpenAI or template reasoning dialect are not OpenRouter, so
+// they keep their request bytes unchanged.
+bool WantsAnthropicCacheControl(const std::string& model,
+                                bool responsesApi,
+                                ReasoningDialect dialect)
+{
+    if (responsesApi) return false;
+    if (dialect != ReasoningDialect::OpenRouterStyle) return false;
+    if (LooksLikeLocalGgufModel(model)) return false;
+    std::string id = model;
+    if (!id.empty() && id[0] == '~') id.erase(0, 1);
+    static const char kPrefix[] = "anthropic/";
+    if (id.size() <= sizeof(kPrefix) - 1) return false;
+    for (size_t i = 0; i < sizeof(kPrefix) - 1; ++i) {
+        if (std::tolower(static_cast<unsigned char>(id[i])) != kPrefix[i])
+            return false;
+    }
+    return true;
+}
+
+Poco::JSON::Object::Ptr EphemeralCacheControl()
+{
+    Poco::JSON::Object::Ptr cc = new Poco::JSON::Object;
+    cc->set("type", std::string("ephemeral"));
+    return cc;
+}
+
 void ApplyLocalLlamaSampling(Poco::JSON::Object::Ptr root,
                              const std::string& model,
                              bool agentSamplingProfile)
@@ -316,6 +352,30 @@ std::string StripThinkBlocks(const std::string& content)
             break;
         }
         out.erase(open, close + kClose.size() - open);
+    }
+
+    // Orphan closer: reasoning that streamed as ordinary content (seen
+    // with Qwen3.8 when its thinking quoted a literal "<tool_call>" tag)
+    // arrives with no opening <think> but still ends in "</think>".  The
+    // pair loop above cannot see it, so the whole leaked block -- 10 KB
+    // in the observed case -- rode along on every later request.  Drop
+    // everything up to the last stray closer, unless that closer is
+    // quoted material: inside a ``` fence or wrapped in backticks/quotes
+    // (code or prose ABOUT think tags must survive).
+    {
+        const size_t stray = out.rfind(kClose);
+        if (stray != std::string::npos) {
+            size_t fences = 0;
+            for (size_t f = out.find("```"); f != std::string::npos && f < stray;
+                 f = out.find("```", f + 3))
+                ++fences;
+            const char before = stray > 0 ? out[stray - 1] : '\n';
+            const size_t afterPos = stray + kClose.size();
+            const char after = afterPos < out.size() ? out[afterPos] : '\n';
+            auto isQuote = [](char c) { return c == '`' || c == '"' || c == '\''; };
+            if (fences % 2 == 0 && !isQuote(before) && !isQuote(after))
+                out.erase(0, afterPos);
+        }
     }
 
     if (out.size() != content.size()) {
@@ -1175,22 +1235,34 @@ std::string ChatHistory::BuildChatRequestJson(const std::string& model, bool str
 
     // ── Step 1b: strip stale live-loop budget trailers ──────────
     // AgentController appends a model-facing "[agent tool step N of 12]"
-    // trailer to the newest counted tool result while a loop is actively
-    // iterating.  That trailer is useful for the immediate follow-up request,
-    // but stale trailers from older turns become misleading instructions.
-    // Keep it only when the latest non-system wire message is itself a tool
-    // result; otherwise strip it from every tool result before request build.
-    size_t lastNonSystemIndex = wire.size();
+    // trailer to each counted tool result while a loop is iterating.
+    // Trailers from EARLIER user turns are stale (a previous turn's "budget
+    // nearly exhausted" must not steer this one), so they are stripped.
+    //
+    // Trailers from the CURRENT turn -- every tool result after the newest
+    // real user message -- are kept, even the older ones.  Stripping the
+    // previous step's trailer on each new request (the old rule: keep only
+    // the newest) rewrote a message in the middle of the prompt on every
+    // agent step, so no prompt cache could ever extend past it: llama-server
+    // re-processed the tail each step, and Anthropic's rolling breakpoint
+    // never hit, re-writing the whole conversation at 1.25x input price
+    // every step.  Within a turn the trailers are a monotonic history
+    // ("step 3 of 12", "step 4 of 12", ...), so keeping them misleads
+    // nothing; the bytes now change only once, when the next user turn
+    // starts.
+    size_t newestRealUserForTrailers = wire.size();
     for (size_t i = wire.size(); i-- > 0;) {
-        if (wire[i].role != "system") {
-            lastNonSystemIndex = i;
+        const WireMsg& w = wire[i];
+        if (w.role == "user" && !w.isToolResult && w.toolCallId.empty()) {
+            newestRealUserForTrailers = i;
             break;
         }
     }
 
     for (size_t i = 0; i < wire.size(); ++i) {
-        if (!wire[i].isToolResult) continue;
-        if (i == lastNonSystemIndex) continue;
+        if (!wire[i].isToolResult && wire[i].toolCallId.empty()) continue;
+        if (newestRealUserForTrailers == wire.size() ||   // no user turn found
+            i > newestRealUserForTrailers) continue;     // current turn: keep
         wire[i].content = StripAgentStepTrailer(wire[i].content);
     }
 
@@ -1276,10 +1348,39 @@ std::string ChatHistory::BuildChatRequestJson(const std::string& model, bool str
         }
     }
 
+    // One-request control note from the agent loop (SetOneShotTrailingNote).
+    // Appended after every carrier selection pass so it can never be taken
+    // for the user's own newest message (image carriers key on that), and
+    // before compaction so its bytes are budgeted like any other message.
+    if (!m_oneShotTrailingNote.empty()) {
+        WireMsg note;
+        note.role         = "user";
+        note.content      = m_oneShotTrailingNote;
+        note.isToolResult = false;
+        wire.push_back(std::move(note));
+    }
+
     // Resolved once; the stringify lambda below may run twice (before
     // and after elision) and must not recompute path plumbing.
     const std::string imageChatDir =
         m_filePath.empty() ? std::string() : GetChatFolder(m_filePath);
+
+    // Anthropic prompt caching (see WantsAnthropicCacheControl).  Two
+    // breakpoints, well under Anthropic's limit of four:
+    //   1. Explicit, on the leading system block.  Cache prefix order is
+    //      tools -> system -> messages, so this one entry covers the whole
+    //      tool catalog + system prompt, and because that prefix is
+    //      byte-stable (the live timestamp rides on the user message) it
+    //      is reused across turns AND across chats within the TTL.
+    //   2. Automatic, top-level "cache_control".  The provider puts it on
+    //      the last cacheable block and moves it forward as the
+    //      conversation grows, so each agent step reads everything the
+    //      previous step wrote.
+    // Both are 5-minute ephemeral (same TTL — mixed TTLs on one block 400).
+    // An ephemeral recovery nudge appended to the system prompt changes
+    // the prefix for that one request only: one cache write, not an error.
+    const bool anthropicCache =
+        WantsAnthropicCacheControl(model, m_responsesApi, m_reasoningDialect);
 
     // ── Step 2: optional compaction ─────────────────────────────
     // Only runs when the caller provided a context-window hint.
@@ -1300,6 +1401,8 @@ std::string ChatHistory::BuildChatRequestJson(const std::string& model, bool str
         Poco::JSON::Object::Ptr root = new Poco::JSON::Object;
         root->set("model", model);
         root->set("stream", stream);
+        if (anthropicCache)
+            root->set("cache_control", EphemeralCacheControl());
 
         // OpenAI prompt caching routes on the first few hundred prompt
         // tokens plus an optional prompt_cache_key.  Every LlamaBoss chat
@@ -1548,6 +1651,22 @@ std::string ChatHistory::BuildChatRequestJson(const std::string& model, bool str
             }
             else {
                 m->set("role", w.role);
+
+                // Anthropic breakpoint 1: the leading system prompt as a
+                // single text part carrying cache_control (OpenRouter's
+                // documented shape for system caching).
+                if (anthropicCache && w.role == "system" &&
+                    &w == &wire.front() && !w.content.empty()) {
+                    Poco::JSON::Object::Ptr part = new Poco::JSON::Object;
+                    part->set("type", std::string("text"));
+                    part->set("text", w.content);
+                    part->set("cache_control", EphemeralCacheControl());
+                    Poco::JSON::Array::Ptr parts = new Poco::JSON::Array;
+                    parts->add(part);
+                    m->set("content", parts);
+                    arr->add(m);
+                    continue;
+                }
 
                 // Image carrier: rebuild the OpenAI-style content
                 // array (image_url data-URI parts + text part) from
@@ -2005,6 +2124,19 @@ std::string ChatHistory::BuildChatRequestJson(const std::string& model, bool str
             ++b.imageCount;
             pos = end;
             if (pos >= body.size()) break;
+        }
+        // Fingerprint of the cacheable prefix (leading system prompt +
+        // native tool catalog).  Every provider cache keys on these bytes,
+        // so a fingerprint that changes between requests of one chat is a
+        // guaranteed cache miss -- logged so the metrics export can show it.
+        {
+            std::string prefix;
+            if (!wire.empty() && wire.front().role == "system")
+                prefix = wire.front().content;
+            prefix.push_back('\x1f');
+            if (toolsArr) prefix += toolsArrayJson;
+            b.prefixHash = static_cast<uint32_t>(Fnv1a64(prefix));
+            b.cacheControl = anthropicCache;
         }
         m_lastBuildBreakdown = b;
     }
@@ -3542,7 +3674,16 @@ std::string ChatHistory::FormatToolBlockAsUserMessage(
         for (char& c : v) c = (char)std::tolower((unsigned char)c);
         return v;
     };
-    bool failedTool = !errorBody.empty();
+    // stderr alone is a failure only when nothing says the command
+    // succeeded.  A process that exited 0 often writes its normal report
+    // to stderr (unittest prints "Ran 5 tests ... OK" there, build tools
+    // and progress bars do too); the old rule told the model "TOOL FAILED
+    // ... Do not claim success" for a passing test run.  The chip loop
+    // below still marks real failures (non-zero exit, timeout, blocked).
+    bool exitZero = false;
+    for (const std::string& chip : statusChips)
+        if (lowerAscii(chip) == "exit 0") exitZero = true;
+    bool failedTool = !errorBody.empty() && !exitZero;
     for (const std::string& chip : statusChips) {
         std::string c = lowerAscii(chip);
         if (c == "failed" || c == "blocked" || c == "error" ||

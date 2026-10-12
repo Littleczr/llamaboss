@@ -425,6 +425,10 @@ struct StreamUpdate {
     std::string summary;
     std::string error;
     bool completed = false;
+    // A function call started or streamed argument bytes in this event.
+    // Lets the caller time the first token of a tool-call-only reply,
+    // which carries no text or summary delta.
+    bool toolActivity = false;
     long inputTokens = -1;
     long outputTokens = -1;
     long cachedInputTokens = -1;   // usage.input_tokens_details.cached_tokens
@@ -494,6 +498,7 @@ public:
             if (call.argumentsDone)
                 throw std::runtime_error("Responses function arguments continued after they ended.");
             AppendArguments(call, RequiredString(event, "delta"));
+            update.toolActivity = true;
         } else if (type == "response.function_call_arguments.done") {
             auto& call = CallSlot(Index(event, "output_index"));
             Adopt(call.itemId, RequiredString(event, "item_id"), "id");
@@ -504,6 +509,7 @@ public:
             if (RequiredString(item, "type") == "function_call") {
                 auto& call = CallSlot(Index(event, "output_index"));
                 RecordCall(call, item, /*snapshot*/ type == "response.output_item.done");
+                if (type == "response.output_item.added") update.toolActivity = true;
             }
             // Keep every finished item.  The ChatGPT plan route ends with a
             // response.completed whose `output` is EMPTY (the Codex backend

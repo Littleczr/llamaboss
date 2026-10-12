@@ -246,6 +246,35 @@ bool EchoPointsInsideWorkspace(const std::string& echo,
     return true;
 }
 
+// Whole contents of a workspace file named by its workspace-relative path,
+// for a reused-file handle card.  The tool body handed to demotion can be
+// a TRUNCATED read (tool_read caps a whole-file read to fit the model's
+// context), and a card built from it misreports the file: a 425 KB / 8000
+// line log came back as "375.3 KB, 7068 lines" with a tail from the middle,
+// which the model correctly flagged as contradicting its own line count.
+// The handle points at the real file, so the card must describe the real
+// file.  False (caller falls back to the body) on any read problem or when
+// the file is larger than |cap|.
+bool ReadWorkspaceFileForCard(const std::string& workspaceDirUtf8,
+                              const std::string& relPath,
+                              size_t cap,
+                              std::string& out)
+{
+    std::error_code ec;
+    const std::filesystem::path p =
+        std::filesystem::path(path_safety::Utf8ToWide(workspaceDirUtf8)) /
+        std::filesystem::path(path_safety::Utf8ToWide(relPath));
+    const auto size = std::filesystem::file_size(p, ec);
+    if (ec || size > cap) return false;
+    std::ifstream f(p, std::ios::binary);
+    if (!f) return false;
+    std::string data(static_cast<size_t>(size), '\0');
+    if (size > 0 && !f.read(&data[0], static_cast<std::streamsize>(size)))
+        return false;
+    out.swap(data);
+    return true;
+}
+
 }  // namespace
 
 // ── public: EnsureVarsDir ──────────────────────────────────────────
@@ -503,10 +532,20 @@ DemoteOutcome MaybeDemoteToolBody(const std::string& toolTag,
     }
 
     // ── build the handle card ──────────────────────────────────────
+    // A reused file is described from its own bytes (the read body may have
+    // been truncated to fit the context; see ReadWorkspaceFileForCard).
+    // 64 MiB matches the largest text attachment the workspace accepts.
+    std::string fileBytes;
+    const std::string* cardSource = &body;
+    if (reused &&
+        ReadWorkspaceFileForCard(workspaceDirUtf8, relPath,
+                                 64ull * 1024 * 1024, fileBytes))
+        cardSource = &fileBytes;
+
     out.demoted  = true;
     out.relPath  = relPath;
     out.absPath  = absPath;
-    out.cardBody = BuildHandleCard(relPath, body, commandEcho, cfg,
+    out.cardBody = BuildHandleCard(relPath, *cardSource, commandEcho, cfg,
                                    /*reusedSameFile=*/reused,
                                    /*utf16Original=*/false);
     return out;

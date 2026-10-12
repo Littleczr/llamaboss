@@ -8,6 +8,7 @@
 #include "chatgpt_auth.h"
 #include "chatgpt_auth_core.h"
 #include "lb_ssl.h"
+#include "background_work.h"   // lb::BeginBackgroundWork (drained in MyApp::OnExit)
 
 #ifdef _WIN32
 #include "lb_windows.h"
@@ -1026,7 +1027,7 @@ void Auth::SignOut(const std::string& clientId)
         SaveLocked(*impl);
     }
     if (refresh.empty()) return;
-    std::thread([clientId, refresh]() {
+    std::thread([work = lb::BeginBackgroundWork(), clientId, refresh]() {
         for (int attempt = 0; attempt < 3; ++attempt) {
             const HttpResult r = PostForm(kRevokeUrl(), {
                 { "token", refresh },

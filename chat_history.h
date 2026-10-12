@@ -527,6 +527,15 @@ public:
     // never receives a message key it does not know.
     void SetActiveResponsesApi(bool on) { m_responsesApi = on; }
 
+    // One-request control note, appended to the END of the wire as a user
+    // message by the next BuildChatRequestJson.  Never stored in history,
+    // never saved.  Used by AgentController for loop-recovery nudges
+    // instead of appending to the system prompt: a change at the end of
+    // the prompt keeps every provider's prefix cache (llama-server KV,
+    // Anthropic, OpenAI) valid, while a system-prompt change invalidates
+    // all of it.  The caller sets it, builds, then clears it.
+    void SetOneShotTrailingNote(const std::string& note) { m_oneShotTrailingNote = note; }
+
     // Per-conversation approval memory.  In this polish pass, plain
     // approve enables one-approval mode for this chat; approve once
     // remains available for a single-card approval.  After trust is
@@ -758,6 +767,7 @@ private:
 
     // Current send target is a Responses endpoint (see SetActiveResponsesApi).
     bool m_responsesApi = false;
+    std::string m_oneShotTrailingNote;   // see SetOneShotTrailingNote
 
     // Optional project association.
     std::string m_projectId;
