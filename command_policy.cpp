@@ -1,6 +1,9 @@
 // command_policy.cpp
 
 #include "command_policy.h"
+#ifndef _WIN32
+#include "command_policy_zsh.h"
+#endif
 
 #include <algorithm>
 #include <array>
@@ -724,6 +727,10 @@ ScanResult ScanAndSplitStages(const std::string& cmd) {
 // ─── Public entry point ─────────────────────────────────────────
 
 PolicyDecision EvaluatePowerShellCommand(const std::string& cmdIn) {
+#ifndef _WIN32
+    // macOS: the shell tool runs zsh; see command_policy_zsh.cpp.
+    return EvaluateZshCommand(cmdIn);
+#endif
     PolicyDecision out;
 
     const std::string cmd = Trim(cmdIn);

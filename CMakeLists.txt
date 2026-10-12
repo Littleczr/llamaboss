@@ -158,3 +158,10 @@ if(APPLE)
 endif()
 
 install(TARGETS LlamaBoss RUNTIME DESTINATION bin BUNDLE DESTINATION .)
+
+# ── macOS shell-policy checks (no wx; run directly) ──
+if(APPLE)
+    add_executable(command_policy_zsh_tests EXCLUDE_FROM_ALL
+        command_policy_zsh.cpp command_policy_zsh_tests.cpp)
+    target_include_directories(command_policy_zsh_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+endif()
