@@ -631,7 +631,7 @@ void ConnectionsDialog::OnAdd(wxCommandEvent&)
                 "A connection named %s.%s already exists. Replace it?",
                 provider, key),
             "Replace existing connection?",
-            wxYES_NO | wxICON_WARNING,
+            wxYES_NO | wxNO_DEFAULT | wxICON_WARNING,
             this);
         if (ans != wxYES) return;
     }
@@ -702,7 +702,7 @@ void ConnectionsDialog::OnEdit(wxCommandEvent&)
                 "A connection named %s.%s already exists. Replace it?",
                 provider, key),
             "Replace existing connection?",
-            wxYES_NO | wxICON_WARNING,
+            wxYES_NO | wxNO_DEFAULT | wxICON_WARNING,
             this);
         if (ans != wxYES) return;
     }
@@ -738,7 +738,7 @@ void ConnectionsDialog::OnDelete(wxCommandEvent&)
 
     int ans = wxMessageBox(
         wxString::Format("Delete %s.%s?", provider, key),
-        "Confirm", wxYES_NO | wxICON_WARNING, this);
+        "Confirm", wxYES_NO | wxNO_DEFAULT | wxICON_WARNING, this);
     if (ans != wxYES) return;
 
     m_store->RemoveSecret(

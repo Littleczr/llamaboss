@@ -1552,7 +1552,7 @@ void ConversationController::DeleteConversations(
     }
 
     int result = wxMessageBox(msg, "Delete Conversation",
-        wxYES_NO | wxICON_WARNING,
+        wxYES_NO | wxNO_DEFAULT | wxICON_WARNING,
         &m_frame);
     if (result != wxYES) return;
 

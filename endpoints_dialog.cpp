@@ -3148,7 +3148,7 @@ void EndpointsDialog::OnDelete(wxCommandEvent&)
                          !target->chatgptAccount.empty();
     wxString question = wxString::Format("Delete endpoint '%s'?", wxString::FromUTF8(id.c_str()));
     if (chatgpt) question += "\n\nThis also signs LlamaBoss out of ChatGPT on this computer.";
-    int ans = wxMessageBox(question, "Confirm", wxYES_NO | wxICON_WARNING, this);
+    int ans = wxMessageBox(question, "Confirm", wxYES_NO | wxNO_DEFAULT | wxICON_WARNING, this);
     if (ans != wxYES) return;
 
     const auto* existing = m_store->FindEndpoint(id);
