@@ -10,6 +10,8 @@
 
 #ifdef __WXMAC__
 #include "lb_mac_native.h"
+#include <wx/taskbar.h>
+#include <memory>
 
 #endif
 #ifdef __WXMSW__
@@ -85,6 +87,37 @@ void StopNewWindowListener()
     if (g_newWindowEvent) { ::CloseHandle(g_newWindowEvent); g_newWindowEvent = nullptr; }
     if (g_listenerStop)   { ::CloseHandle(g_listenerStop);   g_listenerStop   = nullptr; }
 }
+#elif defined(__WXMAC__)
+// macOS: Finder and the Dock never start a second copy of a running app
+// (Launch Services activates the existing one), so there is no handoff to
+// listen for.  The Mac way to get another window is File > New Window or
+// the Dock icon's menu; this adds "New Window" to that menu, opening it
+// through the same path the Windows handoff uses.
+class DockMenuIcon : public wxTaskBarIcon
+{
+public:
+    DockMenuIcon() : wxTaskBarIcon(wxTBI_DOCK)
+    {
+        Bind(wxEVT_MENU, [](wxCommandEvent&) {
+            wxTheApp->CallAfter([]() {
+                static_cast<MyApp*>(wxTheApp)->OpenNewWindowFromSecondLaunch();
+            });
+        }, wxID_NEW);
+    }
+
+protected:
+    wxMenu* CreatePopupMenu() override
+    {
+        auto* menu = new wxMenu;
+        menu->Append(wxID_NEW, "New Window");
+        return menu;
+    }
+};
+
+std::unique_ptr<DockMenuIcon> g_dockMenuIcon;
+
+void StartNewWindowListener() { g_dockMenuIcon = std::make_unique<DockMenuIcon>(); }
+void StopNewWindowListener()  { g_dockMenuIcon.reset(); }
 #else
 void StartNewWindowListener() {}
 void StopNewWindowListener()  {}

@@ -1473,7 +1473,75 @@ private:
 
         // Keyboard shortcuts
         Bind(wxEVT_CHAR_HOOK, &MyFrame::OnCharHook, this);
+#ifdef __WXMAC__
+        BuildMacMenuBar();
+#endif
     }
+#ifdef __WXMAC__
+
+    // macOS: the standard menu bar.  The Windows build has no menu bar (the
+    // toolbar carries these actions); on a Mac users expect About and
+    // Settings (Cmd+,) in the app menu, the File/Edit/View/Help menus, and
+    // the shortcuts shown next to their commands.  wx moves wxID_ABOUT and
+    // wxID_PREFERENCES into the LlamaBoss menu, supplies Hide/Quit there, adds
+    // the Window menu, and routes the Edit stock IDs to the focused control.
+    void BuildMacMenuBar()
+    {
+        const int idNewChat    = wxWindow::NewControlId();
+        const int idNewWindow  = wxWindow::NewControlId();
+        const int idSidebar    = wxWindow::NewControlId();
+
+        auto* file = new wxMenu;
+        file->Append(idNewChat,   "New Chat\tCtrl+N");
+        file->Append(idNewWindow, "New Window\tCtrl+Shift+N");
+        file->AppendSeparator();
+        file->Append(wxID_OPEN, wxString::FromUTF8("Open Conversation\u2026\tCtrl+O"));
+        file->Append(wxID_SAVE, "Save Conversation\tCtrl+S");
+        file->AppendSeparator();
+        file->Append(wxID_CLOSE, "Close Window\tCtrl+W");
+        file->Append(wxID_ABOUT, "About LlamaBoss");
+        file->Append(wxID_PREFERENCES, wxString::FromUTF8("Settings\u2026\tCtrl+,"));
+
+        auto* edit = new wxMenu;
+        edit->Append(wxID_UNDO, "Undo\tCtrl+Z");
+        edit->Append(wxID_REDO, "Redo\tCtrl+Shift+Z");
+        edit->AppendSeparator();
+        edit->Append(wxID_CUT, "Cut\tCtrl+X");
+        edit->Append(wxID_COPY, "Copy\tCtrl+C");
+        edit->Append(wxID_PASTE, "Paste\tCtrl+V");
+        edit->Append(wxID_SELECTALL, "Select All\tCtrl+A");
+
+        auto* view = new wxMenu;
+        // Cmd+Ctrl+S is the macOS sidebar shortcut (Finder, Mail, Notes).
+        view->Append(idSidebar, "Show or Hide Sidebar\tRawCtrl+Ctrl+S");
+
+        auto* help = new wxMenu;
+        help->Append(wxID_HELP, "LlamaBoss Help");
+
+        auto* bar = new wxMenuBar;
+        bar->Append(file, "&File");
+        bar->Append(edit, "&Edit");
+        bar->Append(view, "&View");
+        bar->Append(help, "&Help");
+        SetMenuBar(bar);
+
+        Bind(wxEVT_MENU, [this](wxCommandEvent& e) { OnNewChat(e); }, idNewChat);
+        Bind(wxEVT_MENU, [this](wxCommandEvent&) { OpenNewWindow(); }, idNewWindow);
+        Bind(wxEVT_MENU, [this](wxCommandEvent&) {
+            if (!IsBusy()) m_convController->OnLoadConversation();
+        }, wxID_OPEN);
+        Bind(wxEVT_MENU, [this](wxCommandEvent&) {
+            if (!IsBusy()) m_convController->OnSaveConversation();
+        }, wxID_SAVE);
+        Bind(wxEVT_MENU, [this](wxCommandEvent&) { Close(); }, wxID_CLOSE);
+        Bind(wxEVT_MENU, [this](wxCommandEvent& e) { OnAbout(e); }, wxID_ABOUT);
+        Bind(wxEVT_MENU, [this](wxCommandEvent& e) { OnOpenSettings(e); }, wxID_PREFERENCES);
+        Bind(wxEVT_MENU, [this](wxCommandEvent& e) { OnToggleSidebar(e); }, idSidebar);
+        Bind(wxEVT_MENU, [](wxCommandEvent&) {
+            wxLaunchDefaultBrowser("https://llamaboss.com/docs");
+        }, wxID_HELP);
+    }
+#endif
 
 
     void FinishStartup()

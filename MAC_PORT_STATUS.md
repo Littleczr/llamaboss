@@ -97,6 +97,8 @@ Intended divergences from Windows. Features that are simply not ported yet are l
 | GPU memory wording | "Needs 10+ GB VRAM", "fits in VRAM" | "Needs a Mac with 16 GB+ of memory" (GPU GB x 4/3, rounded up to a Mac memory size), "fits in memory" (`lb_mac_wording.h`) | Apple silicon has unified memory; the GPU can use about 3/4 of it |
 | `py` session memory cap | Job Object: 2 GiB per process; allocations fail with `MemoryError` and the session survives | watchdog stops the kernel when its physical footprint passes 2 GiB; the session is lost and the card says why | macOS refuses `RLIMIT_AS`/`RLIMIT_DATA`, so a failing-allocation cap is not available |
 | Web fetch transport | WinHTTP, system proxy settings | Poco::Net with lb_ssl's verified TLS context; no system proxy; Mac browser user-agent | No WinHTTP on macOS; the UA names the platform it runs on |
+| Menu bar | none (toolbar only) | LlamaBoss menu (About, Settings… Cmd+,, Hide, Quit), File (New Chat, New Window, Open/Save Conversation, Close Window), Edit, View (Show or Hide Sidebar Ctrl+Cmd+S), Window, Help (llamaboss.com/docs) | Mac convention; verified by the user 2026-10-12 |
+| New window | second launch hands off to the running app | Dock icon menu "New Window" (Finder/Dock never start a second copy) | Mac convention; verified by the user 2026-10-12 |
 | Control appearance | n/a | app appearance (dark/light Aqua) set from the theme's background at startup | Native controls match the theme on a system in the other mode |
 
 ## Toolchain (verified 2026-10-09)
@@ -495,11 +497,7 @@ large icons. macOS 26 may show a full-bleed square icon inside its standard roun
 
 ## Next task
 
-1. Mac menu bar: built and listed correctly through Accessibility (LlamaBoss menu with
-   About and Settings..., File, Edit, View, Window, Help). Still to do: test Cmd+, and
-   Ctrl+Cmd+S (sidebar, must not trigger Cmd+S save), use the "…" character in labels,
-   commit. The keystroke test needs the user at the Mac (approval prompt).
-2. Remaining UI checks: project attach, message boxes, light themes.
+1. Remaining UI checks: project attach, message boxes, light themes.
 3. Phase 4: test the notarized DMG on another Mac or a fresh user account; host the DMG;
    Mac entry in the update feed (`version.json`); "Download for Mac" + Mac wording on
    llamaboss.com (preview first, publish only with the user's approval).
