@@ -133,6 +133,9 @@ if(APPLE)
     target_sources(LlamaBoss PRIVATE ${_lb_pyfiles})
     set_source_files_properties(${_lb_pyfiles} PROPERTIES
         MACOSX_PACKAGE_LOCATION Resources/python)
+    # Native controls (lb_mac_native.h); Objective-C++, outside the glob.
+    target_sources(LlamaBoss PRIVATE lb_mac_native.mm)
+    set_source_files_properties(lb_mac_native.mm PROPERTIES SKIP_PRECOMPILE_HEADERS ON)
 endif()
 
 # ── Bundle llama-server (macOS) ──

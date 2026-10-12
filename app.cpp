@@ -8,6 +8,10 @@
 #include "chat_history.h"     // MigrateLegacyChatFolders
 #include "update_installer.h"   // CleanupStaleDownloads
 
+#ifdef __WXMAC__
+#include "lb_mac_native.h"
+
+#endif
 #ifdef __WXMSW__
 #include <wx/msw/wrapwin.h>
 #include <wx/clipbrd.h>
@@ -176,6 +180,11 @@ bool MyApp::OnInit()
 
     m_modelService = std::make_unique<ModelService>(*m_appState);
 
+#ifdef __WXMAC__
+    // Native push buttons and theme-matched appearance (Mac identity).
+    LbMacInstallNativeControls();
+
+#endif
     // ── One-time chat folder migration ───────────────────────────
     // Moves LlamaBoss\Workflows\chat_<id> into
     // LlamaBoss\Chats\<date>_<title-slug>_<id>.  Runs before any window

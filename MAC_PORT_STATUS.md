@@ -84,6 +84,8 @@ Intended divergences from Windows. Features that are simply not ported yet are l
 | Fonts | Consolas / Cascadia Code, Windows point sizes | Menlo, sizes x4/3 (`lb_ui_font.h`) | Same physical size; built-in Mac face |
 | App icon | `app_icon.ico` | `macos/app_icon.icns` (generated from the .ico) | Bundle icon format |
 | Missing `.ico` at startup | file fallback | icon comes from the bundle; no file lookup | Avoids a modal error on launch |
+| Buttons | flat buttons filled with theme colours | native push buttons (`lb_mac_native.mm`): one accent-tinted button per dialog (default/OK), Send and New Chat accent in the main window, stop-red stays red, the rest plain; widened to fit | NSButton ignores theme fills; Mac convention is one default button per window |
+| Control appearance | n/a | app appearance (dark/light Aqua) set from the theme's background at startup | Native controls match the theme on a system in the other mode |
 
 ## Toolchain (verified 2026-10-09)
 
@@ -113,7 +115,7 @@ open build_macos/LlamaBoss.app
 CMake copies `llama-server` and its dylibs into
 `LlamaBoss.app/Contents/Resources/llama.cpp/` (override with `-DLLAMABOSS_LLAMA_DIR=...`).
 When the login keychain has a "LlamaBoss Development" code-signing identity, the build
-signs the bundle with it (see "Keychain prompt on every launch" below).
+signs the bundle with it (see "Keychain prompt after every rebuild" below).
 
 ## Data locations on macOS
 
@@ -336,29 +338,44 @@ large icons. macOS 26 may show a full-bleed square icon inside its standard roun
   They apply to all fixed sizes in 14 UI files, `SidebarMonoFont` and
   `AppState::CreateMonospaceFont`.
 - The user compared against PC screenshots: the chat, composer and top bar now match.
-  Check that the sidebar's fixed-size badge ("13") and "TODAY" header are not clipped.
+  Sidebar badge and "TODAY" header checked 2026-10-12: not clipped.
 
-## Keychain prompt on every launch — fixed 2026-10-12
+## Native buttons, 2026-10-12
 
-- Cause: the linker's ad-hoc signature changes on every rebuild, and the Keychain ACL on
-  the `secrets-file-key` item no longer matched, so macOS asked for the login password
-  each time ("Always Allow" lasted only until the next rebuild).
-- Fix: a self-signed "LlamaBoss Development" code-signing certificate (10 years, RSA-2048,
-  codeSigning EKU) in the user's login keychain, trusted for code signing only, with
-  key access limited to `/usr/bin/codesign`. CMake detects it at configure time and
-  adds a post-build `codesign --force --sign "LlamaBoss Development"` after the
-  llama-server bundling step. Override with `-DLLAMABOSS_CODESIGN_IDENTITY=...`; with no
-  identity the build stays ad-hoc signed.
-- Designated requirement is now
-  `identifier "com.llamaboss.app" and certificate leaf = H"9feba90c…dc8a2efd3a4"`,
-  identical across builds.
-- Verified with UI automation: launch, chat via OpenRouter (key read from Keychain), then
-  a forced relink (CDHash changed), relaunch and chat again. No Keychain prompt.
-- The certificate is local to this Mac and not a distribution signature: Developer ID
-  signing and notarization for a public download remain Phase 4.
+- `lb_mac_native.mm` (Objective-C++, Mac only, hooked from `MyApp::OnInit` under
+  `__WXMAC__`): an app-wide `wxEventFilter` restyles every text `wxButton` when a top-level
+  window is shown and, throttled to 250 ms, on idle (covers theme switches and relabels).
+  It reads the role from the colour the shared code set, remembers it, clears the wx
+  colours (wx otherwise paints the flat fill over the bezel) and applies a native bezel.
+  No shared UI file changed; `app.cpp`'s Windows view is identical.
+- The NSApp appearance is only set when it differs from the effective one: setting it
+  makes wx send `wxEVT_SYS_COLOUR_CHANGED`, which reset the chat `wxRichTextCtrl` to the
+  system background (seen once, fixed).
+- Checked by screenshots: Settings (one blue OK, grey Cancel and actions, no truncation),
+  Connections (grey Add/Edit, red Delete, blue Close), Download Models, main window Send,
+  sidebar. Not yet looked at: Model manager, About, project attach, themed message boxes,
+  light themes.
+
+## Keychain prompt after every rebuild — open (development only)
+
+- Cause: Keychain records an "Always Allow" against the app's partition ID. For an app
+  with a Team ID that is `teamid:<ID>`, the same for every build; for an app without one
+  it is tied to the exact build (cdhash), so every rebuild asks again. (Not inspected
+  directly: reading the item's ACL was blocked by the session's safety check. Consistent
+  with every test.)
+- Done 2026-10-12: a self-signed "LlamaBoss Development" code-signing certificate in the
+  login keychain (trusted for code signing only, key usable by `/usr/bin/codesign`), and a
+  CMake post-build `codesign --force --sign` after the llama-server bundling step,
+  auto-detected at configure time (override with `-DLLAMABOSS_CODESIGN_IDENTITY=...`;
+  no identity keeps the ad-hoc signature). The designated requirement is now stable
+  (`identifier "com.llamaboss.app" and certificate leaf = H"9feba90c…"`), but a
+  self-signed certificate has no Team ID, so the prompt still returns after a rebuild.
+- Next: the user is installing Xcode. Create a free "Apple Development" certificate
+  (personal team, has a Team ID) and set `LLAMABOSS_CODESIGN_IDENTITY` to it.
+- Released builds are not affected: Developer ID signing (Phase 4) carries a Team ID.
 
 ## Next task
 
-1. Persistent `py` session on macOS.
-2. Themed buttons readable on macOS (Mac-native design, per the Mac identity principle).
+1. Apple Development signing once Xcode is installed (ends the rebuild Keychain prompt).
+2. Persistent `py` session on macOS.
 3. Mac wording ("fits in VRAM" -> unified memory), web fetch port, then Phase 4 packaging.
