@@ -120,7 +120,11 @@ void LbAboutDialog::BuildUi(const std::string& modelDisplayName,
              0, wxLEFT | wxRIGHT, pad);
     top->AddSpacer(8);
     top->Add(MakeText(this,
+#ifdef __WXMAC__
+                      "Private local desktop AI assistant for Mac.\n"
+#else
                       "Private local desktop AI assistant for Windows.\n"
+#endif
                       "Powered by llama.cpp.",
                       m_theme.textPrimary, 10),
              0, wxLEFT | wxRIGHT, pad);

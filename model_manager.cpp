@@ -191,7 +191,11 @@ void ModelManagerDialog::CreateControls()
     auto* openBtn   = MakeAccentButton(body, ID_MM_OPENFOLDER, "Open folder", t);
 
     auto* deleteHint = new wxStaticText(body, wxID_ANY,
+#ifdef __WXMAC__
+        "Press Delete or Control-click to delete");
+#else
         "Press Del or right-click to delete");
+#endif
     {
         wxFont hf = deleteHint->GetFont();
         hf.SetPointSize(LbUiPt(10));
@@ -462,7 +466,12 @@ void ModelManagerDialog::OnCharHook(wxKeyEvent& event)
     // works as expected.
     // Only when the model list itself has focus: Delete in the URL field
     // (or any other control) must edit text, not delete a model.
+#ifdef __WXMAC__
+    // The Mac "delete" key is Backspace; forward delete is fn-delete.
+    if (event.GetKeyCode() == WXK_DELETE || event.GetKeyCode() == WXK_BACK) {
+#else
     if (event.GetKeyCode() == WXK_DELETE) {
+#endif
         if (m_modelList && !m_modelPaths.empty() &&
             wxWindow::FindFocus() == m_modelList) {
             long sel = m_modelList->GetNextItem(-1, wxLIST_NEXT_ALL,
@@ -514,8 +523,15 @@ void ModelManagerDialog::OnDeleteClicked(wxCommandEvent&)
     }
     confirm += "This cannot be undone.";
 
+#ifdef __WXMAC__
+    // Mac convention for an irreversible action: the safe button is the
+    // default, so a stray Return cannot confirm the delete.
+    if (wxMessageBox(confirm, "Confirm Delete",
+                     wxYES_NO | wxNO_DEFAULT | wxICON_WARNING, this) != wxYES) {
+#else
     if (wxMessageBox(confirm, "Confirm Delete",
                      wxYES_NO | wxICON_WARNING, this) != wxYES) {
+#endif
         return;
     }
 

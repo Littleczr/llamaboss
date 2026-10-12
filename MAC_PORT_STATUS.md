@@ -85,6 +85,7 @@ Intended divergences from Windows. Features that are simply not ported yet are l
 | App icon | `app_icon.ico` | `macos/app_icon.icns` (generated from the .ico) | Bundle icon format |
 | Missing `.ico` at startup | file fallback | icon comes from the bundle; no file lookup | Avoids a modal error on launch |
 | Buttons | flat buttons filled with theme colours | native push buttons (`lb_mac_native.mm`): one accent-tinted button per dialog (default/OK), Send and New Chat accent in the main window, stop-red stays red, the rest plain; widened to fit | NSButton ignores theme fills; Mac convention is one default button per window |
+| Destructive confirmations | Yes is the default button | No is the default (model delete so far) | macOS convention; see "Screen checks" for the Windows decision |
 | GPU memory wording | "Needs 10+ GB VRAM", "fits in VRAM" | "Needs a Mac with 16 GB+ of memory" (GPU GB x 4/3, rounded up to a Mac memory size), "fits in memory" (`lb_mac_wording.h`) | Apple silicon has unified memory; the GPU can use about 3/4 of it |
 | `py` session memory cap | Job Object: 2 GiB per process; allocations fail with `MemoryError` and the session survives | watchdog stops the kernel when its physical footprint passes 2 GiB; the session is lost and the card says why | macOS refuses `RLIMIT_AS`/`RLIMIT_DATA`, so a failing-allocation cap is not available |
 | Web fetch transport | WinHTTP, system proxy settings | Poco::Net with lb_ssl's verified TLS context; no system proxy; Mac browser user-agent | No WinHTTP on macOS; the UA names the platform it runs on |
@@ -373,6 +374,22 @@ large icons. macOS 26 may show a full-bleed square icon inside its standard roun
   Markdown and raw HTML file cards with Open / Save As / Open Folder; correct title and
   first heading in the answer.
 
+## Screen checks, 2026-10-12
+
+- About: says "for Mac" (`lb_about_dialog.cpp`, Mac branch). The update check reads the
+  Windows feed; on a Mac a newer version only opens the download page (never the .exe).
+  A Mac entry in `version.json` belongs to Phase 4.
+- Manage Models: the Mac "delete" key (Backspace) deletes the selected model too, and the
+  hint reads "Press Delete or Control-click to delete". The irreversible-delete
+  confirmation defaults to **No** on the Mac (`wxNO_DEFAULT`, Mac convention).
+- Incident while testing: before that change, a delete-key test confirmed the dialog's
+  default **Yes** (a Return reached it while a macOS permission prompt was on screen) and
+  removed the user's Gemma 3 1B model. It was re-downloaded from Download Models at once.
+- **Decision for main (Windows behavior):** these yes/no confirmations also default to
+  Yes: `connections_dialog.cpp` 634, 705, 741; `conversation_controller.cpp` 1555;
+  `endpoints_dialog.cpp` 3151; `model_manager.cpp` 583; and others in `LlamaBoss.cpp` /
+  `model_switcher.cpp`. The destructive ones should default to No on both platforms.
+
 ## UI fonts, 2026-10-11
 
 - `lb_ui_font.h`: `LbUiPt(n)` (identity on Windows, n*4/3 on macOS, because Windows draws
@@ -419,6 +436,6 @@ large icons. macOS 26 may show a full-bleed square icon inside its standard roun
 
 ## Next task
 
-1. Remaining UI checks: Model manager, About, project attach, message boxes, light themes.
+1. Remaining UI checks: project attach, message boxes, light themes.
 2. Mac menu bar conventions: About and Settings (Cmd+,) in the LlamaBoss menu.
 3. Phase 4: packaging (Developer ID signing, notarization, DMG, updater).
