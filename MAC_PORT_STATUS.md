@@ -261,6 +261,45 @@ large icons. macOS 26 may show a full-bleed square icon inside its standard roun
   script types (.command, .sh, .app, .scpt, .webloc ...). `open` can't launch them anyway, because
   launching is allowlisted. Adding them would also stop the agent writing ordinary `.sh` files.
 
+## Phase 3b: Python helpers and scripts, 2026-10-11
+
+- **Decision:** use the user's installed Python, not a bundled one (user, 2026-10-11).
+- **Interpreter** (`src/platform/lb_python_posix.h`): LlamaBoss's environment
+  `~/Library/Application Support/LlamaBoss/python` if it exists, else Homebrew /
+  python.org `python3`. `/usr/bin/python3` is used only when the Command Line Tools exist.
+- **`python_install_package`** creates that environment on first use
+  (`--system-site-packages`) and pip-installs into it, because Homebrew Python refuses
+  `pip install --user` (PEP 668).
+- **`python_runner.cpp`** is portable; only the Win32 pieces are fenced, each with a POSIX
+  twin. Helper scripts ship in `Contents/Resources/python`.
+- **Verified** (harness and in-app): health check, csv_inspect, csv_to_xlsx with file card,
+  python_run_script (bare name, Skills/..., absolute path, argv, ARTIFACT_FILE), and package
+  install.
+- **Not yet done:** the persistent `py` session (`python_session.cpp`, about 1,000 lines of
+  pipes and Job Object code; it needs a long-lived piped spawn in lb_process).
+
+## UI fonts, 2026-10-11
+
+- `lb_ui_font.h`: `LbUiPt(n)` (identity on Windows, n*4/3 on macOS, because Windows draws
+  1pt = 96/72 px), `LbMonoFaceName()` and `LbFace()` (Consolas / Cascadia -> Menlo on macOS).
+  They apply to all fixed sizes in 14 UI files, `SidebarMonoFont` and
+  `AppState::CreateMonospaceFont`.
+- The user compared against PC screenshots: the chat, composer and top bar now match.
+  Check that the sidebar's fixed-size badge ("13") and "TODAY" header are not clipped.
+
+## Known issue: Keychain prompt on every launch
+
+- The build is ad-hoc signed, so every rebuild changes the code signature and the Keychain
+  ACL on the `secrets-file-key` item no longer matches. macOS then asks for the login
+  password; "Always Allow" lasts only until the next rebuild.
+- Planned fix (waiting for the user, since it needs their password once): a self-signed
+  "LlamaBoss Development" code-signing certificate in the login keychain, and a CMake
+  post-build `codesign --sign` with it. Developer ID signing for a public download is
+  Phase 4.
+
 ## Next task
 
-Phase 3 tool ports (shell: zsh vs pwsh decision pending), then the macOS themed-button fix.
+1. Set up stable local code signing (Keychain prompt fix), with the user present.
+2. Persistent `py` session on macOS.
+3. Themed buttons readable on macOS (dark text on accent, as on Windows).
+4. Mac wording ("fits in VRAM" -> unified memory), web fetch port, then Phase 4 packaging.
