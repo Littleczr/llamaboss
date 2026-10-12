@@ -225,6 +225,13 @@ Both cases use shared code (`model_switcher.cpp`, `server_manager.cpp`), so the 
     `SetForegroundColour` on native buttons. Needs one shared Mac-drawn themed button.
   - Minor: the Settings help text says "fits in VRAM"; on Apple silicon it is unified memory.
 
+## App icon — 2026-10-11
+
+`macos/app_icon.icns` is generated from `app_icon.ico` by `macos/make_icns.sh`. The .ico's
+largest frame is 256 px, so the 512 and 1024 slots are upscaled. CMake copies the .icns into
+`Contents/Resources`, and Info.plist already names it. A 1024 px source would give sharper
+large icons. macOS 26 may show a full-bleed square icon inside its standard rounded frame.
+
 ## Next task
 
 Phase 3 tool ports (shell: zsh vs pwsh decision pending), then the macOS themed-button fix.

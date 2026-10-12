@@ -121,6 +121,12 @@ if(APPLE)
         MACOSX_BUNDLE_SHORT_VERSION_STRING "${PROJECT_VERSION}"
         MACOSX_BUNDLE_COPYRIGHT "Copyright © 2026"
     )
+    # Info.plist names app_icon.icns (CFBundleIconFile); regenerate it from
+    # app_icon.ico with macos/make_icns.sh.
+    set(_lb_icns ${CMAKE_CURRENT_SOURCE_DIR}/macos/app_icon.icns)
+    target_sources(LlamaBoss PRIVATE ${_lb_icns})
+    set_source_files_properties(${_lb_icns} PROPERTIES
+        MACOSX_PACKAGE_LOCATION Resources)
 endif()
 
 # ── Bundle llama-server (macOS) ──
