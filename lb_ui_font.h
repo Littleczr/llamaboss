@@ -25,3 +25,16 @@ inline const char* LbMonoFaceName()
     return "Consolas";
 #endif
 }
+
+// Maps a Windows monospace face (Cascadia Code / Cascadia Mono / Consolas)
+// to the macOS built-in one.  Identity on Windows, so call sites keep their
+// Windows face names.
+inline const char* LbFace(const char* windowsFace)
+{
+#ifdef __WXMAC__
+    (void)windowsFace;
+    return "Menlo";
+#else
+    return windowsFace;
+#endif
+}

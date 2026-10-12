@@ -367,7 +367,7 @@ wxFont AppState::CreateMonospaceFont(int size) const
 {
     return wxFont(LbUiPt(size), wxFONTFAMILY_TELETYPE,
         wxFONTSTYLE_NORMAL, wxFONTWEIGHT_NORMAL,
-        false, "Cascadia Code");
+        false, LbFace("Cascadia Code"));
 }
 
 bool AppState::LoadApplicationIcon(wxFrame* frame, const std::string& /*iconPath*/)

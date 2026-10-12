@@ -271,7 +271,7 @@ wxFont SidebarMonoFont(int pointSize,
 {
     wxFont font(pointSize, wxFONTFAMILY_TELETYPE,
                 italic ? wxFONTSTYLE_ITALIC : wxFONTSTYLE_NORMAL,
-                weight, false, "Cascadia Mono");
+                weight, false, LbFace("Cascadia Mono"));
     if (!font.IsOk() || font.GetFaceName().empty())
         font = wxFont(pointSize, wxFONTFAMILY_TELETYPE,
                       italic ? wxFONTSTYLE_ITALIC : wxFONTSTYLE_NORMAL,

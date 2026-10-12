@@ -10,6 +10,7 @@
 //   - Freeze/Thaw wraps each ProcessDelta to prevent flicker.
 
 #include "markdown_renderer.h"
+#include "lb_ui_font.h"   // LbUiPt / LbFace: macOS font parity
 #include "chat_display_ctrl.h"
 #include "markdown_image_line.h"
 
@@ -111,7 +112,7 @@ bool MarkdownRenderer::MarkCopyLinkCopied(size_t blockIndex)
     attr.SetTextColour(m_codeLabelColor);
     attr.SetFontWeight(wxFONTWEIGHT_NORMAL);
     attr.SetFontStyle(wxFONTSTYLE_NORMAL);
-    attr.SetFontFaceName("Cascadia Code");
+    attr.SetFontFaceName(LbFace("Cascadia Code"));
 
     wxFont currentFont = m_ctrl->GetFont();
     int baseSize = currentFont.GetPointSize();
@@ -891,7 +892,7 @@ void MarkdownRenderer::WriteStyled(const std::string& text, const wxColour& colo
     attr.SetFontStyle(italic ? wxFONTSTYLE_ITALIC : wxFONTSTYLE_NORMAL);
 
     if (monospace) {
-        attr.SetFontFaceName("Cascadia Code");
+        attr.SetFontFaceName(LbFace("Cascadia Code"));
     }
 
     // Always explicitly set font size on every style attr.
