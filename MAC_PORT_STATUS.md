@@ -438,8 +438,15 @@ large icons. macOS 26 may show a full-bleed square icon inside its standard roun
 - The bundle version now comes from `LLAMABOSS_VERSION` in LlamaBoss.cpp (the one place
   the Windows side updates); Info.plist had a stale 0.1.2. The CMake signing step is
   `VERBATIM` (identity names contain parentheses).
-- Waiting on Apple: the Developer ID Application certificate (membership approval), then a
-  one-time `xcrun notarytool store-credentials` (app-specific password).
+- **First notarized release, 2026-10-12:** `dist/LlamaBoss-0.1.23-macOS.dmg`, signed with
+  "Developer ID Application: Cesar Avelar (5QV7H398ZS)" (membership renewed through
+  2027-10-12), notarytool submission c2a5b818-ee05-48fb-9c0e-f2a3ea3ca854 **Accepted**,
+  ticket stapled. `spctl`: the DMG and the app inside it are "accepted, Notarized
+  Developer ID". SHA-256 bc2c59d6f65e82c28b4c10c346f12b5e9d9fd3a45d67b45a41702108163b37cf.
+  Built from commit 02d126a (the untested menu bar / Dock work was set aside).
+  Copy on the share: `Releases/Mac/`.
+- Notary credentials: keychain profile `LlamaBoss-notary` (Apple ID + app-specific
+  password, entered by the user). Release command: `macos/package.sh --notarize LlamaBoss-notary`.
 - Still to design: the Mac entry in the update feed (`version.json`) and the website button.
 
 ## UI fonts, 2026-10-11
@@ -493,7 +500,7 @@ large icons. macOS 26 may show a full-bleed square icon inside its standard roun
    Ctrl+Cmd+S (sidebar, must not trigger Cmd+S save), use the "…" character in labels,
    commit. The keystroke test needs the user at the Mac (approval prompt).
 2. Remaining UI checks: project attach, message boxes, light themes.
-3. Phase 4: first release build with `macos/package.sh` once the static deps finish; then
-   Developer ID signing and notarization when Apple approves the membership; Mac update
-   feed; "Download for Mac" on llamaboss.com.
+3. Phase 4: test the notarized DMG on another Mac or a fresh user account; host the DMG;
+   Mac entry in the update feed (`version.json`); "Download for Mac" + Mac wording on
+   llamaboss.com (preview first, publish only with the user's approval).
 4. Skipped: the `Tests/` suite is for the Windows side (user decision 2026-10-12).
