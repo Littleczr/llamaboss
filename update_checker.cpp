@@ -213,6 +213,32 @@ std::string JsonStringOrEmpty(const Poco::JSON::Object::Ptr& obj,
     return std::string();
 }
 
+#ifndef _WIN32
+// Fills 'info' from the Mac fields of the manifest.  Returns true when the
+// result is final (no Mac release listed); false to continue with the
+// shared checks on the Mac values.
+bool MacManifestFields(const Poco::JSON::Object::Ptr& obj,
+                       const std::string& currentVersion,
+                       UpdateChecker::UpdateInfo& info)
+{
+    const std::string macVersion = JsonStringOrEmpty(obj, "mac_version");
+    info.url.clear();
+    info.notes.clear();
+    info.installerUrl.clear();   // no in-app installer on the Mac yet
+    info.sha256.clear();
+    if (macVersion.empty()) {
+        info.ok = true;
+        info.available = false;
+        info.latest = currentVersion;
+        return true;
+    }
+    info.latest = macVersion;
+    info.url    = JsonStringOrEmpty(obj, "mac_url");
+    info.notes  = JsonStringOrEmpty(obj, "mac_notes");
+    info.sha256 = JsonStringOrEmpty(obj, "mac_sha256");   // for a future installer
+    return false;
+}
+#endif
 } // namespace
 
 namespace UpdateChecker {
@@ -283,8 +309,14 @@ UpdateInfo CheckBlocking(const std::string& currentVersion)
         info.installerUrl = JsonStringOrEmpty(obj, "installer_url");
         info.sha256       = JsonStringOrEmpty(obj, "sha256");
 #else
-        // The manifest's installer is a Windows .exe; Mac builds fall back
-        // to opening the download page until a Mac package is published.
+        // version/url/installer_url/sha256 describe the Windows release
+        // ("url" is the Setup.exe itself), so the Mac build reads its own
+        // fields: mac_version, mac_url (the DMG or a download page),
+        // mac_sha256 and mac_notes.  Without mac_version the feed has no
+        // Mac release, so nothing is offered: the Windows download must
+        // never be, and a Windows-only release is not an update here.
+        if (MacManifestFields(obj, currentVersion, info))
+            return info;
 #endif
         for (char& c : info.sha256)
             if (c >= 'A' && c <= 'F') c = static_cast<char>(c - 'A' + 'a');
