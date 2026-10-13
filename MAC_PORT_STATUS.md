@@ -156,7 +156,7 @@ When the login keychain has an "Apple Development" (or, failing that, a self-sig
 | 5 | Remote endpoint streams; stop works | **Verified** streaming with OpenRouter GPT 6 Luna (2026-10-11 onward). Stop during a remote stream verified (2026-10-13) |
 | 6 | Shell and Python tools | **Done**: zsh shell tool (2026-10-11), Python helpers and scripts (2026-10-11), `py` session (2026-10-12), web fetch (2026-10-12), bundled Python runtime (2026-10-13) |
 | 7 | File-tool boundaries, protected credentials, packaged app | Credentials in the Keychain **verified**; packaged, notarized app **done** (2026-10-12). File-tool boundary cases (symlinks, case-sensitive volumes) implemented, not systematically tested |
-| 8 | Public Mac release | **Done 2026-10-12**: Beta 0.1.23 DMG on R2, "Download for Mac" on llamaboss.com. A build with the bundled Python is not notarized yet |
+| 8 | Public Mac release | **Done 2026-10-12**: Beta 0.1.23 on R2 and llamaboss.com. 0.1.24 with the bundled Python notarized 2026-10-13, not published |
 
 ## Implemented for macOS (compiles; runtime verification pending unless noted)
 
@@ -709,11 +709,29 @@ checkout of 8814026; the 9e8b3d3 packages are refused there. Those are kept in
 - **Suggestion for the Windows version:** the new-project message says "Use [ Change... ] in
   the project strip", but the strip shows "[ Project ▾ ]" (`project_controller.cpp:99`).
 
+## Notarized 0.1.24 with the bundled Python — 2026-10-13 (not published)
+
+- Built from `a44d05f` (merge of main 69a12e6) with `macos/package.sh --notarize
+  LlamaBoss-notary`: static deps, Developer ID "Cesar Avelar (5QV7H398ZS)", hardened runtime.
+  Notarization `f8f48f6f-af83-4706-a34a-e6f334e8ad5f` **Accepted**, ticket stapled to the DMG.
+- `dist/LlamaBoss-0.1.24-macOS.dmg`, 57.3 MB (0.1.23 without Python: 25.0 MB), SHA-256
+  `6591d4af917db1b0a31390b2857a5d47150b733a43fdceb004c97387ee847117`. Copy on the share:
+  `Releases/Mac/` with `_SHA256.txt`. Log: `dist/package-0.1.24.log`.
+- Checked: a quarantined copy of the DMG and the app inside are "accepted, Notarized Developer
+  ID"; bundle version 0.1.24; runtime Python 3.13.16, pypdf 6.20.1, openpyxl 3.1.5; python3
+  carries the library-validation entitlement. Run from the mounted DMG: no prompts, OpenRouter
+  connected, form inspect + fill with the bundled pypdf (0.93 s / 0.09 s).
+- As with 0.1.23, the ticket is stapled to the DMG, not to the app inside, so a user who copies
+  the app out offline gets the online check on first launch. Stapling the app as well needs a
+  second notarization of the app before the DMG is built (left for later).
+- **Not done (needs the user):** upload to R2, website button/version, `mac_version` /
+  `mac_url` / `mac_sha256` / `mac_notes` in version.json.
+
 ## Next task
 
 1. **Needs the user:** fresh-account test with `/Users/Shared/LlamaBoss-FreshTest` (checklist
    inside): create a standard user account and log in to it.
-2. Notarized 0.1.24 build with the bundled Python: see below. Publishing it (R2, website,
-   `mac_*` fields in version.json) needs the user.
+2. **Needs the user:** publish the notarized 0.1.24 DMG (section above): R2 upload, website,
+   `mac_*` fields in version.json.
 3. File-tool boundary cases on the Mac (symlinks, case-sensitive volume), milestone 7.
 4. Skipped: the `Tests/` suite is for the Windows side (user decision 2026-10-12).
