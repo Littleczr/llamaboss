@@ -1,11 +1,13 @@
 // tool_read.cpp
 
 #include "tool_read.h"
+#include "lb_ascii.h"
 #include "tool_path.h"
 #include "tool_path_safety.h"
 #include "path_safety.h"
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -185,7 +187,7 @@ std::string InferBodyLang(const std::string& absPath)
     size_t dot = absPath.rfind('.');
     if (dot == std::string::npos) return "";
     std::string ext = absPath.substr(dot + 1);
-    for (char& c : ext) c = (char)std::tolower((unsigned char)c);
+    for (char& c : ext) c = (char)lb_ascii::ToLower((unsigned char)c);
 
     static const std::unordered_map<std::string, std::string> kLangByExt = {
         { "cpp", "cpp" }, { "cc", "cpp" }, { "cxx", "cpp" },
@@ -425,6 +427,21 @@ ReadResult ReadFile(const std::string& inputPath, const ToolContext& ctx)
     if (truncated) r.chips.push_back("truncated");
     r.body     = std::move(content);
     r.bodyLang = InferBodyLang(resolved);
+
+    // Instruction files (a Skill's SKILL.md, a project WORKFLOW.md) are meant
+    // to be read whole.  Past the global 12 KiB demotion threshold they used
+    // to come back as a Vars\ handle card, so every Skill use cost an extra
+    // read_range round trip -- or the model read only part of the rules.
+    // Give them the same context-aware inline budget as read_range.
+    if (!truncated) {
+        std::string base = tool_path_safety::Basename(resolved);
+        for (char& c : base)
+            c = static_cast<char>(lb_ascii::ToLower(static_cast<unsigned char>(c)));
+        if (base == "skill.md" || base == "workflow.md")
+            r.historyInlineBudgetBytes =
+                ComputeRangedReadHistoryBudget(ctx.ctxTokens);
+    }
+
     r.chips.push_back(ElapsedChip(t0));
     return r;
 }

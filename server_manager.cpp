@@ -1,5 +1,6 @@
 // server_manager.cpp
 #include "server_manager.h"
+#include "lb_ascii.h"
 #include "background_work.h"   // lb::BeginBackgroundWork (drained in MyApp::OnExit)
 #include "server_log_hints.h"   // plain-language startup failure hints
 #include "path_safety.h"
@@ -146,7 +147,7 @@ static std::string ReadLogTail(const std::string& path, size_t maxBytes = 4096)
 static std::string ToLowerAscii(std::string s)
 {
     std::transform(s.begin(), s.end(), s.begin(),
-                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                   [](unsigned char c) { return static_cast<char>(lb_ascii::ToLower(c)); });
     return s;
 }
 
@@ -815,7 +816,7 @@ static std::string SlotCacheFilenameFor(const std::string& modelGgufPath,
             if (c == '\\') c = '/';
 #ifdef __WXMSW__
             c = static_cast<char>(
-                std::tolower(static_cast<unsigned char>(c)));
+                lb_ascii::ToLower(static_cast<unsigned char>(c)));
 #endif
         }
         return out;

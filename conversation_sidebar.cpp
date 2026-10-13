@@ -4,6 +4,7 @@
 
 #include "conversation_sidebar.h"
 #include "lb_ui_font.h"   // LbUiPt: macOS point-size parity
+#include "lb_ascii.h"
 #include "chat_history.h"
 #include "theme.h"
 #include "lb_hover_tile.h"
@@ -82,7 +83,7 @@ bool ParseConversationActivityTime(const std::string& text, wxDateTime& out)
         int v = 0;
         for (size_t i = 0; i < count; ++i) {
             const unsigned char ch = static_cast<unsigned char>(text[pos + i]);
-            if (!std::isdigit(ch)) return false;
+            if (!lb_ascii::IsDigit(ch)) return false;
             v = v * 10 + (ch - '0');
         }
         value = v;
@@ -112,7 +113,7 @@ bool ParseConversationActivityTime(const std::string& text, wxDateTime& out)
     if (pos < text.size() && text[pos] == '.') {
         ++pos;
         int digits = 0;
-        while (pos < text.size() && std::isdigit(
+        while (pos < text.size() && lb_ascii::IsDigit(
                    static_cast<unsigned char>(text[pos]))) {
             if (digits < 3)
                 milliseconds = milliseconds * 10 + (text[pos] - '0');
@@ -188,7 +189,7 @@ std::string CollapseSidebarTitleWhitespace(std::string text)
     bool lastWasSpace = false;
 
     for (unsigned char ch : text) {
-        if (std::isspace(ch)) {
+        if (lb_ascii::IsSpace(ch)) {
             if (!lastWasSpace && !out.empty()) out.push_back(' ');
             lastWasSpace = true;
         } else {
@@ -2003,7 +2004,7 @@ ConversationSidebar::ScanConversations()
                         if (colonPos == std::string::npos) return false;
                         size_t valuePos = colonPos + 1;
                         while (valuePos < line.size() &&
-                               std::isspace(static_cast<unsigned char>(line[valuePos]))) {
+                               lb_ascii::IsSpace(static_cast<unsigned char>(line[valuePos]))) {
                             ++valuePos;
                         }
                         // Only accept actual JSON string values.  Without
@@ -2067,7 +2068,7 @@ ConversationSidebar::ScanConversations()
 
                         size_t valuePos = colonPos + 1;
                         while (valuePos < line.size() &&
-                               std::isspace(
+                               lb_ascii::IsSpace(
                                    static_cast<unsigned char>(line[valuePos]))) {
                             ++valuePos;
                         }

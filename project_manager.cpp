@@ -1,4 +1,5 @@
 #include "project_manager.h"
+#include "lb_ascii.h"
 #include "path_safety.h"
 
 #include <Poco/Timestamp.h>
@@ -57,16 +58,16 @@ std::string CurrentIsoTimestamp()
 std::string TrimAscii(std::string s)
 {
     size_t a = 0;
-    while (a < s.size() && std::isspace(static_cast<unsigned char>(s[a]))) ++a;
+    while (a < s.size() && lb_ascii::IsSpace(static_cast<unsigned char>(s[a]))) ++a;
     size_t b = s.size();
-    while (b > a && std::isspace(static_cast<unsigned char>(s[b - 1]))) --b;
+    while (b > a && lb_ascii::IsSpace(static_cast<unsigned char>(s[b - 1]))) --b;
     return s.substr(a, b - a);
 }
 
 
 std::string LowerAscii(std::string s)
 {
-    for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    for (char& c : s) c = static_cast<char>(lb_ascii::ToLower(static_cast<unsigned char>(c)));
     return s;
 }
 

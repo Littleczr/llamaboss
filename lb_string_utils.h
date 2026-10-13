@@ -1,4 +1,5 @@
 #pragma once
+#include "lb_ascii.h"
 
 // ─── lb_string_utils.h ─────────────────────────────────────────────
 // Tiny ASCII-only string helpers shared across the file-local support
@@ -22,7 +23,7 @@ std::string ProjectSource_HumanBytes(unsigned long long bytes);
 inline std::string LbLowerAscii(std::string s)
 {
     for (char& ch : s)
-        ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+        ch = static_cast<char>(lb_ascii::ToLower(static_cast<unsigned char>(ch)));
     return s;
 }
 

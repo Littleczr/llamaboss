@@ -94,3 +94,7 @@ dist/
 
 # Downloaded llama.cpp release (bundled into the app by CMake)
 third_party/
+
+# Personal release signing (Azure IDs)
+sign-windows-release.ps1
+WINDOWS_SIGNING.md

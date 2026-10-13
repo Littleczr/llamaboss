@@ -1,6 +1,7 @@
 // secrets_store.cpp
 
 #include "secrets_store.h"
+#include "lb_ascii.h"
 #include "chatgpt_auth_core.h"   // lb_chatgpt::Base64UrlEncode / Base64UrlDecode
 
 #include "lb_windows.h"
@@ -101,7 +102,7 @@ std::string NormalizeEnvRefName(std::string envVarName)
 
     std::string lowered = envVarName;
     std::transform(lowered.begin(), lowered.end(), lowered.begin(),
-                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                   [](unsigned char c) { return static_cast<char>(lb_ascii::ToLower(c)); });
 
     constexpr const char* psPrefix = "$env:";
     constexpr size_t psPrefixLen = 5;
@@ -148,8 +149,8 @@ std::string EnvNameComponent(const std::string& s)
     bool lastWasUnderscore = false;
     for (unsigned char ch : s) {
         char c = static_cast<char>(ch);
-        if (std::isalnum(ch)) {
-            out.push_back(static_cast<char>(std::toupper(ch)));
+        if (lb_ascii::IsAlnum(ch)) {
+            out.push_back(static_cast<char>(lb_ascii::ToUpper(ch)));
             lastWasUnderscore = false;
         }
         else if (c == '_') {

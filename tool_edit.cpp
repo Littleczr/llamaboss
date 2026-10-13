@@ -1,12 +1,15 @@
 // tool_edit.cpp
 
 #include "tool_edit.h"
+#include "lb_ascii.h"
 #include "tool_path.h"
 #include "tool_path_safety.h"   // IsUnderAllowedWriteRoot, Basename
 #include "tool_staged_write.h"  // StagedTempFile, CreateStagedTempFile
 #include "tool_open.h"          // ClassifyForOpen, FileRisk
 #include "path_safety.h"
 #include "tool_mutation_guard.h"
+
+#include <cctype>
 
 #include "lb_windows.h"
 
@@ -634,14 +637,29 @@ EditResult EditFile(const std::string& argsBlob,
     }
 
     // ── Risky-extension block ────────────────────────────────────
-    // Same kill-list as write/open.  We don't edit .bat / .ps1 /
-    // .exe / .reg / .lnk / .vbs / macro Office docs / etc.  If the
-    // user wants to modify one of these, they can do it manually.
-    if (ClassifyForOpen(resolved) == FileRisk::Risky) {
+    // Same kill-list as write/open.  We don't edit .bat / .exe / .reg /
+    // .lnk / .vbs / macro Office docs / etc.  If the user wants to modify
+    // one of these, they can do it manually.
+    //
+    // Exception: PowerShell .ps1 scripts.  write_powershell_script can
+    // already replace a whole .ps1 after approval, so refusing edit only
+    // forced full-file rewrites for one-line fixes (slow, and a rewrite
+    // can silently drop parts of the script).  tool_approval.h gates every
+    // .ps1 edit behind the same approval card (EditTargetsPowerShellScript).
+    auto isPowerShellScript = [](const std::string& p) {
+        if (p.size() < 4) return false;
+        std::string ext = p.substr(p.size() - 4);
+        for (char& c : ext)
+            c = static_cast<char>(lb_ascii::ToLower(static_cast<unsigned char>(c)));
+        return ext == ".ps1";
+    };
+    if (ClassifyForOpen(resolved) == FileRisk::Risky &&
+        !isPowerShellScript(resolved)) {
         r.chips.push_back("blocked");
         r.errorBody = "Refuses to edit files with executable or "
-                      "scriptable extensions. If the user wants this, "
-                      "they can edit the file manually.";
+                      "scriptable extensions (PowerShell .ps1 scripts are "
+                      "the exception, after approval). If the user wants "
+                      "this, they can edit the file manually.";
         r.chips.push_back(ElapsedChip(t0));
         return r;
     }

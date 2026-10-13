@@ -1,4 +1,5 @@
 #pragma once
+#include "lb_ascii.h"
 // skill_connections.h
 //
 // Which Connections (SecretsStore providers) a script is allowed to see.
@@ -41,7 +42,7 @@ inline std::string NormalizeToken(const std::string& s)
     std::string out;
     out.reserve(s.size());
     for (unsigned char c : s) {
-        out.push_back(std::isalnum(c) ? static_cast<char>(std::tolower(c)) : '_');
+        out.push_back(lb_ascii::IsAlnum(c) ? static_cast<char>(lb_ascii::ToLower(c)) : '_');
     }
     return out;
 }
@@ -58,7 +59,7 @@ inline std::string Trim(const std::string& s)
 
 inline std::string Lower(std::string s)
 {
-    for (auto& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    for (auto& c : s) c = static_cast<char>(lb_ascii::ToLower(static_cast<unsigned char>(c)));
     return s;
 }
 
@@ -91,7 +92,7 @@ inline std::string FirstWord(const std::string& raw)
     std::string word;
     for (; i < s.size(); ++i) {
         const unsigned char c = static_cast<unsigned char>(s[i]);
-        if (std::isalnum(c) || c == '_' || c == '-' || c == '.') {
+        if (lb_ascii::IsAlnum(c) || c == '_' || c == '-' || c == '.') {
             word.push_back(static_cast<char>(c));
         } else {
             break;
@@ -112,7 +113,7 @@ inline bool StripListMarker(const std::string& line, std::string& rest)
         return true;
     }
     size_t i = 0;
-    while (i < s.size() && std::isdigit(static_cast<unsigned char>(s[i]))) ++i;
+    while (i < s.size() && lb_ascii::IsDigit(static_cast<unsigned char>(s[i]))) ++i;
     if (i > 0 && i + 1 < s.size() && (s[i] == '.' || s[i] == ')') &&
         (s[i + 1] == ' ' || s[i + 1] == '\t')) {
         rest = s.substr(i + 2);

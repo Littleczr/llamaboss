@@ -1,5 +1,6 @@
 // activity_strip.cpp — see activity_strip.h
 #include "activity_strip.h"
+#include "lb_ascii.h"
 #include "theme.h"
 
 #include <wx/sizer.h>
@@ -36,7 +37,7 @@ int ParsePercent(const std::string& line)
     for (size_t i = 0; i < line.size(); ++i) {
         if (line[i] != '%') continue;
         size_t j = i;
-        while (j > 0 && (std::isdigit(static_cast<unsigned char>(line[j - 1])) ||
+        while (j > 0 && (lb_ascii::IsDigit(static_cast<unsigned char>(line[j - 1])) ||
                          line[j - 1] == '.')) {
             --j;
         }

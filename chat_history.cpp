@@ -1,5 +1,6 @@
 // chat_history.cpp
 #include "chat_history.h"
+#include "lb_ascii.h"
 #include "reasoning_policy.h"
 #include "openai_responses.h"
 #include "path_safety.h"
@@ -68,7 +69,7 @@ std::string StripSessionContextHeader(std::string content)
     if (closeBracket != std::string::npos) {
         size_t start = closeBracket + 1;
         while (start < content.size() &&
-               std::isspace(static_cast<unsigned char>(content[start]))) {
+               lb_ascii::IsSpace(static_cast<unsigned char>(content[start]))) {
             ++start;
         }
         return content.substr(start);
@@ -86,7 +87,7 @@ bool EndsWithAsciiNoCase(const std::string& value, const std::string& suffix)
     for (size_t i = 0; i < suffix.size(); ++i) {
         const unsigned char a = static_cast<unsigned char>(value[offset + i]);
         const unsigned char b = static_cast<unsigned char>(suffix[i]);
-        if (std::tolower(a) != std::tolower(b)) return false;
+        if (lb_ascii::ToLower(a) != lb_ascii::ToLower(b)) return false;
     }
     return true;
 }
@@ -123,16 +124,29 @@ bool WantsAnthropicCacheControl(const std::string& model,
     static const char kPrefix[] = "anthropic/";
     if (id.size() <= sizeof(kPrefix) - 1) return false;
     for (size_t i = 0; i < sizeof(kPrefix) - 1; ++i) {
-        if (std::tolower(static_cast<unsigned char>(id[i])) != kPrefix[i])
+        if (lb_ascii::ToLower(static_cast<unsigned char>(id[i])) != kPrefix[i])
             return false;
     }
     return true;
 }
 
+// One-hour TTL on both breakpoints (mixed TTLs on one block are rejected,
+// and Anthropic requires longer-TTL entries to precede shorter ones, so both
+// use the same value).  With the default 5 minutes, any pause longer than
+// that -- a 6-minute publish/build tool run, or the user reading a dry-run
+// report before replying -- expired the cache and the next step re-wrote
+// the whole conversation (seen: one 117k-token rewrite costing ~12x a
+// normal step).  1h writes cost 2x input instead of 1.25x, but only the
+// new tail of each step is written, so the extra cost is small next to a
+// single full rewrite.  Set kAnthropicCacheTtl to "" to restore 5 minutes.
+constexpr const char* kAnthropicCacheTtl = "1h";
+
 Poco::JSON::Object::Ptr EphemeralCacheControl()
 {
     Poco::JSON::Object::Ptr cc = new Poco::JSON::Object;
     cc->set("type", std::string("ephemeral"));
+    if (kAnthropicCacheTtl[0] != '\0')
+        cc->set("ttl", std::string(kAnthropicCacheTtl));
     return cc;
 }
 
@@ -1377,7 +1391,8 @@ std::string ChatHistory::BuildChatRequestJson(const std::string& model, bool str
     //      the last cacheable block and moves it forward as the
     //      conversation grows, so each agent step reads everything the
     //      previous step wrote.
-    // Both are 5-minute ephemeral (same TTL — mixed TTLs on one block 400).
+    // Both use the same TTL (kAnthropicCacheTtl, 1 hour) — mixed TTLs on one
+    // block 400.
     // An ephemeral recovery nudge appended to the system prompt changes
     // the prefix for that one request only: one cache write, not an error.
     const bool anthropicCache =
@@ -1404,6 +1419,20 @@ std::string ChatHistory::BuildChatRequestJson(const std::string& model, bool str
         root->set("stream", stream);
         if (anthropicCache)
             root->set("cache_control", EphemeralCacheControl());
+
+        // OpenRouter sticky routing: with a session_id, OpenRouter keeps this
+        // conversation on the same Claude provider from the first successful
+        // request (without one, stickiness starts only after a cache hit).
+        // A provider switch mid-chat lands on a cold cache and re-writes the
+        // conversation.  Same stable per-conversation key as the OpenAI
+        // prompt_cache_key below; only sent where cache_control is.
+        if (anthropicCache) {
+            if (m_createdAt.empty()) m_createdAt = CurrentTimestamp();
+            char sessionKey[24];
+            std::snprintf(sessionKey, sizeof(sessionKey), "lb-%016llx",
+                          static_cast<unsigned long long>(Fnv1a64(m_createdAt)));
+            root->set("session_id", std::string(sessionKey));
+        }
 
         // OpenAI prompt caching routes on the first few hundred prompt
         // tokens plus an optional prompt_cache_key.  Every LlamaBoss chat
@@ -2973,12 +3002,12 @@ namespace {
 
 bool TitleIsIdChar(char c)
 {
-    return std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '-';
+    return lb_ascii::IsAlnum(static_cast<unsigned char>(c)) || c == '_' || c == '-';
 }
 
 std::string TitleTrim(std::string s)
 {
-    auto notSpace = [](unsigned char c) { return !std::isspace(c); };
+    auto notSpace = [](unsigned char c) { return !lb_ascii::IsSpace(c); };
     s.erase(s.begin(), std::find_if(s.begin(), s.end(), notSpace));
     s.erase(std::find_if(s.rbegin(), s.rend(), notSpace).base(), s.end());
     return s;
@@ -2987,7 +3016,7 @@ std::string TitleTrim(std::string s)
 std::string TitleLower(std::string s)
 {
     std::transform(s.begin(), s.end(), s.begin(),
-        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        [](unsigned char c) { return static_cast<char>(lb_ascii::ToLower(c)); });
     return s;
 }
 
@@ -3001,7 +3030,7 @@ std::string TitleCollapseWhitespace(std::string s)
     out.reserve(s.size());
     bool lastWasSpace = false;
     for (unsigned char ch : s) {
-        if (std::isspace(ch)) {
+        if (lb_ascii::IsSpace(ch)) {
             if (!lastWasSpace) out.push_back(' ');
             lastWasSpace = true;
         }
@@ -3677,7 +3706,7 @@ std::string ChatHistory::FormatToolBlockAsUserMessage(
     const std::string fence(fenceLen, '`');
 
     auto lowerAscii = [](std::string v) {
-        for (char& c : v) c = (char)std::tolower((unsigned char)c);
+        for (char& c : v) c = (char)lb_ascii::ToLower((unsigned char)c);
         return v;
     };
     // stderr alone is a failure only when nothing says the command

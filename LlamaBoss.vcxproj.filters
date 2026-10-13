@@ -483,6 +483,9 @@
     <ClInclude Include="activity_strip.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="lb_ascii.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="lb_string_utils.h">
       <Filter>Header Files</Filter>
     </ClInclude>

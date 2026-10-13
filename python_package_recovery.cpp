@@ -106,7 +106,8 @@ bool LbExtractAfterToken(const std::string& text,
 //      --disable-pip-version-check ..." — a hint our own scripts
 //      sometimes emit before failing.
 //   3. A small allow-list of "openpyxl python package is required",
-//      "install pymupdf", "install pypdf" phrases that our own
+//      "install pymupdf", "install pypdf", "missing pdf form/text
+//      extraction dependency" (both pypdf) phrases that our own
 //      helpers emit when they detect a missing dependency early.
 // On success: importNameOut is the raw import-name candidate,
 // packageNameOut is the normalized PyPI name, and installableOut is
@@ -132,10 +133,10 @@ bool LbFindMissingPythonPackage(const std::string& stdoutText,
             !LbExtractAfterToken(lower, "pip install --user", candidate)) {
             if (lower.find("openpyxl python package is required") != std::string::npos) {
                 candidate = "openpyxl";
-            } else if (lower.find("missing pdf form dependency") != std::string::npos ||
-                       lower.find("install pymupdf") != std::string::npos) {
+            } else if (lower.find("install pymupdf") != std::string::npos) {
                 candidate = "pymupdf";
-            } else if (lower.find("missing pdf text extraction dependency") != std::string::npos ||
+            } else if (lower.find("missing pdf form dependency") != std::string::npos ||
+                       lower.find("missing pdf text extraction dependency") != std::string::npos ||
                        lower.find("install pypdf") != std::string::npos) {
                 candidate = "pypdf";
             }

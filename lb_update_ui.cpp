@@ -1,11 +1,12 @@
 #include "lb_update_ui.h"
+#include "lb_ascii.h"
 
 namespace {
 
 std::string LbUpdateLowerAscii(std::string s)
 {
     std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
-        return static_cast<char>(std::tolower(c));
+        return static_cast<char>(lb_ascii::ToLower(c));
     });
     return s;
 }

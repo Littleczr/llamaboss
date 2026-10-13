@@ -159,8 +159,8 @@ public:
     // summary of every form field (name, type, current value,
     // options where applicable, page, required flag, tooltip).
     // Read-only, no file output, no approval gate.  Refuses XFA-only
-    // PDFs with a model-readable explanation.  Requires the PyMuPDF
-    // (`pymupdf` / `fitz`) Python package on the system Python.
+    // PDFs with a model-readable explanation.  Requires the pypdf Python
+    // package.
     bool StartPdfInspectForm(const std::string& pathArg,
                              const std::string& cwd,
                              unsigned long      timeoutMs = kDefaultTimeoutMs);
@@ -173,8 +173,8 @@ public:
     // remaining lines are a JSON object mapping field names to values.
     // Mutating, approval-gated.  Refuses XFA-only PDFs and rejects the
     // entire call (no partial fills) if any field name does not exist
-    // or any value is invalid for its field type.  Requires the
-    // PyMuPDF (`pymupdf`) Python package on the system Python.
+    // or any value is invalid for its field type.  Requires the pypdf
+    // Python package.
     bool StartPdfFillForm(const std::string& argsBlob,
                           const std::string& cwd,
                           unsigned long      timeoutMs = kDefaultTimeoutMs);

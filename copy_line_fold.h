@@ -1,4 +1,5 @@
 #pragma once
+#include "lb_ascii.h"
 // ═══════════════════════════════════════════════════════════════════
 //  copy_line_fold.h — fold runs of "<src> -> <dst> done" lines
 // ═══════════════════════════════════════════════════════════════════
@@ -41,7 +42,7 @@ namespace detail {
 
 inline std::string Lower(std::string s)
 {
-    for (char& c : s) c = (char)std::tolower((unsigned char)c);
+    for (char& c : s) c = (char)lb_ascii::ToLower((unsigned char)c);
     return s;
 }
 

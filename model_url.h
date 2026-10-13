@@ -1,4 +1,5 @@
 #pragma once
+#include "lb_ascii.h"
 
 // model_url.h
 //
@@ -33,7 +34,7 @@ namespace detail {
 
 inline std::string Lower(std::string s)
 {
-    for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    for (char& c : s) c = static_cast<char>(lb_ascii::ToLower(static_cast<unsigned char>(c)));
     return s;
 }
 
@@ -88,7 +89,7 @@ inline bool IsSplitPart(const std::string& lowerName)
     const std::string t = stem.substr(stem.size() - 15);
     if (t[0] != '-' || t.compare(6, 4, "-of-") != 0) return false;
     for (int i : {1, 2, 3, 4, 5, 10, 11, 12, 13, 14})
-        if (!std::isdigit(static_cast<unsigned char>(t[i]))) return false;
+        if (!lb_ascii::IsDigit(static_cast<unsigned char>(t[i]))) return false;
     return true;
 }
 

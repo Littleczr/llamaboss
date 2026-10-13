@@ -3,6 +3,7 @@
 #ifdef __WXMAC__
 #include "lb_mac_confirm.h"   // Mac alert button labels
 #endif
+#include "lb_ascii.h"
 
 #include "app.h"
 #include "app_state.h"
@@ -94,7 +95,7 @@ static bool IsHiddenGoalReplaySystemMessage(const std::string& content)
 
 static std::string TrimCopy(std::string s)
 {
-    auto notSpace = [](unsigned char c) { return !std::isspace(c); };
+    auto notSpace = [](unsigned char c) { return !lb_ascii::IsSpace(c); };
     s.erase(s.begin(), std::find_if(s.begin(), s.end(), notSpace));
     s.erase(std::find_if(s.rbegin(), s.rend(), notSpace).base(), s.end());
     return s;
@@ -103,7 +104,7 @@ static std::string TrimCopy(std::string s)
 static std::string LowerCopy(std::string s)
 {
     std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
-        return static_cast<char>(std::tolower(c));
+        return static_cast<char>(lb_ascii::ToLower(c));
     });
     return s;
 }
@@ -174,7 +175,7 @@ static std::string ToolNameFromTag(const std::string& tag)
 
     if (tag.empty()) return "Tool";
     std::string out = tag;
-    out[0] = static_cast<char>(std::toupper(static_cast<unsigned char>(out[0])));
+    out[0] = static_cast<char>(lb_ascii::ToUpper(static_cast<unsigned char>(out[0])));
     return out;
 }
 
@@ -900,7 +901,7 @@ std::string ExportToolName(std::string name)
     for (char& c : name) {
         if (c == '_') { c = ' '; startWord = true; continue; }
         if (startWord)
-            c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+            c = static_cast<char>(lb_ascii::ToUpper(static_cast<unsigned char>(c)));
         startWord = (c == ' ');
     }
     return name;

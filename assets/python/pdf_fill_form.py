@@ -37,25 +37,24 @@ def unique_path(folder, filename):
     return folder / f"{stem}_latest{suffix}"
 
 
-def load_fitz():
+def load_pypdf():
+    # pypdf is pure Python and permissively licensed (BSD), so it can ship
+    # with LlamaBoss; the Mac app bundles it.  Re-add the user site before
+    # giving up (PythonRunner launches helpers with -I, which suppresses
+    # per-user site packages).
     errors = []
 
     def try_import():
         try:
-            import pymupdf
-            return pymupdf, 'pymupdf'
+            import pypdf
+            return pypdf
         except Exception as ex:
-            errors.append('pymupdf: ' + str(ex))
-        try:
-            import fitz
-            return fitz, 'fitz'
-        except Exception as ex:
-            errors.append('fitz: ' + str(ex))
-        return None, None
+            errors.append('pypdf: ' + str(ex))
+        return None
 
-    mod, name = try_import()
+    mod = try_import()
     if mod is not None:
-        return mod, name, errors
+        return mod, errors
 
     try:
         user_site = getattr(site, 'USER_SITE', None)
@@ -64,118 +63,166 @@ def load_fitz():
     except Exception as ex:
         errors.append('user-site enable failed: ' + str(ex))
 
-    mod, name = try_import()
-    return mod, name, errors
+    return try_import(), errors
 
 
-def normalize_field_type(fitz_mod, widget):
+# ── AcroForm walking (shared shape with pdf_fill_form.py) ───────────
+# Field attributes /FT, /Ff, /V and /DA are inheritable: a widget may
+# carry them itself (merged field+widget) or inherit them from any
+# ancestor in the /Parent chain.  Names are fully qualified
+# ("parent.child"), matching what Acrobat and Preview show.
+
+FF_REQUIRED = 1 << 1
+FF_RADIO = 1 << 15
+FF_PUSHBUTTON = 1 << 16
+FF_COMBO = 1 << 17
+
+
+def inherited(node, key):
+    seen = 0
+    while node is not None and seen < 64:
+        if key in node:
+            return node[key]
+        parent = node.get('/Parent')
+        node = parent.get_object() if parent is not None else None
+        seen += 1
+    return None
+
+
+def field_dict(widget):
+    # The terminal field is the widget itself when it has a /T, else its parent.
+    if '/T' in widget:
+        return widget
+    parent = widget.get('/Parent')
+    return parent.get_object() if parent is not None else widget
+
+
+def qualified_name(field):
+    parts = []
+    node, seen = field, 0
+    while node is not None and seen < 64:
+        t = node.get('/T')
+        if t is not None:
+            parts.append(str(t))
+        parent = node.get('/Parent')
+        node = parent.get_object() if parent is not None else None
+        seen += 1
+    return '.'.join(reversed(parts))
+
+
+def name_str(v):
+    # PDF names come back as '/Yes'; text strings as-is.
+    s = '' if v is None else str(v)
+    return s[1:] if s.startswith('/') else s
+
+
+def field_type(widget):
+    ft = inherited(widget, '/FT')
     try:
-        t = int(widget.field_type)
+        ff = int(inherited(widget, '/Ff') or 0)
     except Exception:
-        return 'unknown'
-
-    name_by_int = {
-        getattr(fitz_mod, 'PDF_WIDGET_TYPE_BUTTON', -1):       'button',
-        getattr(fitz_mod, 'PDF_WIDGET_TYPE_CHECKBOX', -1):     'checkbox',
-        getattr(fitz_mod, 'PDF_WIDGET_TYPE_RADIOBUTTON', -1):  'radio',
-        getattr(fitz_mod, 'PDF_WIDGET_TYPE_TEXT', -1):         'text',
-        getattr(fitz_mod, 'PDF_WIDGET_TYPE_LISTBOX', -1):      'listbox',
-        getattr(fitz_mod, 'PDF_WIDGET_TYPE_COMBOBOX', -1):     'dropdown',
-        getattr(fitz_mod, 'PDF_WIDGET_TYPE_SIGNATURE', -1):    'signature',
-    }
-    if t in name_by_int and name_by_int[t] != 'unknown':
-        return name_by_int[t]
-    label = getattr(widget, 'field_type_string', '') or ''
-    label = str(label).strip().lower()
-    if 'check' in label:    return 'checkbox'
-    if 'radio' in label:    return 'radio'
-    if 'combo' in label:    return 'dropdown'
-    if 'list' in label:     return 'listbox'
-    if 'sign' in label:     return 'signature'
-    if 'text' in label:     return 'text'
-    if 'button' in label:   return 'button'
+        ff = 0
+    if ft == '/Tx':
+        return 'text'
+    if ft == '/Btn':
+        if ff & FF_PUSHBUTTON:
+            return 'button'
+        return 'radio' if ff & FF_RADIO else 'checkbox'
+    if ft == '/Ch':
+        return 'dropdown' if ff & FF_COMBO else 'listbox'
+    if ft == '/Sig':
+        return 'signature'
     return 'unknown'
 
 
 def widget_on_states(widget):
     try:
-        states = widget.button_states() or {}
-        on_states = list(states.get('normal', []) or [])
-        return [s for s in on_states if str(s).lower() not in ('off', '')]
+        normal = widget['/AP'].get_object()['/N'].get_object()
+        return [name_str(k) for k in normal.keys() if name_str(k).lower() != 'off']
     except Exception:
         return []
 
 
-def widget_options(widget):
+def field_options(field):
+    out = []
     try:
-        return [str(o) for o in (getattr(widget, 'choice_values', None) or [])]
-    except Exception:
-        return []
-
-
-def detect_form_kind(doc):
-    try:
-        is_acro = bool(getattr(doc, 'is_form_pdf', False))
-    except Exception:
-        is_acro = False
-    has_xfa = False
-    try:
-        xfa = getattr(doc, 'xfa', None)
-        if xfa:
-            has_xfa = True
+        for o in (inherited(field, '/Opt') or []):
+            o = o.get_object() if hasattr(o, 'get_object') else o
+            # [export_value, display_text] pairs: the export value is what /V holds.
+            if isinstance(o, list) and o:
+                o = o[0]
+            out.append(str(o))
     except Exception:
         pass
-    if is_acro and not has_xfa:
+    return out
+
+
+def iter_widgets(pages):
+    for page_index, page in enumerate(pages, start=1):
+        try:
+            annots = page.get('/Annots')
+            annots = annots.get_object() if annots is not None else []
+        except Exception:
+            annots = []
+        for a in annots or []:
+            try:
+                w = a.get_object()
+            except Exception:
+                continue
+            if w.get('/Subtype') == '/Widget':
+                yield page_index, w
+
+
+def form_kind(reader):
+    try:
+        acro = reader.trailer['/Root'].get('/AcroForm')
+        acro = acro.get_object() if acro is not None else None
+    except Exception:
+        acro = None
+    if acro is None:
+        return 'None'
+    try:
+        has_fields = len(acro.get('/Fields') or []) > 0
+    except Exception:
+        has_fields = False
+    has_xfa = '/XFA' in acro
+    if has_fields and not has_xfa:
         return 'AcroForm'
-    if is_acro and has_xfa:
+    if has_fields and has_xfa:
         return 'AcroForm+XFA'
     if has_xfa:
         return 'XFA'
     return 'None'
 
 
-def collect_field_metadata(doc, fitz_mod):
-    """Walk the document once and capture every per-field detail
-    needed for validation, WITHOUT keeping widget references.
-
-    PyMuPDF widgets become "unbound from their page" once the parent
-    page Python object falls out of scope, which makes any later
-    .update() call fail with "Annot is not bound to a page".  We
-    sidestep that entirely by reading button_states / choice_values
-    while the page is still in scope, caching only plain Python data,
-    and re-walking the doc again in the mutation pass.
-    """
+def collect_field_metadata(reader):
+    """Walk the form once and capture every per-field detail needed for
+    validation as plain Python data: type, first page, on-states and
+    options.  Radio groups and mirrored fields appear once."""
     meta = {}
-    for page_index, page in enumerate(doc, start=1):
-        try:
-            widgets = list(page.widgets() or [])
-        except Exception:
-            widgets = []
-        for w in widgets:
-            name = str(getattr(w, 'field_name', '') or '')
-            if not name:
-                continue
-            ftype = normalize_field_type(fitz_mod, w)
-            entry = meta.get(name)
-            if entry is None:
-                entry = {
-                    'type':            ftype,
-                    'first_page':      page_index,
-                    'on_states':       set(),
-                    'options':         [],
-                    'instance_count':  0,
-                }
-                meta[name] = entry
-            if ftype in ('checkbox', 'radio'):
-                for st in widget_on_states(w):
-                    entry['on_states'].add(st)
-            if ftype in ('dropdown', 'listbox') and not entry['options']:
-                entry['options'] = widget_options(w)
-            entry['instance_count'] += 1
-
-    # Stabilize set-typed fields for downstream comparisons.
-    for entry in meta.values():
-        entry['on_states'] = sorted(entry['on_states'])
+    for page_index, widget in iter_widgets(reader.pages):
+        field = field_dict(widget)
+        name = qualified_name(field)
+        if not name:
+            continue
+        ftype = field_type(widget)
+        entry = meta.get(name)
+        if entry is None:
+            entry = {
+                'type':            ftype,
+                'first_page':      page_index,
+                'on_states':       [],
+                'options':         [],
+                'instance_count':  0,
+            }
+            meta[name] = entry
+        if ftype in ('checkbox', 'radio'):
+            for st in widget_on_states(widget):
+                if st not in entry['on_states']:
+                    entry['on_states'].append(st)
+        if ftype in ('dropdown', 'listbox') and not entry['options']:
+            entry['options'] = field_options(field)
+        entry['instance_count'] += 1
     return meta
 
 
@@ -298,47 +345,49 @@ def main():
     if not fill_map:
         emit({'ok': False, 'helper': 'pdf_fill_form', 'error': 'Field map is empty -- nothing to fill. Provide at least one {field_name: value} entry.'}, 14)
 
-    fitz_mod, mod_name, import_errors = load_fitz()
-    if fitz_mod is None:
+    pypdf, import_errors = load_pypdf()
+    if pypdf is None:
         emit({
             'ok': False,
             'helper': 'pdf_fill_form',
-            'error': 'Missing PDF form dependency. Install PyMuPDF with: py -3 -m pip install --user pymupdf',
+            'error': 'Missing PDF form dependency: the Python package pypdf is not installed.',
             'details': import_errors[-6:],
         }, 8)
+    mod_name = 'pypdf'
 
     try:
-        doc = fitz_mod.open(str(target))
+        reader = pypdf.PdfReader(str(target))
+        if reader.is_encrypted:
+            reader.decrypt('')
+        len(reader.pages)   # parse the page tree now, so a damaged file fails here
     except Exception as ex:
         emit({'ok': False, 'helper': 'pdf_fill_form', 'error': 'Could not open PDF: ' + str(ex), 'path': str(target)}, 6)
 
-    form_kind = detect_form_kind(doc)
-    if form_kind == 'XFA':
+    form_kind_name = form_kind(reader)
+    if form_kind_name == 'XFA':
         emit({
             'ok': False,
             'helper': 'pdf_fill_form',
             'error': 'This PDF uses XFA forms (older Adobe LiveCycle format), not AcroForm. pdf_fill_form does not support XFA. Re-saving the PDF in a recent Acrobat or printing-to-PDF often produces an AcroForm-compatible copy.',
             'input_path': str(target),
-            'form_type': form_kind,
+            'form_type': form_kind_name,
         }, 10)
-    if form_kind == 'None':
+    if form_kind_name == 'None':
         emit({
             'ok': False,
             'helper': 'pdf_fill_form',
             'error': 'This PDF does not contain any fillable form fields. There is nothing for pdf_fill_form to fill.',
             'input_path': str(target),
-            'form_type': form_kind,
+            'form_type': form_kind_name,
         }, 11)
 
-    field_meta = collect_field_metadata(doc, fitz_mod)
+    field_meta = collect_field_metadata(reader)
 
     # ── Validation pass: hard-fail policy.  Any unknown field name or
     # invalid value rejects the WHOLE call.  We collect every error
     # before reporting so the model gets one complete picture instead
     # of having to retry repeatedly to surface each problem.  Operates
-    # purely on field_meta (plain Python data) -- no widget references
-    # are touched here, since PyMuPDF widget objects can lose their
-    # page binding the moment the originating page falls out of scope.
+    # purely on field_meta (plain Python data).
     errors = []
     plan = {}  # {field_name: (ftype, resolved_value, original_input)}
 
@@ -430,57 +479,71 @@ def main():
             'helper': 'pdf_fill_form',
             'error': 'Field map validation failed. No changes were written. Fix every entry below and try again.',
             'input_path': str(target),
-            'form_type': form_kind,
+            'form_type': form_kind_name,
             'validation_errors': errors,
             'extractor_module': mod_name,
         }, 15)
 
-    # ── Mutation pass: re-walk the doc fresh.  Crucially, the widgets
-    # mutated here are obtained INSIDE the same enumerate() that holds
-    # their parent page in scope; we never carry widget references
-    # across iterations.  This is what avoids "Annot is not bound to
-    # a page" failures from PyMuPDF.
+    # ── Write pass, on a copy of the document.  Text and choice values
+    # go through pypdf, which also writes each widget's appearance stream:
+    # viewers such as Preview draw that stream, not the raw value.
+    # Checkboxes and radios are set here: /V on the field (a PDF name)
+    # and /AS on every widget, the on-state on the matching widget and
+    # /Off on the others, so the existing check/dot appearances show.
+    from pypdf.generic import NameObject
+
     fill_results = []
     applied = set()  # names that have already produced a fill_results entry
     try:
-        for page_index, page in enumerate(doc, start=1):
-            try:
-                widgets_iter = list(page.widgets() or [])
-            except Exception:
-                widgets_iter = []
-            for widget in widgets_iter:
-                name = str(getattr(widget, 'field_name', '') or '')
-                if not name or name not in plan:
-                    continue
-                ftype, resolved, original = plan[name]
-                # Radios: a single field name corresponds to multiple
-                # widgets (one per option).  Setting field_value on every
-                # widget in the group is idempotent and defends against
-                # PyMuPDF version quirks where setting on the wrong widget
-                # is a no-op.  Other field types: set on first encounter
-                # only; later encounters with the same name are unusual
-                # mirrored fields and the value is already in field_value.
-                if ftype != 'radio' and name in applied:
-                    continue
-                widget.field_value = resolved
-                widget.update()
-                if name not in applied:
-                    applied.add(name)
-                    preview = resolved
-                    if ftype == 'text' and isinstance(resolved, str) and len(resolved) > 200:
-                        preview = resolved[:200] + '...'
-                    fill_results.append({
-                        'field':          name,
-                        'type':           ftype,
-                        'page':           page_index,
-                        'value_written':  preview,
-                        'original_input': original,
-                    })
+        writer = pypdf.PdfWriter(clone_from=reader)
+        text_values = {}  # page index -> {qualified name: value}
+        for page_index, widget in iter_widgets(writer.pages):
+            field = field_dict(widget)
+            name = qualified_name(field)
+            if not name or name not in plan:
+                continue
+            ftype, resolved, original = plan[name]
+            if ftype in ('checkbox', 'radio'):
+                on = NameObject('/' + resolved)
+                states = []
+                try:
+                    states = list(widget['/AP'].get_object()['/N'].get_object().keys())
+                except Exception:
+                    pass
+                widget[NameObject('/AS')] = on if on in states else NameObject('/Off')
+                field[NameObject('/V')] = on if resolved != 'Off' else NameObject('/Off')
+            else:
+                text_values.setdefault(page_index, {})[name] = resolved
+            if name not in applied:
+                applied.add(name)
+                preview = resolved
+                if ftype == 'text' and isinstance(resolved, str) and len(resolved) > 200:
+                    preview = resolved[:200] + '...'
+                fill_results.append({
+                    'field':          name,
+                    'type':           ftype,
+                    'page':           page_index,
+                    'value_written':  preview,
+                    'original_input': original,
+                })
+        warnings = []
+        if form_kind_name == 'AcroForm+XFA':
+            # Acrobat prefers the XFA copy of the form and would show it
+            # empty; without /XFA every viewer uses the AcroForm values.
+            acro = writer._root_object['/AcroForm'].get_object()
+            if '/XFA' in acro:
+                del acro['/XFA']
+            warnings.append('This PDF also carried an XFA form. The filled copy keeps only the AcroForm fields (what Preview, browsers and Acrobat then show).')
+        for page_index, values in text_values.items():
+            # auto_regenerate=False: the appearance streams are written
+            # now, so viewers need not rebuild them.
+            writer.update_page_form_field_values(
+                writer.pages[page_index - 1], values, auto_regenerate=False)
     except Exception as ex:
         emit({
             'ok': False,
             'helper': 'pdf_fill_form',
-            'error': 'Failed during widget update: ' + str(ex),
+            'error': 'Failed during field update: ' + str(ex),
             'input_path': str(target),
             'fields_processed_before_failure': len(fill_results),
         }, 16)
@@ -502,10 +565,8 @@ def main():
     output_path = unique_path(out_dir, output_name)
 
     try:
-        # garbage=4 cleans unused objects; deflate=True compresses
-        # streams.  Both are cheap on a single-form save and produce
-        # smaller output, which matters for large filled HR packets.
-        doc.save(str(output_path), garbage=4, deflate=True)
+        with open(output_path, 'wb') as f:
+            writer.write(f)
     except Exception as ex:
         emit({
             'ok': False,
@@ -525,11 +586,12 @@ def main():
         'output_filename':  output_path.name,
         'cwd':              str(cwd),
         'filled_forms_dir': str(out_dir),
-        'form_type':        form_kind,
+        'form_type':        form_kind_name,
         'fields_filled':    len(fill_results),
         'fields':           fill_results,
         'output_size_bytes': out_size,
         'extractor_module': mod_name,
+        'warnings':         warnings,
     })
 
 

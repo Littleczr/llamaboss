@@ -1,4 +1,5 @@
 #pragma once
+#include "lb_ascii.h"
 // ═══════════════════════════════════════════════════════════════════
 //  progress_output_fold.h — tame progress bars and PS 5.1 stderr noise
 // ═══════════════════════════════════════════════════════════════════
@@ -80,8 +81,8 @@ inline void SplitTerminator(const std::string& line, std::string& content, std::
 inline std::string Trim(const std::string& s)
 {
     std::size_t b = 0, e = s.size();
-    while (b < e && std::isspace((unsigned char)s[b])) ++b;
-    while (e > b && std::isspace((unsigned char)s[e - 1])) --e;
+    while (b < e && lb_ascii::IsSpace((unsigned char)s[b])) ++b;
+    while (e > b && lb_ascii::IsSpace((unsigned char)s[e - 1])) --e;
     return s.substr(b, e - b);
 }
 
@@ -107,7 +108,7 @@ inline bool IsAtLinePosition(const std::string& s)
 // first " : " as long as it does not start with whitespace.
 inline bool SplitRecordHead(const std::string& s, std::string& text)
 {
-    if (s.empty() || std::isspace((unsigned char)s[0])) return false;
+    if (s.empty() || lb_ascii::IsSpace((unsigned char)s[0])) return false;
     const std::size_t sep = s.find(" : ");
     if (sep == std::string::npos || sep == 0) return false;
     text = s.substr(sep + 3);
@@ -231,7 +232,7 @@ inline bool IsProgressLine(const std::string& raw)
     {
         const std::size_t bar = s.find("%|");
         if (bar != std::string::npos && bar > 0 &&
-            std::isdigit((unsigned char)s[bar - 1]) &&
+            lb_ascii::IsDigit((unsigned char)s[bar - 1]) &&
             s.find('|', bar + 2) != std::string::npos)
             return true;
     }
@@ -242,7 +243,7 @@ inline bool IsProgressLine(const std::string& raw)
         const unsigned char c = (unsigned char)ch;
         if (c == '#') { hasHash = true; continue; }
         if (c == '%') { hasPct = true; continue; }
-        if (std::isdigit(c) || c == '.' || c == ' ' || c == '\t' ||
+        if (lb_ascii::IsDigit(c) || c == '.' || c == ' ' || c == '\t' ||
             c == '=' || c == 'O' || c == '-')
             continue;
         return false;
@@ -258,7 +259,7 @@ inline std::string LastPercent(const std::string& line)
     const std::size_t pct = line.rfind('%');
     if (pct == std::string::npos) return std::string();
     std::size_t b = pct;
-    while (b > 0 && (std::isdigit((unsigned char)line[b - 1]) || line[b - 1] == '.')) --b;
+    while (b > 0 && (lb_ascii::IsDigit((unsigned char)line[b - 1]) || line[b - 1] == '.')) --b;
     if (b == pct) return std::string();
     return line.substr(b, pct + 1 - b);
 }

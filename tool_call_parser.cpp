@@ -1,6 +1,7 @@
 // tool_call_parser.cpp
 
 #include "tool_call_parser.h"
+#include "lb_ascii.h"
 
 #include <algorithm>
 #include <cctype>
@@ -120,7 +121,7 @@ std::string Trim(const std::string& s)
 std::string Lower(std::string s)
 {
     std::transform(s.begin(), s.end(), s.begin(),
-                   [](unsigned char c){ return (char)std::tolower(c); });
+                   [](unsigned char c){ return (char)lb_ascii::ToLower(c); });
     return s;
 }
 
@@ -305,7 +306,7 @@ const std::string kParameterClose   = "</parameter>";
 
 size_t SkipWs(const std::string& s, size_t i, size_t to)
 {
-    while (i < to && std::isspace(static_cast<unsigned char>(s[i]))) ++i;
+    while (i < to && lb_ascii::IsSpace(static_cast<unsigned char>(s[i]))) ++i;
     return i;
 }
 
@@ -337,7 +338,7 @@ bool MatchFunctionNameTag(const std::string& s,
 
     const size_t n0 = i;
     while (i < to &&
-           (std::isalnum(static_cast<unsigned char>(s[i])) || s[i] == '_')) {
+           (lb_ascii::IsAlnum(static_cast<unsigned char>(s[i])) || s[i] == '_')) {
         ++i;
     }
     if (i == n0) return false;
@@ -791,7 +792,7 @@ bool ParseInnerByVariantImpl(size_t             openerLen,
             // so prose ahead of a literal <args> example cannot dispatch.
             size_t n = 0;
             while (n < t.size() &&
-                   (std::isalnum(static_cast<unsigned char>(t[n])) ||
+                   (lb_ascii::IsAlnum(static_cast<unsigned char>(t[n])) ||
                     t[n] == '_')) {
                 ++n;
             }
@@ -802,7 +803,7 @@ bool ParseInnerByVariantImpl(size_t             openerLen,
             // so fall through to the brace parser as before.
             bool onlyWsBetween = !rawName.empty();
             for (size_t i = n; onlyWsBetween && i < hybridArgsA; ++i) {
-                if (!std::isspace(static_cast<unsigned char>(t[i])))
+                if (!lb_ascii::IsSpace(static_cast<unsigned char>(t[i])))
                     onlyWsBetween = false;
             }
 
@@ -908,7 +909,7 @@ bool TryRecoverTerminalGemmaHybridWithoutCloser(
     // by the native parser's last-brace semantics.
     const size_t afterArgs = argsB + kArgsClose.size();
     for (size_t i = afterArgs; i < finalBrace; ++i) {
-        if (!std::isspace(static_cast<unsigned char>(trimmed[i]))) {
+        if (!lb_ascii::IsSpace(static_cast<unsigned char>(trimmed[i]))) {
             return false;
         }
     }
@@ -981,7 +982,7 @@ bool TryRecoverTerminalGemmaNewlineArgsWithArgsCloser(
     std::string rawName = Trim(inner.substr(0, nl));
     if (rawName.empty()) return false;
     for (unsigned char ch : rawName) {
-        if (!(std::isalnum(ch) || ch == '_')) return false;
+        if (!(lb_ascii::IsAlnum(ch) || ch == '_')) return false;
     }
 
     // The final </args> must close the tail (whitespace-only after it)
@@ -989,7 +990,7 @@ bool TryRecoverTerminalGemmaNewlineArgsWithArgsCloser(
     const size_t closeAt = inner.rfind(kArgsClose);
     if (closeAt == std::string::npos || closeAt <= nl) return false;
     for (size_t i = closeAt + kArgsClose.size(); i < inner.size(); ++i) {
-        if (!std::isspace(static_cast<unsigned char>(inner[i]))) {
+        if (!lb_ascii::IsSpace(static_cast<unsigned char>(inner[i]))) {
             return false;
         }
     }
@@ -1058,7 +1059,7 @@ bool TryRecoverTerminalGemmaTaggedArgsWithoutCloser(
 
     size_t i = 0;
     while (i < inner.size() &&
-           (std::isalnum(static_cast<unsigned char>(inner[i])) ||
+           (lb_ascii::IsAlnum(static_cast<unsigned char>(inner[i])) ||
             inner[i] == '_')) {
         ++i;
     }
@@ -1068,7 +1069,7 @@ bool TryRecoverTerminalGemmaTaggedArgsWithoutCloser(
     std::string name = Lower(rawName);
 
     while (i < inner.size() &&
-           std::isspace(static_cast<unsigned char>(inner[i]))) {
+           lb_ascii::IsSpace(static_cast<unsigned char>(inner[i]))) {
         ++i;
     }
 
@@ -1093,7 +1094,7 @@ bool TryRecoverTerminalGemmaTaggedArgsWithoutCloser(
     // Require </args> to terminate the tail.  This prevents swallowing
     // trailing prose or protocol examples into an executable invocation.
     for (size_t j = argsEnd + kArgsClose.size(); j < inner.size(); ++j) {
-        if (!std::isspace(static_cast<unsigned char>(inner[j]))) return false;
+        if (!lb_ascii::IsSpace(static_cast<unsigned char>(inner[j]))) return false;
     }
 
     ToolInvocation recovered;
@@ -1141,7 +1142,7 @@ bool TryRecoverTerminalGemmaDanglingArgsWithoutCloser(
     std::string rawName = Trim(inner.substr(0, nameBoundary));
     if (rawName.empty()) return false;
     for (unsigned char ch : rawName) {
-        if (!(std::isalnum(ch) || ch == '_')) return false;
+        if (!(lb_ascii::IsAlnum(ch) || ch == '_')) return false;
     }
 
     std::string remainder = Trim(inner.substr(nameBoundary + kArgsClose.size()));
@@ -1193,13 +1194,13 @@ bool IsWhitespaceAndStrayClosingTags(const std::string& s)
     size_t i = 0;
     int tags = 0;
     while (i < s.size()) {
-        if (std::isspace(static_cast<unsigned char>(s[i]))) { ++i; continue; }
+        if (lb_ascii::IsSpace(static_cast<unsigned char>(s[i]))) { ++i; continue; }
         if (s[i] != '<') return false;
         ++i;
         if (i >= s.size() || s[i] != '/') return false;
         ++i;
         while (i < s.size() &&
-               (std::isalnum(static_cast<unsigned char>(s[i])) ||
+               (lb_ascii::IsAlnum(static_cast<unsigned char>(s[i])) ||
                 s[i] == '_' || s[i] == '|')) {
             ++i;
         }

@@ -11,6 +11,7 @@
 
 #include "markdown_renderer.h"
 #include "lb_ui_font.h"   // LbUiPt / LbFace: macOS font parity
+#include "lb_ascii.h"
 #include "chat_display_ctrl.h"
 #include "markdown_image_line.h"
 
@@ -726,7 +727,7 @@ static bool IsEmphasisChar(char c) { return c == '*' || c == '_'; }
 static bool IsWordCharForUnderscore(char c)
 {
     unsigned char uc = static_cast<unsigned char>(c);
-    return std::isalnum(uc) || c == '.' || c == '-';
+    return lb_ascii::IsAlnum(uc) || c == '.' || c == '-';
 }
 
 static bool IsIntraWordUnderscore(const std::string& text, size_t pos)
@@ -1001,12 +1002,12 @@ bool MarkdownRenderer::IsLikelyFilename(const std::string& s) const
 
     if (ext.size() < 1 || ext.size() > 10) return false;
     for (char c : ext)
-        if (!std::isalnum(static_cast<unsigned char>(c))) return false;
+        if (!lb_ascii::IsAlnum(static_cast<unsigned char>(c))) return false;
 
     for (char c : stem) {
         // Allow alphanumerics plus a small punctuation set.  Disallow
         // whitespace, slashes, colons, quotes, parens, angles, etc.
-        if (std::isalnum(static_cast<unsigned char>(c))) continue;
+        if (lb_ascii::IsAlnum(static_cast<unsigned char>(c))) continue;
         if (c == '_' || c == '-' || c == '.') continue;
         return false;
     }

@@ -3,6 +3,7 @@
 // Supports multiple simultaneous attachments.
 
 #include "attachment_manager.h"
+#include "lb_ascii.h"
 #include "var_store.h"
 #include "path_safety.h"
 
@@ -22,7 +23,7 @@ namespace {
 std::string LowerAscii(std::string s)
 {
     std::transform(s.begin(), s.end(), s.begin(), [](unsigned char ch) {
-        return static_cast<char>(std::tolower(ch));
+        return static_cast<char>(lb_ascii::ToLower(ch));
     });
     return s;
 }
@@ -30,7 +31,7 @@ std::string LowerAscii(std::string s)
 bool IsAsciiWordChar(char ch)
 {
     unsigned char u = static_cast<unsigned char>(ch);
-    return std::isalnum(u) != 0 || ch == '_';
+    return lb_ascii::IsAlnum(u) != 0 || ch == '_';
 }
 
 bool ContainsBoundedPhrase(const std::string& haystack, const char* needle)

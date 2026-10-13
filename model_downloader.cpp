@@ -4,6 +4,7 @@
 
 #include "model_downloader.h"
 #include "lb_ui_font.h"   // LbUiPt: macOS point-size parity
+#include "lb_ascii.h"
 #include "server_manager.h"
 #include "theme.h"
 #include "path_safety.h"
@@ -361,7 +362,7 @@ static std::string HttpFailureMessage(int status, const std::string& reason,
 {
     std::string host;
     try { host = Poco::URI(url).getHost(); } catch (...) {}
-    for (char& c : host) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    for (char& c : host) c = static_cast<char>(lb_ascii::ToLower(static_cast<unsigned char>(c)));
     const bool hf = host == "huggingface.co" || host == "www.huggingface.co" || host == "hf.co";
 
     if ((status == 401 || status == 403) && hf)

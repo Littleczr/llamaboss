@@ -5,6 +5,8 @@
 // emissions go to the sink as typed AgentEvent objects.
 
 #include "agent_controller.h"
+#include "lb_ascii.h"
+#include "transient_error.h"
 
 #include "wait_executor.h"   // WaitExecutor, WaitResult
 #include "python_runner.h"
@@ -162,7 +164,7 @@ std::string KeepExecutableToolCallsJson(
 std::string AgentLowerAscii(std::string s)
 {
     for (char& ch : s)
-        ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+        ch = static_cast<char>(lb_ascii::ToLower(static_cast<unsigned char>(ch)));
     return s;
 }
 
@@ -596,10 +598,10 @@ bool AgentFindMissingPythonPackage(const std::string& stdoutText,
             !AgentExtractAfterToken(lower, "pip install --user", candidate)) {
             if (lower.find("openpyxl python package is required") != std::string::npos) {
                 candidate = "openpyxl";
-            } else if (lower.find("missing pdf form dependency") != std::string::npos ||
-                       lower.find("install pymupdf") != std::string::npos) {
+            } else if (lower.find("install pymupdf") != std::string::npos) {
                 candidate = "pymupdf";
-            } else if (lower.find("missing pdf text extraction dependency") != std::string::npos ||
+            } else if (lower.find("missing pdf form dependency") != std::string::npos ||
+                       lower.find("missing pdf text extraction dependency") != std::string::npos ||
                        lower.find("install pypdf") != std::string::npos) {
                 candidate = "pypdf";
             }
@@ -814,7 +816,7 @@ std::string NormalizeScriptNameForOneShotApproval(const std::string& input)
     out.reserve(name.size());
     for (char ch : name) {
         unsigned char c = static_cast<unsigned char>(ch);
-        out.push_back(static_cast<char>(std::tolower(c)));
+        out.push_back(static_cast<char>(lb_ascii::ToLower(c)));
     }
     return out;
 }
@@ -960,7 +962,7 @@ bool IsNativeBatchSafeWriteSet(const std::vector<ToolInvocation>& invocations)
         path = path.substr(a, b - a + 1);
         for (char& c : path) {
             if (c == '/') c = '\\';
-            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            c = static_cast<char>(lb_ascii::ToLower(static_cast<unsigned char>(c)));
         }
         if (path.size() >= 2 && path[1] == ':') return false;      // C:\...
         if (path[0] == '\\' || path[0] == '%' || path[0] == '~') return false;
@@ -1088,7 +1090,7 @@ bool ShouldStopAfterStandaloneWriteArtifact(const ToolInvocation& inv,
     const PresentedFile& f = r.presentedFiles.front();
     std::string key = f.diskPath.empty() ? f.displayName : f.diskPath;
     std::transform(key.begin(), key.end(), key.begin(),
-                   [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+                   [](unsigned char ch) { return static_cast<char>(lb_ascii::ToLower(ch)); });
     {
         // write/overwrite_file args: path on line 1, content after it.
         const size_t nl = inv.args.find('\n');
@@ -1181,6 +1183,9 @@ void AgentController::Begin()
     m_waitSecondsUsed      = 0;   // wait tool's per-turn budget consumption
     m_consecutiveMalformed = 0;
     m_consecutiveEmptyAssistant = 0;
+    m_transientRetries = 0;
+    m_awaitingTransientRetry = false;
+    ++m_transientRetryToken;
     m_nextRequestSystemNudge.clear();
     m_announcedStepRecoveries = 0;
     m_toolAttemptsThisTurn = 0;
@@ -1292,6 +1297,9 @@ void AgentController::EndLoop(AgentEndReason     reason,
     m_standaloneWritePathsThisTurn.clear();
     m_pendingSoftHint.clear();
     m_consecutiveEmptyAssistant = 0;
+    m_transientRetries = 0;
+    m_awaitingTransientRetry = false;
+    ++m_transientRetryToken;   // invalidates any pending retry timer
     m_nextRequestSystemNudge.clear();
     m_announcedStepRecoveries = 0;
     m_toolAttemptsThisTurn = 0;
@@ -1466,7 +1474,7 @@ std::string AgentController::BuildToolSignature(const ToolInvocation& inv) const
     std::string name = inv.name;
     std::transform(name.begin(), name.end(), name.begin(),
                    [](unsigned char c) {
-                       return static_cast<char>(std::tolower(c));
+                       return static_cast<char>(lb_ascii::ToLower(c));
                    });
 
     std::string signature = name + "|" + NormalizeForToolSignature(inv.args);
@@ -2535,6 +2543,7 @@ bool AgentController::HandleAssistantComplete(const std::string& fullResponse,
 
     // Visible prose or a structured tool call proves the provider recovered.
     m_consecutiveEmptyAssistant = 0;
+    m_transientRetries = 0;
     m_nextRequestSystemNudge.clear();
 
     // ── Native protocol path ────────────────────────────────────
@@ -3939,11 +3948,69 @@ bool AgentController::HandleWebFetchError(const std::string& errorText)
     return true;
 }
 
-bool AgentController::HandleAssistantError(const std::string& /*errorText*/)
+bool AgentController::HandleAssistantError(const std::string& errorText)
 {
     if (!m_active) return false;
-    // Errors always end the loop.  Let MyFrame's existing error
-    // handler render the friendly message; we just reset state.
-    EndLoop(AgentEndReason::StreamError, "");  // no extra message
+    // Errors end the loop (after MyFrame's automatic transient retries,
+    // see BeginTransientRetry).  Record WHY as an agent status card: it is
+    // stored in history, so the saved/exported transcript no longer just
+    // stops after a successful tool result, and a follow-up "continue"
+    // gives the model the context that its last request failed.
+    // Two internal callers pass fixed labels and own their messaging (the
+    // repetition notice; the send-failure path, whose placeholder is removed
+    // AFTER this call, so a stored card would sit in front of it).
+    const bool frameOwnsMessage = errorText == "repetition loop" ||
+                                  errorText == "Failed to start chat request";
+    if (!m_cancelled && !frameOwnsMessage) {
+        std::vector<std::string> chips = { "stopped", "model request failed" };
+        std::string msg = "The model request failed: " +
+            lb_transient_error::ShortForm(errorText, 300) + ".";
+        if (m_transientRetries > 0)
+            msg += " Automatic retries used: " +
+                   std::to_string(m_transientRetries) + ".";
+        msg += " No tool from the failed reply ran. Send `continue` to resume "
+               "from the last completed step.";
+        EmitAndStoreAgentStatusCard("Agent Status", chips, msg, true);
+    }
+    EndLoop(AgentEndReason::StreamError, "");  // card above carries the message
     return false;
+}
+
+bool AgentController::BeginTransientRetry(const std::string& errorText,
+                                          int& attemptOut, int& delayMsOut)
+{
+    attemptOut = 0;
+    delayMsOut = 0;
+    if (!m_active || m_cancelled || m_awaitingAsyncResult || m_awaitingApproval)
+        return false;
+    if (!lb_transient_error::IsTransient(errorText)) return false;
+    if (m_transientRetries >= lb_transient_error::kMaxRetries) return false;
+
+    ++m_transientRetries;
+    attemptOut = m_transientRetries;
+    delayMsOut = lb_transient_error::RetryDelayMs(attemptOut);
+    m_awaitingTransientRetry = true;
+    ++m_transientRetryToken;
+
+    if (m_appState) {
+        if (auto* logger = m_appState->GetLogger())
+            logger->warning("Agent: transient model error, retry " +
+                            std::to_string(attemptOut) + " of " +
+                            std::to_string(lb_transient_error::kMaxRetries) +
+                            " in " + std::to_string(delayMsOut) + " ms: " +
+                            lb_transient_error::ShortForm(errorText, 400));
+    }
+    return true;
+}
+
+void AgentController::ResumeAfterTransientRetry(unsigned long token)
+{
+    if (!m_active || !m_awaitingTransientRetry || token != m_transientRetryToken)
+        return;
+    m_awaitingTransientRetry = false;
+    // The failed request left no assistant message behind (MyFrame removed
+    // the empty placeholder), so the history still ends with the last tool
+    // result or user message: ContinueLoop re-sends exactly that request.
+    // It also honours a Stop pressed during the wait (m_cancelled).
+    ContinueLoop();
 }

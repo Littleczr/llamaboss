@@ -36,6 +36,7 @@
 // Pure std C++, no wx / Poco.  Tested in announced_step_tests.cpp.
 
 #pragma once
+#include "lb_ascii.h"
 
 #include <cctype>
 #include <string>
@@ -47,7 +48,7 @@ constexpr size_t kMaxAnnouncementBytes = 600;
 
 inline std::string LowerAscii(std::string s)
 {
-    for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    for (char& c : s) c = static_cast<char>(lb_ascii::ToLower(static_cast<unsigned char>(c)));
     return s;
 }
 
@@ -154,7 +155,7 @@ inline bool LooksLikeAnnouncedNextStep(const std::string& rawReply)
     if (endsWithColon && s.find('?') == std::string::npos) return true;
 
     if (StartsWith(s, "step ") && s.size() > 5 &&
-        std::isdigit(static_cast<unsigned char>(s[5])))
+        lb_ascii::IsDigit(static_cast<unsigned char>(s[5])))
         return true;
     if (StartsWith(s, "let me ") && !StartsWith(s, "let me know"))
         return true;

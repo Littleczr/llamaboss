@@ -4,6 +4,7 @@
 // every fstream/Win32 boundary, no wx dependency.
 
 #include "var_store.h"
+#include "lb_ascii.h"
 
 #include "path_safety.h"   // Utf8ToWide, SanitizeFilename
 
@@ -30,7 +31,7 @@ namespace {
 std::string ToLowerAscii(std::string s)
 {
     std::transform(s.begin(), s.end(), s.begin(),
-                   [](unsigned char c) { return (char)std::tolower(c); });
+                   [](unsigned char c) { return (char)lb_ascii::ToLower(c); });
     return s;
 }
 
