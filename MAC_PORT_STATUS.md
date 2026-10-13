@@ -149,13 +149,14 @@ When the login keychain has an "Apple Development" (or, failing that, a self-sig
 
 | # | Milestone | State |
 | --- | --- | --- |
-| 1 | Reproducible arm64 build | **Done**: all 91 translation units compile and link |
+| 1 | Reproducible arm64 build | **Done**: all translation units compile and link (Homebrew dev build and static release build) |
 | 2 | App launches, main window | **Done**: main window and Welcome dialog open |
-| 3 | Conversations save and reopen (Unicode paths) | **Verified 2026-10-09** for ASCII titles: the chat saved to `~/LlamaBoss/Chats/…`, reopened after quit/relaunch, and the model auto-reloaded. Unicode file names not yet tested |
-| 4 | Local llama-server starts, reports errors, stops | **Verified 2026-10-09** with Gemma 3 1B Q4_K_M: bundled server on Metal, ready in 0.85 s, single slot confirmed, two chat turns, stopped cleanly on quit (0.1 s). Error path **verified 2026-10-11** (see below) |
-| 5 | Remote endpoint streams; stop works | Not started |
-| 6 | Shell and Python tools | Stubbed (see below) |
-| 7 | File-tool boundaries, protected credentials, packaged app | Partly implemented, not verified |
+| 3 | Conversations save and reopen (Unicode paths) | **Verified 2026-10-09** for ASCII titles (save, quit, relaunch, reopen, model auto-reload). Unicode file names not yet tested |
+| 4 | Local llama-server starts, reports errors, stops | **Verified**: Gemma 3 1B on Metal (2026-10-09); error path (2026-10-11); orphan cleanup (2026-10-12) |
+| 5 | Remote endpoint streams; stop works | **Verified** streaming with OpenRouter GPT 6 Luna (2026-10-11 onward). Stop verified on a local model (2026-10-13); Stop during a remote stream not yet tested |
+| 6 | Shell and Python tools | **Done**: zsh shell tool (2026-10-11), Python helpers and scripts (2026-10-11), `py` session (2026-10-12), web fetch (2026-10-12), bundled Python runtime (2026-10-13) |
+| 7 | File-tool boundaries, protected credentials, packaged app | Credentials in the Keychain **verified**; packaged, notarized app **done** (2026-10-12). File-tool boundary cases (symlinks, case-sensitive volumes) implemented, not systematically tested |
+| 8 | Public Mac release | **Done 2026-10-12**: Beta 0.1.23 DMG on R2, "Download for Mac" on llamaboss.com. A build with the bundled Python is not notarized yet |
 
 ## Implemented for macOS (compiles; runtime verification pending unless noted)
 
@@ -610,12 +611,58 @@ large icons. macOS 26 may show a full-bleed square icon inside its standard roun
   `py -3 -m pip install --user pymupdf`, which is wrong on the Mac. A neutral message
   ("Install the PyMuPDF package (pymupdf)") would suit both; the script is shared.
 
+## Packages for the PC and Mac fixes, 2026-10-13 (afternoon)
+
+Standing instructions from the user (2026-10-13): Claude works on the Mac alone; shared-code
+fixes go to the PC as packages on the share (`D:\ForMacMini\Patches`), built on a local branch
+from `main`, compiled on the Mac, each with an `install_<item>.py` (dry run, hash check, backup
+outside the repo, sha256 verify, restore). Built by `macos/make_pc_package.py`.
+
+| Package | Branch (local only) | Files | State |
+| --- | --- | --- | --- |
+| `LlamaBoss_Patch_ascii_ctype.zip` | `suggest/ascii-ctype` (09761e2, on main 9e8b3d3) | 40 | Waiting for the user to apply on the PC |
+| `LlamaBoss_Patch_pdf_forms_pypdf.zip` | `suggest/pdf-forms-pypdf` (838e172, on ascii-ctype) | 7 | Waiting; **install after ascii_ctype** |
+
+- **ascii_ctype (bug):** wxWidgets sets `LC_CTYPE` to "UTF-8" at startup on macOS (checked with
+  a bare wx app: "C" before, "UTF-8" after). There `isspace(0xA0)` and `isalpha(0xC3)` are true
+  and `tolower(0xC3)` is `0xE3`, so byte-wise `<cctype>` use corrupts UTF-8 (à = C3 A0,
+  ⚠ = E2 9A A0). Seen: a fetched llamaboss.com page saved `E2 9A 20` into a chat file (invalid
+  UTF-8). Setting `LC_CTYPE` back to "C" is not an option: `wxConvLibc` (implicit wxString
+  conversions) depends on it. Fix: `lb_ascii.h` (`lb_ascii::IsSpace`, `ToLower`, ...), 157
+  calls in 37 files; identical results on Windows. Verified on the Mac: cherry-picked onto
+  the Mac branch, full build, zsh policy tests, in-app web fetch keeps ⚠ and the chat file is
+  valid UTF-8. `Tests/` left alone (Windows only).
+- **pdf_forms_pypdf (user request):** the form helpers use pypdf (bundled on the Mac) instead
+  of PyMuPDF: offline, no install prompt. Same JSON contract. Verified with a synthetic form
+  of every field type and the real IRS W-9: inspect parity with the old helper, fill read
+  back, values visible in Quick Look and in Preview (text with accents, check mark, radio dot,
+  choice fields), validation errors, missing-pypdf path. In-app (GPT 6 Luna): inspect 0.09 s,
+  fill 0.08 s, no prompts. Test forms: `~/LlamaBoss-pytest/all_fields_form.pdf`, `fw9.pdf`,
+  `form.pdf`.
+- **Choices made (standing instruction: take the recommendation and record it):**
+  - Shared fixes are not applied to the Mac branch: its Windows view must match `main`. The
+    Mac gets them when the user applies the packages and Claude merges `main`. Until then the
+    Mac build keeps the `<cctype>` bug and the PyMuPDF form helpers.
+  - The two packages are stacked (both touch `agent_controller.cpp` and `tool_router.cpp`);
+    chain-tested from a CRLF checkout of main: install both, restore both, byte-identical.
+  - pypdf only, no PyMuPDF fallback in the form helpers: one code path, permissive license.
+  - A form with both AcroForm and XFA (the W-9) gets `/XFA` removed from the filled copy, with
+    a warning: Acrobat would otherwise show the empty XFA copy.
+  - The test form is written with raw pypdf objects (PyMuPDF's radio creation failed), which
+    also keeps it independent of the code under test.
+- **Mac-only fixes committed:** `669210f` expands a leading `~` in Python helper path arguments
+  (the Mac prompt allows `~/`; helpers resolved it under the chat folder); `90f0710` lets CMake
+  configure without `third_party/llama.cpp` (empty glob) and adds the package builder.
+- **Suggestion for the Windows version:** none beyond the two packages.
+
 ## Next task
 
-1. Notarize a build with the bundled Python before the next release.
-2. Remaining UI checks: project attach, message boxes, light themes.
-3. Mac entry in the update feed: Mac app reads e.g. `mac_url` / `mac_sha256` from
+1. Fresh-account test (needs the user: an administrator password to create the account and a
+   login to it). Use the stacked build (Mac branch + both packages) from `/Users/Shared`.
+2. Notarize a build with the bundled Python before the next release (needs the user's OK).
+3. Remaining UI checks: project attach, message boxes, light themes.
+4. Mac entry in the update feed: Mac app reads e.g. `mac_url` / `mac_sha256` from
    version.json (Mac code), the user adds the fields on the PC side. Until then Check for
    Updates opens the download page.
-4. Optional: test the public DMG on another Mac or a fresh user account.
-5. Skipped: the `Tests/` suite is for the Windows side (user decision 2026-10-12).
+5. Milestone gaps: Unicode chat titles (3), Stop during a remote stream (5).
+6. Skipped: the `Tests/` suite is for the Windows side (user decision 2026-10-12).
