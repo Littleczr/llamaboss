@@ -1,6 +1,7 @@
 // tool_copy.cpp -- see tool_copy.h
 
 #include "tool_copy.h"
+#include "lb_ascii.h"
 #include "tool_hash.h"
 #include "tool_write.h"
 #include "lb_sha256.h"
@@ -38,7 +39,7 @@ std::string Unquote(std::string s)
 std::string Lower(std::string s)
 {
     std::transform(s.begin(), s.end(), s.begin(),
-                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                   [](unsigned char c) { return static_cast<char>(lb_ascii::ToLower(c)); });
     return s;
 }
 

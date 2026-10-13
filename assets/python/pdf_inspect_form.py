@@ -1,4 +1,3 @@
-
 import json
 import site
 import sys
@@ -18,28 +17,24 @@ def is_relative_to(child, parent):
         return False
 
 
-def load_fitz():
-    # PyMuPDF imports as `pymupdf` on recent versions and `fitz` on
-    # older ones.  Try both before re-adding the user site (PythonRunner
-    # launches helpers with -I, which suppresses per-user site packages).
+def load_pypdf():
+    # pypdf is pure Python and permissively licensed (BSD), so it can ship
+    # with LlamaBoss; the Mac app bundles it.  Re-add the user site before
+    # giving up (PythonRunner launches helpers with -I, which suppresses
+    # per-user site packages).
     errors = []
 
     def try_import():
         try:
-            import pymupdf
-            return pymupdf, 'pymupdf'
+            import pypdf
+            return pypdf
         except Exception as ex:
-            errors.append('pymupdf: ' + str(ex))
-        try:
-            import fitz
-            return fitz, 'fitz'
-        except Exception as ex:
-            errors.append('fitz: ' + str(ex))
-        return None, None
+            errors.append('pypdf: ' + str(ex))
+        return None
 
-    mod, name = try_import()
+    mod = try_import()
     if mod is not None:
-        return mod, name, errors
+        return mod, errors
 
     try:
         user_site = getattr(site, 'USER_SITE', None)
@@ -48,43 +43,136 @@ def load_fitz():
     except Exception as ex:
         errors.append('user-site enable failed: ' + str(ex))
 
-    mod, name = try_import()
-    return mod, name, errors
+    return try_import(), errors
 
 
-def normalize_field_type(fitz_mod, widget):
-    # Map PyMuPDF's int constants to the canonical strings the LlamaBoss
-    # tool surface uses.  Exact constant names vary slightly between
-    # PyMuPDF major versions, so look up the int once and compare.
+# ── AcroForm walking (shared shape with pdf_fill_form.py) ───────────
+# Field attributes /FT, /Ff, /V and /DA are inheritable: a widget may
+# carry them itself (merged field+widget) or inherit them from any
+# ancestor in the /Parent chain.  Names are fully qualified
+# ("parent.child"), matching what Acrobat and Preview show.
+
+FF_REQUIRED = 1 << 1
+FF_RADIO = 1 << 15
+FF_PUSHBUTTON = 1 << 16
+FF_COMBO = 1 << 17
+
+
+def inherited(node, key):
+    seen = 0
+    while node is not None and seen < 64:
+        if key in node:
+            return node[key]
+        parent = node.get('/Parent')
+        node = parent.get_object() if parent is not None else None
+        seen += 1
+    return None
+
+
+def field_dict(widget):
+    # The terminal field is the widget itself when it has a /T, else its parent.
+    if '/T' in widget:
+        return widget
+    parent = widget.get('/Parent')
+    return parent.get_object() if parent is not None else widget
+
+
+def qualified_name(field):
+    parts = []
+    node, seen = field, 0
+    while node is not None and seen < 64:
+        t = node.get('/T')
+        if t is not None:
+            parts.append(str(t))
+        parent = node.get('/Parent')
+        node = parent.get_object() if parent is not None else None
+        seen += 1
+    return '.'.join(reversed(parts))
+
+
+def name_str(v):
+    # PDF names come back as '/Yes'; text strings as-is.
+    s = '' if v is None else str(v)
+    return s[1:] if s.startswith('/') else s
+
+
+def field_type(widget):
+    ft = inherited(widget, '/FT')
     try:
-        t = int(widget.field_type)
+        ff = int(inherited(widget, '/Ff') or 0)
     except Exception:
-        return 'unknown'
-
-    name_by_int = {
-        getattr(fitz_mod, 'PDF_WIDGET_TYPE_BUTTON', -1):       'button',
-        getattr(fitz_mod, 'PDF_WIDGET_TYPE_CHECKBOX', -1):     'checkbox',
-        getattr(fitz_mod, 'PDF_WIDGET_TYPE_RADIOBUTTON', -1):  'radio',
-        getattr(fitz_mod, 'PDF_WIDGET_TYPE_TEXT', -1):         'text',
-        getattr(fitz_mod, 'PDF_WIDGET_TYPE_LISTBOX', -1):      'listbox',
-        getattr(fitz_mod, 'PDF_WIDGET_TYPE_COMBOBOX', -1):     'dropdown',
-        getattr(fitz_mod, 'PDF_WIDGET_TYPE_SIGNATURE', -1):    'signature',
-    }
-    if t in name_by_int and name_by_int[t] != 'unknown':
-        return name_by_int[t]
-
-    # Fall back to the human string PyMuPDF exposes; lower-case it so
-    # the wire shape stays predictable.
-    label = getattr(widget, 'field_type_string', '') or ''
-    label = str(label).strip().lower()
-    if 'check' in label:    return 'checkbox'
-    if 'radio' in label:    return 'radio'
-    if 'combo' in label:    return 'dropdown'
-    if 'list' in label:     return 'listbox'
-    if 'sign' in label:     return 'signature'
-    if 'text' in label:     return 'text'
-    if 'button' in label:   return 'button'
+        ff = 0
+    if ft == '/Tx':
+        return 'text'
+    if ft == '/Btn':
+        if ff & FF_PUSHBUTTON:
+            return 'button'
+        return 'radio' if ff & FF_RADIO else 'checkbox'
+    if ft == '/Ch':
+        return 'dropdown' if ff & FF_COMBO else 'listbox'
+    if ft == '/Sig':
+        return 'signature'
     return 'unknown'
+
+
+def widget_on_states(widget):
+    try:
+        normal = widget['/AP'].get_object()['/N'].get_object()
+        return [name_str(k) for k in normal.keys() if name_str(k).lower() != 'off']
+    except Exception:
+        return []
+
+
+def field_options(field):
+    out = []
+    try:
+        for o in (inherited(field, '/Opt') or []):
+            o = o.get_object() if hasattr(o, 'get_object') else o
+            # [export_value, display_text] pairs: the export value is what /V holds.
+            if isinstance(o, list) and o:
+                o = o[0]
+            out.append(str(o))
+    except Exception:
+        pass
+    return out
+
+
+def iter_widgets(pages):
+    for page_index, page in enumerate(pages, start=1):
+        try:
+            annots = page.get('/Annots')
+            annots = annots.get_object() if annots is not None else []
+        except Exception:
+            annots = []
+        for a in annots or []:
+            try:
+                w = a.get_object()
+            except Exception:
+                continue
+            if w.get('/Subtype') == '/Widget':
+                yield page_index, w
+
+
+def form_kind(reader):
+    try:
+        acro = reader.trailer['/Root'].get('/AcroForm')
+        acro = acro.get_object() if acro is not None else None
+    except Exception:
+        acro = None
+    if acro is None:
+        return 'None'
+    try:
+        has_fields = len(acro.get('/Fields') or []) > 0
+    except Exception:
+        has_fields = False
+    has_xfa = '/XFA' in acro
+    if has_fields and not has_xfa:
+        return 'AcroForm'
+    if has_fields and has_xfa:
+        return 'AcroForm+XFA'
+    if has_xfa:
+        return 'XFA'
+    return 'None'
 
 
 def safe_str(v):
@@ -96,100 +184,57 @@ def safe_str(v):
         return ''
 
 
-def collect_fields(doc, fitz_mod, max_fields):
-    fields = []
+def collect_fields(reader, max_fields):
+    # One entry per field; radio groups and mirrored fields have several
+    # widgets but are listed once (page = first widget's page).
+    fields, by_name = [], {}
     truncated = False
-    total_seen = 0
 
-    for page_index, page in enumerate(doc, start=1):
-        try:
-            widgets = list(page.widgets() or [])
-        except Exception:
-            widgets = []
-
-        for widget in widgets:
-            total_seen += 1
+    for page_index, widget in iter_widgets(reader.pages):
+        field = field_dict(widget)
+        name = qualified_name(field)
+        if not name:
+            continue
+        ftype = field_type(widget)
+        entry = by_name.get(name)
+        if entry is None:
             if len(fields) >= max_fields:
                 truncated = True
+                by_name[name] = {}
                 continue
-
-            ftype = normalize_field_type(fitz_mod, widget)
-
-            # Required = bit 1 (value 2) of /Ff
             try:
-                flags = int(getattr(widget, 'field_flags', 0) or 0)
+                flags = int(inherited(widget, '/Ff') or 0)
             except Exception:
                 flags = 0
-            required = bool(flags & 2)
-
+            value = inherited(field, '/V')
+            if isinstance(value, list):
+                value = ', '.join(safe_str(v) for v in value)
             entry = {
-                'name':          safe_str(getattr(widget, 'field_name', '')),
+                'name':          name,
                 'type':          ftype,
                 'page':          page_index,
-                'current_value': safe_str(getattr(widget, 'field_value', '')),
-                'required':      required,
+                'current_value': name_str(value) if ftype in ('checkbox', 'radio') else safe_str(value),
+                'required':      bool(flags & FF_REQUIRED),
             }
-
-            tooltip = safe_str(getattr(widget, 'field_label', '') or
-                               getattr(widget, 'field_display', ''))
+            tooltip = safe_str(inherited(field, '/TU'))
             if tooltip:
                 entry['tooltip'] = tooltip
-
             if ftype in ('dropdown', 'listbox'):
-                try:
-                    options = list(getattr(widget, 'choice_values', None) or [])
-                    entry['options'] = [safe_str(o) for o in options]
-                except Exception:
-                    entry['options'] = []
-
-            if ftype in ('checkbox', 'radio'):
-                # button_states() returns {'normal': [...], 'down': [...]}.
-                # The 'normal' on-state names are what /pdf_fill_form
-                # needs to know to set a checkbox/radio correctly.
-                try:
-                    states = widget.button_states() or {}
-                    on_states = list(states.get('normal', []) or [])
-                    # Filter the off marker so the model only sees
-                    # actual on-values to choose from.
-                    on_states = [safe_str(s) for s in on_states
-                                 if safe_str(s).lower() not in ('off', '')]
-                    if on_states:
-                        entry['on_states'] = on_states
-                except Exception:
-                    pass
-
+                entry['options'] = field_options(field)
             fields.append(entry)
+            by_name[name] = entry
+        if ftype in ('checkbox', 'radio') and entry:
+            # The on-state names are what pdf_fill_form needs to set a
+            # checkbox or pick a radio option.
+            states = entry.setdefault('on_states', [])
+            for st in widget_on_states(widget):
+                if st not in states:
+                    states.append(st)
 
-    return fields, truncated, total_seen
-
-
-def detect_form_kind(doc):
-    # PyMuPDF's `is_form_pdf` returns True for AcroForm PDFs.  XFA-only
-    # PDFs typically have a /XFA entry on the AcroForm dict but no widget
-    # annotations -- detect them so we can refuse with a useful message
-    # rather than reporting "0 fields".
-    try:
-        is_acro = bool(getattr(doc, 'is_form_pdf', False))
-    except Exception:
-        is_acro = False
-
-    has_xfa = False
-    try:
-        # In PyMuPDF >= 1.18, doc.xfa is a list/None.  Treat any non-empty
-        # XFA payload as evidence.
-        xfa = getattr(doc, 'xfa', None)
-        if xfa:
-            has_xfa = True
-    except Exception:
-        pass
-
-    if is_acro and not has_xfa:
-        return 'AcroForm'
-    if is_acro and has_xfa:
-        return 'AcroForm+XFA'
-    if has_xfa:
-        return 'XFA'
-    return 'None'
+    for e in fields:
+        if 'on_states' in e and not e['on_states']:
+            del e['on_states']
+    return fields, truncated, len(by_name)
 
 
 def main():
@@ -216,52 +261,57 @@ def main():
     if size_bytes > max_file_bytes:
         emit({'ok': False, 'helper': 'pdf_inspect_form', 'error': 'PDF is larger than the first-phase 50 MB safety cap', 'path': str(target), 'file_size_bytes': size_bytes}, 7)
 
-    fitz_mod, mod_name, import_errors = load_fitz()
-    if fitz_mod is None:
+    pypdf, import_errors = load_pypdf()
+    if pypdf is None:
         emit({
             'ok': False,
             'helper': 'pdf_inspect_form',
-            'error': 'Missing PDF form dependency. Install PyMuPDF with: py -3 -m pip install --user pymupdf',
+            'error': 'Missing PDF form dependency: the Python package pypdf is not installed.',
             'details': import_errors[-6:],
         }, 8)
 
     try:
-        doc = fitz_mod.open(str(target))
+        reader = pypdf.PdfReader(str(target))
+        if reader.is_encrypted:
+            reader.decrypt('')
+        page_count = len(reader.pages)
     except Exception as ex:
         emit({'ok': False, 'helper': 'pdf_inspect_form', 'error': 'Could not open PDF: ' + str(ex), 'path': str(target)}, 6)
 
-    form_kind = detect_form_kind(doc)
-    page_count = doc.page_count
+    kind = form_kind(reader)
 
-    if form_kind == 'XFA':
+    if kind == 'XFA':
         emit({
             'ok': False,
             'helper': 'pdf_inspect_form',
             'error': 'This PDF uses XFA forms (older Adobe LiveCycle format), not AcroForm. pdf_inspect_form and pdf_fill_form do not support XFA. Common XFA examples: older IRS forms, some state DMV forms. Re-saving the PDF in a recent Acrobat or printing-to-PDF often produces an AcroForm-compatible copy.',
             'input_path': str(target),
             'page_count': page_count,
-            'form_type': form_kind,
-            'extractor_module': mod_name,
+            'form_type': kind,
+            'extractor_module': 'pypdf',
         }, 10)
 
-    if form_kind == 'None':
+    if kind == 'None':
         emit({
             'ok': False,
             'helper': 'pdf_inspect_form',
             'error': 'This PDF does not contain any fillable form fields. It may be a flat document or a scanned image.',
             'input_path': str(target),
             'page_count': page_count,
-            'form_type': form_kind,
-            'extractor_module': mod_name,
+            'form_type': kind,
+            'extractor_module': 'pypdf',
         }, 11)
 
     max_fields = 500
-    fields, truncated, total_seen = collect_fields(doc, fitz_mod, max_fields)
+    try:
+        fields, truncated, total_seen = collect_fields(reader, max_fields)
+    except Exception as ex:
+        emit({'ok': False, 'helper': 'pdf_inspect_form', 'error': 'Could not read the form fields: ' + str(ex), 'path': str(target)}, 6)
 
     warnings = []
     if truncated:
         warnings.append(f'Only the first {max_fields} of {total_seen} fields are listed.')
-    if form_kind == 'AcroForm+XFA':
+    if kind == 'AcroForm+XFA':
         warnings.append('PDF carries both AcroForm and XFA dictionaries. Reading AcroForm fields; XFA-only fields will not appear.')
 
     emit({
@@ -271,11 +321,11 @@ def main():
         'cwd': str(cwd),
         'file_size_bytes': size_bytes,
         'page_count': page_count,
-        'form_type': form_kind,
+        'form_type': kind,
         'field_count': len(fields),
         'total_fields_seen': total_seen,
         'fields': fields,
-        'extractor_module': mod_name,
+        'extractor_module': 'pypdf',
         'warnings': warnings,
     })
 

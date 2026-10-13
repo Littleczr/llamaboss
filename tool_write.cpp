@@ -1,6 +1,7 @@
 // tool_write.cpp
 
 #include "tool_write.h"
+#include "lb_ascii.h"
 #include "tool_path.h"
 #include "tool_path_safety.h"    // IsUnderAllowedWriteRoot, Basename, ParentDir
 #include "tool_staged_write.h"   // StagedTempFile, CreateStagedTempFile
@@ -101,7 +102,7 @@ bool HasPythonExtension(const std::string& absPath)
 {
     std::string lower = absPath;
     std::transform(lower.begin(), lower.end(), lower.begin(),
-                   [](unsigned char c){ return static_cast<char>(std::tolower(c)); });
+                   [](unsigned char c){ return static_cast<char>(lb_ascii::ToLower(c)); });
     return lower.size() >= 3 &&
            (lower.rfind(".py") == lower.size() - 3 ||
             (lower.size() >= 4 && lower.rfind(".pyw") == lower.size() - 4));
@@ -111,7 +112,7 @@ bool HasPowerShellScriptExtension(const std::string& absPath)
 {
     std::string lower = absPath;
     std::transform(lower.begin(), lower.end(), lower.begin(),
-                   [](unsigned char c){ return static_cast<char>(std::tolower(c)); });
+                   [](unsigned char c){ return static_cast<char>(lb_ascii::ToLower(c)); });
     return lower.size() >= 4 && lower.rfind(".ps1") == lower.size() - 4;
 }
 

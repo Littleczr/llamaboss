@@ -1,5 +1,6 @@
 // chat_history.cpp
 #include "chat_history.h"
+#include "lb_ascii.h"
 #include "reasoning_policy.h"
 #include "openai_responses.h"
 #include "path_safety.h"
@@ -68,7 +69,7 @@ std::string StripSessionContextHeader(std::string content)
     if (closeBracket != std::string::npos) {
         size_t start = closeBracket + 1;
         while (start < content.size() &&
-               std::isspace(static_cast<unsigned char>(content[start]))) {
+               lb_ascii::IsSpace(static_cast<unsigned char>(content[start]))) {
             ++start;
         }
         return content.substr(start);
@@ -86,7 +87,7 @@ bool EndsWithAsciiNoCase(const std::string& value, const std::string& suffix)
     for (size_t i = 0; i < suffix.size(); ++i) {
         const unsigned char a = static_cast<unsigned char>(value[offset + i]);
         const unsigned char b = static_cast<unsigned char>(suffix[i]);
-        if (std::tolower(a) != std::tolower(b)) return false;
+        if (lb_ascii::ToLower(a) != lb_ascii::ToLower(b)) return false;
     }
     return true;
 }
@@ -123,7 +124,7 @@ bool WantsAnthropicCacheControl(const std::string& model,
     static const char kPrefix[] = "anthropic/";
     if (id.size() <= sizeof(kPrefix) - 1) return false;
     for (size_t i = 0; i < sizeof(kPrefix) - 1; ++i) {
-        if (std::tolower(static_cast<unsigned char>(id[i])) != kPrefix[i])
+        if (lb_ascii::ToLower(static_cast<unsigned char>(id[i])) != kPrefix[i])
             return false;
     }
     return true;
@@ -2995,12 +2996,12 @@ namespace {
 
 bool TitleIsIdChar(char c)
 {
-    return std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '-';
+    return lb_ascii::IsAlnum(static_cast<unsigned char>(c)) || c == '_' || c == '-';
 }
 
 std::string TitleTrim(std::string s)
 {
-    auto notSpace = [](unsigned char c) { return !std::isspace(c); };
+    auto notSpace = [](unsigned char c) { return !lb_ascii::IsSpace(c); };
     s.erase(s.begin(), std::find_if(s.begin(), s.end(), notSpace));
     s.erase(std::find_if(s.rbegin(), s.rend(), notSpace).base(), s.end());
     return s;
@@ -3009,7 +3010,7 @@ std::string TitleTrim(std::string s)
 std::string TitleLower(std::string s)
 {
     std::transform(s.begin(), s.end(), s.begin(),
-        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        [](unsigned char c) { return static_cast<char>(lb_ascii::ToLower(c)); });
     return s;
 }
 
@@ -3023,7 +3024,7 @@ std::string TitleCollapseWhitespace(std::string s)
     out.reserve(s.size());
     bool lastWasSpace = false;
     for (unsigned char ch : s) {
-        if (std::isspace(ch)) {
+        if (lb_ascii::IsSpace(ch)) {
             if (!lastWasSpace) out.push_back(' ');
             lastWasSpace = true;
         }
@@ -3699,7 +3700,7 @@ std::string ChatHistory::FormatToolBlockAsUserMessage(
     const std::string fence(fenceLen, '`');
 
     auto lowerAscii = [](std::string v) {
-        for (char& c : v) c = (char)std::tolower((unsigned char)c);
+        for (char& c : v) c = (char)lb_ascii::ToLower((unsigned char)c);
         return v;
     };
     // stderr alone is a failure only when nothing says the command

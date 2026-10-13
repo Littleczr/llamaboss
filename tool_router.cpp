@@ -1,6 +1,7 @@
 // tool_router.cpp
 
 #include "tool_router.h"
+#include "lb_ascii.h"
 
 #include "python_arg_policy.h"
 
@@ -44,7 +45,7 @@ namespace {
 std::string Lower(std::string s)
 {
     std::transform(s.begin(), s.end(), s.begin(),
-                   [](unsigned char c){ return (char)std::tolower(c); });
+                   [](unsigned char c){ return (char)lb_ascii::ToLower(c); });
     return s;
 }
 
@@ -471,7 +472,7 @@ void ParseReadHeadArgs(const std::string& args,
 
     auto parseLines = [](const std::string& raw, size_t& out) -> bool {
         std::string n = Trim(raw);
-        if (n.empty() || !std::all_of(n.begin(), n.end(), [](unsigned char c){ return std::isdigit(c); }))
+        if (n.empty() || !std::all_of(n.begin(), n.end(), [](unsigned char c){ return lb_ascii::IsDigit(c); }))
             return false;
         try {
             unsigned long v = std::stoul(n);
@@ -608,7 +609,7 @@ bool ParseReadRangesArgs(const std::string&       args,
     }
     auto num = [](const std::string& t, size_t& out) -> bool {
         if (t.empty() || !std::all_of(t.begin(), t.end(),
-                [](unsigned char c){ return std::isdigit(c); }))
+                [](unsigned char c){ return lb_ascii::IsDigit(c); }))
             return false;
         try { out = (size_t)std::stoul(t); return out > 0; }
         catch (...) { return false; }
@@ -3865,7 +3866,7 @@ std::vector<ToolSpec> BuildBuiltinSpecs()
         pdfInspectSafety.readOnly             = true;
         pdfInspectSafety.mayInspectOutsideCwd = true;
         pdfInspectSafety.isAsync              = true;
-        pdfInspectSafety.summary = "Runs only the fixed pdf_inspect_form helper against a local AcroForm .pdf source file. Read-only JSON listing of every form field (name, type, page, current value, options, on-states, required flag, tooltip). Does not create or modify files. Refuses XFA-only PDFs with a clear explanation. Requires the PyMuPDF (`pymupdf`) Python package on the system Python.";
+        pdfInspectSafety.summary = "Runs only the fixed pdf_inspect_form helper against a local AcroForm .pdf source file. Read-only JSON listing of every form field (name, type, page, current value, options, on-states, required flag, tooltip). Does not create or modify files. Refuses XFA-only PDFs with a clear explanation. Requires the pypdf Python package.";
         addBatchSafe(tool_names::kPdfInspectForm,
             "Inspect the AcroForm fields of a local fillable PDF using the fixed Python pdf_inspect_form helper. Returns a JSON list of every field (name, type, page, current value, options/on_states, required, tooltip). Does not modify files and does not require approval. Call this before pdf_fill_form so you know the exact field names to fill.",
             kSchemaPdfInspectForm,
@@ -3880,7 +3881,7 @@ std::vector<ToolSpec> BuildBuiltinSpecs()
         pdfFillSafety.mayInspectOutsideCwd = true;
         pdfFillSafety.writesInsideCwdOnly  = false;  // writes to fixed Filled Forms lane, not cwd
         pdfFillSafety.isAsync              = true;
-        pdfFillSafety.summary = "Runs only the fixed pdf_fill_form helper against a local AcroForm .pdf source file. Validates the entire {field: value} map first; on any unknown field or invalid value, rejects the whole call with no partial write. On success, writes one filled .pdf to the conversation Filled Forms folder. Cannot fill XFA forms or signature fields. Requires the PyMuPDF (`pymupdf`) Python package on the system Python.";
+        pdfFillSafety.summary = "Runs only the fixed pdf_fill_form helper against a local AcroForm .pdf source file. Validates the entire {field: value} map first; on any unknown field or invalid value, rejects the whole call with no partial write. On success, writes one filled .pdf to the conversation Filled Forms folder. Cannot fill XFA forms or signature fields. Requires the pypdf Python package.";
         add(tool_names::kPdfFillForm,
             "Fill the AcroForm fields of a local fillable PDF using the fixed Python pdf_fill_form helper. Args: first line is the path; remaining lines are a JSON object mapping field names (exactly as pdf_inspect_form reported) to values. Validation is hard-fail across the entire map: any unknown field or invalid value rejects the whole call with no partial write. On success, writes one filled .pdf to the conversation Filled Forms folder and returns an artifact card. Always call pdf_inspect_form first; do not guess field names.",
             kSchemaPdfFillForm,

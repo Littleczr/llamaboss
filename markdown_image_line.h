@@ -20,6 +20,7 @@
 // Header-only, no wx dependency (unit-tested off Windows).
 //
 #pragma once
+#include "lb_ascii.h"
 
 #include <cctype>
 #include <string>
@@ -81,7 +82,7 @@ inline std::string CleanTarget(std::string t)
     t = Trim(t);
     // file:///C:/x or file://C:/x -> C:/x
     std::string lower = t;
-    for (char& c : lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    for (char& c : lower) c = static_cast<char>(lb_ascii::ToLower(static_cast<unsigned char>(c)));
     if (lower.rfind("file:///", 0) == 0)      t = t.substr(8);
     else if (lower.rfind("file://", 0) == 0)  t = t.substr(7);
     if (t.find('%') != std::string::npos) t = PercentDecode(t);
@@ -129,7 +130,7 @@ inline bool Parse(const std::string& line, std::vector<ImageRef>& out)
 inline bool IsRemoteOrInline(const std::string& src)
 {
     std::string lower = src;
-    for (char& c : lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    for (char& c : lower) c = static_cast<char>(lb_ascii::ToLower(static_cast<unsigned char>(c)));
     return lower.rfind("http://", 0) == 0 || lower.rfind("https://", 0) == 0 ||
            lower.rfind("data:", 0) == 0   || lower.rfind("ftp://", 0) == 0;
 }

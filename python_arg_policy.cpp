@@ -1,13 +1,14 @@
 // python_arg_policy.cpp
 
 #include "python_arg_policy.h"
+#include "lb_ascii.h"
 
 namespace {
 
 std::string LowerAscii(std::string s)
 {
     std::transform(s.begin(), s.end(), s.begin(),
-                   [](unsigned char c){ return static_cast<char>(std::tolower(c)); });
+                   [](unsigned char c){ return static_cast<char>(lb_ascii::ToLower(c)); });
     return s;
 }
 

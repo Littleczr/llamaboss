@@ -5,6 +5,7 @@
 // emissions go to the sink as typed AgentEvent objects.
 
 #include "agent_controller.h"
+#include "lb_ascii.h"
 #include "transient_error.h"
 
 #include "wait_executor.h"   // WaitExecutor, WaitResult
@@ -163,7 +164,7 @@ std::string KeepExecutableToolCallsJson(
 std::string AgentLowerAscii(std::string s)
 {
     for (char& ch : s)
-        ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+        ch = static_cast<char>(lb_ascii::ToLower(static_cast<unsigned char>(ch)));
     return s;
 }
 
@@ -597,10 +598,10 @@ bool AgentFindMissingPythonPackage(const std::string& stdoutText,
             !AgentExtractAfterToken(lower, "pip install --user", candidate)) {
             if (lower.find("openpyxl python package is required") != std::string::npos) {
                 candidate = "openpyxl";
-            } else if (lower.find("missing pdf form dependency") != std::string::npos ||
-                       lower.find("install pymupdf") != std::string::npos) {
+            } else if (lower.find("install pymupdf") != std::string::npos) {
                 candidate = "pymupdf";
-            } else if (lower.find("missing pdf text extraction dependency") != std::string::npos ||
+            } else if (lower.find("missing pdf form dependency") != std::string::npos ||
+                       lower.find("missing pdf text extraction dependency") != std::string::npos ||
                        lower.find("install pypdf") != std::string::npos) {
                 candidate = "pypdf";
             }
@@ -810,7 +811,7 @@ std::string NormalizeScriptNameForOneShotApproval(const std::string& input)
     out.reserve(name.size());
     for (char ch : name) {
         unsigned char c = static_cast<unsigned char>(ch);
-        out.push_back(static_cast<char>(std::tolower(c)));
+        out.push_back(static_cast<char>(lb_ascii::ToLower(c)));
     }
     return out;
 }
@@ -956,7 +957,7 @@ bool IsNativeBatchSafeWriteSet(const std::vector<ToolInvocation>& invocations)
         path = path.substr(a, b - a + 1);
         for (char& c : path) {
             if (c == '/') c = '\\';
-            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            c = static_cast<char>(lb_ascii::ToLower(static_cast<unsigned char>(c)));
         }
         if (path.size() >= 2 && path[1] == ':') return false;      // C:\...
         if (path[0] == '\\' || path[0] == '%' || path[0] == '~') return false;
@@ -1084,7 +1085,7 @@ bool ShouldStopAfterStandaloneWriteArtifact(const ToolInvocation& inv,
     const PresentedFile& f = r.presentedFiles.front();
     std::string key = f.diskPath.empty() ? f.displayName : f.diskPath;
     std::transform(key.begin(), key.end(), key.begin(),
-                   [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+                   [](unsigned char ch) { return static_cast<char>(lb_ascii::ToLower(ch)); });
     {
         // write/overwrite_file args: path on line 1, content after it.
         const size_t nl = inv.args.find('\n');
@@ -1468,7 +1469,7 @@ std::string AgentController::BuildToolSignature(const ToolInvocation& inv) const
     std::string name = inv.name;
     std::transform(name.begin(), name.end(), name.begin(),
                    [](unsigned char c) {
-                       return static_cast<char>(std::tolower(c));
+                       return static_cast<char>(lb_ascii::ToLower(c));
                    });
 
     std::string signature = name + "|" + NormalizeForToolSignature(inv.args);

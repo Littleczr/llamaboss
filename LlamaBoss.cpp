@@ -1,4 +1,5 @@
 #include "endpoints_dialog.h"
+#include "lb_ascii.h"
 #include <cassert>
 #include <wx/file.h>
 #include <wx/datetime.h>
@@ -3019,7 +3020,7 @@ private:
                         sub.size() <= 8 &&
                         std::all_of(sub.begin(), sub.end(),
                             [](unsigned char c) {
-                                return std::isalnum(c) != 0;
+                                return lb_ascii::IsAlnum(c) != 0;
                             });
                     ext = clean ? sub : std::string("png");
                 }
@@ -4494,7 +4495,7 @@ private:
             std::string v = picked;
             std::transform(v.begin(), v.end(), v.begin(),
                            [](unsigned char ch) {
-                               return static_cast<char>(std::tolower(ch));
+                               return static_cast<char>(lb_ascii::ToLower(ch));
                            });
             return v;
         }();

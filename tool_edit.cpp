@@ -1,6 +1,7 @@
 // tool_edit.cpp
 
 #include "tool_edit.h"
+#include "lb_ascii.h"
 #include "tool_path.h"
 #include "tool_path_safety.h"   // IsUnderAllowedWriteRoot, Basename
 #include "tool_staged_write.h"  // StagedTempFile, CreateStagedTempFile
@@ -649,7 +650,7 @@ EditResult EditFile(const std::string& argsBlob,
         if (p.size() < 4) return false;
         std::string ext = p.substr(p.size() - 4);
         for (char& c : ext)
-            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            c = static_cast<char>(lb_ascii::ToLower(static_cast<unsigned char>(c)));
         return ext == ".ps1";
     };
     if (ClassifyForOpen(resolved) == FileRisk::Risky &&

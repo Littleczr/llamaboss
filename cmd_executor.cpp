@@ -19,6 +19,7 @@
 //     quoting a non-issue for anything the user types.
 //
 #include "cmd_executor.h"
+#include "lb_ascii.h"
 #include "copy_line_fold.h"   // fold MSBuild/vcpkg copy-progress runs
 #include "progress_output_fold.h" // collapse \r progress bars, PS 5.1 NativeCommandError wrappers
 
@@ -299,7 +300,7 @@ std::string BaseNameLocal(const std::string& path)
 std::string LowerForOutputLocal(std::string s)
 {
     std::transform(s.begin(), s.end(), s.begin(),
-                   [](unsigned char c){ return static_cast<char>(std::tolower(c)); });
+                   [](unsigned char c){ return static_cast<char>(lb_ascii::ToLower(c)); });
     return s;
 }
 
@@ -356,9 +357,9 @@ std::string SafeOutputStemLocal(const std::string& text, const std::string& fall
     out.reserve(std::min<size_t>(text.size(), 64));
     for (char ch : text) {
         unsigned char c = static_cast<unsigned char>(ch);
-        if (std::isalnum(c)) out.push_back(static_cast<char>(std::tolower(c)));
+        if (lb_ascii::IsAlnum(c)) out.push_back(static_cast<char>(lb_ascii::ToLower(c)));
         else if (c == '_' || c == '-' || c == '.') out.push_back(ch);
-        else if (std::isspace(c) || c == ':' || c == '\\' || c == '/' || c == '|') {
+        else if (lb_ascii::IsSpace(c) || c == ':' || c == '\\' || c == '/' || c == '|') {
             if (!out.empty() && out.back() != '_') out.push_back('_');
         }
         if (out.size() >= 48) break;
@@ -1767,7 +1768,7 @@ bool CmdExecutor::Start(const std::string& command,
     // Reject empty / whitespace-only input.
     bool anyNonWs = false;
     for (char c : command) {
-        if (!std::isspace((unsigned char)c)) { anyNonWs = true; break; }
+        if (!lb_ascii::IsSpace((unsigned char)c)) { anyNonWs = true; break; }
     }
     if (!anyNonWs) return false;
 

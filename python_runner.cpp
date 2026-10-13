@@ -5,6 +5,7 @@
 // Windows process model but narrows the command surface to fixed helpers.
 
 #include "python_runner.h"
+#include "lb_ascii.h"
 
 #include "python_arg_policy.h"
 
@@ -530,7 +531,7 @@ bool WriteUtf8ArgTempFile(const std::string& prefix,
 std::string LowerLocal(std::string s)
 {
     std::transform(s.begin(), s.end(), s.begin(),
-                   [](unsigned char c){ return static_cast<char>(std::tolower(c)); });
+                   [](unsigned char c){ return static_cast<char>(lb_ascii::ToLower(c)); });
     return s;
 }
 
@@ -592,13 +593,13 @@ std::string NormalizePathForCompare(std::string path)
     std::replace(path.begin(), path.end(), '/', '\\');
     while (!path.empty() && (path.back() == '\\' || path.back() == '/')) path.pop_back();
     std::transform(path.begin(), path.end(), path.begin(),
-                   [](unsigned char c){ return static_cast<char>(std::tolower(c)); });
+                   [](unsigned char c){ return static_cast<char>(lb_ascii::ToLower(c)); });
     return path;
 }
 
 bool IsAbsoluteWindowsPath(const std::string& path)
 {
-    if (path.size() >= 3 && std::isalpha(static_cast<unsigned char>(path[0])) &&
+    if (path.size() >= 3 && lb_ascii::IsAlpha(static_cast<unsigned char>(path[0])) &&
         path[1] == ':' && (path[2] == '\\' || path[2] == '/')) {
         return true;
     }
@@ -971,9 +972,9 @@ std::string SafeOutputStemForTool(const std::string& text, const std::string& fa
     out.reserve(std::min<size_t>(text.size(), 64));
     for (char ch : text) {
         unsigned char c = static_cast<unsigned char>(ch);
-        if (std::isalnum(c)) out.push_back(static_cast<char>(std::tolower(c)));
+        if (lb_ascii::IsAlnum(c)) out.push_back(static_cast<char>(lb_ascii::ToLower(c)));
         else if (c == '_' || c == '-' || c == '.') out.push_back(ch);
-        else if (std::isspace(c) || c == ':' || c == '\\' || c == '/' || c == '|') {
+        else if (lb_ascii::IsSpace(c) || c == ':' || c == '\\' || c == '/' || c == '|') {
             if (!out.empty() && out.back() != '_') out.push_back('_');
         }
         if (out.size() >= 48) break;

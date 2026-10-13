@@ -1,6 +1,7 @@
 // tool_read.cpp
 
 #include "tool_read.h"
+#include "lb_ascii.h"
 #include "tool_path.h"
 #include "tool_path_safety.h"
 #include "path_safety.h"
@@ -186,7 +187,7 @@ std::string InferBodyLang(const std::string& absPath)
     size_t dot = absPath.rfind('.');
     if (dot == std::string::npos) return "";
     std::string ext = absPath.substr(dot + 1);
-    for (char& c : ext) c = (char)std::tolower((unsigned char)c);
+    for (char& c : ext) c = (char)lb_ascii::ToLower((unsigned char)c);
 
     static const std::unordered_map<std::string, std::string> kLangByExt = {
         { "cpp", "cpp" }, { "cc", "cpp" }, { "cxx", "cpp" },
@@ -435,7 +436,7 @@ ReadResult ReadFile(const std::string& inputPath, const ToolContext& ctx)
     if (!truncated) {
         std::string base = tool_path_safety::Basename(resolved);
         for (char& c : base)
-            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            c = static_cast<char>(lb_ascii::ToLower(static_cast<unsigned char>(c)));
         if (base == "skill.md" || base == "workflow.md")
             r.historyInlineBudgetBytes =
                 ComputeRangedReadHistoryBudget(ctx.ctxTokens);

@@ -23,6 +23,7 @@
 // child-window background seams to fight.
 
 #pragma once
+#include "lb_ascii.h"
 
 #include <wx/wx.h>
 #include <wx/dcbuffer.h>
@@ -175,7 +176,7 @@ private:
         std::string ext = name.substr(dot + 1);
         if (ext.size() > 4) ext = ext.substr(0, 4);
         for (char& c : ext)
-            c = (char)std::toupper((unsigned char)c);
+            c = (char)lb_ascii::ToUpper((unsigned char)c);
         return ext;
     }
 

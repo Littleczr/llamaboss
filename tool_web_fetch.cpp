@@ -4,6 +4,7 @@
 // Uses WinHTTP from the Windows SDK; no third-party HTTP/HTML libraries.
 
 #include "tool_web_fetch.h"
+#include "lb_ascii.h"
 #include "ui_event_post.h"
 #include "var_store.h"      // demotion threshold — see kInlineBodyBudget below
 #include "chat_folders.h"   // chat folder recognizer
@@ -103,7 +104,7 @@ constexpr const wchar_t* kUserAgent =
 
 std::string Trim(std::string s)
 {
-    auto isWs = [](unsigned char c) { return std::isspace(c) != 0; };
+    auto isWs = [](unsigned char c) { return lb_ascii::IsSpace(c) != 0; };
     while (!s.empty() && isWs(static_cast<unsigned char>(s.front()))) s.erase(s.begin());
     while (!s.empty() && isWs(static_cast<unsigned char>(s.back()))) s.pop_back();
     return s;
@@ -112,7 +113,7 @@ std::string Trim(std::string s)
 std::string Lower(std::string s)
 {
     std::transform(s.begin(), s.end(), s.begin(),
-        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        [](unsigned char c) { return static_cast<char>(lb_ascii::ToLower(c)); });
     return s;
 }
 
@@ -379,7 +380,7 @@ std::string SafeFileStem(const std::string& host, const std::string& path, const
 
     for (char& c : s) {
         unsigned char uc = static_cast<unsigned char>(c);
-        bool ok = std::isalnum(uc) || c == '-' || c == '_' || c == '.';
+        bool ok = lb_ascii::IsAlnum(uc) || c == '-' || c == '_' || c == '.';
         if (!ok) c = '_';
     }
     // Collapse runs of '_' in one linear pass (no std::regex).
@@ -853,10 +854,10 @@ std::string ExtractCharsetFromContentType(const std::string& contentType)
     std::size_t pos = lower.find("charset");
     if (pos == std::string::npos) return std::string();
     pos += 7;
-    while (pos < lower.size() && std::isspace(static_cast<unsigned char>(lower[pos]))) ++pos;
+    while (pos < lower.size() && lb_ascii::IsSpace(static_cast<unsigned char>(lower[pos]))) ++pos;
     if (pos >= lower.size() || lower[pos] != '=') return std::string();
     ++pos;
-    while (pos < contentType.size() && std::isspace(static_cast<unsigned char>(contentType[pos]))) ++pos;
+    while (pos < contentType.size() && lb_ascii::IsSpace(static_cast<unsigned char>(contentType[pos]))) ++pos;
 
     if (pos < contentType.size() && (contentType[pos] == '\'' || contentType[pos] == '"')) {
         char quote = contentType[pos++];
@@ -867,7 +868,7 @@ std::string ExtractCharsetFromContentType(const std::string& contentType)
     std::size_t end = pos;
     while (end < contentType.size()) {
         char c = contentType[end];
-        if (c == ';' || std::isspace(static_cast<unsigned char>(c))) break;
+        if (c == ';' || lb_ascii::IsSpace(static_cast<unsigned char>(c))) break;
         ++end;
     }
     return Lower(Trim(contentType.substr(pos, end - pos)));
@@ -892,17 +893,17 @@ std::string ExtractMetaCharsetFromBytes(const std::string& bytes)
         while ((charset = tagLower.find("charset", charset)) != std::string::npos) {
             char before = (charset == 0) ? '\0' : tagLower[charset - 1];
             bool leftOk = charset == 0 ||
-                          (!std::isalnum(static_cast<unsigned char>(before)) &&
+                          (!lb_ascii::IsAlnum(static_cast<unsigned char>(before)) &&
                            before != '-' && before != '_');
             if (leftOk) break;
             charset += 7;
         }
         if (charset != std::string::npos) {
             charset += 7;
-            while (charset < tagLower.size() && std::isspace(static_cast<unsigned char>(tagLower[charset]))) ++charset;
+            while (charset < tagLower.size() && lb_ascii::IsSpace(static_cast<unsigned char>(tagLower[charset]))) ++charset;
             if (charset < tagLower.size() && tagLower[charset] == '=') {
                 ++charset;
-                while (charset < tag.size() && std::isspace(static_cast<unsigned char>(tag[charset]))) ++charset;
+                while (charset < tag.size() && lb_ascii::IsSpace(static_cast<unsigned char>(tag[charset]))) ++charset;
                 if (charset < tag.size() && (tag[charset] == '\'' || tag[charset] == '"')) {
                     char quote = tag[charset++];
                     std::size_t end = tag.find(quote, charset);
@@ -917,7 +918,7 @@ std::string ExtractMetaCharsetFromBytes(const std::string& bytes)
                     // closing quote was glued onto the charset ("X\""),
                     // failing the codepage lookup for every such page.
                     if (c == ';' || c == '>' || c == '/' || c == '"' || c == '\'' ||
-                        std::isspace(static_cast<unsigned char>(c))) break;
+                        lb_ascii::IsSpace(static_cast<unsigned char>(c))) break;
                     ++end;
                 }
                 return Lower(Trim(tag.substr(charset, end - charset)));
@@ -1105,8 +1106,8 @@ std::string DecodeEntities(const std::string& in)
 
 bool AsciiEqualsI(char a, char b)
 {
-    return std::tolower(static_cast<unsigned char>(a)) ==
-           std::tolower(static_cast<unsigned char>(b));
+    return lb_ascii::ToLower(static_cast<unsigned char>(a)) ==
+           lb_ascii::ToLower(static_cast<unsigned char>(b));
 }
 
 bool MatchAsciiI(const std::string& s, std::size_t pos, const char* needle)
@@ -1129,7 +1130,7 @@ std::size_t FindAsciiI(const std::string& s, const char* needle, std::size_t fro
 bool IsTagNameBoundary(char c)
 {
     unsigned char uc = static_cast<unsigned char>(c);
-    return c == '>' || c == '/' || std::isspace(uc) != 0;
+    return c == '>' || c == '/' || lb_ascii::IsSpace(uc) != 0;
 }
 
 bool IsOpeningTagAt(const std::string& s, std::size_t pos, const char* tag)
@@ -1238,7 +1239,7 @@ std::string StripUnsafeHtmlBlocks(const std::string& html)
             // page. (Spec-correct for svg, which is foreign content; for the
             // HTML tags a self-closed form is broken markup either way.)
             std::size_t back = openEnd;
-            while (back > i && std::isspace(static_cast<unsigned char>(html[back - 1]))) --back;
+            while (back > i && lb_ascii::IsSpace(static_cast<unsigned char>(html[back - 1]))) --back;
             if (back > i && html[back - 1] == '/') {
                 out.push_back(' ');
                 i = openEnd + 1;
@@ -1313,22 +1314,22 @@ std::string ExtractHtmlAttribute(const std::string& tagText, const char* attrNam
     std::size_t pos = 0;
 
     while ((pos = lower.find(attr, pos)) != std::string::npos) {
-        bool leftOk = (pos == 0) || !std::isalnum(static_cast<unsigned char>(lower[pos - 1]));
+        bool leftOk = (pos == 0) || !lb_ascii::IsAlnum(static_cast<unsigned char>(lower[pos - 1]));
         std::size_t endName = pos + attr.size();
-        bool rightOk = endName >= lower.size() || !std::isalnum(static_cast<unsigned char>(lower[endName]));
+        bool rightOk = endName >= lower.size() || !lb_ascii::IsAlnum(static_cast<unsigned char>(lower[endName]));
         if (!leftOk || !rightOk) {
             pos = endName;
             continue;
         }
 
         std::size_t p = endName;
-        while (p < tagText.size() && std::isspace(static_cast<unsigned char>(tagText[p]))) ++p;
+        while (p < tagText.size() && lb_ascii::IsSpace(static_cast<unsigned char>(tagText[p]))) ++p;
         if (p >= tagText.size() || tagText[p] != '=') {
             pos = endName;
             continue;
         }
         ++p;
-        while (p < tagText.size() && std::isspace(static_cast<unsigned char>(tagText[p]))) ++p;
+        while (p < tagText.size() && lb_ascii::IsSpace(static_cast<unsigned char>(tagText[p]))) ++p;
         if (p >= tagText.size()) return std::string();
 
         if (tagText[p] == '\'' || tagText[p] == '"') {
@@ -1340,7 +1341,7 @@ std::string ExtractHtmlAttribute(const std::string& tagText, const char* attrNam
         std::size_t end = p;
         while (end < tagText.size()) {
             char c = tagText[end];
-            if (std::isspace(static_cast<unsigned char>(c)) || c == '>') break;
+            if (lb_ascii::IsSpace(static_cast<unsigned char>(c)) || c == '>') break;
             if (c == '/') {
                 // '/' is legal inside unquoted attribute values per the HTML5
                 // tokenizer (href=/docs/page, src=img/a.png). Only treat it as
@@ -1351,7 +1352,7 @@ std::string ExtractHtmlAttribute(const std::string& tagText, const char* attrNam
                 // while root-relative links are preserved.
                 std::size_t rest = end + 1;
                 while (rest < tagText.size() &&
-                       std::isspace(static_cast<unsigned char>(tagText[rest]))) {
+                       lb_ascii::IsSpace(static_cast<unsigned char>(tagText[rest]))) {
                     ++rest;
                 }
                 if (rest >= tagText.size() || tagText[rest] == '>') break;
@@ -1380,7 +1381,7 @@ void EnsureLineBreak(std::string& out)
 bool HasVisibleNonSpace(const std::string& s)
 {
     for (unsigned char c : s) {
-        if (!std::isspace(c)) return true;
+        if (!lb_ascii::IsSpace(c)) return true;
     }
     return false;
 }
@@ -1446,7 +1447,7 @@ std::string HtmlTagsToMarkdown(const std::string& html, const std::string& baseU
             out.append(html, i, count);
             if (!anchors.empty() && !anchors.back().hasText) {
                 for (std::size_t k = i; k < i + count; ++k) {
-                    if (!std::isspace(static_cast<unsigned char>(html[k]))) {
+                    if (!lb_ascii::IsSpace(static_cast<unsigned char>(html[k]))) {
                         anchors.back().hasText = true;
                         break;
                     }
@@ -1461,7 +1462,7 @@ std::string HtmlTagsToMarkdown(const std::string& html, const std::string& baseU
         // page text) is literal text.
         char nextC = (i + 1 < html.size()) ? html[i + 1] : '\0';
         bool tagStart = nextC == '/' || nextC == '!' || nextC == '?' ||
-                        std::isalpha(static_cast<unsigned char>(nextC)) != 0;
+                        lb_ascii::IsAlpha(static_cast<unsigned char>(nextC)) != 0;
         if (!tagStart) {
             out.push_back(html[i++]);
             NoteAnchorText(anchors, "<");
@@ -1480,13 +1481,13 @@ std::string HtmlTagsToMarkdown(const std::string& html, const std::string& baseU
             closing = true;
             ++j;
         }
-        while (j < html.size() && std::isspace(static_cast<unsigned char>(html[j]))) ++j;
+        while (j < html.size() && lb_ascii::IsSpace(static_cast<unsigned char>(html[j]))) ++j;
 
         std::string tag;
         while (j < html.size()) {
             unsigned char uc = static_cast<unsigned char>(html[j]);
-            if (!std::isalnum(uc)) break;
-            tag.push_back(static_cast<char>(std::tolower(uc)));
+            if (!lb_ascii::IsAlnum(uc)) break;
+            tag.push_back(static_cast<char>(lb_ascii::ToLower(uc)));
             ++j;
         }
 
@@ -1581,7 +1582,7 @@ std::string CollapseInlineWhitespace(const std::string& line)
     bool lastSpace = false;
     for (char c : line) {
         unsigned char uc = static_cast<unsigned char>(c);
-        if (std::isspace(uc)) {
+        if (lb_ascii::IsSpace(uc)) {
             if (!lastSpace) out.push_back(' ');
             lastSpace = true;
         } else {
@@ -1666,7 +1667,7 @@ std::string ExtractTitle(const std::string& html)
     bool lastSpace = false;
     for (char c : t) {
         unsigned char uc = static_cast<unsigned char>(c);
-        if (std::isspace(uc)) {
+        if (lb_ascii::IsSpace(uc)) {
             if (!lastSpace) out.push_back(' ');
             lastSpace = true;
         } else {

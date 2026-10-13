@@ -1,6 +1,7 @@
 // command_policy.cpp
 
 #include "command_policy.h"
+#include "lb_ascii.h"
 
 #include <algorithm>
 #include <array>
@@ -112,8 +113,8 @@ bool StartsWithCi(const std::string& s, const char* prefix) {
     size_t i = 0;
     while (prefix[i] != '\0') {
         if (i >= s.size()) return false;
-        if (std::tolower((unsigned char)s[i]) !=
-            std::tolower((unsigned char)prefix[i])) return false;
+        if (lb_ascii::ToLower((unsigned char)s[i]) !=
+            lb_ascii::ToLower((unsigned char)prefix[i])) return false;
         ++i;
     }
     return true;
@@ -122,8 +123,8 @@ bool StartsWithCi(const std::string& s, const char* prefix) {
 bool EqualsCi(const std::string& s, const char* other) {
     size_t i = 0;
     while (other[i] != '\0' && i < s.size()) {
-        if (std::tolower((unsigned char)s[i]) !=
-            std::tolower((unsigned char)other[i])) return false;
+        if (lb_ascii::ToLower((unsigned char)s[i]) !=
+            lb_ascii::ToLower((unsigned char)other[i])) return false;
         ++i;
     }
     return other[i] == '\0' && i == s.size();
@@ -152,7 +153,7 @@ std::string FirstToken(const std::string& stage) {
 bool IsIdentifierShape(const std::string& head) {
     if (head.empty()) return false;
     for (char c : head) {
-        const bool ok = std::isalnum((unsigned char)c) ||
+        const bool ok = lb_ascii::IsAlnum((unsigned char)c) ||
                         c == '-' || c == '_';
         if (!ok) return false;
     }
@@ -213,8 +214,8 @@ void MarkApproval(ScanResult& out, const std::string& reason) {
 
 // ─── Safe-expression micro-grammar (calculated-property bodies) ──
 
-bool IsIdentStartChar(char c) { return std::isalpha((unsigned char)c) || c == '_'; }
-bool IsIdentChar(char c)      { return std::isalnum((unsigned char)c) || c == '_'; }
+bool IsIdentStartChar(char c) { return lb_ascii::IsAlpha((unsigned char)c) || c == '_'; }
+bool IsIdentChar(char c)      { return lb_ascii::IsAlnum((unsigned char)c) || c == '_'; }
 
 void SkipWs(const std::string& s, size_t& i) {
     while (i < s.size() && (s[i] == ' ' || s[i] == '\t' || s[i] == '\r' || s[i] == '\n')) ++i;
@@ -276,11 +277,11 @@ bool TryMatchDollarUnderscoreChain(const std::string& s, size_t& i) {
 bool TryMatchNumberLiteral(const std::string& s, size_t& i) {
     size_t j = i;
     bool any = false;
-    while (j < s.size() && std::isdigit((unsigned char)s[j])) { ++j; any = true; }
+    while (j < s.size() && lb_ascii::IsDigit((unsigned char)s[j])) { ++j; any = true; }
     if (j < s.size() && s[j] == '.') {
         size_t k = j + 1;
         bool anyFrac = false;
-        while (k < s.size() && std::isdigit((unsigned char)s[k])) { ++k; anyFrac = true; }
+        while (k < s.size() && lb_ascii::IsDigit((unsigned char)s[k])) { ++k; anyFrac = true; }
         if (anyFrac) { j = k; any = true; }
     }
     if (!any) return false;
@@ -290,7 +291,7 @@ bool TryMatchNumberLiteral(const std::string& s, size_t& i) {
         if (j + n <= s.size()) {
             bool matched = true;
             for (size_t t = 0; t < n; ++t) {
-                if (std::tolower((unsigned char)s[j + t]) != std::tolower((unsigned char)suf[t])) {
+                if (lb_ascii::ToLower((unsigned char)s[j + t]) != lb_ascii::ToLower((unsigned char)suf[t])) {
                     matched = false;
                     break;
                 }
@@ -458,7 +459,7 @@ bool IsSafeSimpleAssignment(const std::string& stmt) {
         if (!TryMatchSafeStringLiteral(stmt, i)) return false;
     } else {
         size_t start = i;
-        while (i < stmt.size() && std::isdigit((unsigned char)stmt[i])) ++i;
+        while (i < stmt.size() && lb_ascii::IsDigit((unsigned char)stmt[i])) ++i;
         if (i == start) return false;
     }
 
@@ -791,8 +792,8 @@ bool HasAssignmentTo(const std::string& command, const std::string& name)
         for (size_t i = from; i + needle.size() <= hay.size(); ++i) {
             size_t j = 0;
             while (j < needle.size() &&
-                   std::tolower((unsigned char)hay[i + j]) ==
-                   std::tolower((unsigned char)needle[j])) {
+                   lb_ascii::ToLower((unsigned char)hay[i + j]) ==
+                   lb_ascii::ToLower((unsigned char)needle[j])) {
                 ++j;
             }
             if (j == needle.size()) return i;

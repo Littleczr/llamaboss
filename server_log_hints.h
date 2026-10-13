@@ -1,4 +1,5 @@
 #pragma once
+#include "lb_ascii.h"
 
 // server_log_hints.h
 //
@@ -15,7 +16,7 @@ namespace server_log_hints {
 namespace detail {
 inline std::string Lower(std::string s)
 {
-    for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    for (char& c : s) c = static_cast<char>(lb_ascii::ToLower(static_cast<unsigned char>(c)));
     return s;
 }
 } // namespace detail

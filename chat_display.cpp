@@ -1,5 +1,6 @@
 // chat_display.cpp
 #include "chat_display.h"
+#include "lb_ascii.h"
 #include "chat_display_ctrl.h"
 #include "markdown_renderer.h"
 #include "ascii_animation.h"
@@ -214,7 +215,7 @@ bool LoadImageThumbnailCached(const std::string& imgPath,
 
 std::string ToLowerAscii(std::string s)
 {
-    for (char& ch : s) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    for (char& ch : s) ch = static_cast<char>(lb_ascii::ToLower(static_cast<unsigned char>(ch)));
     return s;
 }
 

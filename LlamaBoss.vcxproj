@@ -326,6 +326,7 @@
     <ClInclude Include="project_attach_dialog.h" />
     <ClInclude Include="project_status_strip.h" />
     <ClInclude Include="activity_strip.h" />
+    <ClInclude Include="lb_ascii.h" />
     <ClInclude Include="lb_string_utils.h" />
     <ClInclude Include="skill_authoring_support.h" />
     <ClInclude Include="skill_prompt_builder.h" />

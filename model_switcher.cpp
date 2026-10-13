@@ -1,5 +1,6 @@
 // model_switcher.cpp
 #include "model_switcher.h"
+#include "lb_ascii.h"
 
 #include "model_service.h"
 #include "app_state.h"
@@ -80,7 +81,7 @@ bool LooksLikeQuantization(const std::string& token)
     lower.reserve(token.size());
     for (char c : token) {
         lower.push_back(
-            static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+            static_cast<char>(lb_ascii::ToLower(static_cast<unsigned char>(c))));
     }
 
     if (lower == "f16"  || lower == "fp16" || lower == "bf16" ||
@@ -89,7 +90,7 @@ bool LooksLikeQuantization(const std::string& token)
     }
 
     auto isDigitCh = [](char c) {
-        return std::isdigit(static_cast<unsigned char>(c)) != 0;
+        return lb_ascii::IsDigit(static_cast<unsigned char>(c)) != 0;
     };
 
     // "qN..."  -- q4, q4_0, q4_K_M, q5_K_S, q8_0, etc.
@@ -151,7 +152,7 @@ std::string LowerAscii(std::string s)
 {
     for (char& c : s) {
         c = static_cast<char>(
-            std::tolower(static_cast<unsigned char>(c)));
+            lb_ascii::ToLower(static_cast<unsigned char>(c)));
     }
     return s;
 }

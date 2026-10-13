@@ -1,6 +1,7 @@
 // endpoints_dialog.cpp
 
 #include "endpoints_dialog.h"
+#include "lb_ascii.h"
 #include "reasoning_policy.h"
 #include "openai_responses.h"
 #include "endpoint_store.h"
@@ -232,7 +233,7 @@ bool IdLooksLikeImageModel(const std::string& id)
     std::string seg = (slash == std::string::npos) ? id
                                                    : id.substr(slash + 1);
     std::transform(seg.begin(), seg.end(), seg.begin(),
-                   [](unsigned char c) { return (char)std::tolower(c); });
+                   [](unsigned char c) { return (char)lb_ascii::ToLower(c); });
     std::string token;
     auto flush = [&]() {
         const bool hit = (token == "image");
@@ -265,15 +266,15 @@ std::string PrettyNameFromId(const std::string& id)
         if (word.empty()) return;
         std::string lower = word;
         std::transform(lower.begin(), lower.end(), lower.begin(),
-                       [](unsigned char c) { return (char)std::tolower(c); });
+                       [](unsigned char c) { return (char)lb_ascii::ToLower(c); });
         if (!out.empty()) out += ' ';
         if (lower == "gpt" || lower == "ai" || lower == "vl" ||
             lower == "xl") {
             std::transform(lower.begin(), lower.end(), lower.begin(),
-                           [](unsigned char c) { return (char)std::toupper(c); });
+                           [](unsigned char c) { return (char)lb_ascii::ToUpper(c); });
             out += lower;
         } else {
-            lower[0] = (char)std::toupper((unsigned char)lower[0]);
+            lower[0] = (char)lb_ascii::ToUpper((unsigned char)lower[0]);
             out += lower;
         }
         word.clear();
@@ -311,7 +312,7 @@ std::vector<EndpointStore::Model> ParseModelsText(const wxString& text)
                 if (line.size() < tag.size()) return false;
                 std::string tail = line.substr(line.size() - tag.size());
                 std::transform(tail.begin(), tail.end(), tail.begin(),
-                               [](unsigned char c) { return (char)std::tolower(c); });
+                               [](unsigned char c) { return (char)lb_ascii::ToLower(c); });
                 if (tail != tag) return false;
                 line.erase(line.size() - tag.size());
                 auto e = line.find_last_not_of(" \t");
@@ -1437,7 +1438,7 @@ private:
         const size_t port = host.rfind(':');
         if (port != std::string::npos) host.erase(port);
         std::transform(host.begin(), host.end(), host.begin(),
-                       [](unsigned char c) { return (char)std::tolower(c); });
+                       [](unsigned char c) { return (char)lb_ascii::ToLower(c); });
         return host;
     }
 
@@ -1744,7 +1745,7 @@ private:
             const wxUniChar uc = name[i];
             const wxUint32 cp = uc.GetValue();
             if (cp > 0x7F) { pendingSep = !out.empty(); continue; }
-            const char c = (char)std::tolower((unsigned char)cp);
+            const char c = (char)lb_ascii::ToLower((unsigned char)cp);
             if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) {
                 if (pendingSep) out += '_';
                 pendingSep = false;
@@ -2193,11 +2194,11 @@ private:
 
         std::string filter = TrimUtf8(m_filterField->GetValue());
         std::transform(filter.begin(), filter.end(), filter.begin(),
-                       [](unsigned char c) { return (char)std::tolower(c); });
+                       [](unsigned char c) { return (char)lb_ascii::ToLower(c); });
         auto lower = [](std::string s) {
             std::transform(s.begin(), s.end(), s.begin(),
                            [](unsigned char c) {
-                               return (char)std::tolower(c);
+                               return (char)lb_ascii::ToLower(c);
                            });
             return s;
         };

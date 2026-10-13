@@ -4,6 +4,7 @@
 // small parser outside tool_router.cpp lets the native regression runner test
 // the exact production behavior without linking every tool implementation.
 #pragma once
+#include "lb_ascii.h"
 
 #include <algorithm>
 #include <cctype>
@@ -46,7 +47,7 @@ inline bool ParseQuotedPattern(const std::string& text,
     }
 
     if (close + 1 < text.size() &&
-        !std::isspace(static_cast<unsigned char>(text[close + 1]))) {
+        !lb_ascii::IsSpace(static_cast<unsigned char>(text[close + 1]))) {
         errorOut = "Quoted grep pattern must be followed by whitespace.";
         return true;
     }
@@ -82,7 +83,7 @@ inline ParsedGrepArgs Parse(const std::string& args,
 
     auto parseContext = [&](const std::string& token) -> bool {
         if (token.empty() || !std::all_of(token.begin(), token.end(),
-                [](unsigned char c){ return std::isdigit(c); })) {
+                [](unsigned char c){ return lb_ascii::IsDigit(c); })) {
             out.error = "grep -C context must be an integer from 0 to "
                 + std::to_string(maxContextLines);
             return false;
@@ -118,15 +119,15 @@ inline ParsedGrepArgs Parse(const std::string& args,
         patternWasLineDelimited = true;
         nativeStructured = true;
     } else if (s.size() >= 2 && s[0] == '-' && s[1] == 'C' &&
-               (s.size() == 2 || std::isdigit(static_cast<unsigned char>(s[2])) ||
-                std::isspace(static_cast<unsigned char>(s[2])) ||
+               (s.size() == 2 || lb_ascii::IsDigit(static_cast<unsigned char>(s[2])) ||
+                lb_ascii::IsSpace(static_cast<unsigned char>(s[2])) ||
                 s[2] == '-' || s[2] == '+')) {
         size_t pos = 2;
         while (pos < s.size() && (s[pos] == ' ' || s[pos] == '\t')) ++pos;
         size_t end = pos;
-        while (end < s.size() && std::isdigit(static_cast<unsigned char>(s[end]))) ++end;
+        while (end < s.size() && lb_ascii::IsDigit(static_cast<unsigned char>(s[end]))) ++end;
         if (!parseContext(s.substr(pos, end - pos))) return out;
-        if (end < s.size() && !std::isspace(static_cast<unsigned char>(s[end]))) {
+        if (end < s.size() && !lb_ascii::IsSpace(static_cast<unsigned char>(s[end]))) {
             out.error = "grep -C context must be followed by whitespace";
             return out;
         }

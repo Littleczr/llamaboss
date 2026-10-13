@@ -12,6 +12,7 @@
 // clearly read-only commands, rejects malformed commands, and routes
 // broader shell automation into this approval-card layer.
 #pragma once
+#include "lb_ascii.h"
 
 #include "command_policy.h"
 #include "lb_string_utils.h"   // LbUtf8SafeTruncate
@@ -644,7 +645,7 @@ inline bool EditTargetsPowerShellScript(const ToolInvocation& inv)
         if (path.size() < 4) return false;
         std::string ext = path.substr(path.size() - 4);
         for (char& c : ext)
-            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            c = static_cast<char>(lb_ascii::ToLower(static_cast<unsigned char>(c)));
         return ext == ".ps1";
     };
     // Fail closed: check both the parsed path and the raw first line, so an

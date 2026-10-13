@@ -1,4 +1,5 @@
 #pragma once
+#include "lb_ascii.h"
 // transient_error.h -- classify model-request errors that are worth an
 // automatic retry inside a running agent loop.
 //
@@ -27,7 +28,7 @@ inline std::string Lower(const std::string& s)
 {
     std::string out = s;
     for (char& c : out)
-        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        c = static_cast<char>(lb_ascii::ToLower(static_cast<unsigned char>(c)));
     return out;
 }
 
