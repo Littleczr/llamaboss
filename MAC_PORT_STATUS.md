@@ -151,9 +151,9 @@ When the login keychain has an "Apple Development" (or, failing that, a self-sig
 | --- | --- | --- |
 | 1 | Reproducible arm64 build | **Done**: all translation units compile and link (Homebrew dev build and static release build) |
 | 2 | App launches, main window | **Done**: main window and Welcome dialog open |
-| 3 | Conversations save and reopen (Unicode paths) | **Verified 2026-10-09** for ASCII titles (save, quit, relaunch, reopen, model auto-reload). Unicode file names not yet tested |
+| 3 | Conversations save and reopen (Unicode paths) | **Verified**: ASCII titles (2026-10-09); Unicode title with accents, CJK and emoji (2026-10-13). Chat folders use an ASCII slug |
 | 4 | Local llama-server starts, reports errors, stops | **Verified**: Gemma 3 1B on Metal (2026-10-09); error path (2026-10-11); orphan cleanup (2026-10-12) |
-| 5 | Remote endpoint streams; stop works | **Verified** streaming with OpenRouter GPT 6 Luna (2026-10-11 onward). Stop verified on a local model (2026-10-13); Stop during a remote stream not yet tested |
+| 5 | Remote endpoint streams; stop works | **Verified** streaming with OpenRouter GPT 6 Luna (2026-10-11 onward). Stop during a remote stream verified (2026-10-13) |
 | 6 | Shell and Python tools | **Done**: zsh shell tool (2026-10-11), Python helpers and scripts (2026-10-11), `py` session (2026-10-12), web fetch (2026-10-12), bundled Python runtime (2026-10-13) |
 | 7 | File-tool boundaries, protected credentials, packaged app | Credentials in the Keychain **verified**; packaged, notarized app **done** (2026-10-12). File-tool boundary cases (symlinks, case-sensitive volumes) implemented, not systematically tested |
 | 8 | Public Mac release | **Done 2026-10-12**: Beta 0.1.23 DMG on R2, "Download for Mac" on llamaboss.com. A build with the bundled Python is not notarized yet |
@@ -655,14 +655,39 @@ outside the repo, sha256 verify, restore). Built by `macos/make_pc_package.py`.
   configure without `third_party/llama.cpp` (empty glob) and adds the package builder.
 - **Suggestion for the Windows version:** none beyond the two packages.
 
+## UI checks and Mac fixes, 2026-10-13 (late)
+
+- **Update feed** (`c91680d`, Mac only): the Mac build read the Windows `url` (the Setup.exe)
+  and treated a Windows-only release as a Mac update. It now reads `mac_version`, `mac_url`,
+  `mac_sha256`, `mac_notes`; with no `mac_version` it reports up to date. Harness: Windows-only
+  feed → no update; Mac fields → update with the DMG URL; live llamaboss.com → up to date.
+  About shows "You're up to date (v0.1.23)". **For the PC side:** add the `mac_*` fields to
+  version.json at the next Mac release (they are ignored by Windows builds).
+- **Theme switching** (`fbf0f97`, Mac only): switching dark ↔ light at runtime flips the app
+  appearance, and wx then reset colours: the chat view went to the system background and the
+  ☰ + ⓘ glyphs kept the old colour (invisible) without hover. Fixed by re-applying the theme
+  on `wxEVT_SYS_COLOUR_CHANGED` and syncing borderless button titles in the native layer.
+  Verified Nord → Light (glyphs visible, hover tint shows) → Nord.
+- **Confirmation alerts** (`02c76b8`, Mac only): verb buttons (Delete / Replace / Sign Out /
+  Stop Download) with Cancel as the default, Esc cancels, action shown as destructive; native
+  NSAlert because wx's custom labels dropped `wxNO_DEFAULT`. Verified with the delete-
+  conversation alert: Esc and Return cancel, clicking Delete deletes (a test chat).
+- **Light theme, menus, project attach:** checked by screenshot. Row menu and Project menu are
+  native; New Project and Add Source Files (native Open panel) work; Clear from This Chat
+  detaches. Test project deleted afterwards.
+- **Milestone gaps closed:** Unicode chat title (Café crème, 東京, 🦙) saved, listed and reopened
+  after a relaunch; Stop during a remote stream ("Generation stopped by user", no further
+  output).
+- **Suggestion for the Windows version:** the new-project message says "Use [ Change... ] in
+  the project strip", but the strip shows "[ Project ▾ ]" (`project_controller.cpp:99`).
+
 ## Next task
 
-1. Fresh-account test (needs the user: an administrator password to create the account and a
-   login to it). Use the stacked build (Mac branch + both packages) from `/Users/Shared`.
-2. Notarize a build with the bundled Python before the next release (needs the user's OK).
-3. Remaining UI checks: project attach, message boxes, light themes.
-4. Mac entry in the update feed: Mac app reads e.g. `mac_url` / `mac_sha256` from
-   version.json (Mac code), the user adds the fields on the PC side. Until then Check for
-   Updates opens the download page.
-5. Milestone gaps: Unicode chat titles (3), Stop during a remote stream (5).
-6. Skipped: the `Tests/` suite is for the Windows side (user decision 2026-10-12).
+1. **Needs the user:** apply the two PC packages (`D:\ForMacMini\Patches`, ascii_ctype first),
+   then Claude merges `main` into the Mac branch.
+2. **Needs the user:** fresh-account test with `/Users/Shared/LlamaBoss-FreshTest` (checklist
+   inside): create a standard user account and log in to it.
+3. **Needs the user's OK:** notarize a build with the bundled Python, then add `mac_*` fields
+   to version.json at that release.
+4. File-tool boundary cases on the Mac (symlinks, case-sensitive volume), milestone 7.
+5. Skipped: the `Tests/` suite is for the Windows side (user decision 2026-10-12).
