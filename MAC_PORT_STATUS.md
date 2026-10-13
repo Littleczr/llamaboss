@@ -524,6 +524,30 @@ large icons. macOS 26 may show a full-bleed square icon inside its standard roun
 - Released builds will use Developer ID signing and notarization (Phase 4); that also
   carries a Team ID, so users' updates will not prompt either.
 
+## Polish, 2026-10-13
+
+- **File card right border** (`chat_display.cpp`, Mac only): the `[Open] [Save As...]
+  [Open Folder]` row stuck out 2-4 px past the card's right border. Core Text advances
+  are fractional (Menlo 18 pt: 10.837 px) and wx rounds each styled run's width up, so
+  the action row (8 runs) came out wider than the one-run rows (measured: 535 vs 532 px).
+  On the Mac every card row is now written as the same three runs (2 chars, middle,
+  2 chars); the action row's middle is one italic run with the chips registered by
+  offset. wx merges equal neighbouring runs, so the middle run carries a character
+  style name (no style sheet, so it draws the same). Menlo Italic and Regular have equal
+  advances. Verified by screenshot: the border is straight.
+- **Empty chat saved on every launch** (`LlamaBoss.cpp`, Mac only): the New Chat prompt
+  pre-warm (from main dc9d27b) builds the agent prompt, whose cwd line called
+  `ResolveCurrentCwd()`. That gave the untouched chat a file path and created
+  `~/LlamaBoss/Chats/<date>_<id>/Workspace`, and `HasPersistableContent()` counts a file
+  path, so switching away saved an empty `chat_<id>.json` (sidebar showed it by file
+  name). While the pre-warm builds its prompt, a chat with no file now gets the Chats
+  root as a stand-in cwd; the cwd is after the cached cut, and the pre-warm key is
+  unchanged (`5ccbfa498e2a1e9f` before and after). Verified: launch + pre-warm + switch
+  creates no file or folder; a real first message still creates and titles both.
+- **Suggestion for the Windows version:** the same pre-warm path exists on Windows, so it
+  likely leaves an empty chat (and empty Chats folder) after each launch or New Chat that
+  is then left. The empty `chat_<id>.json` entries in the sidebar are the symptom.
+
 ## Next task
 
 1. Remaining UI checks: project attach, message boxes, light themes.

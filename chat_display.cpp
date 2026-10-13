@@ -920,17 +920,81 @@ void ChatDisplay::PresentFile(const PresentedFile& file)
         m_displayCtrl->WriteText(wxString::FromUTF8(s));
         m_displayCtrl->EndStyle();
     };
+#ifdef __WXMAC__
+    // Every row is written as the same three runs (two characters, middle,
+    // two characters), like the action row below.  wx rounds each run's
+    // width separately, so equal splits keep the right border straight.
+    // wx merges neighbouring runs with equal attributes, so the middle run
+    // carries a character style name (no style sheet: it draws the same).
+    wxRichTextAttr cardMidAttr = cardAttr;
+    cardMidAttr.SetCharacterStyleName("lb-card-row");
+    auto writeCardRow = [&](const std::string& row, bool newline) {
+        const wxString w = wxString::FromUTF8(row);
+        const size_t n = w.length();
+        const wxString parts[3] = { w.Left(2), w.Mid(2, n >= 4 ? n - 4 : 0),
+                                    (n >= 4 ? w.Right(2) : wxString()) +
+                                        (newline ? "\n" : "") };
+        for (int i = 0; i < 3; ++i) {
+            if (parts[i].empty()) continue;
+            m_displayCtrl->BeginStyle(i == 1 ? cardMidAttr : cardAttr);
+            m_displayCtrl->WriteText(parts[i]);
+            m_displayCtrl->EndStyle();
+        }
+    };
+#endif
 
     const std::string label = " " + DescribePresentedFileCardLabel(local) + " ";
     const int topFill = std::max(2, innerWidth + 2 - DisplayCharCount(label));
+#ifdef __WXMAC__
+    writeCardRow("┌" + label + RepeatText("─", topFill) + "┐", true);
+#else
     writeCardText("┌" + label + RepeatText("─", topFill) + "┐\n");
+#endif
+#ifdef __WXMAC__
+    writeCardRow("│ " + PadRight(contentLine, innerWidth) + " │", true);
+#else
     writeCardText("│ " + PadRight(contentLine, innerWidth) + " │\n");
+#endif
 
     if (!actions.empty()) {
+#ifdef __WXMAC__
+        writeCardRow("│ " + std::string(static_cast<size_t>(innerWidth), ' ') + " │", true);
+#else
         writeCardText("│ " + std::string(static_cast<size_t>(innerWidth), ' ') + " │\n");
+#endif
 
         writeCardText("│ ");
         int usedWidth = 0;
+#ifdef __WXMAC__
+        // Core Text advances are fractional and wx rounds each styled run's
+        // width up, so a row split into many runs drifts a few pixels past
+        // the card's right border.  Write the actions, gaps and padding as
+        // one italic run and register each chip by its offset inside it.
+        {
+            const long rowStart = m_displayCtrl->GetLastPosition();
+            std::string row;
+            for (size_t i = 0; i < actions.size(); ++i) {
+                if (i > 0) row += "  ";
+                const long chipStart = rowStart + static_cast<long>(row.size());
+                row += actions[i].first;   // labels are ASCII: bytes == chars
+
+                FileChipRegion region;
+                region.startPos = chipStart;
+                region.endPos   = rowStart + static_cast<long>(row.size());
+                region.file     = local;
+                region.action   = actions[i].second;
+                m_fileChips.push_back(std::move(region));
+            }
+            usedWidth = DisplayCharCount(row);
+            if (usedWidth < innerWidth)
+                row += std::string(static_cast<size_t>(innerWidth - usedWidth), ' ');
+            usedWidth = innerWidth;
+
+            m_displayCtrl->BeginStyle(actionAttr);
+            m_displayCtrl->WriteText(wxString::FromUTF8(row));
+            m_displayCtrl->EndStyle();
+        }
+#else
         for (size_t i = 0; i < actions.size(); ++i) {
             if (i > 0) {
                 writeCardText("  ");
@@ -952,6 +1016,7 @@ void ChatDisplay::PresentFile(const PresentedFile& file)
 
             usedWidth += DisplayCharCount(actions[i].first);
         }
+#endif
 
         if (usedWidth < innerWidth) {
             writeCardText(std::string(static_cast<size_t>(innerWidth - usedWidth), ' '));
@@ -959,7 +1024,11 @@ void ChatDisplay::PresentFile(const PresentedFile& file)
         writeCardText(" │\n");
     }
 
+#ifdef __WXMAC__
+    writeCardRow("└" + RepeatText("─", innerWidth + 2) + "┘", false);
+#else
     writeCardText("└" + RepeatText("─", innerWidth + 2) + "┘");
+#endif
 }
 void ChatDisplay::SetFilePersistenceContext(const std::string& absDir, size_t msgIdx)
 {
