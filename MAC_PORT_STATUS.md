@@ -620,8 +620,17 @@ outside the repo, sha256 verify, restore). Built by `macos/make_pc_package.py`.
 
 | Package | Branch (local only) | Files | State |
 | --- | --- | --- | --- |
-| `LlamaBoss_Patch_ascii_ctype.zip` | `suggest/ascii-ctype` (09761e2, on main 9e8b3d3) | 40 | Waiting for the user to apply on the PC |
-| `LlamaBoss_Patch_pdf_forms_pypdf.zip` | `suggest/pdf-forms-pypdf` (838e172, on ascii-ctype) | 7 | Waiting; **install after ascii_ctype** |
+| `LlamaBoss_Patch_ascii_ctype.zip` | `suggest/ascii-ctype-8814026` (a2bf8d6, on main 8814026) | 43 | Waiting for the user to apply on the PC |
+| `LlamaBoss_Patch_pdf_forms_pypdf.zip` | `suggest/pdf-forms-pypdf-8814026` (4f8a114, on ascii-ctype) | 7 | Waiting; **install after ascii_ctype** |
+
+Rebuilt 2026-10-13 on main **8814026** ("Transient error handling and agent/tool fixes"),
+fetched read-only from GitHub. The ASCII change was regenerated with the same script rather
+than rebased (only an `#include` line conflicted), so it also covers the 4 new calls in
+`transient_error.h`, `tool_approval.h`, `tool_edit.cpp`, `tool_read.cpp` (161 calls, 40 files);
+the PDF commit applied unchanged. Checked: Mac branch + 8814026 + both packages builds, zsh
+policy tests and `transient_error_tests.cpp` pass; installer suite and chain test on a CRLF
+checkout of 8814026; the 9e8b3d3 packages are refused there. Those are kept in
+`Patches\superseded_9e8b3d3` (do not install).
 
 - **ascii_ctype (bug):** wxWidgets sets `LC_CTYPE` to "UTF-8" at startup on macOS (checked with
   a bare wx app: "C" before, "UTF-8" after). There `isspace(0xA0)` and `isalpha(0xC3)` are true
