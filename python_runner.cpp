@@ -2441,6 +2441,18 @@ private:
             return;
         }
 
+#ifndef _WIN32
+        // macOS: the agent prompt allows "~/..." paths, and the helpers
+        // take their source path literally (relative to the chat folder),
+        // so expand a leading "~" here.  For pdf_fill_form and
+        // python_run_script the path is the argument's first line, which
+        // this also covers; package names and JSON specs never start
+        // with "~".
+        if (m_helperArg == "~" || m_helperArg.rfind("~/", 0) == 0) {
+            const char* home = std::getenv("HOME");
+            if (home && *home) m_helperArg = home + m_helperArg.substr(1);
+        }
+#endif
         if (m_helperName == "python_install_package") {
             std::string packageName;
             if (!python_arg_policy::NormalizeAllowedPythonPackage(m_helperArg, packageName, scriptError)) {
