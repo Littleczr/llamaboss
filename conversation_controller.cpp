@@ -1,5 +1,8 @@
 // conversation_controller.cpp
 #include "conversation_controller.h"
+#ifdef __WXMAC__
+#include "lb_mac_confirm.h"   // Mac alert button labels
+#endif
 
 #include "app.h"
 #include "app_state.h"
@@ -765,10 +768,17 @@ bool ConversationController::SaveBeforeLeaving(bool allowRecoveryDialog)
                          "Conversation In Use", wxOK | wxICON_WARNING, &m_frame);
             continue;
         }
+#ifdef __WXMAC__
+        if (wxFileExists(destination) && LbMacConfirm(
+                "Replace the existing conversation in this folder?",
+                "Replace Conversation", "Replace",
+                wxYES_NO | wxNO_DEFAULT | wxICON_WARNING, &m_frame) != wxYES) return false;
+#else
         if (wxFileExists(destination) && wxMessageBox(
                 "Replace the existing conversation in this folder?",
                 "Replace Conversation", wxYES_NO | wxNO_DEFAULT | wxICON_WARNING,
                 &m_frame) != wxYES) return false;
+#endif
 
         // Dialogs may have delivered more stream/tool results. Drain old
         // writes and take a fresh snapshot. This recovery export deliberately
@@ -1565,13 +1575,14 @@ void ConversationController::DeleteConversations(
             filePaths.size());
     }
 
-    int result = wxMessageBox(msg, "Delete Conversation",
 #ifdef __WXMAC__
-        wxYES_NO | wxNO_DEFAULT | wxICON_WARNING,
+    int result = LbMacConfirm(msg, "Delete Conversation", "Delete",
+        wxYES_NO | wxNO_DEFAULT | wxICON_WARNING, &m_frame);
 #else
+    int result = wxMessageBox(msg, "Delete Conversation",
         wxYES_NO | wxICON_WARNING,
-#endif
         &m_frame);
+#endif
     if (result != wxYES) return;
 
     // ── Re-run the ownership filter AFTER the confirmation modal ──

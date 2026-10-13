@@ -6,6 +6,9 @@
 // downloading a model from a pasted link.
 
 #include "model_manager.h"
+#ifdef __WXMAC__
+#include "lb_mac_confirm.h"   // Mac alert button labels
+#endif
 #include "lb_ui_font.h"   // LbUiPt: macOS point-size parity
 #include "server_manager.h"
 #include "theme.h"
@@ -527,7 +530,7 @@ void ModelManagerDialog::OnDeleteClicked(wxCommandEvent&)
 #ifdef __WXMAC__
     // Mac convention for an irreversible action: the safe button is the
     // default, so a stray Return cannot confirm the delete.
-    if (wxMessageBox(confirm, "Confirm Delete",
+    if (LbMacConfirm(confirm, "Confirm Delete", "Delete",
                      wxYES_NO | wxNO_DEFAULT | wxICON_WARNING, this) != wxYES) {
 #else
     if (wxMessageBox(confirm, "Confirm Delete",
@@ -578,12 +581,16 @@ void ModelManagerDialog::OnCloseWindow(wxCloseEvent& ev)
 bool ModelManagerDialog::ConfirmLeaveDuringDownload()
 {
     if (m_urlState != UrlState::Downloading) return true;
+#ifdef __WXMAC__
+    const int answer = LbMacConfirm(
+        "A model is still downloading. Closing this window cancels the "
+        "download.\n\nCancel the download and close?",
+        "Download in Progress", "Stop Download",
+        wxYES_NO | wxNO_DEFAULT | wxICON_WARNING, this, "Keep Downloading");
+#else
     const int answer = wxMessageBox(
         "A model is still downloading. Closing this window cancels the "
         "download.\n\nCancel the download and close?",
-#ifdef __WXMAC__
-        "Download in Progress", wxYES_NO | wxNO_DEFAULT | wxICON_WARNING, this);
-#else
         "Download in Progress", wxYES_NO | wxICON_WARNING, this);
 #endif
     if (answer != wxYES) return false;

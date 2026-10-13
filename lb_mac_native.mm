@@ -1,5 +1,6 @@
 // lb_mac_native.mm — see lb_mac_native.h.
 #include "lb_mac_native.h"
+#include "lb_mac_confirm.h"
 
 #import <Cocoa/Cocoa.h>
 
@@ -274,4 +275,51 @@ void LbMacInstallNativeControls()
     filter = new NativeControlsFilter;
     wxEvtHandler::AddFilter(filter);
     MatchAppearance(wxGetApp().GetAppState().GetTheme());
+}
+
+// ── Confirmation alerts (lb_mac_confirm.h) ──────────────────────────
+int LbMacConfirm(const wxString& message, const wxString& caption,
+                 const wxString& action, long style, wxWindow* /*parent*/,
+                 const wxString& cancel)
+{
+    auto ns = [](const wxString& s) { return [NSString stringWithUTF8String:s.utf8_str().data()]; };
+    NSAlert* alert = [[NSAlert alloc] init];
+    [alert setMessageText:ns(caption)];
+    [alert setInformativeText:ns(message)];
+    // Critical shows the caution triangle with the app icon badge, as the
+    // wx alert did; informational shows the app icon.
+    [alert setAlertStyle:(style & wxICON_WARNING) ? NSAlertStyleCritical
+                                                  : NSAlertStyleInformational];
+    const bool cancelDefault = (style & wxNO_DEFAULT) != 0;
+    // The first button is the default (rightmost, Return); "Cancel" also
+    // answers Esc.
+    NSButton* actionButton = nil;
+    if (cancelDefault) {
+        // AppKit gives a "Cancel" button Esc instead of Return; make it
+        // the default explicitly (Esc still cancels the alert).
+        NSButton* cancelButton = [alert addButtonWithTitle:ns(cancel)];
+        [cancelButton setKeyEquivalent:@"\r"];
+        actionButton = [alert addButtonWithTitle:ns(action)];
+        if (@available(macOS 11.0, *)) [actionButton setHasDestructiveAction:YES];
+    } else {
+        actionButton = [alert addButtonWithTitle:ns(action)];
+        [alert addButtonWithTitle:ns(cancel)];
+    }
+    // Esc cancels too: the cancel button's own Esc equivalent was
+    // replaced by Return above.
+    id escMonitor = [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskKeyDown
+                                                          handler:^NSEvent*(NSEvent* e) {
+        if ([e keyCode] == 53 && [NSApp modalWindow] == [alert window]) {
+            [NSApp stopModalWithCode:cancelDefault ? NSAlertFirstButtonReturn
+                                                   : NSAlertSecondButtonReturn];
+            return nil;
+        }
+        return e;
+    }];
+    const NSModalResponse r = [alert runModal];
+    [NSEvent removeMonitor:escMonitor];
+    [alert release];
+    const NSModalResponse actionResponse =
+        cancelDefault ? NSAlertSecondButtonReturn : NSAlertFirstButtonReturn;
+    return r == actionResponse ? wxYES : wxNO;
 }

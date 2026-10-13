@@ -1,6 +1,9 @@
 // endpoints_dialog.cpp
 
 #include "endpoints_dialog.h"
+#ifdef __WXMAC__
+#include "lb_mac_confirm.h"   // Mac alert button labels
+#endif
 #include "lb_ui_font.h"   // LbUiPt: macOS point-size parity
 #include "reasoning_policy.h"
 #include "openai_responses.h"
@@ -1677,10 +1680,18 @@ private:
     void OnChatGptSignOut(wxCommandEvent&)
     {
         if (m_chatgptAccount.empty()) return;
+#ifdef __WXMAC__
+        if (LbMacConfirm("Sign LlamaBoss out of ChatGPT on this computer?\n\n"
+                         "Chats using this connection will stop until you sign in again.",
+                         "Sign out of ChatGPT", "Sign Out",
+                         wxYES_NO | wxNO_DEFAULT | wxICON_QUESTION, this) != wxYES)
+            return;
+#else
         if (wxMessageBox("Sign LlamaBoss out of ChatGPT on this computer?\n\n"
                          "Chats using this connection will stop until you sign in again.",
                          "Sign out of ChatGPT", wxYES_NO | wxNO_DEFAULT | wxICON_QUESTION, this) != wxYES)
             return;
+#endif
         lb_chatgpt::Auth::Get().SignOut(m_chatgptAccount);
         m_chatgptAccount.clear();
         InvalidateFetch();
@@ -2522,9 +2533,16 @@ private:
         const auto* existing = m_endpointStore->FindEndpoint(ep.id);
         const bool hadEndpoint = existing != nullptr;
         if (hadEndpoint) previousEndpoint = *existing;
+#ifdef __WXMAC__
+        if (m_isNew && hadEndpoint && m_seededExistingId != ep.id && LbMacConfirm(
+            "This connection already exists. Replace its model list and settings? Use Edit to keep its existing models.",
+            "Replace connection?", "Replace",
+            wxYES_NO | wxNO_DEFAULT | wxICON_QUESTION, this) != wxYES) return false;
+#else
         if (m_isNew && hadEndpoint && m_seededExistingId != ep.id && wxMessageBox(
             "This connection already exists. Replace its model list and settings? Use Edit to keep its existing models.",
             "Replace connection?", wxYES_NO | wxNO_DEFAULT | wxICON_QUESTION, this) != wxYES) return false;
+#endif
 
         const std::string enteredKey = noAuth ? std::string() : TrimUtf8(m_apiKeyField->GetValue());
         SecretsStore::SecretEntry previousKey;
@@ -3150,7 +3168,8 @@ void EndpointsDialog::OnDelete(wxCommandEvent&)
     wxString question = wxString::Format("Delete endpoint '%s'?", wxString::FromUTF8(id.c_str()));
     if (chatgpt) question += "\n\nThis also signs LlamaBoss out of ChatGPT on this computer.";
 #ifdef __WXMAC__
-    int ans = wxMessageBox(question, "Confirm", wxYES_NO | wxNO_DEFAULT | wxICON_WARNING, this);
+    int ans = LbMacConfirm(question, "Confirm", "Delete",
+                           wxYES_NO | wxNO_DEFAULT | wxICON_WARNING, this);
 #else
     int ans = wxMessageBox(question, "Confirm", wxYES_NO | wxICON_WARNING, this);
 #endif

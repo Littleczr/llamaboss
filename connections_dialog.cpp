@@ -1,6 +1,9 @@
 // connections_dialog.cpp
 
 #include "connections_dialog.h"
+#ifdef __WXMAC__
+#include "lb_mac_confirm.h"   // Mac alert button labels
+#endif
 #include "lb_ui_font.h"   // LbUiPt: macOS point-size parity
 #include "secrets_store.h"
 #include "theme.h"
@@ -626,17 +629,22 @@ void ConnectionsDialog::OnAdd(wxCommandEvent&)
     std::string v = value.ToUTF8().data();
 
     if (m_store->HasSecret(p, k)) {
+#ifdef __WXMAC__
+        int ans = LbMacConfirm(
+            wxString::Format(
+                "A connection named %s.%s already exists. Replace it?",
+                provider, key),
+            "Replace existing connection?", "Replace",
+            wxYES_NO | wxNO_DEFAULT | wxICON_WARNING, this);
+#else
         int ans = wxMessageBox(
             wxString::Format(
                 "A connection named %s.%s already exists. Replace it?",
                 provider, key),
             "Replace existing connection?",
-#ifdef __WXMAC__
-            wxYES_NO | wxNO_DEFAULT | wxICON_WARNING,
-#else
             wxYES_NO | wxICON_WARNING,
-#endif
             this);
+#endif
         if (ans != wxYES) return;
     }
 
@@ -701,17 +709,22 @@ void ConnectionsDialog::OnEdit(wxCommandEvent&)
         (originalProvider != provider || originalKey != key);
 
     if (identityChanged && m_store->HasSecret(p, k)) {
+#ifdef __WXMAC__
+        int ans = LbMacConfirm(
+            wxString::Format(
+                "A connection named %s.%s already exists. Replace it?",
+                provider, key),
+            "Replace existing connection?", "Replace",
+            wxYES_NO | wxNO_DEFAULT | wxICON_WARNING, this);
+#else
         int ans = wxMessageBox(
             wxString::Format(
                 "A connection named %s.%s already exists. Replace it?",
                 provider, key),
             "Replace existing connection?",
-#ifdef __WXMAC__
-            wxYES_NO | wxNO_DEFAULT | wxICON_WARNING,
-#else
             wxYES_NO | wxICON_WARNING,
-#endif
             this);
+#endif
         if (ans != wxYES) return;
     }
 
@@ -744,11 +757,13 @@ void ConnectionsDialog::OnDelete(wxCommandEvent&)
     wxString provider = m_list->GetItemText(sel, 0);
     wxString key      = m_list->GetItemText(sel, 1);
 
+#ifdef __WXMAC__
+    int ans = LbMacConfirm(
+        wxString::Format("Delete %s.%s?", provider, key),
+        "Confirm", "Delete", wxYES_NO | wxNO_DEFAULT | wxICON_WARNING, this);
+#else
     int ans = wxMessageBox(
         wxString::Format("Delete %s.%s?", provider, key),
-#ifdef __WXMAC__
-        "Confirm", wxYES_NO | wxNO_DEFAULT | wxICON_WARNING, this);
-#else
         "Confirm", wxYES_NO | wxICON_WARNING, this);
 #endif
     if (ans != wxYES) return;
