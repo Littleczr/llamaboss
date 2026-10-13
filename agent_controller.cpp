@@ -5,6 +5,7 @@
 // emissions go to the sink as typed AgentEvent objects.
 
 #include "agent_controller.h"
+#include "transient_error.h"
 
 #include "wait_executor.h"   // WaitExecutor, WaitResult
 #include "python_runner.h"
@@ -1176,6 +1177,9 @@ void AgentController::Begin()
     m_waitSecondsUsed      = 0;   // wait tool's per-turn budget consumption
     m_consecutiveMalformed = 0;
     m_consecutiveEmptyAssistant = 0;
+    m_transientRetries = 0;
+    m_awaitingTransientRetry = false;
+    ++m_transientRetryToken;
     m_nextRequestSystemNudge.clear();
     m_announcedStepRecoveries = 0;
     m_toolAttemptsThisTurn = 0;
@@ -1287,6 +1291,9 @@ void AgentController::EndLoop(AgentEndReason     reason,
     m_standaloneWritePathsThisTurn.clear();
     m_pendingSoftHint.clear();
     m_consecutiveEmptyAssistant = 0;
+    m_transientRetries = 0;
+    m_awaitingTransientRetry = false;
+    ++m_transientRetryToken;   // invalidates any pending retry timer
     m_nextRequestSystemNudge.clear();
     m_announcedStepRecoveries = 0;
     m_toolAttemptsThisTurn = 0;
@@ -2530,6 +2537,7 @@ bool AgentController::HandleAssistantComplete(const std::string& fullResponse,
 
     // Visible prose or a structured tool call proves the provider recovered.
     m_consecutiveEmptyAssistant = 0;
+    m_transientRetries = 0;
     m_nextRequestSystemNudge.clear();
 
     // ── Native protocol path ────────────────────────────────────
@@ -3930,11 +3938,69 @@ bool AgentController::HandleWebFetchError(const std::string& errorText)
     return true;
 }
 
-bool AgentController::HandleAssistantError(const std::string& /*errorText*/)
+bool AgentController::HandleAssistantError(const std::string& errorText)
 {
     if (!m_active) return false;
-    // Errors always end the loop.  Let MyFrame's existing error
-    // handler render the friendly message; we just reset state.
-    EndLoop(AgentEndReason::StreamError, "");  // no extra message
+    // Errors end the loop (after MyFrame's automatic transient retries,
+    // see BeginTransientRetry).  Record WHY as an agent status card: it is
+    // stored in history, so the saved/exported transcript no longer just
+    // stops after a successful tool result, and a follow-up "continue"
+    // gives the model the context that its last request failed.
+    // Two internal callers pass fixed labels and own their messaging (the
+    // repetition notice; the send-failure path, whose placeholder is removed
+    // AFTER this call, so a stored card would sit in front of it).
+    const bool frameOwnsMessage = errorText == "repetition loop" ||
+                                  errorText == "Failed to start chat request";
+    if (!m_cancelled && !frameOwnsMessage) {
+        std::vector<std::string> chips = { "stopped", "model request failed" };
+        std::string msg = "The model request failed: " +
+            lb_transient_error::ShortForm(errorText, 300) + ".";
+        if (m_transientRetries > 0)
+            msg += " Automatic retries used: " +
+                   std::to_string(m_transientRetries) + ".";
+        msg += " No tool from the failed reply ran. Send `continue` to resume "
+               "from the last completed step.";
+        EmitAndStoreAgentStatusCard("Agent Status", chips, msg, true);
+    }
+    EndLoop(AgentEndReason::StreamError, "");  // card above carries the message
     return false;
+}
+
+bool AgentController::BeginTransientRetry(const std::string& errorText,
+                                          int& attemptOut, int& delayMsOut)
+{
+    attemptOut = 0;
+    delayMsOut = 0;
+    if (!m_active || m_cancelled || m_awaitingAsyncResult || m_awaitingApproval)
+        return false;
+    if (!lb_transient_error::IsTransient(errorText)) return false;
+    if (m_transientRetries >= lb_transient_error::kMaxRetries) return false;
+
+    ++m_transientRetries;
+    attemptOut = m_transientRetries;
+    delayMsOut = lb_transient_error::RetryDelayMs(attemptOut);
+    m_awaitingTransientRetry = true;
+    ++m_transientRetryToken;
+
+    if (m_appState) {
+        if (auto* logger = m_appState->GetLogger())
+            logger->warning("Agent: transient model error, retry " +
+                            std::to_string(attemptOut) + " of " +
+                            std::to_string(lb_transient_error::kMaxRetries) +
+                            " in " + std::to_string(delayMsOut) + " ms: " +
+                            lb_transient_error::ShortForm(errorText, 400));
+    }
+    return true;
+}
+
+void AgentController::ResumeAfterTransientRetry(unsigned long token)
+{
+    if (!m_active || !m_awaitingTransientRetry || token != m_transientRetryToken)
+        return;
+    m_awaitingTransientRetry = false;
+    // The failed request left no assistant message behind (MyFrame removed
+    // the empty placeholder), so the history still ends with the last tool
+    // result or user message: ContinueLoop re-sends exactly that request.
+    // It also honours a Stop pressed during the wait (m_cancelled).
+    ContinueLoop();
 }

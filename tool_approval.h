@@ -629,6 +629,33 @@ inline bool RequiresWriteRootGrant(const ToolInvocation& inv,
     return true;
 }
 
+// edit on a PowerShell .ps1 script: allowed (so a small fix to an existing
+// script no longer forces a whole-file write_powershell_script rewrite), but
+// always behind the same approval card that write_powershell_script uses.
+inline bool EditTargetsPowerShellScript(const ToolInvocation& inv)
+{
+    if (inv.name != tool_names::kEdit) return false;
+    auto endsWithPs1 = [](std::string path) {
+        path = Trim(path);
+        // Quotes, and the trailing dots/spaces Windows ignores in a name.
+        while (!path.empty() && (path.back() == '"' || path.back() == '\'' ||
+                                 path.back() == '.' || path.back() == ' '))
+            path.pop_back();
+        if (path.size() < 4) return false;
+        std::string ext = path.substr(path.size() - 4);
+        for (char& c : ext)
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        return ext == ".ps1";
+    };
+    // Fail closed: check both the parsed path and the raw first line, so an
+    // args shape this parser reads differently from EditFile still gets the
+    // card rather than slipping through.
+    std::string path, oldText, newText;
+    if (SplitEditArgs(inv.args, path, oldText, newText) && endsWithPs1(path))
+        return true;
+    return endsWithPs1(FirstLine(inv.args));
+}
+
 inline bool RequiresApproval(const ToolInvocation& inv,
                              const ToolContext&    ctx,
                              ApprovalDecision&     out)
@@ -675,7 +702,8 @@ inline bool RequiresApproval(const ToolInvocation& inv,
         return true;
     }
 
-    if (ClassifyTier(inv.name) != RiskTier::Dangerous) {
+    const bool powerShellScriptEdit = EditTargetsPowerShellScript(inv);
+    if (!powerShellScriptEdit && ClassifyTier(inv.name) != RiskTier::Dangerous) {
         // Safe and Moderate tools never render an approval card.
         // Conversational consent (agent mode) and explicit user
         // invocation (slash mode) carry the trust burden instead.
@@ -698,6 +726,10 @@ inline bool RequiresApproval(const ToolInvocation& inv,
     else if (inv.name == tool_names::kWritePowerShellScript) {
         out.required = true;
         out.reason = "Creates or replaces a PowerShell .ps1 script. The script is written but not executed; review the source before approving.";
+    }
+    else if (powerShellScriptEdit) {
+        out.required = true;
+        out.reason = "Edits a PowerShell .ps1 script in place. The script is changed but not executed; review the old and new text before approving.";
     }
     else if (inv.name == tool_names::kPythonRunScript) {
         out.required = true;

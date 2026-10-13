@@ -4067,7 +4067,7 @@ std::vector<ToolSpec> BuildBuiltinSpecs()
         ValCopy, DoCopy);
 
     add(tool_names::kEdit,
-        "Replace a unique text block in an existing file.",
+        "Replace a unique text block in an existing file. Also works on PowerShell .ps1 scripts after an approval card; prefer it over write_powershell_script for small changes to an existing script.",
         kSchemaEdit,
         MutatingCwdSafety("Edits an existing file. Controlled write scoped to trusted write roots."),
         ValEdit, DoEdit);

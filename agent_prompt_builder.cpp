@@ -339,7 +339,7 @@ std::string BuildAgentSystemPromptXml(const AgentPromptBuilderInput& input)
         << "  When you get 'not found', the most common reasons are: indentation differs from what you wrote, a trailing space exists in the file that you didn't include, or the file uses different whitespace. Read the file first and copy the exact bytes you want to change.\n"
         << "  edit preserves the file's line ending style: CRLF files stay CRLF, LF files stay LF. Don't worry about line endings in your OLD/NEW blocks; they're normalized before matching.\n"
         << "  An empty NEW block deletes OLD. An empty OLD block is rejected -- there is no defensible 'replace nothing' behaviour.\n"
-        << "  edit refuses files with executable or scriptable extensions, the same kill-list write uses.\n"
+        << "  edit refuses files with executable or scriptable extensions, the same kill-list write uses -- except PowerShell .ps1 scripts, which edit changes after an approval card. For a small change to an existing .ps1, use edit (it keeps the rest of the script byte-for-byte); use write_powershell_script only for a new script or a deliberate full rewrite.\n"
         << "\n"
         << "delete behavior -- one entry at a time, never recursive:\n"
         << "  delete removes one file or one EMPTY directory per call. It is not idempotent: deleting a path that doesn't exist returns 'not found' rather than silently succeeding.\n"

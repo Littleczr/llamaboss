@@ -129,10 +129,23 @@ bool WantsAnthropicCacheControl(const std::string& model,
     return true;
 }
 
+// One-hour TTL on both breakpoints (mixed TTLs on one block are rejected,
+// and Anthropic requires longer-TTL entries to precede shorter ones, so both
+// use the same value).  With the default 5 minutes, any pause longer than
+// that -- a 6-minute publish/build tool run, or the user reading a dry-run
+// report before replying -- expired the cache and the next step re-wrote
+// the whole conversation (seen: one 117k-token rewrite costing ~12x a
+// normal step).  1h writes cost 2x input instead of 1.25x, but only the
+// new tail of each step is written, so the extra cost is small next to a
+// single full rewrite.  Set kAnthropicCacheTtl to "" to restore 5 minutes.
+constexpr const char* kAnthropicCacheTtl = "1h";
+
 Poco::JSON::Object::Ptr EphemeralCacheControl()
 {
     Poco::JSON::Object::Ptr cc = new Poco::JSON::Object;
     cc->set("type", std::string("ephemeral"));
+    if (kAnthropicCacheTtl[0] != '\0')
+        cc->set("ttl", std::string(kAnthropicCacheTtl));
     return cc;
 }
 
@@ -1376,7 +1389,8 @@ std::string ChatHistory::BuildChatRequestJson(const std::string& model, bool str
     //      the last cacheable block and moves it forward as the
     //      conversation grows, so each agent step reads everything the
     //      previous step wrote.
-    // Both are 5-minute ephemeral (same TTL — mixed TTLs on one block 400).
+    // Both use the same TTL (kAnthropicCacheTtl, 1 hour) — mixed TTLs on one
+    // block 400.
     // An ephemeral recovery nudge appended to the system prompt changes
     // the prefix for that one request only: one cache write, not an error.
     const bool anthropicCache =
@@ -1403,6 +1417,20 @@ std::string ChatHistory::BuildChatRequestJson(const std::string& model, bool str
         root->set("stream", stream);
         if (anthropicCache)
             root->set("cache_control", EphemeralCacheControl());
+
+        // OpenRouter sticky routing: with a session_id, OpenRouter keeps this
+        // conversation on the same Claude provider from the first successful
+        // request (without one, stickiness starts only after a cache hit).
+        // A provider switch mid-chat lands on a cold cache and re-writes the
+        // conversation.  Same stable per-conversation key as the OpenAI
+        // prompt_cache_key below; only sent where cache_control is.
+        if (anthropicCache) {
+            if (m_createdAt.empty()) m_createdAt = CurrentTimestamp();
+            char sessionKey[24];
+            std::snprintf(sessionKey, sizeof(sessionKey), "lb-%016llx",
+                          static_cast<unsigned long long>(Fnv1a64(m_createdAt)));
+            root->set("session_id", std::string(sessionKey));
+        }
 
         // OpenAI prompt caching routes on the first few hundred prompt
         // tokens plus an optional prompt_cache_key.  Every LlamaBoss chat

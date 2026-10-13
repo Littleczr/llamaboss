@@ -243,7 +243,7 @@ WriteResult WriteContentCore(const std::string& requestedPath,
     } else if (ClassifyForOpen(resolved) == FileRisk::Risky) {
         r.chips.push_back("blocked");
         r.errorBody = overwriteExisting
-            ? "Refuses to overwrite files with executable or scriptable extensions. Use write_powershell_script for approved .ps1 project scripts, or edit the file manually."
+            ? "Refuses to overwrite files with executable or scriptable extensions. For .ps1 scripts use edit for targeted changes or write_powershell_script for a full replacement (both need approval); otherwise edit the file manually."
             : "Refuses to create files with executable or scriptable extensions. Use write_powershell_script for approved .ps1 project scripts, or drop the file in manually.";
         r.chips.push_back(ElapsedChip(t0));
         return r;

@@ -40,6 +40,7 @@
 #include "wait_executor.h"
 #include "tool_call_parser.h"  // ToolCallStreamDetector for hiding raw <tool_call> blocks
 #include "agent_controller.h"
+#include "transient_error.h"
 #include "tool_protocol.h"     // tool-call protocol detection
 #include "tool_router.h"       // BuildToolsArrayJson for native requests
 #include "tool_approval.h"     // approval cards
@@ -88,7 +89,7 @@
 #include "chat_folders.h"
 
 // ─── Application version ─────────────────────────────────────
-static const char* LLAMABOSS_VERSION = "0.1.23";
+static const char* LLAMABOSS_VERSION = "0.1.24";
 
 // Native menu command ids. Keep above wxID_HIGHEST to avoid collisions
 // with stock wxWidgets commands.
@@ -98,6 +99,7 @@ enum {
     ID_REMINDER_TIMER,
     ID_PY_SESSION_REAP_TIMER,
     ID_PENDING_SEND_PROTOCOL_TIMER,
+    ID_AGENT_RETRY_TIMER,
 
     ID_PROJECT_NEW = wxID_HIGHEST + 2100,
     ID_PROJECT_ATTACH,
@@ -340,6 +342,8 @@ public:
         StopAnimation();
         if (m_reminderTimer.IsRunning())
             m_reminderTimer.Stop();
+        if (m_agentRetryTimer.IsRunning())
+            m_agentRetryTimer.Stop();
 
         // Commit any short UI-side delta batch before autosave.  ChatHistory
         // already flushes its own stream buffer in SaveToFile(), but
@@ -1176,6 +1180,10 @@ private:
         Bind(wxEVT_TIMER, &MyFrame::OnPendingSendProtocolTimeout, this,
              m_pendingSendProtocolTimer.GetId());
 
+        // Automatic retry of a transient agent request failure.
+        Bind(wxEVT_TIMER, &MyFrame::OnAgentRetryTimer, this,
+             m_agentRetryTimer.GetId());
+
 
         // Attach: native SVG bitmap states tint the paperclip on hover;
         // no background tile (glyph-only, like the ctx meter).
@@ -1788,6 +1796,10 @@ private:
     // Safety net: if detection never reports (probe hang), fall back to
     // XML and send anyway rather than leave the prompt stuck "Queued".
     wxTimer m_pendingSendProtocolTimer{this, ID_PENDING_SEND_PROTOCOL_TIMER};
+    // One-shot wait before re-sending an agent request that failed with a
+    // transient error (AgentController::BeginTransientRetry).
+    wxTimer m_agentRetryTimer{this, ID_AGENT_RETRY_TIMER};
+    unsigned long m_agentRetryToken = 0;
     static constexpr int kPendingSendProtocolTimeoutMs = 15000;
 
     // Flip the composer into / out of "queued behind a model load" state.
@@ -3324,6 +3336,36 @@ private:
 
         if (m_skillDraftController->ConsumeAssistantError(error)) return;
 
+        // ── Transient failure inside an agent turn: retry, don't end ──
+        // A dropped connection or a 5xx/overload reply used to end a long
+        // agent task on the spot (the user saw one line and had to type
+        // "continue").  When nothing visible was streamed (the placeholder
+        // is still empty, so no partial answer would be lost or duplicated)
+        // and the controller still has retries for this request, remove
+        // the placeholder, show a notice, and re-send after a short wait.
+        // Streaming state stays on, so Stop cancels the turn normally.
+        if (m_agentController->IsActive() &&
+            m_chatHistory->HasAssistantPlaceholder()) {
+            int attempt = 0;
+            int delayMs = 0;
+            if (m_agentController->BeginTransientRetry(error, attempt, delayMs)) {
+                m_chatHistory->RemoveLastAssistantMessage();
+                ResetAgentToolStreamFilter();
+                m_chatClient->ResetStreamingState();
+                m_chatDisplay->DisplayAssistantComplete();
+                m_chatDisplay->DisplaySystemNotice(
+                    "Model request failed (" +
+                    lb_transient_error::ShortForm(error) +
+                    "). Retrying in " + std::to_string(delayMs / 1000) +
+                    " s (attempt " + std::to_string(attempt) + " of " +
+                    std::to_string(lb_transient_error::kMaxRetries) +
+                    "). Press Stop to cancel.");
+                m_agentRetryToken = m_agentController->TransientRetryToken();
+                m_agentRetryTimer.StartOnce(delayMs);
+                return;
+            }
+        }
+
         std::string modelName = ServerManager::ModelDisplayName(
             m_modelSwitcher->GetConversationModelForSave());
 
@@ -3333,13 +3375,17 @@ private:
             error.find("No connection") != std::string::npos ||
             error.find("Connection reset") != std::string::npos ||
             error.find("Net Exception") != std::string::npos) {
-            friendly = "Could not connect to llama-server at " + m_appState->GetApiUrl() +
-                ".\nThe server may still be loading the model \xe2\x80\x94 try again in a moment.";
+            // Not always llama-server: cloud endpoints fail through here too.
+            friendly = "Connection to the model endpoint failed (" +
+                lb_transient_error::ShortForm(error) + ").\n"
+                "If this is the local llama-server, it may still be loading "
+                "the model \xe2\x80\x94 try again in a moment.";
             _statusDot->SetConnected(false);
         }
         else if (error.find("Timeout") != std::string::npos ||
             error.find("timeout") != std::string::npos) {
-            friendly = "Request timed out. The model may still be loading \xe2\x80\x94 try again in a moment.";
+            friendly = "Request timed out (" + lb_transient_error::ShortForm(error) +
+                "). A local model may still be loading \xe2\x80\x94 try again in a moment.";
         }
         else if (error.find("model") != std::string::npos &&
             error.find("not found") != std::string::npos) {
@@ -3350,7 +3396,10 @@ private:
             friendly = "Error: " + error;
         }
 
-        m_chatDisplay->DisplaySystemMessage(friendly);
+        // Inside an agent turn the controller records an "Agent Status" card
+        // (kept in the saved transcript) with the raw error instead.
+        if (!m_agentController->IsActive())
+            m_chatDisplay->DisplaySystemMessage(friendly);
 
         // Match Stop/Close behavior: remove only an empty placeholder.  If
         // useful partial text was streamed before the error, keep it in
@@ -4977,6 +5026,16 @@ private:
             ". Press Stop to cancel.");
     }
 
+    void OnAgentRetryTimer(wxTimerEvent&)
+    {
+        if (m_isClosing) return;
+        if (!m_agentController->IsActive() ||
+            !m_agentController->IsAwaitingTransientRetry())
+            return;
+        // Stale tokens (loop ended or restarted) are ignored inside.
+        m_agentController->ResumeAfterTransientRetry(m_agentRetryToken);
+    }
+
     void OnStopGeneration(wxCommandEvent&)
     {
         if (m_isClosing) return;
@@ -5044,6 +5103,8 @@ private:
         // different: ChatClient intentionally suppresses COMPLETE/ERROR after
         // StopGeneration(), so we finalize that agent loop explicitly below.
         const bool stoppingAgentStream = m_agentController->IsActive();
+        if (m_agentRetryTimer.IsRunning())
+            m_agentRetryTimer.Stop();   // a pending transient retry never fires
         if (stoppingAgentStream) {
             m_agentController->Cancel();
 

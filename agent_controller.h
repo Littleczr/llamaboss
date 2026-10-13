@@ -322,6 +322,20 @@ public:
     bool HandleWebFetchError(const std::string& errorText);
     bool HandleAssistantError(const std::string& errorText);
 
+    // ─── Transient model-error retry (transient_error.h) ─────────
+    // A dropped connection or a 5xx/overload reply mid-task used to end
+    // the turn on the first failure.  MyFrame asks here first: when the
+    // error is transient and this request has retries left, the call
+    // returns true with the 1-based attempt number and the delay, and the
+    // loop stays active (Stop still cancels it).  MyFrame then calls
+    // ResumeAfterTransientRetry(token) when its one-shot timer fires; a
+    // stale token (loop ended or restarted meanwhile) is ignored.
+    bool BeginTransientRetry(const std::string& errorText,
+                             int& attemptOut, int& delayMsOut);
+    void ResumeAfterTransientRetry(unsigned long token);
+    unsigned long TransientRetryToken() const { return m_transientRetryToken; }
+    bool IsAwaitingTransientRetry() const { return m_awaitingTransientRetry; }
+
 private:
     // Dispatch a parsed invocation.  Sync tools render + feed
     // result + start next iteration synchronously.  Async tools
@@ -513,6 +527,9 @@ private:
     int           m_iterationsUsed       = 0;
     int           m_consecutiveMalformed = 0;
     int           m_consecutiveEmptyAssistant = 0;
+    int           m_transientRetries     = 0;   // retries used for the current request
+    unsigned long m_transientRetryToken  = 0;
+    bool          m_awaitingTransientRetry = false;
     ToolProtocol  m_requestProtocol      = ToolProtocol::Unknown;
 
     // One-request-only system nudge used after an empty assistant

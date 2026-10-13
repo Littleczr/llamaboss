@@ -83,3 +83,7 @@ PATCH_NOTES.txt
 README_DROP_IN.txt
 Zip-LlamaBossSource.ps1
 desktop.ini
+
+# Personal release signing (Azure IDs)
+sign-windows-release.ps1
+WINDOWS_SIGNING.md

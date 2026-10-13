@@ -6,6 +6,7 @@
 #include "path_safety.h"
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -425,6 +426,21 @@ ReadResult ReadFile(const std::string& inputPath, const ToolContext& ctx)
     if (truncated) r.chips.push_back("truncated");
     r.body     = std::move(content);
     r.bodyLang = InferBodyLang(resolved);
+
+    // Instruction files (a Skill's SKILL.md, a project WORKFLOW.md) are meant
+    // to be read whole.  Past the global 12 KiB demotion threshold they used
+    // to come back as a Vars\ handle card, so every Skill use cost an extra
+    // read_range round trip -- or the model read only part of the rules.
+    // Give them the same context-aware inline budget as read_range.
+    if (!truncated) {
+        std::string base = tool_path_safety::Basename(resolved);
+        for (char& c : base)
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        if (base == "skill.md" || base == "workflow.md")
+            r.historyInlineBudgetBytes =
+                ComputeRangedReadHistoryBudget(ctx.ctxTokens);
+    }
+
     r.chips.push_back(ElapsedChip(t0));
     return r;
 }
