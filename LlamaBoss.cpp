@@ -1208,6 +1208,17 @@ private:
         // About (i): same glyph hover.
         _aboutButton->Bind(wxEVT_BUTTON, &MyFrame::OnAbout, this);
         BindIconHover(_aboutButton, &ThemeData::bgToolbar, true);
+#ifdef __WXMAC__
+        // A theme change between dark and light also flips the app's
+        // appearance (lb_mac_native.mm), and wx answers that with
+        // wxEVT_SYS_COLOUR_CHANGED after the theme was applied: the chat
+        // view falls back to the system background and the glyph buttons
+        // keep the previous theme's colour.  Apply the theme again then.
+        Bind(wxEVT_SYS_COLOUR_CHANGED, [this](wxSysColourChangedEvent& e) {
+            e.Skip();
+            CallAfter([this] { if (!m_isClosing) ApplyThemeToUI(); });
+        });
+#endif
 
         // Pinned context panel follows the chat view's corner: window
         // moves, chat view resizes (window resize, sidebar toggle, input

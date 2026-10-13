@@ -141,10 +141,40 @@ Role TakeRole(wxButton* btn, const ThemeData& theme)
     return role;
 }
 
+// wx sets a borderless button's title colour when SetForegroundColour is
+// called, but after the app appearance changes (a theme switch between dark
+// and light) it no longer reaches the NSButton: the toolbar glyphs (☰ + ⓘ)
+// kept the previous theme's colour, invisible on the new background, and
+// their hover tint stopped showing.  Copy the colour wx holds onto the title.
+void SyncFlatTitleColour(wxButton* btn)
+{
+    if (!btn->UseForegroundColour() || btn->GetLabel().empty() || btn->GetBitmap().IsOk())
+        return;
+    NSButton* b = (NSButton*)btn->GetHandle();
+    if (![b isKindOfClass:[NSButton class]] || [b isBordered] || [[b title] length] == 0)
+        return;
+    NSColor* want = [btn->GetForegroundColour().OSXGetNSColor()
+                        colorUsingColorSpace:[NSColorSpace sRGBColorSpace]];
+    NSAttributedString* t = [b attributedTitle];
+    NSColor* have = [t length] ? [t attribute:NSForegroundColorAttributeName atIndex:0
+                                    effectiveRange:nullptr] : nil;
+    have = [have colorUsingColorSpace:[NSColorSpace sRGBColorSpace]];
+    if (have && want &&
+        std::fabs([have redComponent] - [want redComponent]) < 0.004 &&
+        std::fabs([have greenComponent] - [want greenComponent]) < 0.004 &&
+        std::fabs([have blueComponent] - [want blueComponent]) < 0.004 &&
+        std::fabs([have alphaComponent] - [want alphaComponent]) < 0.004)
+        return;
+    if (want) SetTitleColour(b, want);
+}
+
 void StyleButton(wxButton* btn, const ThemeData& theme)
 {
     const Role role = TakeRole(btn, theme);
-    if (role == Role::Leave) return;
+    if (role == Role::Leave) {
+        SyncFlatTitleColour(btn);
+        return;
+    }
     NSButton* b = (NSButton*)btn->GetHandle();
     if (![b isKindOfClass:[NSButton class]]) return;
 
@@ -206,6 +236,15 @@ public:
     int FilterEvent(wxEvent& event) override
     {
         const wxEventType t = event.GetEventType();
+        if (t == wxEVT_ENTER_WINDOW || t == wxEVT_LEAVE_WINDOW) {
+            // The shared hover code recolours glyph buttons in its own
+            // handler for this event; sync the title once it has run.
+            if (auto* btn = wxDynamicCast(event.GetEventObject(), wxButton)) {
+                wxWeakRef<wxButton> ref(btn);
+                wxTheApp->CallAfter([ref] { if (ref) SyncFlatTitleColour(ref.get()); });
+            }
+            return Event_Skip;
+        }
         if (t != wxEVT_SHOW && t != wxEVT_IDLE) return Event_Skip;
         auto* win = wxDynamicCast(event.GetEventObject(), wxWindow);
         if (!win || !win->IsTopLevel() || win->IsBeingDeleted()) return Event_Skip;
