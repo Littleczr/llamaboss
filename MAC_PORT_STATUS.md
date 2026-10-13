@@ -724,8 +724,15 @@ checkout of 8814026; the 9e8b3d3 packages are refused there. Those are kept in
 - As with 0.1.23, the ticket is stapled to the DMG, not to the app inside, so a user who copies
   the app out offline gets the online check on first launch. Stapling the app as well needs a
   second notarization of the app before the DMG is built (left for later).
-- **Not done (needs the user):** upload to R2, website button/version, `mac_version` /
-  `mac_url` / `mac_sha256` / `mac_notes` in version.json.
+- **Publishing (user asked 2026-10-13):** DMG uploaded to R2 as
+  `LlamaBoss_Beta_v0.1.24_macOS.dmg`; public URL verified (200, 57,295,617 bytes, checksum
+  matches, Gatekeeper accepts it with a quarantine flag). Site 0.2.9 (Windows stays 0.1.23; Mac
+  buttons and `data-ver-mac` show 0.1.24; docs Mac section and FAQ updated; version.json adds
+  the `mac_*` fields, Windows fields unchanged) deployed to the **preview**
+  https://mac-0-1-24.llamaboss.pages.dev . **Production waits for the user's OK.** Package:
+  `Websites/LlamaBoss_Website_v0_2_9_mac_v0_1_24.zip`.
+- The released 0.1.23 Mac app predates the Mac feed fields (it reads the Windows `version`), so
+  it will not announce 0.1.24; Mac builds from 0.1.24 on will announce later Mac releases.
 
 ## Next task
 
