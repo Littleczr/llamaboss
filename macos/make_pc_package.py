@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Build a PC package for a shared-code change prepared on a branch from main.
 
-    macos/make_pc_package.py <item> <repo> <base> <head> <out_dir> [--notes FILE]
+    macos/make_pc_package.py <item> <repo> <base> <head> <out_dir> [--notes FILE] [--requires ITEM]
 
 <repo> is a checkout (or worktree) containing both commits.  The zip holds the
 files changed between <base> and <head> (added or modified; deletions are not
@@ -52,6 +52,7 @@ import argparse, datetime, hashlib, json, os, shutil, sys
 ITEM = "__ITEM__"
 BASE = "__BASE__"
 HEAD = "__HEAD__"
+REQUIRES_HINT = "__REQUIRES_HINT__"
 # path -> {"orig": LF-normalised sha256 of the expected original, or None for a new file,
 #          "new":  LF-normalised sha256 of the packaged file}
 MANIFEST = json.loads(r"""__MANIFEST__""")
@@ -100,7 +101,7 @@ def install(repo, dry):
             if h["orig"] is None:
                 fail(rel + " already exists in the repo and is not this package's file")
             if s != h["orig"]:
-                fail(rel + " has changed since the package was made (expected main " + BASE[:9] + ")")
+                fail(rel + " is not the version this package was built on (" + BASE[:9] + ")" + REQUIRES_HINT)
             crlf = uses_crlf(cur)
         else:
             if h["orig"] is not None:
@@ -197,7 +198,7 @@ def main():
     repo = os.path.abspath(a.repo)
     if not os.path.isdir(os.path.join(repo, ".git")):
         fail(repo + " is not a git checkout")
-    print(ITEM + " package (main " + BASE[:9] + " -> " + HEAD[:9] + "), repo " + repo)
+    print(ITEM + " package (" + BASE[:9] + " -> " + HEAD[:9] + "), repo " + repo)
     if a.restore is not None:
         restore(repo, a.restore, a.dry_run)
     else:
@@ -212,6 +213,9 @@ if __name__ == "__main__":
 def main():
     args = sys.argv[1:]
     notes = None
+    requires = None
+    if "--requires" in args:
+        i = args.index("--requires"); requires = args[i + 1]; del args[i:i + 2]
     if "--notes" in args:
         i = args.index("--notes"); notes = open(args[i + 1]).read(); del args[i:i + 2]
     item, repo, base, head, out_dir = args
@@ -227,9 +231,11 @@ def main():
         manifest[path] = {"orig": orig, "new": lf_sha(new)}
         files[path] = new
     installer = (INSTALLER.replace("__ITEM__", item).replace("__BASE__", base)
-                 .replace("__HEAD__", head).replace("__DEFAULT_REPO__", DEFAULT_PC_REPO)
+                 .replace("__HEAD__", head)
+                 .replace("__REQUIRES_HINT__", ("; install the " + requires + " package first") if requires else "").replace("__DEFAULT_REPO__", DEFAULT_PC_REPO)
                  .replace("__MANIFEST__", json.dumps(manifest, indent=4, sort_keys=True)))
-    readme = (f"{item} package\n\nShared-code change prepared on the Mac against main {base[:9]}.\n"
+    readme = (f"{item} package\n\nShared-code change prepared on the Mac against {base[:9]}"
+              + (f" (main + the {requires} package; install that first)" if requires else " (main)") + ".\n"
               f"Files ({len(files)}):\n" + "".join(f"  {p}\n" for p in sorted(files)) +
               ("\n" + notes if notes else ""))
     os.makedirs(out_dir, exist_ok=True)
