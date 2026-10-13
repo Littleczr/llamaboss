@@ -99,6 +99,7 @@ Intended divergences from Windows. Features that are simply not ported yet are l
 | Web fetch transport | WinHTTP, system proxy settings | Poco::Net with lb_ssl's verified TLS context; no system proxy; Mac browser user-agent | No WinHTTP on macOS; the UA names the platform it runs on |
 | Menu bar | none (toolbar only) | LlamaBoss menu (About, Settings… Cmd+,, Hide, Quit), File (New Chat, New Window, Open/Save Conversation, Close Window), Edit, View (Show or Hide Sidebar Ctrl+Cmd+S), Window, Help (llamaboss.com/docs) | Mac convention; verified by the user 2026-10-12 |
 | New window | second launch hands off to the running app | Dock icon menu "New Window" (Finder/Dock never start a second copy) | Mac convention; verified by the user 2026-10-12 |
+| Sidebar selection | stays on the last clicked row after New Chat | a single selection follows the open chat | Mac list convention (Mail, Notes) |
 | Control appearance | n/a | app appearance (dark/light Aqua) set from the theme's background at startup | Native controls match the theme on a system in the other mode |
 
 ## Toolchain (verified 2026-10-09)
@@ -544,6 +545,11 @@ large icons. macOS 26 may show a full-bleed square icon inside its standard roun
   root as a stand-in cwd; the cwd is after the cached cut, and the pre-warm key is
   unchanged (`5ccbfa498e2a1e9f` before and after). Verified: launch + pre-warm + switch
   creates no file or folder; a real first message still creates and titles both.
+- **Sidebar selection follows the open chat** (`conversation_sidebar.cpp`, Mac only):
+  after New Chat, the previously clicked row stayed selected, so two rows looked current.
+  A single selection that marked the old open chat now moves to the new one (or clears
+  for an unsaved New Chat), as in Mail and Notes; multi-selections are left alone.
+  Verified: open a chat, New Chat, no row stays highlighted.
 - **Suggestion for the Windows version:** the same pre-warm path exists on Windows, so it
   likely leaves an empty chat (and empty Chats folder) after each launch or New Chat that
   is then left. The empty `chat_<id>.json` entries in the sidebar are the symptom.

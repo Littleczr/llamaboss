@@ -936,6 +936,17 @@ void ConversationSidebar::Refresh(const std::string& activeFilePath)
     const std::string previousActiveFilePath = m_activeFilePath;
     m_activeFilePath = activeFilePath;
     const bool activeChatChanged = (m_activeFilePath != previousActiveFilePath);
+#ifdef __WXMAC__
+    // A single selection that marked the open chat follows it (New Chat,
+    // File > Open), as in Mail and Notes; otherwise two rows look current.
+    // A multi-selection is the user's and stays as it is.
+    if (activeChatChanged && m_selected.size() == 1 &&
+        *m_selected.begin() == previousActiveFilePath) {
+        m_selected.clear();
+        if (!m_activeFilePath.empty()) m_selected.insert(m_activeFilePath);
+        m_anchorPath = m_activeFilePath;
+    }
+#endif
 
     // Scan all conversations, then select normal or archived mode.
     auto entries = ScanConversations();
