@@ -205,6 +205,32 @@ if(APPLE)
     endif()
 endif()
 
+# ── Bundle the Python runtime (macOS) ──
+# macos/fetch_python.sh builds it in third_party/python: CPython from
+# python-build-standalone plus pypdf and openpyxl.  It goes to
+# Contents/Resources/python-runtime, which lb_python
+# (src/platform/lb_python_posix.h) always prefers; without it the app falls
+# back to a Python on the system.  Not Helpers: codesign takes any folder
+# with a dot in its name there (lib/python3.13, *.dist-info) for a bundle.
+# sign_bundle.sh signs its two Mach-O files individually.
+if(APPLE)
+    set(LLAMABOSS_PYTHON_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/python" CACHE PATH
+        "Python runtime from macos/fetch_python.sh")
+    if(EXISTS "${LLAMABOSS_PYTHON_DIR}/bin/python3")
+        message(STATUS "Bundling Python from ${LLAMABOSS_PYTHON_DIR}")
+        add_custom_command(TARGET LlamaBoss POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E make_directory
+                    "$<TARGET_BUNDLE_CONTENT_DIR:LlamaBoss>/Resources/python-runtime"
+            COMMAND rsync -a --delete "${LLAMABOSS_PYTHON_DIR}/"
+                    "$<TARGET_BUNDLE_CONTENT_DIR:LlamaBoss>/Resources/python-runtime/"
+            COMMENT "Bundling Python"
+            VERBATIM)
+    else()
+        message(WARNING "Python not bundled: run macos/fetch_python.sh. The app will use "
+                        "a Python installed on this Mac instead.")
+    endif()
+endif()
+
 # ── Stable local code signature (macOS) ──
 # The linker's ad-hoc signature changes on every build, and Keychain ties a
 # stored secret's "Always Allow" to the signer: an app with a Team ID is
@@ -215,7 +241,7 @@ endif()
 # "LlamaBoss Development" identity is the fallback (stable signature, but no
 # Team ID, so Keychain still asks after a rebuild); with neither, the build
 # keeps the ad-hoc signature.
-# Must stay after the llama-server bundling step: POST_BUILD commands run in order.
+# Must stay after the llama-server and Python bundling steps: POST_BUILD commands run in order.
 if(APPLE)
     set(LLAMABOSS_CODESIGN_IDENTITY "" CACHE STRING
         "Code-signing identity for local builds (empty = auto-detect Apple Development, then 'LlamaBoss Development')")

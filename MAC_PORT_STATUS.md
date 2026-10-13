@@ -86,7 +86,9 @@ Intended divergences from Windows. Features that are simply not ported yet are l
 | Agent prompt | PowerShell rules, backslash paths | zsh/BSD rules, forward-slash paths, `~` (under `#else`) | Same rules, Mac wording |
 | Secrets at rest | DPAPI | AES-256-GCM, key in the login Keychain | Platform key store |
 | App data | `%LOCALAPPDATA%\LlamaBoss` | `~/Library/Application Support/LlamaBoss` | Mac convention |
-| Python packages | `pip install --user` | LlamaBoss environment in the data folder (`--system-site-packages`) | Homebrew Python refuses `--user` (PEP 668) |
+| Python runtime | the user's installed Python (`py -3`, `python`, `python3`) | bundled CPython 3.13 in `Contents/Resources/python-runtime`, always used when present (2026-10-13) | Works on a Mac with no Python installed; same version everywhere |
+| Python packages | `pip install --user` | LlamaBoss environment in the data folder (`--system-site-packages`), built on the bundled Python | Homebrew Python refuses `--user` (PEP 668); the bundle is signed and read-only |
+| Bundled Python packages | none | pypdf and openpyxl ship with the runtime; PyMuPDF installs on first use through the approval card | PyMuPDF is AGPL; LlamaBoss does not redistribute it (user decision 2026-10-13) |
 | Python helpers | RCDATA in the .exe | files in `Contents/Resources/python` | App-bundle resources |
 | llama.cpp | CPU/CUDA builds | Metal build in `Contents/Helpers/llama` | Apple silicon GPU |
 | Fonts | Consolas / Cascadia Code, Windows point sizes | Menlo, sizes x4/3 (`lb_ui_font.h`) | Same physical size; built-in Mac face |
@@ -350,6 +352,7 @@ large icons. macOS 26 may show a full-bleed square icon inside its standard roun
 ## Phase 3b: Python helpers and scripts, 2026-10-11
 
 - **Decision:** use the user's installed Python, not a bundled one (user, 2026-10-11).
+  **Changed 2026-10-13:** a bundled runtime is now preferred; see "Bundled Python runtime" below.
 - **Interpreter** (`src/platform/lb_python_posix.h`): LlamaBoss's environment
   `~/Library/Application Support/LlamaBoss/python` if it exists, else Homebrew /
   python.org `python3`. `/usr/bin/python3` is used only when the Command Line Tools exist.
@@ -554,11 +557,65 @@ large icons. macOS 26 may show a full-bleed square icon inside its standard roun
   likely leaves an empty chat (and empty Chats folder) after each launch or New Chat that
   is then left. The empty `chat_<id>.json` entries in the sidebar are the symptom.
 
+## Bundled Python runtime, 2026-10-13
+
+- **Decisions (user, 2026-10-13):** bundle Python with pypdf and openpyxl only; PyMuPDF
+  (AGPL-3.0 or a paid Artifex license; LlamaBoss is MIT) is not bundled and installs on
+  first use through the `python_install_package` approval card. When the bundled Python
+  exists, LlamaBoss always uses it.
+- **Runtime:** `macos/fetch_python.sh` downloads python-build-standalone 20261009, CPython
+  3.13.16 `aarch64-apple-darwin-install_only_stripped` (SHA-256 pinned), removes Tcl/Tk,
+  IDLE, turtle, pydoc data, man pages and the embedding `libpython3.13.dylib`
+  (`bin/python3.13` is statically linked), installs `macos/python-requirements.txt`
+  (pypdf 6.20.1, openpyxl 3.1.5, et-xmlfile 2.0.0; `--require-hashes`, wheels only), then
+  removes the runtime's own pip (the environment gets pip 26.2.1 from `ensurepip`) and
+  precompiles everything as unchecked-hash `.pyc`, so Python never writes `__pycache__`
+  into the signed app. Output `third_party/python`: 49 MB, 2 Mach-O files.
+- **Location:** `Contents/Resources/python-runtime`. Not `Contents/Helpers`: codesign
+  takes any folder with a dot in its name there (`lib/python3.13`, `*.dist-info`) for a
+  nested bundle and refuses to sign the app. CMake copies it (rsync) before signing.
+- **Signing:** `sign_bundle.sh` signs the runtime's Mach-O files; `bin/python3.13` gets
+  `macos/python.entitlements` (`com.apple.security.cs.disable-library-validation`).
+  Verified necessary: under the hardened runtime, the same binary without the entitlement
+  refuses PyMuPDF's `_extra.so` ("different Team IDs"); with it, PyMuPDF loads.
+  `package.sh` requires the runtime and checks its Mach-O files are self-contained.
+- **Interpreter** (`src/platform/lb_python_posix.h`): bundled Python first, then the old
+  Homebrew / python.org / Command Line Tools order (only builds without the runtime). The
+  environment `~/Library/Application Support/LlamaBoss/python` must be built on the
+  bundled Python (`pyvenv.cfg` `home`): if the app moved and the minor version matches,
+  `venv --upgrade` re-points it and keeps its packages; otherwise (or if that fails) it is
+  renamed to `python.previous-<timestamp>` and rebuilt on the next package install. This
+  runs in `RunInterpreter()`, which is only called on worker threads. Both `venv` runs use
+  the data folder as cwd: wx sets the app's cwd to the folder holding the bundle, and
+  Python reads its cwd at startup, so an app run from the Desktop or Downloads raised a
+  folder-access prompt (seen in testing: the run waited on it until the 60 s timeout).
+- **Size:** release DMG 58 MB (was 25 MB without Python).
+- **Verified (GPT 6 Luna, Agent Mode):**
+  - Dev build: `python_health` reports the bundled 3.13.16 with pypdf and openpyxl;
+    `pdf_extract_text` works with the bundled pypdf; `pdf_inspect_form` reports PyMuPDF
+    missing, the approval card installs it into a new environment on the bundled Python
+    (2.3 s), and the retry uses it.
+  - Release build (Developer ID, hardened runtime; local test DMG, not notarized or
+    published) run from the mounted DMG: the environment from the dev build was
+    re-pointed in place and kept PyMuPDF; `pdf_inspect_form` and `pdf_fill_form` worked
+    (the filled PDF reads back `full_name` = Cesar Test, `city` = Los Angeles). Repeated
+    after the trim and cwd fix: re-pointed in place, inspect in 0.84 s, no prompt.
+  - The set-aside path also ran once (the timeout above): the old environment was kept
+    as `python.previous-…` and the next install built a new one.
+- **First-run prompts a user can see:** macOS asks once for Desktop/Documents/Downloads
+  access the first time a helper reads a file there (normal for Mac apps). On this Mac the
+  dev and Developer ID copies count as different apps, so each asked separately.
+- **Not done:** notarization of a build with the runtime (do it with the next release).
+- **Suggestion for the Windows version:** the PDF form helpers' error text says
+  `py -3 -m pip install --user pymupdf`, which is wrong on the Mac. A neutral message
+  ("Install the PyMuPDF package (pymupdf)") would suit both; the script is shared.
+
 ## Next task
 
-1. Remaining UI checks: project attach, message boxes, light themes.
-2. Mac entry in the update feed: Mac app reads e.g. `mac_url` / `mac_sha256` from
+1. Notarize a build with the bundled Python before the next release.
+2. Remaining UI checks: project attach, message boxes, light themes.
+3. Mac entry in the update feed: Mac app reads e.g. `mac_url` / `mac_sha256` from
    version.json (Mac code), the user adds the fields on the PC side. Until then Check for
    Updates opens the download page.
-3. Optional: test the public DMG on another Mac or a fresh user account.
-4. Skipped: the `Tests/` suite is for the Windows side (user decision 2026-10-12).
+4. Optional: test the public DMG on another Mac or a fresh user account.
+5. Skipped: the `Tests/` suite is for the Windows side (user decision 2026-10-12).

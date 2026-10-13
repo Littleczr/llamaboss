@@ -1,0 +1,10 @@
+# Packages bundled with the macOS Python runtime (macos/fetch_python.sh).
+# Small, pure Python and permissively licensed only. PyMuPDF (AGPL) is not
+# bundled: the PDF form helpers install it on first use through the
+# python_install_package approval card (user decision 2026-10-13).
+pypdf==6.20.1 \
+    --hash=sha256:aa5a55ddcffdc5e5ab291d5decb23f6383f4e56f8e3263dc39af41fff03885ad
+openpyxl==3.1.5 \
+    --hash=sha256:5282c12b107bffeef825f4617dc029afaf41d0ea60823bbb665ef3079dc79de2
+et-xmlfile==2.0.0 \
+    --hash=sha256:7a91720bc756843502c3b7504c77b8fe44217c85c537d85037f0f536151b2caa

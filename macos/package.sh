@@ -13,8 +13,9 @@
 #                (asks for an app-specific password from account.apple.com).
 #                Omit to skip notarization.
 #
-# Needs macos/build_deps.sh to have run (default ~/LlamaBossDeps/prefix) and
-# the llama.cpp macOS release unpacked in third_party/llama.cpp.
+# Needs macos/build_deps.sh to have run (default ~/LlamaBossDeps/prefix), the
+# llama.cpp macOS release unpacked in third_party/llama.cpp, and
+# macos/fetch_python.sh (third_party/python).
 # Output: dist/LlamaBoss-<version>-macOS.dmg
 set -euo pipefail
 
@@ -75,9 +76,13 @@ done
 for name in ${(k)need}; do cp -a $SRCH/$name $H/; done
 echo "llama.cpp files kept: ${(ok)need}"
 
+# ── Python runtime (macos/fetch_python.sh; staged with Resources) ────
+[[ -x $APP/Contents/Resources/python-runtime/bin/python3 ]] ||
+    { echo "Python runtime missing from the build: run macos/fetch_python.sh" >&2; exit 1; }
+
 # ── Self-containment check: only system libraries may be referenced ──
 bad=0
-for f in $APP/Contents/MacOS/LlamaBoss $APP/Contents/Helpers/llama/*(.); do
+for f in $APP/Contents/MacOS/LlamaBoss $APP/Contents/Helpers/llama/*(.) $APP/Contents/Resources/python-runtime/**/*(.); do
     file -b $f | grep -q Mach-O || continue
     while read -r lib; do
         case $lib in
