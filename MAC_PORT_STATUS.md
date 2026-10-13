@@ -620,8 +620,8 @@ outside the repo, sha256 verify, restore). Built by `macos/make_pc_package.py`.
 
 | Package | Branch (local only) | Files | State |
 | --- | --- | --- | --- |
-| `LlamaBoss_Patch_ascii_ctype.zip` | `suggest/ascii-ctype-8814026` (a2bf8d6, on main 8814026) | 43 | Waiting for the user to apply on the PC |
-| `LlamaBoss_Patch_pdf_forms_pypdf.zip` | `suggest/pdf-forms-pypdf-8814026` (4f8a114, on ascii-ctype) | 7 | Waiting; **install after ascii_ctype** |
+| `LlamaBoss_Patch_ascii_ctype.zip` | `suggest/ascii-ctype-8814026` (a2bf8d6, on main 8814026) | 43 | **Applied** by the user (main 69a12e6) |
+| `LlamaBoss_Patch_pdf_forms_pypdf.zip` | `suggest/pdf-forms-pypdf-8814026` (4f8a114, on ascii-ctype) | 7 | **Applied** by the user (main 69a12e6) |
 
 Rebuilt 2026-10-13 on main **8814026** ("Transient error handling and agent/tool fixes"),
 fetched read-only from GitHub. The ASCII change was regenerated with the same script rather
@@ -664,6 +664,25 @@ checkout of 8814026; the 9e8b3d3 packages are refused there. Those are kept in
   configure without `third_party/llama.cpp` (empty glob) and adds the package builder.
 - **Suggestion for the Windows version:** none beyond the two packages.
 
+## Merge of `main` 69a12e6 — 2026-10-13
+
+- The user applied both PC packages on 8814026 and pushed **69a12e6** ("ASCII-only ctype
+  helpers; PDF form tools on pypdf"). Its tree is byte-identical to the package branch
+  `suggest/pdf-forms-pypdf-8814026`, so main now has exactly what was tested on the Mac.
+- Merged into `macos/port-v0.1.21` as `10da291`. Conflicts, all mechanical: `#include
+  "lb_ascii.h"` next to Mac-only includes (kept both) in 7 files; `.gitignore` (kept the Mac
+  and the Windows-signing blocks); the agent prompt's Python helper line (Mac `#else` branch
+  kept, shared line taken from main and checked equal); `python_runner.cpp`
+  IsDriveRootedPath (Mac early return kept, main's `lb_ascii::IsAlpha`).
+- Windows view: the same 46 files differ from main as before the merge, with identical
+  differences (the long-standing ones listed under Baseline). No new ones.
+- Verified: build, zsh policy tests, `transient_error_tests.cpp`; in-app (GPT 6 Luna) a form
+  fill with the bundled pypdf (0.08 s, no install prompt, `~/` path) and a web fetch that
+  keeps ⚠ intact in the saved chat (valid UTF-8).
+- The `<cctype>` bug and the PyMuPDF dependency are now fixed on both platforms. The packages
+  table above is done; local `suggest/*` and `scratch/*` branches can be deleted.
+- Main sets `LLAMABOSS_VERSION` 0.1.24.
+
 ## UI checks and Mac fixes, 2026-10-13 (late)
 
 - **Update feed** (`c91680d`, Mac only): the Mac build read the Windows `url` (the Setup.exe)
@@ -692,11 +711,9 @@ checkout of 8814026; the 9e8b3d3 packages are refused there. Those are kept in
 
 ## Next task
 
-1. **Needs the user:** apply the two PC packages (`D:\ForMacMini\Patches`, ascii_ctype first),
-   then Claude merges `main` into the Mac branch.
-2. **Needs the user:** fresh-account test with `/Users/Shared/LlamaBoss-FreshTest` (checklist
+1. **Needs the user:** fresh-account test with `/Users/Shared/LlamaBoss-FreshTest` (checklist
    inside): create a standard user account and log in to it.
-3. **Needs the user's OK:** notarize a build with the bundled Python, then add `mac_*` fields
-   to version.json at that release.
-4. File-tool boundary cases on the Mac (symlinks, case-sensitive volume), milestone 7.
-5. Skipped: the `Tests/` suite is for the Windows side (user decision 2026-10-12).
+2. Notarized 0.1.24 build with the bundled Python: see below. Publishing it (R2, website,
+   `mac_*` fields in version.json) needs the user.
+3. File-tool boundary cases on the Mac (symlinks, case-sensitive volume), milestone 7.
+4. Skipped: the `Tests/` suite is for the Windows side (user decision 2026-10-12).
