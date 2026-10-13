@@ -469,6 +469,13 @@ large icons. macOS 26 may show a full-bleed square icon inside its standard roun
   e9ecf29daeeaf8fbd20e5b6ba09ce64672009f0f43eb6c5175fc8ef9b0c8d6b8. Replaces the earlier
   test DMG on the share (`Releases/Mac/`, with a `_SHA256.txt`). The Windows installer is
   hosted on Cloudflare R2 (version.json `url`); the Mac DMG is not hosted yet.
+- **Published 2026-10-12:** DMG on R2 bucket `llamaboss-releases` as
+  `LlamaBoss_Beta_v0.1.23_macOS.dmg` (public URL verified: checksum matches, Gatekeeper
+  accepts it with a quarantine flag). llamaboss.com site 0.2.8 (deployment 43d24ecf,
+  approved by the user): Download for Mac buttons, Windows and Mac wording and
+  requirements, docs for 0.1.23 with a rewritten Mac section and FAQ answer; it also
+  restores the 0.2.7 docs that the PC's 0.1.23 deploy (built from 0.2.6) had replaced.
+  Package on the share: `Websites/LlamaBoss_Website_v0_2_8_mac_v0_1_23.zip`.
 - Notary credentials: keychain profile `LlamaBoss-notary` (Apple ID + app-specific
   password, entered by the user). Release command: `macos/package.sh --notarize LlamaBoss-notary`.
 - Still to design: the Mac entry in the update feed (`version.json`) and the website button.
@@ -520,7 +527,8 @@ large icons. macOS 26 may show a full-bleed square icon inside its standard roun
 ## Next task
 
 1. Remaining UI checks: project attach, message boxes, light themes.
-2. Phase 4: test the notarized DMG on another Mac or a fresh user account; host the DMG;
-   Mac entry in the update feed (`version.json`); "Download for Mac" + Mac wording on
-   llamaboss.com (preview first, publish only with the user's approval).
-3. Skipped: the `Tests/` suite is for the Windows side (user decision 2026-10-12).
+2. Mac entry in the update feed: Mac app reads e.g. `mac_url` / `mac_sha256` from
+   version.json (Mac code), the user adds the fields on the PC side. Until then Check for
+   Updates opens the download page.
+3. Optional: test the public DMG on another Mac or a fresh user account.
+4. Skipped: the `Tests/` suite is for the Windows side (user decision 2026-10-12).
