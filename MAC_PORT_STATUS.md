@@ -156,7 +156,7 @@ When the login keychain has an "Apple Development" (or, failing that, a self-sig
 | 5 | Remote endpoint streams; stop works | **Verified** streaming with OpenRouter GPT 6 Luna (2026-10-11 onward). Stop during a remote stream verified (2026-10-13) |
 | 6 | Shell and Python tools | **Done**: zsh shell tool (2026-10-11), Python helpers and scripts (2026-10-11), `py` session (2026-10-12), web fetch (2026-10-12), bundled Python runtime (2026-10-13) |
 | 7 | File-tool boundaries, protected credentials, packaged app | Credentials in the Keychain **verified**; packaged, notarized app **done** (2026-10-12). File-tool boundary cases (symlinks, case-sensitive volumes) implemented, not systematically tested |
-| 8 | Public Mac release | **Done 2026-10-12**: Beta 0.1.23 on R2 and llamaboss.com. 0.1.24 with the bundled Python notarized 2026-10-13, not published |
+| 8 | Public Mac release | **Done 2026-10-12**: Beta 0.1.23 on R2 and llamaboss.com. 0.1.24 with the bundled Python notarized and published 2026-10-13 (R2 + site 0.2.9) |
 
 ## Implemented for macOS (compiles; runtime verification pending unless noted)
 
@@ -728,8 +728,10 @@ checkout of 8814026; the 9e8b3d3 packages are refused there. Those are kept in
   `LlamaBoss_Beta_v0.1.24_macOS.dmg`; public URL verified (200, 57,295,617 bytes, checksum
   matches, Gatekeeper accepts it with a quarantine flag). Site 0.2.9 (Windows stays 0.1.23; Mac
   buttons and `data-ver-mac` show 0.1.24; docs Mac section and FAQ updated; version.json adds
-  the `mac_*` fields, Windows fields unchanged) deployed to the **preview**
-  https://mac-0-1-24.llamaboss.pages.dev . **Production waits for the user's OK.** Package:
+  the `mac_*` fields, Windows fields unchanged) deployed to the preview
+  https://mac-0-1-24.llamaboss.pages.dev , then, with the user's OK, to **production**
+  (deployment 4036fd72, 2026-10-13). Live llamaboss.com/version.json carries `mac_version`
+  0.1.24 with the Windows fields unchanged; both Mac buttons link the 0.1.24 DMG. Package:
   `Websites/LlamaBoss_Website_v0_2_9_mac_v0_1_24.zip`.
 - The released 0.1.23 Mac app predates the Mac feed fields (it reads the Windows `version`), so
   it will not announce 0.1.24; Mac builds from 0.1.24 on will announce later Mac releases.
@@ -738,7 +740,9 @@ checkout of 8814026; the 9e8b3d3 packages are refused there. Those are kept in
 
 1. **Needs the user:** fresh-account test with `/Users/Shared/LlamaBoss-FreshTest` (checklist
    inside): create a standard user account and log in to it.
-2. **Needs the user:** publish the notarized 0.1.24 DMG (section above): R2 upload, website,
-   `mac_*` fields in version.json.
-3. File-tool boundary cases on the Mac (symlinks, case-sensitive volume), milestone 7.
-4. Skipped: the `Tests/` suite is for the Windows side (user decision 2026-10-12).
+2. **Needs the user:** rotate the Cloudflare Pages API token (it was printed into a session
+   transcript on 2026-10-13; not sent anywhere else) and update the credentials file on the share.
+3. When the PC next deploys the site, start from site 0.2.9 or keep the `mac_*` fields in
+   version.json, or the Mac feed and buttons fall back to 0.1.23.
+4. File-tool boundary cases on the Mac (symlinks, case-sensitive volume), milestone 7.
+5. Skipped: the `Tests/` suite is for the Windows side (user decision 2026-10-12).
