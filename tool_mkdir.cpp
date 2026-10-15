@@ -1,6 +1,7 @@
 // tool_mkdir.cpp
 
 #include "tool_mkdir.h"
+#include "lb_string_utils.h"
 #include "tool_path.h"
 #include "tool_path_safety.h"   // IsUnderAllowedWriteRoot, Basename, ParentDir
 #include "path_safety.h"
@@ -9,17 +10,6 @@
 #include "lb_windows.h"
 
 namespace {
-
-std::string ElapsedChip(std::chrono::steady_clock::time_point t0)
-{
-    double elapsed = std::chrono::duration<double>(
-        std::chrono::steady_clock::now() - t0).count();
-    std::ostringstream ts;
-    ts << std::fixed;
-    ts.precision(elapsed < 10.0 ? 2 : 1);
-    ts << elapsed << "s";
-    return ts.str();
-}
 
 std::string Trim(const std::string& s)
 {
@@ -41,14 +31,14 @@ MkdirResult MakeDirectory(const std::string& pathIn,
     if (requested.empty()) {
         r.chips.push_back("failed");
         r.errorBody = "mkdir requires a directory path in <args>.";
-        r.chips.push_back(ElapsedChip(t0));
+        r.chips.push_back(LbElapsedChip(t0));
         return r;
     }
 
     if (ctx.cwd.empty()) {
         r.chips.push_back("blocked");
         r.errorBody = "No working directory set; refuse to create.";
-        r.chips.push_back(ElapsedChip(t0));
+        r.chips.push_back(LbElapsedChip(t0));
         return r;
     }
 
@@ -56,7 +46,7 @@ MkdirResult MakeDirectory(const std::string& pathIn,
     if (resolved.empty()) {
         r.chips.push_back("failed");
         r.errorBody = "Could not resolve path: " + requested;
-        r.chips.push_back(ElapsedChip(t0));
+        r.chips.push_back(LbElapsedChip(t0));
         return r;
     }
 
@@ -70,7 +60,7 @@ MkdirResult MakeDirectory(const std::string& pathIn,
                       tool_path_safety::AllowedWriteRootsDiagnostic(
                           ctx.cwd, ctx.activeProjectRoot, ctx.skillsRoot,
                           ctx.additionalWriteRoots);
-        r.chips.push_back(ElapsedChip(t0));
+        r.chips.push_back(LbElapsedChip(t0));
         return r;
     }
 
@@ -80,7 +70,7 @@ MkdirResult MakeDirectory(const std::string& pathIn,
     if (!mutation.Begin(resolved, /*allowMissingParents=*/true)) {
         r.chips.push_back("blocked");
         r.errorBody = mutation.Error();
-        r.chips.push_back(ElapsedChip(t0));
+        r.chips.push_back(LbElapsedChip(t0));
         return r;
     }
 
@@ -88,7 +78,7 @@ MkdirResult MakeDirectory(const std::string& pathIn,
     if (IsDirectory(resolved)) {
         r.chips.push_back("exists");
         r.body = "Directory already exists: " + resolved + "\n";
-        r.chips.push_back(ElapsedChip(t0));
+        r.chips.push_back(LbElapsedChip(t0));
         return r;
     }
 
@@ -97,7 +87,7 @@ MkdirResult MakeDirectory(const std::string& pathIn,
     if (IsFile(resolved)) {
         r.chips.push_back("failed");
         r.errorBody = "A file already exists at this path: " + resolved;
-        r.chips.push_back(ElapsedChip(t0));
+        r.chips.push_back(LbElapsedChip(t0));
         return r;
     }
 
@@ -114,7 +104,7 @@ MkdirResult MakeDirectory(const std::string& pathIn,
         if (IsFile(cur)) {
             r.chips.push_back("failed");
             r.errorBody = "A file exists where a directory is needed: " + cur;
-            r.chips.push_back(ElapsedChip(t0));
+            r.chips.push_back(LbElapsedChip(t0));
             return r;
         }
 
@@ -125,7 +115,7 @@ MkdirResult MakeDirectory(const std::string& pathIn,
             r.errorBody = "Directory name '" + basename +
                           "' has characters or a shape that aren't "
                           "safe on Windows.";
-            r.chips.push_back(ElapsedChip(t0));
+            r.chips.push_back(LbElapsedChip(t0));
             return r;
         }
 
@@ -134,7 +124,7 @@ MkdirResult MakeDirectory(const std::string& pathIn,
         if (parent.empty() || parent == cur) {
             r.chips.push_back("failed");
             r.errorBody = "Could not find an existing parent while creating: " + resolved;
-            r.chips.push_back(ElapsedChip(t0));
+            r.chips.push_back(LbElapsedChip(t0));
             return r;
         }
         cur = parent;
@@ -143,7 +133,7 @@ MkdirResult MakeDirectory(const std::string& pathIn,
     if (cur.empty() || !IsDirectory(cur)) {
         r.chips.push_back("failed");
         r.errorBody = "Could not find an existing parent while creating: " + resolved;
-        r.chips.push_back(ElapsedChip(t0));
+        r.chips.push_back(LbElapsedChip(t0));
         return r;
     }
 
@@ -155,14 +145,14 @@ MkdirResult MakeDirectory(const std::string& pathIn,
                 dir, ctx.cwd, ctx.activeProjectRoot, ctx.skillsRoot, ctx.additionalWriteRoots)) {
             r.chips.push_back("blocked");
             r.errorBody = "A missing parent directory is outside the granted write roots: " + dir;
-            r.chips.push_back(ElapsedChip(t0));
+            r.chips.push_back(LbElapsedChip(t0));
             return r;
         }
         std::wstring wDir = path_safety::Utf8ToWide(dir);
         if (wDir.empty()) {
             r.chips.push_back("failed");
             r.errorBody = "Path conversion failed: " + dir;
-            r.chips.push_back(ElapsedChip(t0));
+            r.chips.push_back(LbElapsedChip(t0));
             return r;
         }
 
@@ -174,7 +164,7 @@ MkdirResult MakeDirectory(const std::string& pathIn,
                 if (!mutation.PinCreatedDirectory(dir)) {
                     r.chips.push_back("blocked");
                     r.errorBody = mutation.Error();
-                    r.chips.push_back(ElapsedChip(t0));
+                    r.chips.push_back(LbElapsedChip(t0));
                     return r;
                 }
                 continue;
@@ -186,14 +176,14 @@ MkdirResult MakeDirectory(const std::string& pathIn,
                 r.errorBody = "CreateDirectory failed for " + dir +
                               " (Win32 error " + std::to_string(err) + ").";
             }
-            r.chips.push_back(ElapsedChip(t0));
+            r.chips.push_back(LbElapsedChip(t0));
             return r;
         }
         ++createdCount;
         if (!mutation.PinCreatedDirectory(dir)) {
             r.chips.push_back("blocked");
             r.errorBody = mutation.Error();
-            r.chips.push_back(ElapsedChip(t0));
+            r.chips.push_back(LbElapsedChip(t0));
             return r;
         }
     }
@@ -210,6 +200,6 @@ MkdirResult MakeDirectory(const std::string& pathIn,
         }
         r.body += "\n";
     }
-    r.chips.push_back(ElapsedChip(t0));
+    r.chips.push_back(LbElapsedChip(t0));
     return r;
 }

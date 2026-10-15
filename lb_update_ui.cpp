@@ -1,15 +1,8 @@
 #include "lb_update_ui.h"
+#include "lb_string_utils.h"
 #include "lb_ascii.h"
 
 namespace {
-
-std::string LbUpdateLowerAscii(std::string s)
-{
-    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
-        return static_cast<char>(lb_ascii::ToLower(c));
-    });
-    return s;
-}
 
 } // namespace
 
@@ -22,8 +15,8 @@ bool LbIsTrustedUpdateUrl(const std::string& url)
 {
     try {
         Poco::URI uri(url);
-        const std::string scheme = LbUpdateLowerAscii(uri.getScheme());
-        const std::string host   = LbUpdateLowerAscii(uri.getHost());
+        const std::string scheme = LbLowerAscii(uri.getScheme());
+        const std::string host   = LbLowerAscii(uri.getHost());
 
         if (scheme != "https")
             return false;

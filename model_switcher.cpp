@@ -1,5 +1,6 @@
 // model_switcher.cpp
 #include "model_switcher.h"
+#include "lb_string_utils.h"
 #include "lb_ascii.h"
 
 #include "model_service.h"
@@ -148,19 +149,10 @@ std::string FormatModelNameForPill(const std::string& displayName)
     return out;
 }
 
-std::string LowerAscii(std::string s)
-{
-    for (char& c : s) {
-        c = static_cast<char>(
-            lb_ascii::ToLower(static_cast<unsigned char>(c)));
-    }
-    return s;
-}
-
 bool EndsWithGguf(const std::string& s)
 {
     if (s.size() < 5) return false;
-    return LowerAscii(s.substr(s.size() - 5)) == ".gguf";
+    return LbLowerAscii(s.substr(s.size() - 5)) == ".gguf";
 }
 
 bool ModelFileExists(const std::string& path)

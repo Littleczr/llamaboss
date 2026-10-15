@@ -11,6 +11,7 @@
 // (PeekNamedPipe tick loop), not process exit.
 
 #include "python_session.h"
+#include "lb_win_process.h"
 #include "background_work.h"   // lb::BeginBackgroundWork (drained in MyApp::OnExit)
 
 #include "path_safety.h"
@@ -59,69 +60,24 @@ namespace {
 //  a refactor that S1 deliberately avoids)
 // ═══════════════════════════════════════════════════════════════════
 
-std::wstring Utf8ToWide(const std::string& s)
-{
-    return path_safety::Utf8ToWide(s);
-}
-
 double NowSec()
 {
     using namespace std::chrono;
     return duration<double>(steady_clock::now().time_since_epoch()).count();
 }
 
-struct HandleGuard {
-    HANDLE h = nullptr;
-    HandleGuard() = default;
-    explicit HandleGuard(HANDLE handle) : h(handle) {}
-    ~HandleGuard() {
-        if (h && h != INVALID_HANDLE_VALUE) CloseHandle(h);
-    }
-    HandleGuard(const HandleGuard&) = delete;
-    HandleGuard& operator=(const HandleGuard&) = delete;
-    HANDLE release() { HANDLE r = h; h = nullptr; return r; }
-};
+using lb_win::HandleGuard;   // lb_win_process.h
 
 // Same rationale and mechanism as python_runner.cpp / cmd_executor.cpp:
 // unblock a drain thread parked in a synchronous ReadFile when the
 // job-object kill alone does not deliver EOF (something outside the
 // job inherited a write handle).
-void CancelThreadSynchronousIoLocal(HANDLE threadHandle)
-{
-    if (!threadHandle) return;
-    using Fn = BOOL (WINAPI *)(HANDLE);
-    HMODULE kernel = GetModuleHandleW(L"kernel32.dll");
-    if (!kernel) return;
-    auto* fn = reinterpret_cast<Fn>(GetProcAddress(kernel, "CancelSynchronousIo"));
-    if (fn) fn(threadHandle);
-}
+using lb_win::CancelThreadSynchronousIo;   // lb_win_process.h
 
 // Full Windows CRT argv quoting — byte-identical policy to
 // python_runner.cpp's QuoteArg (trailing backslashes doubled so an
 // argument ending in \ cannot escape the closing quote).
-std::wstring QuoteArg(const std::wstring& arg)
-{
-    std::wstring out = L"\"";
-    size_t backslashes = 0;
-
-    for (wchar_t ch : arg) {
-        if (ch == L'\\') {
-            ++backslashes;
-        } else if (ch == L'\"') {
-            out.append(backslashes * 2 + 1, L'\\');
-            out.push_back(L'\"');
-            backslashes = 0;
-        } else {
-            out.append(backslashes, L'\\');
-            backslashes = 0;
-            out.push_back(ch);
-        }
-    }
-
-    out.append(backslashes * 2, L'\\');
-    out.push_back(L'\"');
-    return out;
-}
+using lb_win::QuoteArg;   // lb_win_process.h
 
 // Lossy UTF-8 sanitizer for bytes we did NOT receive through the
 // (ensure_ascii) frame channel — i.e. salvaged capture files and the
@@ -160,7 +116,7 @@ std::string SanitizeUtf8Lossy(const std::string& in)
 // Normalize, without pulling wxFileName into worker-thread code.
 std::string NormalizeKey(const std::string& cwdUtf8)
 {
-    std::wstring w = Utf8ToWide(cwdUtf8);
+    std::wstring w = path_safety::Utf8ToWide(cwdUtf8);
     if (w.empty()) return std::string();
     wchar_t buf[MAX_PATH * 4];
     DWORD got = GetFullPathNameW(w.c_str(),
@@ -373,7 +329,7 @@ struct PySession {
         // (leaked-writer paranoia, same as python_runner.cpp).
         if (proc) WaitForSingleObject(proc, 2000);
         if (drainThread.joinable()) {
-            CancelThreadSynchronousIoLocal(
+            CancelThreadSynchronousIo(
                 static_cast<HANDLE>(drainThread.native_handle()));
             drainThread.join();
         }
@@ -592,7 +548,7 @@ std::shared_ptr<PySession> SpawnSession(
     const std::shared_ptr<std::atomic<bool>>& cancelFlag,
     std::string& errorOut)
 {
-    const std::wstring cwdW = Utf8ToWide(cwdUtf8);
+    const std::wstring cwdW = path_safety::Utf8ToWide(cwdUtf8);
     LPCWSTR cwdArg = cwdW.empty() ? nullptr : cwdW.c_str();
 
     std::ostringstream startErrors;

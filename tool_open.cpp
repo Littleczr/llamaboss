@@ -1,6 +1,7 @@
 // tool_open.cpp
 
 #include "tool_open.h"
+#include "path_safety.h"
 
 #include "tool_path.h"
 #include "tool_path_safety.h"
@@ -209,34 +210,6 @@ std::string StripCopiedPowerShellListingColumns(const std::string& input)
     return s;
 }
 
-// Same Utf8/Wide helpers as elsewhere in the tool layer.  Local copy
-// rather than reaching across translation units; the eventual
-// tool_util consolidation pass picks up these duplicates.
-std::wstring Utf8ToWide(const std::string& s)
-{
-    if (s.empty()) return L"";
-    int len = ::MultiByteToWideChar(CP_UTF8, 0, s.data(),
-                                    (int)s.size(), nullptr, 0);
-    if (len <= 0) return L"";
-    std::wstring w((size_t)len, L'\0');
-    ::MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(),
-                          &w[0], len);
-    return w;
-}
-
-std::string WideToUtf8(const std::wstring& w)
-{
-    if (w.empty()) return "";
-    int len = ::WideCharToMultiByte(CP_UTF8, 0, w.data(),
-                                    (int)w.size(),
-                                    nullptr, 0, nullptr, nullptr);
-    if (len <= 0) return "";
-    std::string s((size_t)len, char(0));
-    ::WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(),
-                          &s[0], len, nullptr, nullptr);
-    return s;
-}
-
 // Returns the lowercase extension (no leading dot) or empty if none.
 // "foo.tar.gz" -> "gz".  Splits at the LAST dot only -- consistent
 // with Windows filesystem semantics (the extension that determines
@@ -441,7 +414,7 @@ std::string LangForExtImpl(const std::string& ext)
 // as the server_manager fix from earlier work.
 std::string ShellOpenFile(const std::string& absPath)
 {
-    std::wstring wPath = Utf8ToWide(absPath);
+    std::wstring wPath = path_safety::Utf8ToWide(absPath);
 
     // ShellExecuteW returns an HINSTANCE that's actually an integer
     // status >32 == success, <=32 == failure, with documented codes.
@@ -658,7 +631,7 @@ bool EnumerateDirectoryEntryNames(const std::string& directory,
 {
     if (directory.empty() || !IsDirectory(directory)) return false;
 
-    std::wstring pattern = Utf8ToWide(directory);
+    std::wstring pattern = path_safety::Utf8ToWide(directory);
     if (pattern.empty()) return false;
     wchar_t last = pattern.back();
     if (last != static_cast<wchar_t>(92) && last != L'/')
@@ -672,7 +645,7 @@ bool EnumerateDirectoryEntryNames(const std::string& directory,
     do {
         std::wstring nameW(fd.cFileName);
         if (nameW == L"." || nameW == L"..") continue;
-        std::string name = WideToUtf8(nameW);
+        std::string name = path_safety::WideToUtf8(nameW);
         if (!name.empty()) outEntries.push_back(name);
     } while (::FindNextFileW(h, &fd));
 
@@ -708,8 +681,8 @@ bool EnumerateDirectoryEntryNamesRecursiveFiltered(
     if (filter.find('/') != std::string::npos || filter.find('\\') != std::string::npos)
         return false;
 
-    std::wstring rootW = Utf8ToWide(rootDirectory);
-    std::wstring filterW = Utf8ToWide(filter);
+    std::wstring rootW = path_safety::Utf8ToWide(rootDirectory);
+    std::wstring filterW = path_safety::Utf8ToWide(filter);
     if (rootW.empty() || filterW.empty()) return false;
 
     // Safety/perf caps: this only supports the friendly media/document
@@ -734,7 +707,7 @@ bool EnumerateDirectoryEntryNamesRecursiveFiltered(
             do {
                 std::wstring nameW(fd.cFileName);
                 if (nameW == L"." || nameW == L"..") continue;
-                std::string name = WideToUtf8(nameW);
+                std::string name = path_safety::WideToUtf8(nameW);
                 if (!name.empty()) {
                     outEntries.push_back(relPrefix + name);
                     if (outEntries.size() >= kMaxMatches) break;
@@ -758,7 +731,7 @@ bool EnumerateDirectoryEntryNamesRecursiveFiltered(
             if ((dd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0) continue;
             if ((dd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) continue;
 
-            std::string name = WideToUtf8(nameW);
+            std::string name = path_safety::WideToUtf8(nameW);
             if (name.empty()) continue;
 
             std::wstring childDir = JoinWidePath(dirW, nameW);

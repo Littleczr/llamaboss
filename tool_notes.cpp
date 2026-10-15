@@ -63,17 +63,9 @@ std::string ToUtf8(const wxString& s)
     return b.data() ? std::string(b.data()) : std::string();
 }
 
-std::string LowerAscii(std::string s)
-{
-    for (char& c : s) {
-        if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
-    }
-    return s;
-}
-
 bool EndsWithMd(const std::string& name)
 {
-    const std::string lower = LowerAscii(name);
+    const std::string lower = LbLowerAscii(name);
     return lower.size() > 3 && lower.compare(lower.size() - 3, 3, ".md") == 0;
 }
 
@@ -255,7 +247,7 @@ std::string DescribeNoteFile(const std::string& path)
 
         if (inFrontmatter) {
             if (t == "---") { inFrontmatter = false; continue; }
-            if (LowerAscii(t).rfind("description:", 0) == 0) {
+            if (LbLowerAscii(t).rfind("description:", 0) == 0) {
                 std::string v = Trim(t.substr(12));
                 if (v.size() >= 2 &&
                     ((v.front() == '"' && v.back() == '"') ||
@@ -350,7 +342,7 @@ bool NormalizeNotesRelPath(const std::string& input, std::string& out, std::stri
 
     // Tolerate a "Notes\" prefix -- models often repeat the folder name.
     {
-        const std::string lower = LowerAscii(s);
+        const std::string lower = LbLowerAscii(s);
         if (lower.rfind("notes\\", 0) == 0 || lower.rfind("notes/", 0) == 0)
             s = s.substr(6);
     }
@@ -416,7 +408,7 @@ AppendArgs ParseAppendArgs(const std::string& raw)
             const size_t eol = text.find('\n', lead);
             const std::string first =
                 Trim(text.substr(lead, eol == std::string::npos ? std::string::npos : eol - lead));
-            if (LowerAscii(first).rfind("file:", 0) == 0) {
+            if (LbLowerAscii(first).rfind("file:", 0) == 0) {
                 std::string norm, err;
                 if (!NormalizeNotesRelPath(first.substr(5), norm, err)) {
                     a.error = "notes_append: bad 'file:' line -- " + err + ".";
@@ -503,7 +495,7 @@ std::vector<NoteFileInfo> ListNoteFiles()
     ListMdFilesIn(root, std::string(), files);
     std::sort(files.begin(), files.end(),
               [](const NoteFileInfo& a, const NoteFileInfo& b) {
-                  return LowerAscii(a.name) < LowerAscii(b.name);
+                  return LbLowerAscii(a.name) < LbLowerAscii(b.name);
               });
 
     for (const std::string& folder : ListSubfolders(root)) {
@@ -512,7 +504,7 @@ std::vector<NoteFileInfo> ListNoteFiles()
                       folder + std::string(1, kSep), sub);
         std::sort(sub.begin(), sub.end(),
                   [](const NoteFileInfo& a, const NoteFileInfo& b) {
-                      return LowerAscii(a.name) < LowerAscii(b.name);
+                      return LbLowerAscii(a.name) < LbLowerAscii(b.name);
                   });
         files.insert(files.end(), sub.begin(), sub.end());
     }
@@ -521,8 +513,12 @@ std::vector<NoteFileInfo> ListNoteFiles()
 
 std::string BuildNotesIndexBlock()
 {
+    return BuildNotesIndexBlock(ListNoteFiles());
+}
+
+std::string BuildNotesIndexBlock(const std::vector<NoteFileInfo>& files)
+{
     const std::string root = GetNotesRootDir();
-    const std::vector<NoteFileInfo> files = ListNoteFiles();
 
     std::ostringstream p;
     p << "User notes (cross-conversation memory; only this index is loaded -- read a file only when the task needs it):\n"

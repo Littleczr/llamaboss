@@ -1,6 +1,6 @@
 // attachment_chip.h
-// Composer attachment cards — the pending-attachment strip shown above
-// the input while files are queued but not yet sent.
+// Composer attachment cards — the pending-attachment tray shown INSIDE
+// the input box (above the text) while files are queued but not yet sent.
 //
 // Replaces the old text pill ("[icon] name  ×") with two owner-drawn
 // card shapes:
@@ -87,6 +87,9 @@ public:
                         : FromDIP(kFileCardWidthDip);
         SetInitialSize(wxSize(cardW, m_cardH));
         SetMinSize(wxSize(cardW, m_cardH));
+        // Fixed-size card: a sizer may never stretch it (a stretched card
+        // would scale the thumbnail out of proportion).
+        SetMaxSize(wxSize(cardW, m_cardH));
 
         if (m_model.isImage && m_model.preview.IsOk())
             m_thumb = BuildRoundedCover(m_model.preview, cardW, m_cardH,
@@ -104,7 +107,7 @@ public:
 
 private:
     // ── Layout constants (DIP; scaled through FromDIP) ─────────────
-    static constexpr int kCardHeightDip    = 62;
+    static constexpr int kCardHeightDip    = 72;
     static constexpr int kFileCardWidthDip = 208;
     static constexpr int kRadiusDip        = 10;
     static constexpr int kCloseRadiusDip   = 9;
@@ -128,11 +131,11 @@ private:
     wxColour m_closeBg, m_closeBgHover, m_closeGlyph;
 
     // ── Colour derivation ─────────────────────────────────────────
-    // The chip sits on bgMain but should read as a raised surface, so
-    // it borrows the input-field background rather than the old flat
-    // attachChipBg pill colour.  Everything else is derived by mixing
-    // toward the text colour, which keeps all 12 themes working
-    // without adding new ThemeData fields.
+    // The chip sits inside the input box (bgInputField), so its body is
+    // lifted slightly toward the text colour and given a soft outline --
+    // the same quiet framed-tile look as Claude's composer.  Everything
+    // is derived by mixing, which keeps all 12 themes working without
+    // adding new ThemeData fields.
 
     static wxColour Mix(const wxColour& a, const wxColour& b, double t)
     {
@@ -152,9 +155,9 @@ private:
     {
         const bool dark = IsDarkColour(t.bgMain);
 
-        m_surface      = t.bgInputField;
-        m_surfaceHover = Mix(t.bgInputField, t.textPrimary, dark ? 0.08 : 0.05);
-        m_border       = Mix(t.bgInputField, t.borderSubtle, 0.85);
+        m_surface      = Mix(t.bgInputField, t.textPrimary, dark ? 0.06 : 0.04);
+        m_surfaceHover = Mix(t.bgInputField, t.textPrimary, dark ? 0.12 : 0.08);
+        m_border       = Mix(t.bgInputField, t.textPrimary, dark ? 0.20 : 0.16);
         m_borderHover  = Mix(m_border, t.attachIndicator, 0.55);
 
         m_text     = t.textPrimary;
@@ -262,9 +265,18 @@ private:
         return wxBitmap(img);
     }
 
+    // The card's painted size: its fixed min size, clipped to the client
+    // area.  The × badge and hit box follow the card, not the window.
+    wxSize CardSize() const
+    {
+        const wxSize client = GetClientSize();
+        const wxSize card   = GetMinSize();
+        return wxSize(std::min(client.x, card.x), std::min(client.y, card.y));
+    }
+
     wxRect CloseHitBox() const
     {
-        const wxSize sz = GetClientSize();
+        const wxSize sz = CardSize();
         const int cx = sz.x - m_closeR - FromDIP(4);
         const int cy = m_closeR + FromDIP(4);
         const int pad = FromDIP(2);   // forgiving target for small badges
@@ -344,8 +356,11 @@ private:
         if (!gc) return;
         gc->SetAntialiasMode(wxANTIALIAS_DEFAULT);
 
-        const wxSize sz = GetClientSize();
-        const double w = sz.x, h = sz.y;
+        // Paint at the card's own fixed size, never the client size, so
+        // the thumbnail keeps its proportions even if a sizer stretches
+        // the window.
+        const wxSize card = CardSize();
+        const double w = card.x, h = card.y;
         const double r = m_radius;
 
         // Card body
@@ -477,7 +492,7 @@ private:
 
     void PaintCloseBadge(wxGraphicsContext& gc)
     {
-        const wxSize sz = GetClientSize();
+        const wxSize sz = CardSize();
         const double cx = sz.x - m_closeR - FromDIP(4);
         const double cy = m_closeR + FromDIP(4);
 

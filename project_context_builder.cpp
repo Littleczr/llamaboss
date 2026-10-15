@@ -47,13 +47,20 @@ unsigned long long MixString(unsigned long long seed, const std::string& value)
         static_cast<unsigned long long>(std::hash<std::string>{}(value)));
 }
 
+// Prompt-visible list cap; the cache only tracks the items the prompt shows
+// (plus the total count, which drives the "N more not listed" line).
+constexpr std::size_t kMaxListedItems = 30;
+
 template <typename Items>
-unsigned long long FingerprintItems(const Items& items)
+unsigned long long FingerprintItems(const Items& items,
+                                    std::size_t maxItems = 0)
 {
     unsigned long long h = 1469598103934665603ull;
     h = MixHash(h, static_cast<unsigned long long>(items.size()));
 
+    std::size_t n = 0;
     for (const auto& item : items) {
+        if (maxItems > 0 && n++ >= maxItems) break;
         // The prompt lists name/path/size, but content-relevant edits often
         // keep the same directory timestamp.  Include file mtime so edited
         // SKILL.md, workflow, source, and helper files invalidate the cached
@@ -101,24 +108,26 @@ ProjectContextBuilder::BuildCacheSignature() const
     }
 
     CacheSignature sig;
+    Inventory inv;
     sig.hasProject = m_chatHistory->HasProject();
     sig.skillsDirMTime =
         LbPathMTimeTicks(ProjectManager::GetSkillsDir());
 
     // Directory mtime catches add/remove/rename.  The listed-file
     // fingerprints catch edits to existing files that may not update the
-    // parent directory timestamp.  Keep the list cap aligned with
-    // AppendSkillsBlock() so the cache only tracks prompt-visible items.
-    sig.skillsListHash = FingerprintItems(
-        ProjectManager::ListSkills(30));
-    sig.skillScriptsListHash = FingerprintItems(
-        ProjectManager::ListSkillScripts(30));
+    // parent directory timestamp.  Only prompt-visible items are tracked.
+    // Skill helper scripts are deliberately NOT fingerprinted: the prompt
+    // no longer lists them (see AppendSkillsBlockFrom), so editing a
+    // helper .py must not force a context rebuild.
+    inv.skills = ProjectManager::ListSkills(0);
+    sig.skillsListHash = FingerprintItems(inv.skills, kMaxListedItems);
 
     // Notes index: folder mtime catches add/remove at the root; the file
     // fingerprint (name/size/mtime, root + one subfolder level) catches
     // edited descriptions.  The legacy NOTES.md mtime toggles its pointer.
     sig.notesDirMTime = LbPathMTimeTicks(GetNotesRootDir());
-    sig.notesListHash = FingerprintItems(ListNoteFiles());
+    inv.notes = ListNoteFiles();
+    sig.notesListHash = FingerprintItems(inv.notes);
     sig.legacyNotesMTime = LbPathMTimeTicks(GetLegacyNotesPath());
 
     if (sig.hasProject) {
@@ -130,16 +139,20 @@ ProjectContextBuilder::BuildCacheSignature() const
             LbPathMTimeTicks(ProjectManager::ProjectInstructionsPath(sig.projectRoot));
         sig.sourcesDirMTime =
             LbPathMTimeTicks(ProjectManager::ProjectSourcesPath(sig.projectRoot));
-        sig.sourcesListHash = FingerprintItems(
-            ProjectManager::ListProjectSources(sig.projectRoot, 30));
+        inv.projectRoot = sig.projectRoot;
+        inv.sources = ProjectManager::ListProjectSources(sig.projectRoot, 0);
+        inv.workflows = ProjectManager::ListProjectWorkflows(sig.projectRoot, 0);
+        inv.workflowScripts =
+            ProjectManager::ListProjectWorkflowScripts(sig.projectRoot, 0);
+        sig.sourcesListHash = FingerprintItems(inv.sources, kMaxListedItems);
         sig.workflowsDirMTime =
             LbPathMTimeTicks(ProjectManager::ProjectWorkflowsPath(sig.projectRoot));
-        sig.workflowsListHash = FingerprintItems(
-            ProjectManager::ListProjectWorkflows(sig.projectRoot, 30));
-        sig.workflowScriptsListHash = FingerprintItems(
-            ProjectManager::ListProjectWorkflowScripts(sig.projectRoot, 30));
+        sig.workflowsListHash = FingerprintItems(inv.workflows, kMaxListedItems);
+        sig.workflowScriptsListHash =
+            FingerprintItems(inv.workflowScripts, kMaxListedItems);
     }
 
+    m_cache.recentInventory = std::move(inv);
     m_cache.recentProbeSig = sig;
     m_cache.recentProbeAt = now;
     m_cache.hasRecentProbe = true;
@@ -169,6 +182,23 @@ ProjectContextBuilder::GetProjectStripCounts(const std::string& root) const
     }
 
     ProjectStripCounts counts;
+
+    // Reuse the context probe's listing when it is fresh and for this root.
+    if (m_cache.hasRecentProbe &&
+        !root.empty() &&
+        m_cache.recentInventory.projectRoot == root &&
+        now - m_cache.recentProbeAt < std::chrono::seconds(2)) {
+        const Inventory& inv = m_cache.recentInventory;
+        counts.sourceCount = static_cast<int>(inv.sources.size());
+        counts.workflowCount = static_cast<int>(inv.workflows.size());
+        counts.scriptCount = static_cast<int>(inv.workflowScripts.size());
+        m_cache.recentStripCountsRoot = root;
+        m_cache.recentStripCounts = counts;
+        m_cache.recentStripCountsAt = now;
+        m_cache.hasRecentStripCounts = true;
+        return counts;
+    }
+
     counts.sourceCount = static_cast<int>(
         ProjectManager::ListProjectSources(root, 0).size());
     counts.workflowCount = static_cast<int>(
@@ -185,18 +215,27 @@ ProjectContextBuilder::GetProjectStripCounts(const std::string& root) const
 
 void ProjectContextBuilder::AppendSkillsBlock(std::ostringstream& p) const
 {
+    AppendSkillsBlockFrom(p, ProjectManager::ListSkills(0));
+}
+
+void ProjectContextBuilder::AppendSkillsBlockFrom(
+    std::ostringstream& p, const std::vector<SkillInfo>& allSkills) const
+{
     // Listing is capped at 30 (alphabetical).  Count the full set too so a
     // 31st Skill is announced instead of silently vanishing from the prompt.
-    constexpr std::size_t kMaxListedSkills = 30;
-    const auto skills = ProjectManager::ListSkills(kMaxListedSkills);
-    if (skills.empty()) return;
-    const std::size_t totalSkills = ProjectManager::ListSkills(0).size();
+    if (allSkills.empty()) return;
+    const std::size_t totalSkills = allSkills.size();
+    const std::vector<SkillInfo> skills(
+        allSkills.begin(),
+        allSkills.begin() + static_cast<std::ptrdiff_t>(
+            std::min(totalSkills, kMaxListedItems)));
 
     p << "LlamaBoss Skills (cross-project; available even when no project is attached):\n"
       << "  Folder: " << ProjectManager::GetSkillsDir() << "\n"
       << "  Skill execution grounding rule: when the user asks to use, run, invoke, or continue a named Skill, the first tool call for that Skill request MUST read the listed SKILL.md contract path, even if that Skill was just drafted or used earlier in this same chat. Do not run a Skill helper, PowerShell step, or one-off replacement before reading the saved Skill contract.\n"
       << "  After the saved SKILL.md is read, treat that contract and the saved files in the Skill folder as the source of truth. Do not substitute temporary workspace scripts, design-time test scripts, or remembered helper names from an earlier Skill-design conversation unless the saved SKILL.md explicitly directs that exact file.\n"
-      << "  Use a Skill by reading its SKILL.md contract first, then following its steps using normal tools and approval rules. python_run_script can run a Skill's .py helper (same folder or its scripts subfolder) by filename or in-lane path. If the helper needs runtime inputs, put the helper filename/path on the first args line and each optional command-line argument on its own later line; never call python_run_script with only data arguments and no .py script filename/path. Skill helper scripts are files, not tool names: never call the .py filename or Skill name directly as a tool. If an active project has a project workflow with the same name, the project workflow takes precedence.\n";
+      << "  Use a Skill by reading its SKILL.md contract first, then following its steps using normal tools and approval rules. python_run_script can run a Skill's .py helper (same folder or its scripts subfolder) by filename or in-lane path. If the helper needs runtime inputs, put the helper filename/path on the first args line and each optional command-line argument on its own later line; never call python_run_script with only data arguments and no .py script filename/path. Skill helper scripts are files, not tool names: never call the .py filename or Skill name directly as a tool. If an active project has a project workflow with the same name, the project workflow takes precedence.\n"
+      << "  A helper created during Skill setup is a complete runnable implementation, not a scaffold: run it as the contract says once the inputs are known. Do not edit or overwrite it before first use; repair it only after a concrete failure or when the user asks to revise the Skill, and do not replace it with a one-off workspace script.\n";
 
     {
         p << "  Skills (read the listed SKILL.md contract path before using one):\n";
@@ -238,11 +277,12 @@ void ProjectContextBuilder::AppendSkillsBlock(std::ostringstream& p) const
     // a helper before reading its contract.
 }
 
-std::string ProjectContextBuilder::BuildActiveProjectContextBlockFresh() const
+std::string ProjectContextBuilder::BuildActiveProjectContextBlockFresh(
+    const Inventory& inv) const
 {
     std::ostringstream p;
-    AppendSkillsBlock(p);
-    p << BuildNotesIndexBlock();
+    AppendSkillsBlockFrom(p, inv.skills);
+    p << BuildNotesIndexBlock(inv.notes);
 
     if (!m_chatHistory->HasProject()) return p.str();
 
@@ -271,7 +311,15 @@ std::string ProjectContextBuilder::BuildActiveProjectContextBlockFresh() const
       << "  Project workflow Python scripts: optional .py helper scripts may live in Workflows/. Do not run a project workflow script unless the workflow file or user request calls for it. python_run_script can run an active project's workflow script by filename or in-lane path; if the script needs runtime inputs, put the script filename/path on the first args line and each optional command-line argument on its own later line. read/open/ls/write/edit/delete/mkdir can use Workflows\\... project-relative paths; scripts run from the conversation workspace and can infer the project root from their own file path.\n"
       << "  Notes about this project live in the user's Notes folder (see User notes), in projects\\<project name>.md -- not in the project folder.\n";
 
-    const auto projectSources = ProjectManager::ListProjectSources(projectRoot, 30);
+    // Fall back to a fresh listing only if the probe's inventory is for a
+    // different root (cannot normally happen: the signature carries root).
+    const bool invMatches = (inv.projectRoot == projectRoot);
+    auto capped = [](auto v) {
+        if (v.size() > kMaxListedItems) v.resize(kMaxListedItems);
+        return v;
+    };
+    const auto projectSources = capped(invMatches
+        ? inv.sources : ProjectManager::ListProjectSources(projectRoot, 0));
     if (projectSources.empty()) {
         p << "  Project sources: none attached yet.\n";
     } else {
@@ -283,7 +331,8 @@ std::string ProjectContextBuilder::BuildActiveProjectContextBlockFresh() const
         }
     }
 
-    const auto projectWorkflows = ProjectManager::ListProjectWorkflows(projectRoot, 30);
+    const auto projectWorkflows = capped(invMatches
+        ? inv.workflows : ProjectManager::ListProjectWorkflows(projectRoot, 0));
     if (projectWorkflows.empty()) {
         p << "  Project workflows: none created yet.\n";
     } else {
@@ -295,7 +344,9 @@ std::string ProjectContextBuilder::BuildActiveProjectContextBlockFresh() const
         }
     }
 
-    const auto projectWorkflowScripts = ProjectManager::ListProjectWorkflowScripts(projectRoot, 30);
+    const auto projectWorkflowScripts = capped(invMatches
+        ? inv.workflowScripts
+        : ProjectManager::ListProjectWorkflowScripts(projectRoot, 0));
     if (projectWorkflowScripts.empty()) {
         p << "  Project workflow Python scripts: none created yet.\n";
     } else {
@@ -337,7 +388,10 @@ std::string ProjectContextBuilder::BuildActiveProjectContextBlock() const
         return m_cache.block;
     }
 
-    m_cache.block = BuildActiveProjectContextBlockFresh();
+    // BuildCacheSignature() refreshed (or reused, within its 2s window) the
+    // inventory that produced `sig`, so the block is built from exactly the
+    // listing the signature describes.
+    m_cache.block = BuildActiveProjectContextBlockFresh(m_cache.recentInventory);
     m_cache.sig = std::move(sig);
     m_cache.valid = true;
     return m_cache.block;

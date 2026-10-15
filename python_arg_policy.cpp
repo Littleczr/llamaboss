@@ -1,16 +1,10 @@
 // python_arg_policy.cpp
 
 #include "python_arg_policy.h"
+#include "lb_string_utils.h"
 #include "lb_ascii.h"
 
 namespace {
-
-std::string LowerAscii(std::string s)
-{
-    std::transform(s.begin(), s.end(), s.begin(),
-                   [](unsigned char c){ return static_cast<char>(lb_ascii::ToLower(c)); });
-    return s;
-}
 
 std::string TrimAscii(const std::string& s)
 {
@@ -52,7 +46,7 @@ bool NormalizeAllowedPythonPackage(const std::string& requested,
                                    std::string&       packageOut,
                                    std::string&       errorOut)
 {
-    std::string p = LowerAscii(TrimAscii(requested));
+    std::string p = LbLowerAscii(TrimAscii(requested));
     std::replace(p.begin(), p.end(), '_', '-');
 
     // Friendly aliases for import/module names the model or user may mention.
@@ -108,7 +102,7 @@ bool NormalizeAllowedPythonPackage(const std::string& requested,
 
 bool IsReservedBuiltInPythonHelperName(const std::string& filename)
 {
-    const std::string key = LowerAscii(filename);
+    const std::string key = LbLowerAscii(filename);
     static const char* reserved[] = {
         "python_health.py",
         "csv_inspect.py",

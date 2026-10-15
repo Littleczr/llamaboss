@@ -1,6 +1,7 @@
 // tool_read.cpp
 
 #include "tool_read.h"
+#include "lb_string_utils.h"
 #include "lb_ascii.h"
 #include "tool_path.h"
 #include "tool_path_safety.h"
@@ -96,25 +97,6 @@ size_t ComputeRangedReadHistoryBudget(int ctxTokens)
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────
-
-// Human-readable byte count.  Base-1024 throughout (KB=1024 etc.) —
-// that's what most developers mean when they say "KB" casually,
-// and it matches what Windows Explorer shows in "Size".
-std::string HumanBytes(size_t b)
-{
-    std::ostringstream ss;
-    ss << std::fixed;
-    if (b < 1024) {
-        ss << b << " B";
-    } else if (b < 1024 * 1024) {
-        ss.precision(1);
-        ss << (b / 1024.0) << " KB";
-    } else {
-        ss.precision(2);
-        ss << (b / (1024.0 * 1024.0)) << " MB";
-    }
-    return ss.str();
-}
 
 // A byte-budget cut lands on an arbitrary byte.  Drop a trailing
 // INCOMPLETE UTF-8 sequence so a partial body stays valid UTF-8.  A split
@@ -228,19 +210,6 @@ size_t CountLines(const std::string& s)
     return lines;
 }
 
-// Elapsed-time chip — same format as /cmd's header ("0.02s" / "12.3s").
-std::string ElapsedChip(
-    std::chrono::steady_clock::time_point t0)
-{
-    double elapsed = std::chrono::duration<double>(
-        std::chrono::steady_clock::now() - t0).count();
-    std::ostringstream ts;
-    ts << std::fixed;
-    ts.precision(elapsed < 10.0 ? 2 : 1);
-    ts << elapsed << "s";
-    return ts.str();
-}
-
 } // anonymous namespace
 
 namespace {
@@ -312,7 +281,7 @@ ReadResult ReadFile(const std::string& inputPath, const ToolContext& ctx)
     if (resolved.empty()) {
         r.chips.push_back("failed");
         r.errorBody = "Could not resolve path: " + inputPath;
-        r.chips.push_back(ElapsedChip(t0));
+        r.chips.push_back(LbElapsedChip(t0));
         return r;
     }
     if (usedConversationLane) r.chips.push_back("conversation lane");
@@ -337,7 +306,7 @@ ReadResult ReadFile(const std::string& inputPath, const ToolContext& ctx)
             } else {
                 r.errorBody = "File not found: " + resolved;
             }
-            r.chips.push_back(ElapsedChip(t0));
+            r.chips.push_back(LbElapsedChip(t0));
             return r;
         }
     }
@@ -347,7 +316,7 @@ ReadResult ReadFile(const std::string& inputPath, const ToolContext& ctx)
     if (!f.is_open()) {
         r.chips.push_back("failed");
         r.errorBody = "Could not open file: " + resolved;
-        r.chips.push_back(ElapsedChip(t0));
+        r.chips.push_back(LbElapsedChip(t0));
         return r;
     }
 
@@ -355,18 +324,18 @@ ReadResult ReadFile(const std::string& inputPath, const ToolContext& ctx)
     if (fileSize < 0) {
         r.chips.push_back("failed");
         r.errorBody = "Could not determine file size: " + resolved;
-        r.chips.push_back(ElapsedChip(t0));
+        r.chips.push_back(LbElapsedChip(t0));
         return r;
     }
 
     const size_t totalBytes = (size_t)fileSize;
 
     if (totalBytes > kReadRefuseAbove) {
-        r.chips.push_back(HumanBytes(totalBytes));
+        r.chips.push_back(LbToolHumanBytes(totalBytes));
         r.chips.push_back("too large");
-        r.errorBody = "File too large to read: " + HumanBytes(totalBytes)
-                      + " (max " + HumanBytes(kReadRefuseAbove) + ")";
-        r.chips.push_back(ElapsedChip(t0));
+        r.errorBody = "File too large to read: " + LbToolHumanBytes(totalBytes)
+                      + " (max " + LbToolHumanBytes(kReadRefuseAbove) + ")";
+        r.chips.push_back(LbElapsedChip(t0));
         return r;
     }
 
@@ -402,8 +371,8 @@ ReadResult ReadFile(const std::string& inputPath, const ToolContext& ctx)
     if (truncated) {
         if (!content.empty() && content.back() != '\n') content += '\n';
         std::ostringstream marker;
-        marker << "\n[... truncated: showing " << HumanBytes(content.size())
-               << " of " << HumanBytes(totalBytes)
+        marker << "\n[... truncated: showing " << LbToolHumanBytes(content.size())
+               << " of " << LbToolHumanBytes(totalBytes)
                << " to fit model context (ctx=" << ctx.ctxTokens
                << " tokens) ...]\n";
         content += marker.str();
@@ -411,20 +380,30 @@ ReadResult ReadFile(const std::string& inputPath, const ToolContext& ctx)
 
     // ── Binary branch ────────────────────────────────────────────
     if (IsBinary(content.data(), content.size())) {
-        r.chips.push_back(HumanBytes(totalBytes));
+        r.chips.push_back(LbToolHumanBytes(totalBytes));
         r.chips.push_back("binary");
         r.chips.push_back("hex preview");
         r.body = HexPreview(content);
         // No language hint for hex — it's not a real source dump.
-        r.chips.push_back(ElapsedChip(t0));
+        r.chips.push_back(LbElapsedChip(t0));
         return r;
     }
 
     // ── Text branch ──────────────────────────────────────────────
-    r.chips.push_back(HumanBytes(totalBytes));
+    r.chips.push_back(LbToolHumanBytes(totalBytes));
     r.chips.push_back(std::to_string(shownLineCount) +
                       (truncated ? " shown lines" : " lines"));
     if (truncated) r.chips.push_back("truncated");
+    // A UTF-8 BOM is file metadata, not text: shown inline it became an
+    // invisible character glued to line 1 that a model could copy into
+    // an edit's OLD block.  Strip it from the view and say so.
+    if (content.size() >= 3 && content.compare(0, 3, "\xEF\xBB\xBF") == 0) {
+        content.erase(0, 3);
+        r.chips.push_back("UTF-8 BOM");
+    }
+    // An empty body rendered as "(no output)", which reads like a tool
+    // failure.  Say plainly that the file is empty.
+    if (totalBytes == 0) content = "(empty file: 0 bytes)\n";
     r.body     = std::move(content);
     r.bodyLang = InferBodyLang(resolved);
 
@@ -442,7 +421,7 @@ ReadResult ReadFile(const std::string& inputPath, const ToolContext& ctx)
                 ComputeRangedReadHistoryBudget(ctx.ctxTokens);
     }
 
-    r.chips.push_back(ElapsedChip(t0));
+    r.chips.push_back(LbElapsedChip(t0));
     return r;
 }
 
@@ -463,7 +442,7 @@ ReadResult ReadFileHead(const std::string& inputPath,
     if (resolved.empty()) {
         r.chips.push_back("failed");
         r.errorBody = "Could not resolve path: " + inputPath;
-        r.chips.push_back(ElapsedChip(t0));
+        r.chips.push_back(LbElapsedChip(t0));
         return r;
     }
     if (usedConversationLane) r.chips.push_back("conversation lane");
@@ -487,7 +466,7 @@ ReadResult ReadFileHead(const std::string& inputPath,
             } else {
                 r.errorBody = "File not found: " + resolved;
             }
-            r.chips.push_back(ElapsedChip(t0));
+            r.chips.push_back(LbElapsedChip(t0));
             return r;
         }
     }
@@ -496,7 +475,7 @@ ReadResult ReadFileHead(const std::string& inputPath,
     if (!f.is_open()) {
         r.chips.push_back("failed");
         r.errorBody = "Could not open file: " + resolved;
-        r.chips.push_back(ElapsedChip(t0));
+        r.chips.push_back(LbElapsedChip(t0));
         return r;
     }
 
@@ -504,17 +483,17 @@ ReadResult ReadFileHead(const std::string& inputPath,
     if (fileSize < 0) {
         r.chips.push_back("failed");
         r.errorBody = "Could not determine file size: " + resolved;
-        r.chips.push_back(ElapsedChip(t0));
+        r.chips.push_back(LbElapsedChip(t0));
         return r;
     }
 
     const size_t totalBytes = (size_t)fileSize;
     if (totalBytes > kReadRefuseAbove) {
-        r.chips.push_back(HumanBytes(totalBytes));
+        r.chips.push_back(LbToolHumanBytes(totalBytes));
         r.chips.push_back("too large");
-        r.errorBody = "File too large to preview: " + HumanBytes(totalBytes)
-                      + " (max " + HumanBytes(kReadRefuseAbove) + ")";
-        r.chips.push_back(ElapsedChip(t0));
+        r.errorBody = "File too large to preview: " + LbToolHumanBytes(totalBytes)
+                      + " (max " + LbToolHumanBytes(kReadRefuseAbove) + ")";
+        r.chips.push_back(LbElapsedChip(t0));
         return r;
     }
 
@@ -531,11 +510,11 @@ ReadResult ReadFileHead(const std::string& inputPath,
     if (toRead < totalBytes) DropIncompleteUtf8Tail(content);
 
     if (IsBinary(content.data(), content.size())) {
-        r.chips.push_back(HumanBytes(totalBytes));
+        r.chips.push_back(LbToolHumanBytes(totalBytes));
         r.chips.push_back("binary");
         r.chips.push_back("hex preview");
         r.body = HexPreview(content);
-        r.chips.push_back(ElapsedChip(t0));
+        r.chips.push_back(LbElapsedChip(t0));
         return r;
     }
 
@@ -544,35 +523,62 @@ ReadResult ReadFileHead(const std::string& inputPath,
     size_t lines = 0;
     size_t pos = 0;
     bool truncatedByLines = false;
+    // read_head is a preview: one enormous line (minified JSON, a log
+    // with no newlines) must not turn it into a 128 KB body that gets
+    // demoted to a Vars\ card claiming to hold "the complete content".
+    constexpr size_t kMaxHeadLineBytes = 2000;
+    bool clampedAnyLine = false;
+    auto appendLine = [&](size_t from, size_t len, bool withNewline) {
+        if (len > kMaxHeadLineBytes) {
+            size_t cut = kMaxHeadLineBytes;
+            while (cut > 0 &&
+                   (static_cast<unsigned char>(content[from + cut]) & 0xC0) == 0x80)
+                --cut;   // keep UTF-8 sequences whole
+            out.append(content.data() + from, cut);
+            out += " ...[line clamped: " + std::to_string(len) +
+                   " bytes in this line; use read_range or grep for the rest]";
+            if (withNewline) out += '\n';
+            clampedAnyLine = true;
+        } else {
+            out.append(content.data() + from, len + (withNewline ? 1 : 0));
+        }
+    };
     while (pos < content.size() && lines < maxLines) {
         size_t nl = content.find('\n', pos);
         if (nl == std::string::npos) {
-            out.append(content.substr(pos));
+            appendLine(pos, content.size() - pos, false);
             pos = content.size();
             ++lines;
             break;
         }
-        out.append(content.data() + pos, nl - pos + 1);
+        appendLine(pos, nl - pos, true);
         pos = nl + 1;
         ++lines;
+    }
+    bool headBomStripped = false;
+    if (out.size() >= 3 && out.compare(0, 3, "\xEF\xBB\xBF") == 0) {
+        out.erase(0, 3);
+        headBomStripped = true;
     }
     if (pos < content.size() || toRead < totalBytes) {
         truncatedByLines = true;
         if (!out.empty() && out.back() != '\n') out += '\n';
         std::ostringstream marker;
         marker << "\n[... preview: showing first " << lines
-               << " line(s) of " << HumanBytes(totalBytes)
+               << " line(s) of " << LbToolHumanBytes(totalBytes)
                << " file ...]\n";
         out += marker.str();
     }
 
-    r.chips.push_back(HumanBytes(totalBytes));
+    r.chips.push_back(LbToolHumanBytes(totalBytes));
     r.chips.push_back(std::to_string(lines) + " shown lines");
     r.chips.push_back("preview");
     if (truncatedByLines) r.chips.push_back("truncated");
+    if (clampedAnyLine) r.chips.push_back("long lines clamped");
+    if (headBomStripped) r.chips.push_back("UTF-8 BOM");
     r.body = std::move(out);
     r.bodyLang = InferBodyLang(resolved);
-    r.chips.push_back(ElapsedChip(t0));
+    r.chips.push_back(LbElapsedChip(t0));
     return r;
 }
 
@@ -593,13 +599,13 @@ ReadResult ReadFileRange(const std::string& inputPath,
     if (startLine == 0 || endLine == 0) {
         r.chips.push_back("failed");
         r.errorBody = "Range 1 must use positive 1-based line numbers.";
-        r.chips.push_back(ElapsedChip(t0));
+        r.chips.push_back(LbElapsedChip(t0));
         return r;
     }
     if (endLine < startLine) {
         r.chips.push_back("failed");
         r.errorBody = "Range 1 has END before START.";
-        r.chips.push_back(ElapsedChip(t0));
+        r.chips.push_back(LbElapsedChip(t0));
         return r;
     }
     constexpr size_t kMaxSpan = 1000;
@@ -612,7 +618,7 @@ ReadResult ReadFileRange(const std::string& inputPath,
                     + std::to_string(kMaxSpan)
                     + ". Split the request into smaller inclusive ranges; "
                       "sequential pages must not repeat the previous end line.";
-        r.chips.push_back(ElapsedChip(t0));
+        r.chips.push_back(LbElapsedChip(t0));
         return r;
     }
 
@@ -622,7 +628,7 @@ ReadResult ReadFileRange(const std::string& inputPath,
     if (resolved.empty()) {
         r.chips.push_back("failed");
         r.errorBody = "Could not resolve path: " + inputPath;
-        r.chips.push_back(ElapsedChip(t0));
+        r.chips.push_back(LbElapsedChip(t0));
         return r;
     }
     if (usedConversationLane) r.chips.push_back("conversation lane");
@@ -643,7 +649,7 @@ ReadResult ReadFileRange(const std::string& inputPath,
             } else {
                 r.errorBody = "File not found: " + resolved;
             }
-            r.chips.push_back(ElapsedChip(t0));
+            r.chips.push_back(LbElapsedChip(t0));
             return r;
         }
     }
@@ -652,7 +658,7 @@ ReadResult ReadFileRange(const std::string& inputPath,
     if (!f.is_open()) {
         r.chips.push_back("failed");
         r.errorBody = "Could not open file: " + resolved;
-        r.chips.push_back(ElapsedChip(t0));
+        r.chips.push_back(LbElapsedChip(t0));
         return r;
     }
 
@@ -660,17 +666,17 @@ ReadResult ReadFileRange(const std::string& inputPath,
     if (fileSize < 0) {
         r.chips.push_back("failed");
         r.errorBody = "Could not determine file size: " + resolved;
-        r.chips.push_back(ElapsedChip(t0));
+        r.chips.push_back(LbElapsedChip(t0));
         return r;
     }
 
     const size_t totalBytes = (size_t)fileSize;
     if (totalBytes > kReadRefuseAbove) {
-        r.chips.push_back(HumanBytes(totalBytes));
+        r.chips.push_back(LbToolHumanBytes(totalBytes));
         r.chips.push_back("too large");
-        r.errorBody = "File too large to read: " + HumanBytes(totalBytes)
-                      + " (max " + HumanBytes(kReadRefuseAbove) + ")";
-        r.chips.push_back(ElapsedChip(t0));
+        r.errorBody = "File too large to read: " + LbToolHumanBytes(totalBytes)
+                      + " (max " + LbToolHumanBytes(kReadRefuseAbove) + ")";
+        r.chips.push_back(LbElapsedChip(t0));
         return r;
     }
 
@@ -685,19 +691,24 @@ ReadResult ReadFileRange(const std::string& inputPath,
     }
 
     if (IsBinary(content.data(), std::min(content.size(), (size_t)4096))) {
-        r.chips.push_back(HumanBytes(totalBytes));
+        r.chips.push_back(LbToolHumanBytes(totalBytes));
         r.chips.push_back("binary");
         r.chips.push_back("hex preview");
         r.body = HexPreview(content);
-        r.chips.push_back(ElapsedChip(t0));
+        r.chips.push_back(LbElapsedChip(t0));
         return r;
     }
 
-    // Single forward scan: count lines, capture [startLine, endLine].
-    std::string out;
+    // Single forward scan: count lines, record [startLine, endLine] as byte
+    // slices.  Nothing is copied until the output size is known to fit the
+    // context cap below, so a huge line (minified JSON, a one-line log) is
+    // rejected without first duplicating it in memory.
+    struct LineSlice { size_t begin; size_t end; };
+    std::vector<LineSlice> slices;
     size_t lineNo = 0;
     size_t pos = 0;
     size_t captured = 0;
+    size_t outBytes = 0;
     // `pos == content.size()` is the byte position after a trailing newline,
     // not another logical line.  Using <= here created a phantom empty line
     // that disagreed with CountLines() and the multi-range indexer.
@@ -706,8 +717,8 @@ ReadResult ReadFileRange(const std::string& inputPath,
         size_t end = (nl == std::string::npos) ? content.size() : nl;
         ++lineNo;
         if (lineNo >= startLine && lineNo <= endLine) {
-            out.append(content.data() + pos, end - pos);
-            out += '\n';
+            slices.push_back({ pos, end });
+            outBytes += (end - pos) + 1;   // + the '\n' appended below
             ++captured;
         }
         if (nl == std::string::npos) break;
@@ -722,12 +733,12 @@ ReadResult ReadFileRange(const std::string& inputPath,
     }
 
     if (captured == 0) {
-        r.chips.push_back(HumanBytes(totalBytes));
+        r.chips.push_back(LbToolHumanBytes(totalBytes));
         r.chips.push_back("failed");
         r.errorBody = "Range starts beyond end of file: requested line "
                       + std::to_string(startLine) + ", file has "
                       + std::to_string(lineNo) + " line(s).";
-        r.chips.push_back(ElapsedChip(t0));
+        r.chips.push_back(LbElapsedChip(t0));
         return r;
     }
 
@@ -739,19 +750,26 @@ ReadResult ReadFileRange(const std::string& inputPath,
     // a slice that gets returned is guaranteed to fit inline and can never be
     // demoted to a Vars\ handle card behind the caller's back.
     const size_t outputCap = ComputeRangedReadHistoryBudget(ctx.ctxTokens);
-    if (out.size() > outputCap) {
+    if (outBytes > outputCap) {
         r.chips.push_back("failed");
-        r.errorBody = "Range output is " + HumanBytes(out.size())
-                    + ", above the safe " + HumanBytes(outputCap)
+        r.errorBody = "Range output is " + LbToolHumanBytes(outBytes)
+                    + ", above the safe " + LbToolHumanBytes(outputCap)
                     + " limit for the active context; narrow the range or "
                       "split the call.";
-        r.chips.push_back(ElapsedChip(t0));
+        r.chips.push_back(LbElapsedChip(t0));
         return r;
     }
 
+    std::string out;
+    out.reserve(outBytes);
+    for (const LineSlice& s : slices) {
+        out.append(content.data() + s.begin, s.end - s.begin);
+        out += '\n';
+    }
+
     const size_t returnedLastLine = startLine + captured - 1;
-    r.chips.push_back("file " + HumanBytes(totalBytes));
-    r.chips.push_back("slice " + HumanBytes(out.size()));
+    r.chips.push_back("file " + LbToolHumanBytes(totalBytes));
+    r.chips.push_back("slice " + LbToolHumanBytes(out.size()));
     r.chips.push_back("lines " + std::to_string(startLine) + "-"
                       + std::to_string(returnedLastLine)
                       + " of " + std::to_string(lineNo));
@@ -764,7 +782,7 @@ ReadResult ReadFileRange(const std::string& inputPath,
     r.bodyLang = InferBodyLang(resolved);
     r.historyInlineBudgetBytes =
         ComputeRangedReadHistoryBudget(ctx.ctxTokens);
-    r.chips.push_back(ElapsedChip(t0));
+    r.chips.push_back(LbElapsedChip(t0));
     return r;
 }
 
@@ -793,7 +811,7 @@ ReadResult ReadFileRanges(const std::string& inputPath,
     auto fail = [&](const std::string& message) -> ReadResult {
         r.chips.push_back("failed");
         r.errorBody = message;
-        r.chips.push_back(ElapsedChip(t0));
+        r.chips.push_back(LbElapsedChip(t0));
         return r;
     };
 
@@ -929,11 +947,11 @@ ReadResult ReadFileRanges(const std::string& inputPath,
 
     const size_t totalBytes = (size_t)fileSize;
     if (totalBytes > kReadRefuseAbove) {
-        r.chips.push_back(HumanBytes(totalBytes));
+        r.chips.push_back(LbToolHumanBytes(totalBytes));
         r.chips.push_back("too large");
-        r.errorBody = "File too large to read: " + HumanBytes(totalBytes)
-                    + " (max " + HumanBytes(kReadRefuseAbove) + ")";
-        r.chips.push_back(ElapsedChip(t0));
+        r.errorBody = "File too large to read: " + LbToolHumanBytes(totalBytes)
+                    + " (max " + LbToolHumanBytes(kReadRefuseAbove) + ")";
+        r.chips.push_back(LbElapsedChip(t0));
         return r;
     }
 
@@ -946,32 +964,20 @@ ReadResult ReadFileRanges(const std::string& inputPath,
     }
 
     if (IsBinary(content.data(), std::min(content.size(), (size_t)4096))) {
-        r.chips.push_back(HumanBytes(totalBytes));
+        r.chips.push_back(LbToolHumanBytes(totalBytes));
         r.chips.push_back("binary");
         r.chips.push_back("hex preview");
         r.body = HexPreview(content);
-        r.chips.push_back(ElapsedChip(t0));
+        r.chips.push_back(LbElapsedChip(t0));
         return r;
     }
 
-    // Index the file once.  Each pair is [byte start, byte end) for one
-    // logical line, excluding '\n' but retaining a preceding '\r' so the
-    // established ranged-read byte behavior is preserved.
-    struct LineSlice { size_t begin; size_t end; };
-    std::vector<LineSlice> lines;
-    lines.reserve(CountLines(content));
-    size_t lineStart = 0;
-    for (size_t i = 0; i < content.size(); ++i) {
-        if (content[i] == '\n') {
-            lines.push_back({ lineStart, i });
-            lineStart = i + 1;
-        }
-    }
-    if (lineStart < content.size()) {
-        lines.push_back({ lineStart, content.size() });
-    }
-
-    const size_t totalLines = lines.size();
+    // Total logical lines without indexing every line: each '\n' ends one,
+    // plus a final unterminated line.  (A per-line offset index of the whole
+    // file cost ~16 bytes per line on top of the file itself.)
+    size_t totalLines = static_cast<size_t>(
+        std::count(content.begin(), content.end(), '\n'));
+    if (!content.empty() && content.back() != '\n') ++totalLines;
     if (totalLines == 0) {
         return fail("Cannot read ranges from an empty file: " + resolved);
     }
@@ -988,21 +994,50 @@ ReadResult ReadFileRanges(const std::string& inputPath,
         }
     }
 
-    std::string out;
+    // One forward pass to the last requested line, recording only the
+    // requested lines as [byte start, byte end) slices (excluding '\n' but
+    // retaining a preceding '\r', preserving established byte behavior).
+    // Ranges are ascending and non-overlapping (validated above) and capped
+    // at 1000 lines combined, so `picked` stays small.
+    struct LineSlice { size_t begin; size_t end; };
+    std::vector<std::vector<LineSlice>> picked(normalized.size());
+    {
+        size_t rangeIdx = 0;
+        size_t lineNo = 0;
+        size_t pos = 0;
+        while (pos < content.size() && rangeIdx < normalized.size()) {
+            const size_t nl  = content.find('\n', pos);
+            const size_t end = (nl == std::string::npos) ? content.size() : nl;
+            ++lineNo;
+            while (rangeIdx < normalized.size() &&
+                   lineNo > std::min(normalized[rangeIdx].endLine, totalLines)) {
+                ++rangeIdx;
+            }
+            if (rangeIdx < normalized.size() &&
+                lineNo >= normalized[rangeIdx].startLine) {
+                picked[rangeIdx].push_back({ pos, end });
+            }
+            if (nl == std::string::npos) break;
+            pos = nl + 1;
+        }
+    }
+
+    // Build the range headers and measure the exact output size before
+    // copying any line bytes, so an oversized request is rejected without
+    // first materializing it.
+    std::vector<std::string> headers(normalized.size());
+    size_t outBytes = 0;
     size_t capturedLines = 0;
     for (size_t i = 0; i < normalized.size(); ++i) {
         const size_t first = normalized[i].startLine;
         const size_t last  = std::min(normalized[i].endLine, totalLines);
-
-        if (!out.empty()) out += '\n';
-        out += "[range " + std::to_string(i + 1) + ": lines "
-             + std::to_string(first) + "-" + std::to_string(last)
-             + " of " + std::to_string(totalLines) + "]\n";
-
-        for (size_t lineNo = first; lineNo <= last; ++lineNo) {
-            const LineSlice& slice = lines[lineNo - 1];
-            out.append(content.data() + slice.begin, slice.end - slice.begin);
-            out += '\n';
+        headers[i] = "[range " + std::to_string(i + 1) + ": lines "
+                   + std::to_string(first) + "-" + std::to_string(last)
+                   + " of " + std::to_string(totalLines) + "]\n";
+        if (i > 0) outBytes += 1;   // blank separator line
+        outBytes += headers[i].size();
+        for (const LineSlice& s : picked[i]) {
+            outBytes += (s.end - s.begin) + 1;
             ++capturedLines;
         }
     }
@@ -1015,15 +1050,26 @@ ReadResult ReadFileRanges(const std::string& inputPath,
     // Same number as historyInlineBudgetBytes below: what comes back always
     // fits inline, so multi-range output never demotes into Vars\ either.
     const size_t outputCap = ComputeRangedReadHistoryBudget(ctx.ctxTokens);
-    if (out.size() > outputCap) {
-        return fail("Combined range output is " + HumanBytes(out.size())
-                    + ", above the safe " + HumanBytes(outputCap)
+    if (outBytes > outputCap) {
+        return fail("Combined range output is " + LbToolHumanBytes(outBytes)
+                    + ", above the safe " + LbToolHumanBytes(outputCap)
                     + " limit for the active context; narrow the ranges or "
                       "split the call.");
     }
 
-    r.chips.push_back("file " + HumanBytes(totalBytes));
-    r.chips.push_back("slice " + HumanBytes(out.size()));
+    std::string out;
+    out.reserve(outBytes);
+    for (size_t i = 0; i < normalized.size(); ++i) {
+        if (i > 0) out += '\n';
+        out += headers[i];
+        for (const LineSlice& s : picked[i]) {
+            out.append(content.data() + s.begin, s.end - s.begin);
+            out += '\n';
+        }
+    }
+
+    r.chips.push_back("file " + LbToolHumanBytes(totalBytes));
+    r.chips.push_back("slice " + LbToolHumanBytes(out.size()));
     r.chips.push_back(std::to_string(normalized.size()) + " ranges");
     r.chips.push_back(std::to_string(capturedLines) + " lines of "
                       + std::to_string(totalLines));
@@ -1032,6 +1078,6 @@ ReadResult ReadFileRanges(const std::string& inputPath,
     r.bodyLang = InferBodyLang(resolved);
     r.historyInlineBudgetBytes =
         ComputeRangedReadHistoryBudget(ctx.ctxTokens);
-    r.chips.push_back(ElapsedChip(t0));
+    r.chips.push_back(LbElapsedChip(t0));
     return r;
 }

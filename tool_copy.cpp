@@ -1,6 +1,7 @@
 // tool_copy.cpp -- see tool_copy.h
 
 #include "tool_copy.h"
+#include "lb_string_utils.h"
 #include "lb_ascii.h"
 #include "tool_hash.h"
 #include "tool_write.h"
@@ -43,27 +44,6 @@ std::string Lower(std::string s)
     return s;
 }
 
-std::string ElapsedChip(std::chrono::steady_clock::time_point t0)
-{
-    const double elapsed = std::chrono::duration<double>(
-        std::chrono::steady_clock::now() - t0).count();
-    std::ostringstream ts;
-    ts << std::fixed;
-    ts.precision(elapsed < 10.0 ? 2 : 1);
-    ts << elapsed << "s";
-    return ts.str();
-}
-
-std::string HumanBytes(size_t b)
-{
-    std::ostringstream ss;
-    ss << std::fixed;
-    if (b < 1024)              { ss << b << " B"; }
-    else if (b < 1024 * 1024)  { ss.precision(1); ss << (b / 1024.0) << " KB"; }
-    else                       { ss.precision(2); ss << (b / (1024.0 * 1024.0)) << " MB"; }
-    return ss.str();
-}
-
 int CountLines(const std::string& s)
 {
     if (s.empty()) return 0;
@@ -91,8 +71,8 @@ bool ReadAllBytes(const std::string& absPath, size_t cap,
         return false;
     }
     if (static_cast<unsigned long long>(size) > cap) {
-        error = "Source is " + HumanBytes(static_cast<size_t>(size)) +
-                ", above the copy limit of " + HumanBytes(cap) +
+        error = "Source is " + LbToolHumanBytes(static_cast<size_t>(size)) +
+                ", above the copy limit of " + LbToolHumanBytes(cap) +
                 ". Use PowerShell Copy-Item for large files (it needs approval).";
         return false;
     }
@@ -162,7 +142,7 @@ CopyResult CopyFileExact(const std::string& args, const ToolContext& ctx)
     const auto t0 = std::chrono::steady_clock::now();
 
     auto fail = [&](const char* chip, const std::string& why) {
-        r.chips = { chip, ElapsedChip(t0) };
+        r.chips = { chip, LbElapsedChip(t0) };
         r.errorBody = why;
         return r;
     };
@@ -229,7 +209,7 @@ CopyResult CopyFileExact(const std::string& args, const ToolContext& ctx)
     r.sizeBytes   = bytes.size();
     r.lineCount   = CountLines(bytes);
     r.chips = { replaced ? "overwritten" : "copied",
-                bytes.empty() ? std::string("empty") : HumanBytes(bytes.size()),
-                "verified", ElapsedChip(t0) };
+                bytes.empty() ? std::string("empty") : LbToolHumanBytes(bytes.size()),
+                "verified", LbElapsedChip(t0) };
     return r;
 }

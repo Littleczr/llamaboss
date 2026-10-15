@@ -90,7 +90,7 @@
 #include "chat_folders.h"
 
 // ─── Application version ─────────────────────────────────────
-static const char* LLAMABOSS_VERSION = "0.1.24";
+static const char* LLAMABOSS_VERSION = "0.1.25";
 
 // Native menu command ids. Keep above wxID_HIGHEST to avoid collisions
 // with stock wxWidgets commands.
@@ -479,7 +479,13 @@ public:
     // The live transcript shows the user's original text (display
     // happens before baking); ConversationController::ReplayConversation
     // strips the header when re-rendering saved chats.
-    static std::string BuildSessionContextHeader()
+    //
+    // attachmentsOnly: the user sent attachments with an empty input
+    // box.  Instead of putting words in their mouth ("What is in this
+    // image?"), the model gets a one-sentence note INSIDE the header
+    // bracket.  Because it lives inside the header, the existing
+    // stripping (titles, replay) hides it from the user automatically.
+    static std::string BuildSessionContextHeader(bool attachmentsOnly = false)
     {
         const wxDateTime now = wxDateTime::Now();
         const wxString stamp = now.Format("%A, %B %d, %Y, %I:%M %p");
@@ -487,7 +493,13 @@ public:
         const wxScopedCharBuffer utf8 = stamp.ToUTF8();
         header += utf8.data() ? utf8.data() : "(unavailable)";
         header += ". Dates are m/d/yyyy. Trust this over any internal "
-                  "assumption about today's date.]";
+                  "assumption about today's date.";
+        if (attachmentsOnly) {
+            header += " The user sent the attached file(s) without typing "
+                      "a message; respond to them in the context of this "
+                      "conversation.";
+        }
+        header += "]";
         return header;
     }
 
@@ -717,9 +729,10 @@ private:
             if (_chatDisplayCtrl) _chatDisplayCtrl->NotifyUserScrolled();
         });
 
-        // One sizer item in the transcript's slot (index 0): later code
-        // inserts the attachment bar at index 1.  The 8 px rail column
-        // doubles as the right margin.
+        // One sizer item in the transcript's slot (index 0).  Pending
+        // attachments live inside the composer's input card (UIBuilder),
+        // not in a row here, so the transcript is never cut short by a
+        // thumbnail strip.  The 8 px rail column doubles as the right margin.
         auto* chatRow = new wxBoxSizer(wxHORIZONTAL);
         chatRow->Add(_chatClip, 1, wxEXPAND);
         chatRow->Add(m_chatRail, 0, wxEXPAND);
@@ -734,31 +747,26 @@ private:
         _stopButton     = ia.stopButton;
         _attachButton   = ia.attachButton;
         _inputSizer     = ia.inputSizer;
+        _inputCard      = ia.inputCard;
 
         // Composer scroll rail: same slim themed rail as the transcript and
         // sidebar.  The native EDIT scrollbar is pushed outside ia.inputClip;
         // the rail sits on the input field colour so it reads as part of it.
+        // Parent is the input card: the rail shares inputFieldRow with the
+        // clip, and a sizer's windows must be children of its window.
         m_inputRail = new LbScrollRail(
-            _inputContainer, ia.inputClip, _userInputCtrl,
+            _inputCard, ia.inputClip, _userInputCtrl,
             [this]() -> const ThemeData& { return m_appState->GetTheme(); });
         m_inputRail->SetBackgroundSlot(&ThemeData::bgInputField);
         ia.inputFieldRow->Add(m_inputRail, 0, wxEXPAND);
 
-        // ─── ATTACHMENT CHIP BAR (hidden by default) ─────────────────
-        // Keep pending cards on the chat surface, immediately above the
-        // composer.  Parenting this bar to _inputContainer makes the whole
-        // full-width attachment row use bgInputArea as soon as the first
-        // chip is shown, which creates a visible horizontal band above the
-        // message field.  The separate bgMain strip preserves the original
-        // floating-card appearance while the input row remains unchanged.
-        _attachChipBar = new wxPanel(_rightPanel, wxID_ANY);
-        _attachChipBar->SetBackgroundColour(m_appState->GetTheme().bgMain);
-        _attachChipSizer = new wxWrapSizer(wxHORIZONTAL);
-        _attachChipBar->SetSizer(_attachChipSizer);
-        _attachChipBar->Hide();
-        rightSizer->Insert(
-            1, _attachChipBar, 0,
-            wxLEFT | wxTOP | wxRIGHT, FromDIP(10));
+        // ─── ATTACHMENT TRAY (hidden by default) ─────────────────────
+        // Pending thumbnails sit INSIDE the input box, above the text, on
+        // the same bgInputField surface (Claude-style composer).  The old
+        // full-width bgMain row above the composer read as a gray band
+        // and clipped the transcript mid-line; it is gone.
+        _attachChipBar   = ia.attachTray;
+        _attachChipSizer = ia.attachTraySizer;
 
         // ─── ACTIVITY STRIP (hidden by default) ──────────────────────
         // One-row live status for a running async tool (powershell /
@@ -804,9 +812,18 @@ private:
             }
             wxASSERT_MSG(foundAttachButton,
                          "BuildMainLayout: attach button not found in input sizer");
+            // Bottom-aligned like the attach button so it stays level
+            // with the text line when thumbnails make the input card
+            // taller.  The toggle is sized in raw px while attach uses
+            // DIPs, so centre it against attach's height explicitly.
+            const int agentPad = std::max(0,
+                (_attachButton->GetSize().y -
+                 _agentToggleButton->GetSize().y) / 2);
+            auto* agentCol = new wxBoxSizer(wxVERTICAL);
+            agentCol->Add(_agentToggleButton, 0, wxBOTTOM, agentPad);
             _inputSizer->Insert(foundAttachButton ? attachIdx + 1 : children.size(),
-                                _agentToggleButton, 0,
-                                wxALIGN_CENTER_VERTICAL | wxLEFT, 4);
+                                agentCol, 0,
+                                wxALIGN_BOTTOM | wxLEFT, 4);
         }
 
         _rightPanel->SetSizer(rightSizer);
@@ -1610,8 +1627,8 @@ private:
     wxButton*        _newChatButton;
     wxButton*        _sidebarToggle;
     wxButton*        _aboutButton;
-    wxPanel*         _attachChipBar;
-    wxWrapSizer*     _attachChipSizer;
+    wxPanel*         _attachChipBar = nullptr;     // UIBuilder's attachTray (inside the input card)
+    wxSizer*         _attachChipSizer = nullptr;
 
     // Decoded composer thumbnails, keyed by a cheap fingerprint of the
     // pending item.  RebuildAttachmentChips() runs on every add, every
@@ -1629,6 +1646,7 @@ private:
 
     wxPanel*       _rightPanel;
     wxPanel*       _inputContainer;
+    wxPanel*       _inputCard = nullptr;   // input box: attachment tray + text field
     wxPanel*       _inputSeparator;
 
     // ── Composer vertical drag-resize state ───────────────────────
@@ -2337,7 +2355,8 @@ private:
         _chatDisplayCtrl->SetBackgroundColour(t.bgMain);
         _chatDisplayCtrl->SetForegroundColour(t.textPrimary);
         if (m_chatRail) m_chatRail->ApplyTheme();   // also recolours _chatClip
-        _attachChipBar->SetBackgroundColour(t.bgMain);
+        if (_inputCard) _inputCard->SetBackgroundColour(t.bgInputField);
+        _attachChipBar->SetBackgroundColour(t.bgInputField);
         RebuildAttachmentChips();
 
         _inputContainer->SetBackgroundColour(t.bgInputArea);
@@ -2502,9 +2521,8 @@ private:
         _attachChipBar->Show();
         _attachChipBar->Layout();
 
-        // The strip is a sibling immediately above the composer.  Re-layout
-        // the right panel so its newly visible height is taken from the chat
-        // display without changing the message row itself.
+        // The tray is inside the input card.  Re-layout the right panel so
+        // the card's new height is taken from the chat display.
         LayoutInputAreaOnly();
     }
 
@@ -6489,10 +6507,20 @@ private:
         // The composer lives entirely inside _rightPanel.  A full frame
         // Layout() needlessly recalculates the toolbar, strips, sidebar,
         // and outer content hierarchy on every mouse-move event.
+        // The input card nests a sizer (attachment tray + text row) one
+        // level below _inputContainer.  Drop any cached best size up the
+        // chain first so a tray show/hide or text auto-grow is measured
+        // fresh, then lay out outer to inner.
+        if (_attachChipBar) _attachChipBar->InvalidateBestSize();
+        if (_inputCard) _inputCard->InvalidateBestSize();
         if (_rightPanel && _rightPanel->GetSizer())
             _rightPanel->GetSizer()->Layout();
         if (_inputContainer && _inputContainer->GetSizer())
             _inputContainer->GetSizer()->Layout();
+        if (_inputCard && _inputCard->GetSizer())
+            _inputCard->GetSizer()->Layout();
+        if (_attachChipBar && _attachChipBar->IsShown())
+            _attachChipBar->Layout();
     }
 
     void OnUserInputChanged(wxCommandEvent&)
@@ -7189,16 +7217,12 @@ private:
     void PrepareAndRecordUserTurn(std::string userInput,
                                   bool hasAttachments)
     {
-        if (userInput.empty() && hasAttachments) {
-            bool onlyImages = m_attachments->HasImage() && !m_attachments->HasTextFile();
-            if (onlyImages) {
-                userInput = (m_attachments->GetCount() == 1)
-                    ? "What is in this image?" : "What is in these images?";
-            } else {
-                userInput = (m_attachments->GetCount() == 1)
-                    ? "Please review this file." : "Please review these files.";
-            }
-        }
+        // Attachments sent with an empty input box stay empty: no
+        // canned "What is in this image?" text in the transcript, the
+        // history, or the chat title.  The model is told the turn has
+        // no typed text via a note inside the session context header
+        // (see BuildSessionContextHeader), which is never displayed.
+        const bool attachmentsOnly = userInput.empty() && hasAttachments;
 
         auto attachInfo = m_attachments->GetAttachmentInfo();
 
@@ -7214,6 +7238,10 @@ private:
                 std::string folderTitle = m_chatHistory->GetChatFolderTitle();
                 if (folderTitle == "Untitled conversation")
                     folderTitle = ChatHistory::TitleFromUserText(userInput);
+                // Picture sent with an empty input box: name the folder
+                // after the attachment rather than leaving it as <date>_<id>.
+                if (folderTitle.empty() && !attachInfo.empty())
+                    folderTitle = attachInfo.front().filename;
                 ChatHistory::EnsureChatFolder(m_chatHistory->GetFilePath(), folderTitle);
             }
 
@@ -7240,7 +7268,9 @@ private:
                 prefix += names[i];
             }
             m_chatDisplay->DisplayUserMessage(
-                "[" + prefix + "] " + userInput, "", imagePaths);
+                userInput.empty() ? "[" + prefix + "]"
+                                  : "[" + prefix + "] " + userInput,
+                "", imagePaths);
         } else {
             m_chatDisplay->DisplayUserMessage(userInput);
         }
@@ -7280,7 +7310,7 @@ private:
         // header is the first line of the wire message.  Stored in
         // history (stable KV prefix; temporal grounding of past turns).
         const std::string wireInput =
-            BuildSessionContextHeader() + "\n\n" + userInput;
+            BuildSessionContextHeader(attachmentsOnly) + "\n\n" + userInput;
 
         m_chatHistory->AddUserMessage(wireInput, "", attachInfo);
     }

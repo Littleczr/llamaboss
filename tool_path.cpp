@@ -1,37 +1,11 @@
 // tool_path.cpp
 
 #include "tool_path.h"
+#include "path_safety.h"
 
 #include "lb_windows.h"
 
 namespace {
-
-// UTF-8 → UTF-16 via MultiByteToWideChar.  Empty input → empty output.
-std::wstring Utf8ToWide(const std::string& s)
-{
-    if (s.empty()) return L"";
-    int len = ::MultiByteToWideChar(CP_UTF8, 0, s.data(),
-                                    (int)s.size(), nullptr, 0);
-    if (len <= 0) return L"";
-    std::wstring w((size_t)len, L'\0');
-    ::MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(),
-                          &w[0], len);
-    return w;
-}
-
-// UTF-16 → UTF-8 via WideCharToMultiByte.  Empty input → empty output.
-std::string WideToUtf8(const std::wstring& w)
-{
-    if (w.empty()) return "";
-    int len = ::WideCharToMultiByte(CP_UTF8, 0, w.data(),
-                                    (int)w.size(),
-                                    nullptr, 0, nullptr, nullptr);
-    if (len <= 0) return "";
-    std::string s((size_t)len, '\0');
-    ::WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(),
-                          &s[0], len, nullptr, nullptr);
-    return s;
-}
 
 
 std::string TrimAscii(const std::string& s)
@@ -109,8 +83,8 @@ std::string ResolveToolPath(const std::string& input,
     std::string normalized = StripMatchingQuotes(input);
     if (normalized.empty()) return "";
 
-    std::wstring wInput = Utf8ToWide(normalized);
-    std::wstring wCwd   = Utf8ToWide(cwd);
+    std::wstring wInput = path_safety::Utf8ToWide(normalized);
+    std::wstring wCwd   = path_safety::Utf8ToWide(cwd);
     if (wInput.empty()) return "";
 
     // ── Step 1: expand %VAR% environment variables.
@@ -170,12 +144,12 @@ std::string ResolveToolPath(const std::string& input,
     if (written == 0 || written >= bufLen) return "";
     out.resize(written);
 
-    return WideToUtf8(out);
+    return path_safety::WideToUtf8(out);
 }
 
 bool IsDirectory(const std::string& absPath)
 {
-    std::wstring w = Utf8ToWide(absPath);
+    std::wstring w = path_safety::Utf8ToWide(absPath);
     if (w.empty()) return false;
     DWORD attrs = ::GetFileAttributesW(w.c_str());
     if (attrs == INVALID_FILE_ATTRIBUTES) return false;
@@ -184,7 +158,7 @@ bool IsDirectory(const std::string& absPath)
 
 bool IsFile(const std::string& absPath)
 {
-    std::wstring w = Utf8ToWide(absPath);
+    std::wstring w = path_safety::Utf8ToWide(absPath);
     if (w.empty()) return false;
     DWORD attrs = ::GetFileAttributesW(w.c_str());
     if (attrs == INVALID_FILE_ATTRIBUTES) return false;

@@ -13,6 +13,9 @@
 // current C locale.
 
 #include <cctype>
+#include <chrono>
+#include <cstddef>
+#include <sstream>
 #include <string>
 
 // Human-readable byte formatter used by project/source prompt summaries.
@@ -25,6 +28,37 @@ inline std::string LbLowerAscii(std::string s)
     for (char& ch : s)
         ch = static_cast<char>(lb_ascii::ToLower(static_cast<unsigned char>(ch)));
     return s;
+}
+
+// Size label used by the native file tools' chips and results
+// ("512 B", "3.4 KB", "1.25 MB").  One definition for the tool_*.cpp files
+// that each used to carry an identical private copy.
+inline std::string LbToolHumanBytes(std::size_t b)
+{
+    std::ostringstream ss;
+    ss << std::fixed;
+    if (b < 1024) {
+        ss << b << " B";
+    } else if (b < 1024 * 1024) {
+        ss.precision(1);
+        ss << (b / 1024.0) << " KB";
+    } else {
+        ss.precision(2);
+        ss << (b / (1024.0 * 1024.0)) << " MB";
+    }
+    return ss.str();
+}
+
+// Elapsed-time chip shared by the native file tools ("0.42s", "12.3s").
+inline std::string LbElapsedChip(std::chrono::steady_clock::time_point t0)
+{
+    const double elapsed = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - t0).count();
+    std::ostringstream ts;
+    ts << std::fixed;
+    ts.precision(elapsed < 10.0 ? 2 : 1);
+    ts << elapsed << "s";
+    return ts.str();
 }
 
 inline std::string LbTrimAscii(std::string s)

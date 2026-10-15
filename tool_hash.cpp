@@ -1,6 +1,7 @@
 // tool_hash.cpp -- see tool_hash.h
 
 #include "tool_hash.h"
+#include "lb_string_utils.h"
 #include "lb_sha256.h"
 #include "tool_path.h"
 #include "tool_path_safety.h"
@@ -31,17 +32,6 @@ std::string Unquote(std::string s)
         s = Trim(s.substr(1, s.size() - 2));
     }
     return s;
-}
-
-std::string ElapsedChip(std::chrono::steady_clock::time_point t0)
-{
-    const double elapsed = std::chrono::duration<double>(
-        std::chrono::steady_clock::now() - t0).count();
-    std::ostringstream ts;
-    ts << std::fixed;
-    ts.precision(elapsed < 10.0 ? 2 : 1);
-    ts << elapsed << "s";
-    return ts.str();
 }
 
 std::string HumanBytes(std::uint64_t b)
@@ -152,7 +142,7 @@ HashResult HashFile(const std::string& args, const ToolContext& ctx)
     const auto t0 = std::chrono::steady_clock::now();
 
     auto fail = [&](const std::string& why) {
-        r.chips = { "failed", ElapsedChip(t0) };
+        r.chips = { "failed", LbElapsedChip(t0) };
         r.errorBody = why;
         return r;
     };
@@ -226,6 +216,6 @@ HashResult HashFile(const std::string& args, const ToolContext& ctx)
     r.body = body.str();
     r.chips.push_back(HumanBytes(size));
     if (!verdictChip.empty()) r.chips.push_back(verdictChip);
-    r.chips.push_back(ElapsedChip(t0));
+    r.chips.push_back(LbElapsedChip(t0));
     return r;
 }

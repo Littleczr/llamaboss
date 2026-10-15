@@ -9,6 +9,7 @@
 #include "chat_folders.h"        // chat folder naming / recognition
 #include "var_store.h"           // elision spool: Vars\ lane + card sentinel
 #include "tool_call_elision.h"   // old tool-call argument elision
+#include "utf8_scrub.h"          // tool results -> valid UTF-8
 
 // Poco headers for JSON
 #include <Poco/Timestamp.h>
@@ -909,7 +910,10 @@ void ChatHistory::AddToolResultMessage(const std::string& toolCallId,
                                         const std::string& content,
                                         const std::vector<std::pair<std::string, std::string>>& toolImages)
 {
-    auto msg = CreateMessage("user", content);
+    // Tool output comes from child processes and files and is not
+    // guaranteed UTF-8.  One invalid byte stored here would break every
+    // later request that re-parses the history, so repair it at entry.
+    auto msg = CreateMessage("user", lb_utf8::Scrub(content));
     if (!toolCallId.empty()) {
         // Sidecar field — read by BuildChatRequestJson when the
         // active protocol is Native, ignored under XML.  Both
@@ -1199,9 +1203,9 @@ std::string ChatHistory::BuildChatRequestJson(const std::string& model, bool str
         // project.  Dropping it would lose the image AND make the carrier
         // loop (which scans `wire` backwards for the newest real user
         // message) select the PREVIOUS turn instead, re-sending stale
-        // images.  The UI injects default text ("What is in this image?")
-        // on the normal send path, so this matters for imported
-        // conversations and any caller that skips that injection.
+        // images.  The normal send path always prepends the session
+        // context header, so wire content is non-blank there; this
+        // matters for imported conversations and other callers.
         const bool hasToolCalls = msg->has("tool_calls");
         const bool blankContent =
             content.find_first_not_of(" \t\r\n") == std::string::npos;
@@ -2382,10 +2386,7 @@ bool ChatHistory::CreateSaveSnapshot(
         }
 
         const std::string generatedTitle = GenerateTitle();
-        const bool titleNeedsRepair =
-            m_title.empty() ||
-            m_title == "Untitled conversation" ||
-            IsLegacySessionContextTitle(m_title);
+        const bool titleNeedsRepair = IsProvisionalTitle(m_title);
         if (titleNeedsRepair &&
             generatedTitle != "Untitled conversation") {
             m_title = generatedTitle;
@@ -2429,10 +2430,10 @@ bool ChatHistory::CreateSaveSnapshot(
             // hasAttachments was computed here but left out of the skip
             // condition, so an attachment-only message with empty text was
             // dropped on save even though the branch below knows how to
-            // serialize its attachments array.  Normal UI turns substitute
-            // default text ("What is in this image?") for empty input, so
-            // this is mainly an import / round-trip guard -- but the loss
-            // is silent and unrecoverable when it happens.
+            // serialize its attachments array.  Normal UI turns always
+            // carry the session context header, so this is mainly an
+            // import / round-trip guard -- but the loss is silent and
+            // unrecoverable when it happens.
             if (content.empty() && !hasToolCalls && !hasToolCallId &&
                 !hasImages && !hasAttachments) {
                 continue;
@@ -2913,8 +2914,9 @@ bool ChatHistory::LoadFromFile(const std::string& filePath, std::vector<std::str
         // Repair legacy titles in memory as soon as the conversation opens
         // so the window title is useful immediately.  The next normal save
         // persists the repaired value; loading itself remains read-only.
-        if (IsLegacySessionContextTitle(m_title) ||
-            m_title == "Untitled conversation") {
+        // Also covers chats saved with an EMPTY title (a picture-only first
+        // message before attachment-named titles existed).
+        if (IsProvisionalTitle(m_title)) {
             const std::string repairedTitle = GenerateTitle();
             if (repairedTitle != "Untitled conversation")
                 m_title = repairedTitle;
@@ -3158,6 +3160,44 @@ std::string TitleTruncate(std::string s, size_t maxLen = 64)
     return s.empty() ? "Untitled conversation" : s;
 }
 
+// Title for a conversation whose user turns carry attachments but no typed
+// text (picture sent with an empty input box): "Image: photo.jpg",
+// "Images: a.jpg, b.png", "File: notes.txt", "Files: a.pdf, b.png".
+// "" when the message has no named attachments.
+std::string TitleFromAttachments(const Poco::JSON::Object::Ptr& msg)
+{
+    if (!msg || !msg->has("attachments") || msg->isNull("attachments"))
+        return std::string();
+
+    std::vector<std::string> names;
+    bool allImages = true;
+    try {
+        Poco::JSON::Array::Ptr arr = msg->getArray("attachments");
+        if (!arr) return std::string();
+        for (unsigned k = 0; k < arr->size(); ++k) {
+            Poco::JSON::Object::Ptr a = arr->getObject(k);
+            if (!a) continue;
+            const std::string name = a->optValue<std::string>("filename", "");
+            if (name.empty()) continue;
+            if (a->optValue<std::string>("kind", "") != "image")
+                allImages = false;
+            names.push_back(name);
+        }
+    } catch (...) {
+        return std::string();
+    }
+    if (names.empty()) return std::string();
+
+    std::string title = allImages
+        ? (names.size() == 1 ? "Image: " : "Images: ")
+        : (names.size() == 1 ? "File: "  : "Files: ");
+    for (size_t i = 0; i < names.size(); ++i) {
+        if (i > 0) title += ", ";
+        title += names[i];
+    }
+    return TitleTruncate(std::move(title));
+}
+
 } // namespace
 
 std::string ChatHistory::TitleFromUserText(const std::string& text)
@@ -3196,7 +3236,35 @@ std::string ChatHistory::GenerateTitle() const
             TitleFromUserText(msg->getValue<std::string>("content"));
         if (!title.empty()) return title;
     }
+    // No typed text anywhere yet (e.g. a picture sent with an empty input
+    // box): name the chat after the first attachment instead of leaving it
+    // untitled, which made the sidebar fall back to the raw file name.
+    const std::string attachmentTitle = AttachmentFallbackTitle();
+    if (!attachmentTitle.empty()) return attachmentTitle;
     return "Untitled conversation";
+}
+
+std::string ChatHistory::AttachmentFallbackTitle() const
+{
+    for (const auto& msg : m_messages) {
+        if (msg->getValue<std::string>("role") != "user") continue;
+        std::string title = TitleFromAttachments(msg);
+        if (!title.empty()) return title;
+    }
+    return std::string();
+}
+
+bool ChatHistory::IsProvisionalTitle(const std::string& title) const
+{
+    // Titles the app may replace on its own.  An attachment-named title is
+    // provisional: once the user types a message, that text names the chat.
+    // (Compared against the CURRENT fallback, so a user rename to anything
+    // else is never overwritten.)
+    if (title.empty() || title == "Untitled conversation" ||
+        IsLegacySessionContextTitle(title))
+        return true;
+    const std::string attachmentTitle = AttachmentFallbackTitle();
+    return !attachmentTitle.empty() && title == attachmentTitle;
 }
 
 std::string ChatHistory::GetChatFolderTitle() const

@@ -14,8 +14,10 @@
 #include <memory>
 #include <sstream>
 #include <string>
+#include <vector>
 
 #include "project_manager.h"   // ProjectManager (static API), SkillInfo
+#include "tool_notes.h"        // NoteFileInfo
 
 class ChatHistory;
 
@@ -60,7 +62,6 @@ private:
         std::string projectName;
         long long   skillsDirMTime = 0;
         unsigned long long skillsListHash = 0;
-        unsigned long long skillScriptsListHash = 0;
         long long   notesDirMTime = 0;
         unsigned long long notesListHash = 0;
         long long   legacyNotesMTime = 0;
@@ -79,7 +80,6 @@ private:
                    projectName == o.projectName &&
                    skillsDirMTime == o.skillsDirMTime &&
                    skillsListHash == o.skillsListHash &&
-                   skillScriptsListHash == o.skillScriptsListHash &&
                    notesDirMTime == o.notesDirMTime &&
                    notesListHash == o.notesListHash &&
                    legacyNotesMTime == o.legacyNotesMTime &&
@@ -93,6 +93,19 @@ private:
         }
     };
 
+    // One directory listing per probe, shared by the cache signature, the
+    // prompt block and the status-strip counts (these used to list the same
+    // folders up to four times per rebuild).  Lists are uncapped; prompt
+    // rendering applies its own 30-item caps.
+    struct Inventory {
+        std::vector<SkillInfo>                 skills;
+        std::vector<NoteFileInfo>              notes;
+        std::string                            projectRoot;   // empty = no project
+        std::vector<ProjectSourceInfo>         sources;
+        std::vector<ProjectWorkflowInfo>       workflows;
+        std::vector<ProjectWorkflowScriptInfo> workflowScripts;
+    };
+
     struct Cache {
         bool valid = false;
         CacheSignature sig;
@@ -104,6 +117,7 @@ private:
         // Explicit invalidations still clear this and force a fresh probe.
         bool hasRecentProbe = false;
         CacheSignature recentProbeSig;
+        Inventory      recentInventory;
         std::chrono::steady_clock::time_point recentProbeAt{};
 
         // The project strip is refreshed from many call sites.  Reuse exact
@@ -115,8 +129,10 @@ private:
         std::chrono::steady_clock::time_point recentStripCountsAt{};
     };
 
-    CacheSignature BuildCacheSignature() const;
-    std::string    BuildActiveProjectContextBlockFresh() const;
+    CacheSignature BuildCacheSignature() const;   // also refreshes m_cache.recentInventory
+    std::string    BuildActiveProjectContextBlockFresh(const Inventory& inv) const;
+    void           AppendSkillsBlockFrom(std::ostringstream& p,
+                                         const std::vector<SkillInfo>& skills) const;
 
     std::unique_ptr<ChatHistory>& m_chatHistory;
     mutable Cache                 m_cache;

@@ -1,5 +1,5 @@
 {
-  "version": "0.1.23",
-  "url": "https://pub-2d2e18de339c4fe3ab067f6afd1e7656.r2.dev/LlamaBoss_Beta_v0.1.23_Setup.exe",
-  "notes": "Improves prompt caching, agent tooling and metrics export; fixes clipboard paste corruption and shutdown crashes. Retains the existing llama.cpp b11146 CPU and CUDA 12.4 binaries."
+  "version": "0.1.25",
+  "url": "https://pub-2d2e18de339c4fe3ab067f6afd1e7656.r2.dev/LlamaBoss_Beta_v0.1.25_Setup.exe",
+  "notes": "Updates bundled llama.cpp to v0.6.0 (b11429); adds agent retries and recovery, improves attachments, prompt caching and tool reliability, and fixes text encoding and picture-only chat history."
 }

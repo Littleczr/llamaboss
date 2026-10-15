@@ -594,8 +594,15 @@ public:
     bool GrantWriteRootForChat(const std::string& canonicalRoot);
     void ClearChatWriteRoots() { m_chatWriteRoots.clear(); }
 
-    // Generate a title from the first user message
+    // Generate a title from the first user message; when no user turn has
+    // typed text yet, from the first attachment ("Image: photo.jpg").
     std::string GenerateTitle() const;
+    // Attachment-derived title ("" when no user turn has a named attachment).
+    std::string AttachmentFallbackTitle() const;
+    // True for titles the app may still replace automatically: empty,
+    // the placeholder, legacy session-context titles, and the current
+    // attachment-derived title (superseded once the user types text).
+    bool IsProvisionalTitle(const std::string& title) const;
     // Same rules as GenerateTitle, for a single piece of user text
     // ("" when it yields nothing usable).
     static std::string TitleFromUserText(const std::string& text);

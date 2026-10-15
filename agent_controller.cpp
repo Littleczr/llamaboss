@@ -5,6 +5,7 @@
 // emissions go to the sink as typed AgentEvent objects.
 
 #include "agent_controller.h"
+#include "lb_string_utils.h"
 #include "lb_ascii.h"
 #include "transient_error.h"
 
@@ -161,13 +162,6 @@ std::string KeepExecutableToolCallsJson(
 
 
 
-std::string AgentLowerAscii(std::string s)
-{
-    for (char& ch : s)
-        ch = static_cast<char>(lb_ascii::ToLower(static_cast<unsigned char>(ch)));
-    return s;
-}
-
 // List the top-level keys of a JSON object payload ("path, contents,
 // mode").  Used to enrich native tool-call validation errors: when a
 // model invents a parameter name ({"file": "x.txt"} instead of
@@ -192,6 +186,41 @@ std::string AgentListJsonObjectKeys(const std::string& json)
             if (!out.empty()) out += ", ";
             out += n;
         }
+        return out;
+    } catch (...) {
+        return std::string();
+    }
+}
+
+// Name the concrete bad VALUES in a native call whose parameter names are
+// all correct, so the error says "'start' is 0" instead of a generic
+// "wrong type or shape".  Empty when nothing specific is found.
+std::string AgentDescribeBadArgValues(const std::string& json)
+{
+    if (json.empty()) return std::string();
+    try {
+        Poco::JSON::Parser parser;
+        Poco::JSON::Object::Ptr obj =
+            parser.parse(json).extract<Poco::JSON::Object::Ptr>();
+        if (!obj) return std::string();
+        std::vector<std::string> names;
+        obj->getNames(names);
+        std::string out;
+        for (const std::string& n : names) {
+            const Poco::Dynamic::Var v = obj->get(n);
+            if (v.isString() && v.extract<std::string>().empty()) {
+                out += "'" + n + "' is empty. ";
+            } else if (v.isNumeric() &&
+                       (n == "start" || n == "end" || n == "line" ||
+                        n == "lines" || n == "count")) {
+                double d = 0;
+                try { d = v.convert<double>(); } catch (...) { continue; }
+                if (d < 1)
+                    out += "'" + n + "' is " + v.convert<std::string>() +
+                           "; it must be 1 or more (line numbers start at 1). ";
+            }
+        }
+        while (!out.empty() && out.back() == ' ') out.pop_back();
         return out;
     } catch (...) {
         return std::string();
@@ -454,7 +483,7 @@ std::string AgentPresentedFileExtLower(const PresentedFile& f)
 
     size_t dot = name.find_last_of('.');
     if (dot == std::string::npos || dot + 1 >= name.size()) return std::string();
-    return AgentLowerAscii(name.substr(dot + 1));
+    return LbLowerAscii(name.substr(dot + 1));
 }
 
 struct AgentArtifactPresentation {
@@ -477,7 +506,7 @@ AgentArtifactPresentation BuildAgentArtifactPresentation(const std::vector<Prese
 
     for (const auto& f : files) {
         const std::string ext = AgentPresentedFileExtLower(f);
-        const std::string lang = AgentLowerAscii(f.language);
+        const std::string lang = LbLowerAscii(f.language);
 
         if (ext == "docx") {
             hasDocx = true;
@@ -542,7 +571,7 @@ std::string AgentTrimPackageToken(std::string s)
 
 std::string AgentNormalizePackageTokenForDisplay(const std::string& raw)
 {
-    std::string p = AgentLowerAscii(AgentTrimPackageToken(raw));
+    std::string p = LbLowerAscii(AgentTrimPackageToken(raw));
     std::replace(p.begin(), p.end(), '_', '-');
     return p;
 }
@@ -589,7 +618,7 @@ bool AgentFindMissingPythonPackage(const std::string& stdoutText,
     installableOut = false;
 
     const std::string text = stderrText + "\n" + stdoutText;
-    const std::string lower = AgentLowerAscii(text);
+    const std::string lower = LbLowerAscii(text);
 
     std::string candidate;
     if (!AgentExtractAfterToken(text, "No module named", candidate) &&
@@ -1854,7 +1883,13 @@ bool AgentController::DispatchAndContinue(const ToolInvocation& inv)
         // Malformed / unknown tool.  Feed the reason back to the
         // model as an error result — it may self-correct.  Counter
         // ticks up; if we exceed the cap, EndLoop.
-        ++m_consecutiveMalformed;
+        //
+        // An argument-VALUE error (inv.argumentError) is an ordinary tool
+        // error: it neither ticks the malformed counter nor gets the
+        // "Reply with ONLY one corrected tool call" escalation, and it
+        // counts toward the normal tool-step cap so it stays bounded.
+        const bool argumentError = inv.argumentError;
+        if (!argumentError) ++m_consecutiveMalformed;
 
         // Echo a head+tail PREVIEW of the broken block, never the full
         // block. The batch parser already previews its malformed
@@ -1884,7 +1919,8 @@ bool AgentController::DispatchAndContinue(const ToolInvocation& inv)
         // demand a bare corrected block — small models that ignore the
         // format reminder often still respond to a direct prohibition
         // on repeating the previous output.
-        if (m_consecutiveMalformed >= 2 &&
+        if (!argumentError &&
+            m_consecutiveMalformed >= 2 &&
             m_consecutiveMalformed < kMaxMalformedPerTurn) {
             // The corrective instruction has to name the protocol the
             // model is actually speaking.  toolCallId is populated only
@@ -1907,7 +1943,8 @@ bool AgentController::DispatchAndContinue(const ToolInvocation& inv)
                       " </tool_call>.");
         }
 
-        if (m_consecutiveMalformed >= kMaxMalformedPerTurn) {
+        if (!argumentError &&
+            m_consecutiveMalformed >= kMaxMalformedPerTurn) {
             // Render and store the terminal error so native tool-call
             // sidecars are not left orphaned on disk.  No iteration
             // follow-up, but the final error still round-trips through
@@ -1926,7 +1963,8 @@ bool AgentController::DispatchAndContinue(const ToolInvocation& inv)
         }
 
         // Feed the error back and let the model try again.
-        FeedResultAndIterate(r, /*countTowardIterationCap=*/false);
+        if (argumentError) r.chips = { "error", "invalid arguments" };
+        FeedResultAndIterate(r, /*countTowardIterationCap=*/argumentError);
         return true;
     }
 
@@ -2958,6 +2996,9 @@ std::vector<ToolInvocation> AgentController::ParseStructuredToolCalls(
         } else if (!ValidateToolArgs(inv.name, inv.args, reason)) {
             inv.valid         = false;
             inv.invalidReason = reason;
+            // Valid JSON for a known tool; a value failed validation.
+            // Cleared below when none of the parameter names match.
+            inv.argumentError = true;
 
             // The most common native-path validation failure is a
             // hallucinated parameter name: ProjectStructuredArgs found
@@ -2984,15 +3025,24 @@ std::vector<ToolInvocation> AgentController::ParseStructuredToolCalls(
                         why += " Missing required parameter(s): " + missing + ".";
                     if (!unknown.empty())
                         why += " Not parameters of this tool: " + unknown + ".";
-                    if (missing.empty() && unknown.empty())
-                        why += " Every parameter name is right, so at least one"
-                               " value has the wrong type or shape; check that"
-                               " parameter's description in the tool catalog.";
+                    if (missing.empty() && unknown.empty()) {
+                        const std::string badValues =
+                            AgentDescribeBadArgValues(argsRaw);
+                        if (!badValues.empty())
+                            why += " " + badValues;
+                        else
+                            why += " Every parameter name is right, so at least one"
+                                   " value has the wrong type or shape; check that"
+                                   " parameter's description in the tool catalog.";
+                    }
                     if (inv.name == tool_names::kReadRange)
                         why += " read_range example: {\"path\":\"file.txt\","
                                "\"ranges\":[{\"start\":60,\"end\":115}]}.";
                     inv.invalidReason = why;
                 } else {
+                    // No parameter name matches: the call shape itself is
+                    // wrong, so it stays a malformed call.
+                    inv.argumentError = false;
                     std::string keys = AgentListJsonObjectKeys(argsRaw);
                     if (!keys.empty()) {
                         inv.invalidReason +=

@@ -15,6 +15,7 @@
 
 #include "chat_client.h"
 #include "openai_responses.h"
+#include "utf8_scrub.h"         // request body -> valid UTF-8
 #include "chatgpt_auth.h"       // ChatGPT plan lane: worker-side token
 #include "chatgpt_auth_core.h"  // plan error vocabulary
 
@@ -561,6 +562,11 @@ wxThread::ExitCode ChatWorkerThread::Entry()
             m_target.authHeaderName  = "Authorization";
             m_target.authHeaderValue = "Bearer " + token;
         }
+
+        // Every provider requires valid UTF-8 JSON.  Valid bodies are
+        // returned byte-for-byte (no change to cache prefixes); only an
+        // invalid byte, e.g. from an old chat, becomes U+FFFD.
+        m_requestBody = lb_utf8::Scrub(m_requestBody);
 
         // Convert after the UI has finished message/attachment projection.
         // The original conversation remains unchanged. Other endpoints keep

@@ -1,4 +1,5 @@
 #include "project_manager.h"
+#include "lb_string_utils.h"
 #include "lb_ascii.h"
 #include "path_safety.h"
 
@@ -9,7 +10,10 @@
 #include <wx/wfstream.h>   // wxFFileInputStream/OutputStream (skill zip import/export)
 #include <wx/zipstrm.h>    // wxZipInputStream/OutputStream (skill zip import/export)
 
+#include <filesystem>
 #include <iterator>
+#include <mutex>
+#include <set>
 
 #include "skill_authoring_support.h"   // frontmatter read/ensure/rewrite for skill import
 
@@ -65,12 +69,6 @@ std::string TrimAscii(std::string s)
 }
 
 
-std::string LowerAscii(std::string s)
-{
-    for (char& c : s) c = static_cast<char>(lb_ascii::ToLower(static_cast<unsigned char>(c)));
-    return s;
-}
-
 std::string StripMatchingQuotes(std::string s)
 {
     s = TrimAscii(std::move(s));
@@ -92,12 +90,12 @@ std::string NormalizeSlashPath(std::string s)
 std::string StripSourcesPrefix(std::string s)
 {
     s = NormalizeSlashPath(StripMatchingQuotes(std::move(s)));
-    std::string lower = LowerAscii(s);
+    std::string lower = LbLowerAscii(s);
     const char* prefixes[] = { "sources/", "source/", "project sources/", "project source/" };
     bool changed = true;
     while (changed) {
         changed = false;
-        lower = LowerAscii(s);
+        lower = LbLowerAscii(s);
         for (const char* prefix : prefixes) {
             const std::string p(prefix);
             if (lower.rfind(p, 0) == 0) {
@@ -113,12 +111,12 @@ std::string StripSourcesPrefix(std::string s)
 std::string StripWorkflowsPrefix(std::string s)
 {
     s = NormalizeSlashPath(StripMatchingQuotes(std::move(s)));
-    std::string lower = LowerAscii(s);
+    std::string lower = LbLowerAscii(s);
     const char* prefixes[] = { "skills/", "skill/", "workflows/", "workflow/", "project workflows/", "project workflow/" };
     bool changed = true;
     while (changed) {
         changed = false;
-        lower = LowerAscii(s);
+        lower = LbLowerAscii(s);
         for (const char* prefix : prefixes) {
             const std::string p(prefix);
             if (lower.rfind(p, 0) == 0) {
@@ -134,7 +132,7 @@ std::string StripWorkflowsPrefix(std::string s)
 std::string StripWorkflowScriptPrefix(std::string s)
 {
     s = NormalizeSlashPath(StripMatchingQuotes(std::move(s)));
-    std::string lower = LowerAscii(s);
+    std::string lower = LbLowerAscii(s);
     const char* prefixes[] = {
         "skill scripts/", "skill script/", "skills/", "skill/",
         "workflow scripts/", "workflow script/",
@@ -144,7 +142,7 @@ std::string StripWorkflowScriptPrefix(std::string s)
     bool changed = true;
     while (changed) {
         changed = false;
-        lower = LowerAscii(s);
+        lower = LbLowerAscii(s);
         for (const char* prefix : prefixes) {
             const std::string p(prefix);
             if (lower.rfind(p, 0) == 0) {
@@ -160,7 +158,7 @@ std::string StripWorkflowScriptPrefix(std::string s)
 std::string FileStemLower(const std::string& fileName)
 {
     wxFileName fn(wxString::FromUTF8(fileName));
-    return LowerAscii(std::string(fn.GetName().ToUTF8().data()));
+    return LbLowerAscii(std::string(fn.GetName().ToUTF8().data()));
 }
 
 std::string WorkflowStemLower(const std::string& fileName)
@@ -176,7 +174,7 @@ std::string WorkflowStemLower(const std::string& fileName)
 
 bool HasLowerSuffix(const std::string& s, const std::string& suffix)
 {
-    const std::string lower = LowerAscii(s);
+    const std::string lower = LbLowerAscii(s);
     return lower.size() >= suffix.size() &&
            lower.compare(lower.size() - suffix.size(), suffix.size(), suffix) == 0;
 }
@@ -198,10 +196,13 @@ bool EnsureSubdir(const std::string& root, const char* name)
 
 unsigned long long FileSizeBytes(const std::string& path)
 {
-    std::ifstream f(path_safety::Utf8ToWide(path), std::ios::binary | std::ios::ate);
-    if (!f.is_open()) return 0;
-    std::streamsize n = f.tellg();
-    if (n < 0) return 0;
+    // Metadata query only: no file handle is opened (an ifstream open per
+    // listed file was the dominant cost of every Skills/Sources/Workflows
+    // listing, and those run on every context-cache probe).
+    std::error_code ec;
+    const auto n = std::filesystem::file_size(
+        std::filesystem::path(path_safety::Utf8ToWide(path)), ec);
+    if (ec) return 0;
     return static_cast<unsigned long long>(n);
 }
 
@@ -500,7 +501,7 @@ bool IsReparsePointOrSymlink(const std::string& path)
 
 bool SkillImportSkipsDirName(const std::string& name)
 {
-    const std::string lower = LowerAscii(name);
+    const std::string lower = LbLowerAscii(name);
     return lower == ".git" || lower == ".vs" || lower == "__pycache__" ||
            lower == "node_modules" || lower == ".venv" || lower == "venv";
 }
@@ -511,7 +512,7 @@ bool SkillImportSkipsDirName(const std::string& name)
 // unrelated files into Skills.
 bool IsSkillShapedTopLevelEntry(const std::string& name, bool isDir)
 {
-    const std::string lower = LowerAscii(name);
+    const std::string lower = LbLowerAscii(name);
     if (isDir) {
         return lower == "scripts" || lower == "references" ||
                lower == "assets" || lower == "templates" ||
@@ -713,6 +714,30 @@ void MoveLegacySkillFilesIfNeeded(const std::string& skillsDir)
     }
 }
 
+void MigrateFlatWorkflowsToFolders(const std::string& workflowsDir,
+                                   const std::string& docName);
+
+// The layout migrations below are one-time conversions of pre-Skills /
+// pre-folder installs.  They used to run on EVERY Skills or project
+// workflow listing (several times per context-cache probe).  Run them at
+// most once per folder per process instead.  A folder is only marked done
+// once it exists, so a project/Skills root created later still migrates on
+// its first listing.
+bool ClaimLayoutMigration(const std::string& dir)
+{
+    if (dir.empty() || !wxDirExists(wxString::FromUTF8(dir))) return false;
+    static std::mutex mtx;
+    static std::set<std::string> done;
+    std::lock_guard<std::mutex> lock(mtx);
+    return done.insert(NormalizeExistingPathForCompare(dir)).second;
+}
+
+void MigrateProjectWorkflowsOnce(const std::string& workflowsDir)
+{
+    if (ClaimLayoutMigration(workflowsDir))
+        MigrateFlatWorkflowsToFolders(workflowsDir, kWorkflowDocName);
+}
+
 // One-time (idempotent) migration from the old flat layout to the
 // folder-per-skill layout.  For every "<stem>.workflow.md" file at the
 // top of `workflowsDir`, this:
@@ -745,7 +770,7 @@ void MigrateFlatWorkflowsToFolders(const std::string& workflowsDir,
         bool cont = scan.GetFirst(&fname, wxEmptyString, wxDIR_FILES);
         while (cont) {
             const std::string name = std::string(fname.ToUTF8().data());
-            if (IsWorkflowDocFileName(LowerAscii(name))) {
+            if (IsWorkflowDocFileName(LbLowerAscii(name))) {
                 flatWorkflowDocs.push_back(name);
             }
             cont = scan.GetNext(&fname);
@@ -758,7 +783,7 @@ void MigrateFlatWorkflowsToFolders(const std::string& workflowsDir,
         std::string stem = docFileName;
         const std::string suffix = ".workflow.md";
         if (stem.size() > suffix.size()) {
-            std::string tail = LowerAscii(stem.substr(stem.size() - suffix.size()));
+            std::string tail = LbLowerAscii(stem.substr(stem.size() - suffix.size()));
             if (tail == suffix) {
                 stem.resize(stem.size() - suffix.size());
             }
@@ -841,7 +866,7 @@ std::string NormalizeExistingPathForCompare(const std::string& path)
     std::replace(out.begin(), out.end(), '\\', '/');
     while (out.size() > 1 && out.back() == '/') out.pop_back();
 #ifdef __WXMSW__
-    out = LowerAscii(out);
+    out = LbLowerAscii(out);
 #endif
     return out;
 }
@@ -887,13 +912,15 @@ std::string ProjectManager::GetSkillsDir()
 bool ProjectManager::EnsureSkillsRoot()
 {
     std::string dir = GetSkillsDir();
-    bool ok = wxFileName::Mkdir(wxString::FromUTF8(dir), wxS_DIR_DEFAULT, wxPATH_MKDIR_FULL);
-    const bool exists = ok || wxDirExists(wxString::FromUTF8(dir));
-    if (exists) {
+    const wxString wxDirPath = wxString::FromUTF8(dir);
+    const bool exists = wxDirExists(wxDirPath) ||
+        wxFileName::Mkdir(wxDirPath, wxS_DIR_DEFAULT, wxPATH_MKDIR_FULL) ||
+        wxDirExists(wxDirPath);
+    if (exists && ClaimLayoutMigration(dir)) {
         // Order matters: pull files in from the legacy Workflows/
         // root first, THEN run the flat -> folder migrator so anything
         // that lands here gets wrapped into the folder-per-skill layout
-        // in the same launch.
+        // in the same launch.  Once per process (see ClaimLayoutMigration).
         MoveLegacySkillFilesIfNeeded(dir);
         MigrateFlatWorkflowsToFolders(dir, kSkillDocName);
     }
@@ -1163,12 +1190,12 @@ bool ProjectManager::ResolveProjectSource(const std::string& rootPath,
         return false;
     }
 
-    const std::string qLower = LowerAscii(NormalizeSlashPath(query));
+    const std::string qLower = LbLowerAscii(NormalizeSlashPath(query));
     std::vector<ProjectSourceInfo> matches;
 
     auto addMatch = [&](const ProjectSourceInfo& src) {
         for (const auto& existing : matches) {
-            if (LowerAscii(existing.path) == LowerAscii(src.path)) return;
+            if (LbLowerAscii(existing.path) == LbLowerAscii(src.path)) return;
         }
         matches.push_back(src);
     };
@@ -1176,7 +1203,7 @@ bool ProjectManager::ResolveProjectSource(const std::string& rootPath,
     // 1) Exact filename match, case-insensitive. This is the safest and most
     // common path: zayra.pdf -> Sources/zayra.pdf.
     for (const auto& src : sources) {
-        if (LowerAscii(src.name) == qLower) addMatch(src);
+        if (LbLowerAscii(src.name) == qLower) addMatch(src);
     }
     if (matches.size() == 1) { outSource = matches.front(); return true; }
     if (matches.size() > 1) {
@@ -1187,7 +1214,7 @@ bool ProjectManager::ResolveProjectSource(const std::string& rootPath,
     // 2) Exact normalized relative tail match. Useful if the caller passes
     // Sources/name.ext or a future nested Sources path.
     for (const auto& src : sources) {
-        const std::string sourceRel = LowerAscii(NormalizeSlashPath(src.name));
+        const std::string sourceRel = LbLowerAscii(NormalizeSlashPath(src.name));
         if (sourceRel == qLower) addMatch(src);
     }
     if (matches.size() == 1) { outSource = matches.front(); return true; }
@@ -1209,7 +1236,7 @@ bool ProjectManager::ResolveProjectSource(const std::string& rootPath,
     // 4) Unique partial filename/stem match. Helpful for natural language tool
     // calls but still refuses ambiguity.
     for (const auto& src : sources) {
-        const std::string nameLower = LowerAscii(src.name);
+        const std::string nameLower = LbLowerAscii(src.name);
         const std::string stemLower = FileStemLower(src.name);
         if (nameLower.find(qLower) != std::string::npos ||
             stemLower.find(qLower) != std::string::npos) {
@@ -1489,7 +1516,7 @@ bool CreateProjectWorkflowInternal(const std::string& rootPath,
     // project's Workflows/ to folders before we create a new one.
     // Keeps the directory shape consistent and avoids the new skill
     // being created in a folder while older siblings stay flat.
-    MigrateFlatWorkflowsToFolders(ProjectManager::ProjectWorkflowsPath(rootPath), kWorkflowDocName);
+    MigrateProjectWorkflowsOnce(ProjectManager::ProjectWorkflowsPath(rootPath));
 
     return CreateWorkflowInternal(ProjectManager::ProjectWorkflowsPath(rootPath),
                                   /*isGlobal=*/false,
@@ -1520,18 +1547,18 @@ bool ResolveWorkflowInList(const std::vector<ProjectWorkflowInfo>& workflows,
         return false;
     }
 
-    const std::string qLower = LowerAscii(NormalizeSlashPath(query));
+    const std::string qLower = LbLowerAscii(NormalizeSlashPath(query));
     std::vector<ProjectWorkflowInfo> matches;
 
     auto addMatch = [&](const ProjectWorkflowInfo& wf) {
         for (const auto& existing : matches) {
-            if (LowerAscii(existing.path) == LowerAscii(wf.path)) return;
+            if (LbLowerAscii(existing.path) == LbLowerAscii(wf.path)) return;
         }
         matches.push_back(wf);
     };
 
     for (const auto& wf : workflows) {
-        if (LowerAscii(wf.name) == qLower) addMatch(wf);
+        if (LbLowerAscii(wf.name) == qLower) addMatch(wf);
     }
     if (matches.size() == 1) { outWorkflow = matches.front(); return true; }
     if (matches.size() > 1) { outError = kindLabel + " reference is ambiguous: " + query; return false; }
@@ -1543,7 +1570,7 @@ bool ResolveWorkflowInList(const std::vector<ProjectWorkflowInfo>& workflows,
     if (matches.size() > 1) { outError = kindLabel + " reference is ambiguous: " + query; return false; }
 
     for (const auto& wf : workflows) {
-        const std::string nameLower = LowerAscii(wf.name);
+        const std::string nameLower = LbLowerAscii(wf.name);
         const std::string stemLower = FileStemLower(wf.name);
         const std::string workflowStemLower = WorkflowStemLower(wf.name);
         if (nameLower.find(qLower) != std::string::npos ||
@@ -1574,19 +1601,19 @@ bool ResolveWorkflowScriptInList(const std::vector<ProjectWorkflowScriptInfo>& s
         return false;
     }
 
-    const std::string qLower = LowerAscii(NormalizeSlashPath(query));
+    const std::string qLower = LbLowerAscii(NormalizeSlashPath(query));
     const std::string qStemLower = FileStemLower(query);
     std::vector<ProjectWorkflowScriptInfo> matches;
 
     auto addMatch = [&](const ProjectWorkflowScriptInfo& script) {
         for (const auto& existing : matches) {
-            if (LowerAscii(existing.path) == LowerAscii(script.path)) return;
+            if (LbLowerAscii(existing.path) == LbLowerAscii(script.path)) return;
         }
         matches.push_back(script);
     };
 
     for (const auto& script : scripts) {
-        if (LowerAscii(script.name) == qLower) addMatch(script);
+        if (LbLowerAscii(script.name) == qLower) addMatch(script);
     }
     if (matches.size() == 1) { outScript = matches.front(); return true; }
     if (matches.size() > 1) { outError = kindLabel + " reference is ambiguous: " + query; return false; }
@@ -1598,7 +1625,7 @@ bool ResolveWorkflowScriptInList(const std::vector<ProjectWorkflowScriptInfo>& s
     if (matches.size() > 1) { outError = kindLabel + " reference is ambiguous: " + query; return false; }
 
     for (const auto& script : scripts) {
-        const std::string nameLower = LowerAscii(script.name);
+        const std::string nameLower = LbLowerAscii(script.name);
         const std::string stemLower = FileStemLower(script.name);
         if (nameLower.find(qLower) != std::string::npos ||
             stemLower.find(qStemLower) != std::string::npos) {
@@ -1634,11 +1661,9 @@ bool ProjectManager::CreateProjectWorkflowWithScript(const std::string& rootPath
 std::vector<ProjectWorkflowInfo> ProjectManager::ListProjectWorkflows(const std::string& rootPath,
                                                                       std::size_t maxItems)
 {
-    // Idempotent: migrates any flat workflows in this project's
-    // Workflows/ to the folder-per-skill layout before listing.
-    // No-op if there's nothing flat to migrate, so the cost is one
-    // directory scan per call.
-    MigrateFlatWorkflowsToFolders(ProjectWorkflowsPath(rootPath), kWorkflowDocName);
+    // Migrates any flat workflows in this project's Workflows/ to the
+    // folder-per-skill layout, once per project folder per process.
+    MigrateProjectWorkflowsOnce(ProjectWorkflowsPath(rootPath));
     return ListWorkflowsInDir(ProjectWorkflowsPath(rootPath), kWorkflowDocName, maxItems);
 }
 
@@ -1675,11 +1700,8 @@ bool ProjectManager::ResolveProjectWorkflow(const std::string& rootPath,
 std::vector<ProjectWorkflowScriptInfo> ProjectManager::ListProjectWorkflowScripts(const std::string& rootPath,
                                                                                   std::size_t maxItems)
 {
-    // Same idempotent migration as ListProjectWorkflows -- ensures
-    // any flat <stem>.py / <stem>.workflow.md pairs get wrapped
-    // into <stem>/ folders before we try to enumerate scripts
-    // (which now only looks inside skill folders).
-    MigrateFlatWorkflowsToFolders(ProjectWorkflowsPath(rootPath), kWorkflowDocName);
+    // Same once-per-folder migration as ListProjectWorkflows.
+    MigrateProjectWorkflowsOnce(ProjectWorkflowsPath(rootPath));
     return ListWorkflowScriptsInDir(ProjectWorkflowsPath(rootPath), kWorkflowDocName, maxItems);
 }
 
@@ -1746,9 +1768,9 @@ bool ProjectManager::ResolveProjectWorkflowScript(const std::string& rootPath,
     }
 
     if (!pinnedFolder.empty()) {
-        std::string resolvedLower = LowerAscii(outScript.path);
+        std::string resolvedLower = LbLowerAscii(outScript.path);
         std::replace(resolvedLower.begin(), resolvedLower.end(), '/', '\\');
-        const std::string needle = "\\" + LowerAscii(pinnedFolder) + "\\";
+        const std::string needle = "\\" + LbLowerAscii(pinnedFolder) + "\\";
         if (resolvedLower.find(needle) == std::string::npos) {
             outError = "Project workflow script " + query +
                        " resolved outside the requested Workflows\\" +

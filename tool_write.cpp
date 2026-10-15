@@ -1,6 +1,7 @@
 // tool_write.cpp
 
 #include "tool_write.h"
+#include "lb_string_utils.h"
 #include "lb_ascii.h"
 #include "tool_path.h"
 #include "tool_path_safety.h"    // IsUnderAllowedWriteRoot, Basename, ParentDir
@@ -23,33 +24,6 @@ namespace {
 constexpr size_t kWriteMaxBytes = 1 * 1024 * 1024;  // 1 MiB
 
 // ─── Helpers (file-local) ────────────────────────────────────────
-
-std::string HumanBytes(size_t b)
-{
-    std::ostringstream ss;
-    ss << std::fixed;
-    if (b < 1024) {
-        ss << b << " B";
-    } else if (b < 1024 * 1024) {
-        ss.precision(1);
-        ss << (b / 1024.0) << " KB";
-    } else {
-        ss.precision(2);
-        ss << (b / (1024.0 * 1024.0)) << " MB";
-    }
-    return ss.str();
-}
-
-std::string ElapsedChip(std::chrono::steady_clock::time_point t0)
-{
-    double elapsed = std::chrono::duration<double>(
-        std::chrono::steady_clock::now() - t0).count();
-    std::ostringstream ts;
-    ts << std::fixed;
-    ts.precision(elapsed < 10.0 ? 2 : 1);
-    ts << elapsed << "s";
-    return ts.str();
-}
 
 size_t CountLines(const std::string& s)
 {
@@ -153,9 +127,9 @@ WriteResult WriteContentCore(const std::string& requestedPath,
     if (content.size() > opt.maxBytes) {
         r.chips.push_back("too large");
         r.errorBody = "Content exceeds write cap: " +
-                      HumanBytes(content.size()) +
-                      " (max " + HumanBytes(opt.maxBytes) + ").";
-        r.chips.push_back(ElapsedChip(t0));
+                      LbToolHumanBytes(content.size()) +
+                      " (max " + LbToolHumanBytes(opt.maxBytes) + ").";
+        r.chips.push_back(LbElapsedChip(t0));
         return r;
     }
 
@@ -163,7 +137,7 @@ WriteResult WriteContentCore(const std::string& requestedPath,
     if (ctx.cwd.empty()) {
         r.chips.push_back("blocked");
         r.errorBody = "No working directory set; refuse to write.";
-        r.chips.push_back(ElapsedChip(t0));
+        r.chips.push_back(LbElapsedChip(t0));
         return r;
     }
 
@@ -171,7 +145,7 @@ WriteResult WriteContentCore(const std::string& requestedPath,
     if (resolved.empty()) {
         r.chips.push_back("failed");
         r.errorBody = "Could not resolve path: " + requestedPath;
-        r.chips.push_back(ElapsedChip(t0));
+        r.chips.push_back(LbElapsedChip(t0));
         return r;
     }
 
@@ -188,7 +162,7 @@ WriteResult WriteContentCore(const std::string& requestedPath,
                       tool_path_safety::AllowedWriteRootsDiagnostic(
                           ctx.cwd, ctx.activeProjectRoot, ctx.skillsRoot,
                           ctx.additionalWriteRoots);
-        r.chips.push_back(ElapsedChip(t0));
+        r.chips.push_back(LbElapsedChip(t0));
         return r;
     }
 
@@ -200,7 +174,7 @@ WriteResult WriteContentCore(const std::string& requestedPath,
         r.errorBody = mutation.Error();
         if (mutation.MissingFolder())
             r.errorBody += tool_path_safety::ConversationLaneWriteHint(requestedPath, ctx.cwd);
-        r.chips.push_back(ElapsedChip(t0));
+        r.chips.push_back(LbElapsedChip(t0));
         return r;
     }
 
@@ -219,7 +193,7 @@ WriteResult WriteContentCore(const std::string& requestedPath,
                       "a shape that aren't safe on Windows. "
                       "Try '" + (sanitized.empty() ? "another name"
                                                    : sanitized) + "'.";
-        r.chips.push_back(ElapsedChip(t0));
+        r.chips.push_back(LbElapsedChip(t0));
         return r;
     }
 
@@ -238,7 +212,7 @@ WriteResult WriteContentCore(const std::string& requestedPath,
         if (!HasPowerShellScriptExtension(resolved)) {
             r.chips.push_back("blocked");
             r.errorBody = "write_powershell_script only creates or replaces .ps1 files.";
-            r.chips.push_back(ElapsedChip(t0));
+            r.chips.push_back(LbElapsedChip(t0));
             return r;
         }
     } else if (ClassifyForOpen(resolved) == FileRisk::Risky) {
@@ -246,7 +220,7 @@ WriteResult WriteContentCore(const std::string& requestedPath,
         r.errorBody = overwriteExisting
             ? "Refuses to overwrite files with executable or scriptable extensions. For .ps1 scripts use edit for targeted changes or write_powershell_script for a full replacement (both need approval); otherwise edit the file manually."
             : "Refuses to create files with executable or scriptable extensions. Use write_powershell_script for approved .ps1 project scripts, or drop the file in manually.";
-        r.chips.push_back(ElapsedChip(t0));
+        r.chips.push_back(LbElapsedChip(t0));
         return r;
     }
 
@@ -260,7 +234,7 @@ WriteResult WriteContentCore(const std::string& requestedPath,
         r.errorBody = "Parent directory does not exist: " + parent +
                       ".\nUse mkdir to create it first." +
                       tool_path_safety::ConversationLaneWriteHint(requestedPath, ctx.cwd);
-        r.chips.push_back(ElapsedChip(t0));
+        r.chips.push_back(LbElapsedChip(t0));
         return r;
     }
 
@@ -272,13 +246,13 @@ WriteResult WriteContentCore(const std::string& requestedPath,
         r.chips.push_back("exists");
         r.errorBody = "File or directory already exists: " + resolved +
                       ".\n" + opt.existsHint;
-        r.chips.push_back(ElapsedChip(t0));
+        r.chips.push_back(LbElapsedChip(t0));
         return r;
     }
     if (overwriteExisting && targetIsDir) {
         r.chips.push_back("blocked");
         r.errorBody = "Refuses to overwrite a directory: " + resolved;
-        r.chips.push_back(ElapsedChip(t0));
+        r.chips.push_back(LbElapsedChip(t0));
         return r;
     }
 
@@ -298,7 +272,7 @@ WriteResult WriteContentCore(const std::string& requestedPath,
                           "\"content\" string parameter; text calls: content on "
                           "the lines after the path). To make the file empty on "
                           "purpose, delete it and write it again.";
-            r.chips.push_back(ElapsedChip(t0));
+            r.chips.push_back(LbElapsedChip(t0));
             return r;
         }
     }
@@ -314,7 +288,7 @@ WriteResult WriteContentCore(const std::string& requestedPath,
     if (wFinal.empty()) {
         r.chips.push_back("failed");
         r.errorBody = "Path conversion failed: " + resolved;
-        r.chips.push_back(ElapsedChip(t0));
+        r.chips.push_back(LbElapsedChip(t0));
         return r;
     }
 
@@ -328,7 +302,7 @@ WriteResult WriteContentCore(const std::string& requestedPath,
         if (!tmp.path.empty()) {
             r.errorBody += "\nLast attempted temp path: " + tmp.path;
         }
-        r.chips.push_back(ElapsedChip(t0));
+        r.chips.push_back(LbElapsedChip(t0));
         return r;
     }
 
@@ -355,7 +329,7 @@ WriteResult WriteContentCore(const std::string& requestedPath,
                 r.chips.push_back("failed");
                 r.errorBody = "WriteFile failed (Win32 error " +
                               std::to_string(err) + ").";
-                r.chips.push_back(ElapsedChip(t0));
+                r.chips.push_back(LbElapsedChip(t0));
                 return r;
             }
             data    += written;
@@ -370,7 +344,7 @@ WriteResult WriteContentCore(const std::string& requestedPath,
         r.chips.push_back("failed");
         r.errorBody = "FlushFileBuffers on tmp failed (Win32 error " +
                       std::to_string(err) + ").";
-        r.chips.push_back(ElapsedChip(t0));
+        r.chips.push_back(LbElapsedChip(t0));
         return r;
     }
 
@@ -383,7 +357,7 @@ WriteResult WriteContentCore(const std::string& requestedPath,
         r.errorBody = "CloseHandle on tmp failed (Win32 error " +
                       std::to_string(err) +
                       "); tmp file preserved at: " + tmpPath;
-        r.chips.push_back(ElapsedChip(t0));
+        r.chips.push_back(LbElapsedChip(t0));
         return r;
     }
 
@@ -394,10 +368,15 @@ WriteResult WriteContentCore(const std::string& requestedPath,
             ::DeleteFileW(wTmp.c_str());
             r.chips.push_back("failed");
             r.chips.push_back("syntax error");
+            // Name the user's file, not the staging temp file Python saw.
+            std::string message = syntax.message;
+            for (size_t at = message.find(tmpPath); at != std::string::npos;
+                 at = message.find(tmpPath, at + resolved.size()))
+                message.replace(at, tmpPath.size(), resolved);
             r.errorBody = "Python syntax check failed; the file was not " +
                           std::string(overwriteExisting ? "overwritten" : "created") +
-                          ".\n\n" + syntax.message;
-            r.chips.push_back(ElapsedChip(t0));
+                          ".\n\n" + message;
+            r.chips.push_back(LbElapsedChip(t0));
             return r;
         }
     }
@@ -405,7 +384,7 @@ WriteResult WriteContentCore(const std::string& requestedPath,
     if (!mutation.VerifyUnchanged()) {
         r.chips.push_back("conflict");
         r.errorBody = mutation.Error() + "\nThe proposed file is preserved at: " + tmpPath;
-        r.chips.push_back(ElapsedChip(t0));
+        r.chips.push_back(LbElapsedChip(t0));
         return r;
     }
     // Even overwrite_file must not clobber a file that appeared after a
@@ -430,7 +409,7 @@ WriteResult WriteContentCore(const std::string& requestedPath,
                           std::to_string(err) +
                           ").\nThe staged content is preserved at: " + tmpPath;
         }
-        r.chips.push_back(ElapsedChip(t0));
+        r.chips.push_back(LbElapsedChip(t0));
         return r;
     }
 
@@ -449,13 +428,13 @@ WriteResult WriteContentCore(const std::string& requestedPath,
     if (bytes == 0) {
         r.chips.push_back("empty");
     } else {
-        r.chips.push_back(HumanBytes(bytes));
+        r.chips.push_back(LbToolHumanBytes(bytes));
         r.chips.push_back(std::to_string(lines) + " lines");
     }
     r.body = std::string(overwriteExisting ? "Overwrote " : "Wrote ") +
-             (bytes == 0 ? std::string("empty file") : HumanBytes(bytes)) +
+             (bytes == 0 ? std::string("empty file") : LbToolHumanBytes(bytes)) +
              " to " + resolved + "\n";
-    r.chips.push_back(ElapsedChip(t0));
+    r.chips.push_back(LbElapsedChip(t0));
     return r;
 }
 
@@ -477,7 +456,7 @@ WriteResult WriteFileContent(const std::string& argsBlob,
         r.errorBody = overwriteExisting
             ? "overwrite_file requires a path on the first line of <args>."
             : "write requires a path on the first line of <args>.";
-        r.chips.push_back(ElapsedChip(t0));
+        r.chips.push_back(LbElapsedChip(t0));
         return r;
     }
 
