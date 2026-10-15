@@ -4,6 +4,7 @@
 // every fstream/Win32 boundary, no wx dependency.
 
 #include "var_store.h"
+#include "lb_string_utils.h"
 #include "lb_ascii.h"
 
 #include "path_safety.h"   // Utf8ToWide, SanitizeFilename
@@ -28,13 +29,6 @@ namespace {
 
 // ── small utilities ────────────────────────────────────────────────
 
-std::string ToLowerAscii(std::string s)
-{
-    std::transform(s.begin(), s.end(), s.begin(),
-                   [](unsigned char c) { return (char)lb_ascii::ToLower(c); });
-    return s;
-}
-
 // Extension (lowercase, with dot) of the LAST path-ish token in a
 // hint string.  For a read echo this is the file's extension; for a
 // command line it is usually "" — which is the correct answer (shape
@@ -53,7 +47,7 @@ std::string ExtensionOfHint(const std::string& hint)
     std::string ext = tok.substr(dot);
     if (ext.size() > 8) return "";
     if (ext.find_first_of("\\/") != std::string::npos) return "";
-    return ToLowerAscii(ext);
+    return LbLowerAscii(ext);
 }
 
 bool IsCodeExt(const std::string& ext)
@@ -458,7 +452,7 @@ DemoteOutcome MaybeDemoteToolBody(const std::string& toolTag,
     // the existing text file, nothing new is written, no duplicates
     // accumulate, and the doom guard sees a stable true repeat.
     std::string reuseRel;
-    const bool isWholeFileRead = (ToLowerAscii(toolTag) == "read");
+    const bool isWholeFileRead = (LbLowerAscii(toolTag) == "read");
     const bool reused = isWholeFileRead &&
         EchoPointsInsideWorkspace(commandEcho, workspaceDirUtf8, &reuseRel);
 
@@ -596,7 +590,10 @@ std::string BuildHandleCard(const std::string& relPath,
         card << "note: the on-disk file is UTF-16; this preview was converted "
                 "to UTF-8. grep may miss — prefer python_run_script for exact "
                 "reads of this file.\n";
-    card << "This is a PREVIEW ONLY. The complete content is stored in the file above.\n"
+    // "The complete output of this tool call", not "the complete content":
+    // a tool may itself have read only part of a source file (read_head,
+    // a truncated read), and the card must not promise the whole file.
+    card << "This is a PREVIEW ONLY. The complete output of this tool call is stored in the file above.\n"
          << "A whole-file read of it returns this card again, not the contents. "
             "Query it instead:\n"
          << "  grep \"<pattern>\" " << relPath << "\n"

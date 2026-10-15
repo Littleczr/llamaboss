@@ -1836,33 +1836,6 @@ size_t CountTextLines(const std::string& s)
     return n;
 }
 
-std::string HumanBytesLocal(size_t b)
-{
-    std::ostringstream ss;
-    ss << std::fixed;
-    if (b < 1024) {
-        ss << b << " B";
-    } else if (b < 1024 * 1024) {
-        ss.precision(1);
-        ss << (b / 1024.0) << " KB";
-    } else {
-        ss.precision(2);
-        ss << (b / (1024.0 * 1024.0)) << " MB";
-    }
-    return ss.str();
-}
-
-std::string ElapsedChipLocal(std::chrono::steady_clock::time_point t0)
-{
-    double elapsed = std::chrono::duration<double>(
-        std::chrono::steady_clock::now() - t0).count();
-    std::ostringstream ts;
-    ts << std::fixed;
-    ts.precision(elapsed < 10.0 ? 2 : 1);
-    ts << elapsed << "s";
-    return ts.str();
-}
-
 void SplitPythonCreateScriptArgs(const std::string& argsBlob,
                                  std::string&       filenameOut,
                                  std::string&       contentOut)
@@ -2232,22 +2205,22 @@ PythonCreateScriptResult CreatePythonScriptArtifact(const std::string& argsBlob,
 
     std::string filename, err;
     if (!NormalizePythonScriptFilename(requestedName, filename, err)) {
-        r.chips = { "blocked", ElapsedChipLocal(t0) };
+        r.chips = { "blocked", LbElapsedChip(t0) };
         r.errorBody = err;
         return r;
     }
 
     if (content.empty()) {
-        r.chips = { "failed", ElapsedChipLocal(t0) };
+        r.chips = { "failed", LbElapsedChip(t0) };
         r.errorBody = "python_create_script requires script content after the filename line. It creates a reviewable .py file but does not run it.";
         return r;
     }
 
     if (content.size() > kMaxScriptBytes) {
-        r.chips = { "too large", ElapsedChipLocal(t0) };
+        r.chips = { "too large", LbElapsedChip(t0) };
         r.errorBody = "Python script content exceeds cap: " +
-                      HumanBytesLocal(content.size()) +
-                      " (max " + HumanBytesLocal(kMaxScriptBytes) + ").";
+                      LbToolHumanBytes(content.size()) +
+                      " (max " + LbToolHumanBytes(kMaxScriptBytes) + ").";
         return r;
     }
 
@@ -2259,7 +2232,7 @@ PythonCreateScriptResult CreatePythonScriptArtifact(const std::string& argsBlob,
         ? ProjectManager::ProjectWorkflowsPath(activeProjectRoot)
         : LlamaBossScriptsDir(cwd);
     if (scriptsDir.empty()) {
-        r.chips = { "failed", ElapsedChipLocal(t0) };
+        r.chips = { "failed", LbElapsedChip(t0) };
         r.errorBody = projectScoped
             ? "Could not resolve the active project Workflows folder."
             : "Could not resolve the conversation Scripts folder.";
@@ -2307,8 +2280,12 @@ PythonCreateScriptResult CreatePythonScriptArtifact(const std::string& argsBlob,
         if (!syntax.ok) {
             std::wstring wTemp = path_safety::Utf8ToWide(tempPath);
             if (!wTemp.empty()) ::DeleteFileW(wTemp.c_str());
-            r.chips = { "failed", "syntax error", ElapsedChipLocal(t0) };
-            r.errorBody = "Python syntax check failed; the script was not created.\n\n" + syntax.message;
+            r.chips = { "failed", "syntax error", LbElapsedChip(t0) };
+            std::string message = syntax.message;
+            for (size_t at = message.find(tempPath); at != std::string::npos;
+                 at = message.find(tempPath, at + candidatePath.size()))
+                message.replace(at, tempPath.size(), candidatePath);
+            r.errorBody = "Python syntax check failed; the script was not created.\n\n" + message;
             return r;
         }
 
@@ -2336,7 +2313,7 @@ PythonCreateScriptResult CreatePythonScriptArtifact(const std::string& argsBlob,
             continue;
         }
 
-        r.chips = { "failed", ElapsedChipLocal(t0) };
+        r.chips = { "failed", LbElapsedChip(t0) };
         r.errorBody = "Could not finalize Python script atomically: " + candidatePath +
                       " (Win32 error " + std::to_string(winErr) + ")";
         return r;
@@ -2347,7 +2324,7 @@ PythonCreateScriptResult CreatePythonScriptArtifact(const std::string& argsBlob,
             tool_python_syntax::CheckFile(tempPath);
         if (!syntax.ok) {
             ::unlink(tempPath.c_str());
-            r.chips = { "failed", "syntax error", ElapsedChipLocal(t0) };
+            r.chips = { "failed", "syntax error", LbElapsedChip(t0) };
             r.errorBody = "Python syntax check failed; the script was not created.\n\n" + syntax.message;
             return r;
         }
@@ -2368,7 +2345,7 @@ PythonCreateScriptResult CreatePythonScriptArtifact(const std::string& argsBlob,
             continue;
         }
 
-        r.chips = { "failed", ElapsedChipLocal(t0) };
+        r.chips = { "failed", LbElapsedChip(t0) };
         r.errorBody = "Could not finalize Python script atomically: " + candidatePath +
                       " (" + std::strerror(renameErr) + ")";
         return r;
@@ -2376,7 +2353,7 @@ PythonCreateScriptResult CreatePythonScriptArtifact(const std::string& argsBlob,
 
 #endif
     if (!created) {
-        r.chips = { "failed", ElapsedChipLocal(t0) };
+        r.chips = { "failed", LbElapsedChip(t0) };
         r.errorBody = lastError.empty()
             ? "Could not find a collision-safe filename in: " + scriptsDir
             : lastError;
@@ -2389,9 +2366,9 @@ PythonCreateScriptResult CreatePythonScriptArtifact(const std::string& argsBlob,
     r.lineCount   = static_cast<int>(CountTextLines(content));
 
     r.chips.push_back("created");
-    r.chips.push_back(HumanBytesLocal(r.sizeBytes));
+    r.chips.push_back(LbToolHumanBytes(r.sizeBytes));
     r.chips.push_back(std::to_string(r.lineCount) + " lines");
-    r.chips.push_back(ElapsedChipLocal(t0));
+    r.chips.push_back(LbElapsedChip(t0));
 
     r.body = std::string(projectScoped
                  ? "Created Python project workflow script at "

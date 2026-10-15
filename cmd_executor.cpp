@@ -19,6 +19,10 @@
 //     quoting a non-issue for anything the user types.
 //
 #include "cmd_executor.h"
+#include "lb_win_process.h"
+#include "path_safety.h"
+#include "lb_string_utils.h"
+#include "utf8_scrub.h"       // detect non-UTF-8 child output
 #include "lb_ascii.h"
 #include "copy_line_fold.h"   // fold MSBuild/vcpkg copy-progress runs
 #include "progress_output_fold.h" // collapse \r progress bars, PS 5.1 NativeCommandError wrappers
@@ -52,23 +56,6 @@ wxDEFINE_EVENT(wxEVT_CMD_OUTPUT,   wxCommandEvent);
 namespace {
 
 // ─── Helpers ─────────────────────────────────────────────────────
-
-// UTF-8 string -> UTF-16LE bytes.  PowerShell's -EncodedCommand expects
-// UTF-16LE, base64-encoded.
-std::wstring Utf8ToWide(const std::string& in) {
-#ifndef _WIN32
-    return lb_utf::Utf8ToWide(in);
-#else
-    if (in.empty()) return std::wstring();
-    int n = MultiByteToWideChar(CP_UTF8, 0, in.data(), (int)in.size(),
-                                nullptr, 0);
-    if (n <= 0) return std::wstring();
-    std::wstring out(n, L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, in.data(), (int)in.size(),
-                        out.data(), n);
-    return out;
-#endif
-}
 
 // Base64-encode the raw bytes of a wide string (UTF-16LE on Windows).
 std::string Base64EncodeUtf16LE(const std::wstring& w) {
@@ -199,7 +186,7 @@ std::wstring BuildPowerShellPayload(const std::string& userCommand) {
     }
     if (!lintBlock.empty()) lintBlock += "\r\n";
 
-    return Utf8ToWide(prefix + lintBlock + userCommand);
+    return path_safety::Utf8ToWide(prefix + lintBlock + userCommand);
 }
 
 #ifdef _WIN32
@@ -280,21 +267,6 @@ const PowerShellChoice& ResolvePowerShell()
 
 #endif // _WIN32
 
-std::string WideToUtf8(const std::wstring& in) {
-#ifndef _WIN32
-    return lb_utf::WideToUtf8(in);
-#else
-    if (in.empty()) return std::string();
-    int n = WideCharToMultiByte(CP_UTF8, 0, in.data(), (int)in.size(),
-                                nullptr, 0, nullptr, nullptr);
-    if (n <= 0) return std::string();
-    std::string out(n, '\0');
-    WideCharToMultiByte(CP_UTF8, 0, in.data(), (int)in.size(),
-                        out.data(), n, nullptr, nullptr);
-    return out;
-#endif
-}
-
 std::string JoinPathLocal(const std::string& a, const std::string& b)
 {
     if (a.empty()) return b;
@@ -314,13 +286,6 @@ std::string BaseNameLocal(const std::string& path)
     std::string clean = TrimTrailingSeparatorsLocal(path);
     size_t pos = clean.find_last_of("/\\");
     return (pos == std::string::npos) ? clean : clean.substr(pos + 1);
-}
-
-std::string LowerForOutputLocal(std::string s)
-{
-    std::transform(s.begin(), s.end(), s.begin(),
-                   [](unsigned char c){ return static_cast<char>(lb_ascii::ToLower(c)); });
-    return s;
 }
 
 bool StartsWithLocal(const std::string& s, const std::string& prefix)
@@ -343,7 +308,7 @@ std::string NormalizePathForCompareLocal(const std::string& path)
 
     std::string normalized = WxToUtf8Local(fn.GetFullPath());
     std::replace(normalized.begin(), normalized.end(), '/', '\\');
-    normalized = LowerForOutputLocal(normalized);
+    normalized = LbLowerAscii(normalized);
     return TrimTrailingSeparatorsLocal(normalized);
 }
 
@@ -400,7 +365,7 @@ std::string UniqueOutputPathLocal(const std::string& dir,
             : (safeStem + "_" + std::to_string(i + 1) + suffix);
         std::string path = JoinPathLocal(dir, displayNameOut);
 #ifdef _WIN32
-        DWORD attrs = GetFileAttributesW(Utf8ToWide(path).c_str());
+        DWORD attrs = GetFileAttributesW(path_safety::Utf8ToWide(path).c_str());
         if (attrs == INVALID_FILE_ATTRIBUTES) return path;
 #else
         struct stat st {};
@@ -474,7 +439,7 @@ size_t FileSizeLocal(const std::string& path)
     return ::stat(path.c_str(), &st) == 0 ? static_cast<size_t>(st.st_size) : 0;
 #else
     WIN32_FILE_ATTRIBUTE_DATA data = {};
-    if (!GetFileAttributesExW(Utf8ToWide(path).c_str(), GetFileExInfoStandard, &data)) return 0;
+    if (!GetFileAttributesExW(path_safety::Utf8ToWide(path).c_str(), GetFileExInfoStandard, &data)) return 0;
     ULARGE_INTEGER u;
     u.HighPart = data.nFileSizeHigh;
     u.LowPart = data.nFileSizeLow;
@@ -485,7 +450,7 @@ size_t FileSizeLocal(const std::string& path)
 bool WriteUtf8TextFileLocal(const std::string& path, const std::string& content)
 {
     try {
-        std::ofstream f(std::filesystem::path(Utf8ToWide(path)), std::ios::binary | std::ios::trunc);
+        std::ofstream f(std::filesystem::path(path_safety::Utf8ToWide(path)), std::ios::binary | std::ios::trunc);
         if (!f) return false;
         f.write(content.data(), static_cast<std::streamsize>(content.size()));
         return f.good();
@@ -533,7 +498,10 @@ void ExternalizeOneStreamLocal(CmdResult& result,
     f.lineCount   = static_cast<int>(CountLinesLocal(fileBody));
     result.presentedFiles.push_back(std::move(f));
 
-    streamText = BuildHeadTailPreviewLocal(streamText, displayName, streamWasCapped);
+    // Name the saved file by its full path: a bare name does not resolve
+    // from the Workspace (the file lives in the chat's ToolOutputs folder),
+    // so "read <name>" failed on the first try.
+    streamText = BuildHeadTailPreviewLocal(streamText, path, streamWasCapped);
 }
 
 void ApplyLargeOutputHandlingLocal(CmdResult& result, const std::string& cwd)
@@ -557,7 +525,7 @@ void ApplyLargeOutputHandlingLocal(CmdResult& result, const std::string& cwd)
 
 std::string LanguageForCreatedFileLocal(const std::string& path)
 {
-    std::string name = LowerForOutputLocal(BaseNameLocal(path));
+    std::string name = LbLowerAscii(BaseNameLocal(path));
     size_t dot = name.find_last_of('.');
     if (dot == std::string::npos) return std::string();
     std::string ext = name.substr(dot + 1);
@@ -586,7 +554,7 @@ bool IsBlankTextLocal(const std::string& s)
 bool IsRegularFileLocal(const std::string& path)
 {
 #ifdef _WIN32
-    DWORD attrs = GetFileAttributesW(Utf8ToWide(path).c_str());
+    DWORD attrs = GetFileAttributesW(path_safety::Utf8ToWide(path).c_str());
     return attrs != INVALID_FILE_ATTRIBUTES &&
            (attrs & FILE_ATTRIBUTE_DIRECTORY) == 0;
 #else
@@ -668,7 +636,7 @@ void AttachExplicitPowerShellArtifactsLocal(CmdResult& result,
         std::string probe = originalLine;
         size_t first = probe.find_first_not_of(" \t");
         if (first != std::string::npos) probe.erase(0, first);
-        std::string lower = LowerForOutputLocal(probe);
+        std::string lower = LbLowerAscii(probe);
 
         const std::string marker = "artifact_file:";
         const bool isMarker = StartsWithLocal(lower, marker);
@@ -858,17 +826,7 @@ void StripClixmlInPlace(std::string& s) {
 
 #ifdef _WIN32
 // RAII for Win32 HANDLEs.
-struct HandleGuard {
-    HANDLE h = nullptr;
-    HandleGuard() = default;
-    explicit HandleGuard(HANDLE handle) : h(handle) {}
-    ~HandleGuard() {
-        if (h && h != INVALID_HANDLE_VALUE) CloseHandle(h);
-    }
-    HandleGuard(const HandleGuard&) = delete;
-    HandleGuard& operator=(const HandleGuard&) = delete;
-    HANDLE release() { HANDLE r = h; h = nullptr; return r; }
-};
+using lb_win::HandleGuard;   // lb_win_process.h
 
 struct ProcThreadAttrGuard {
     std::vector<BYTE> buffer;
@@ -911,6 +869,30 @@ struct ProcThreadAttrGuard {
     }
 };
 
+// PowerShell reports a PARSE error before the payload runs, so the
+// prefix that switches the console to UTF-8 never executes and the error
+// text (which echoes the command, with any accents or curly quotes)
+// arrives in the OEM code page.  Handing those bytes on as UTF-8 lost the
+// whole message: the tool showed "exit 1" and nothing else.  Valid UTF-8
+// is returned unchanged; anything else is decoded from the OEM code page.
+void RepairNonUtf8StreamLocal(std::string& s)
+{
+    if (s.empty() || lb_utf8::IsValid(s)) return;
+    const int wlen = ::MultiByteToWideChar(CP_OEMCP, 0, s.data(),
+                                           static_cast<int>(s.size()), nullptr, 0);
+    if (wlen <= 0) { s = lb_utf8::Scrub(s); return; }
+    std::wstring w(static_cast<size_t>(wlen), L'\0');
+    ::MultiByteToWideChar(CP_OEMCP, 0, s.data(), static_cast<int>(s.size()),
+                          &w[0], wlen);
+    const int ulen = ::WideCharToMultiByte(CP_UTF8, 0, w.data(), wlen,
+                                           nullptr, 0, nullptr, nullptr);
+    if (ulen <= 0) { s = lb_utf8::Scrub(s); return; }
+    std::string out(static_cast<size_t>(ulen), '\0');
+    ::WideCharToMultiByte(CP_UTF8, 0, w.data(), wlen, &out[0], ulen,
+                          nullptr, nullptr);
+    s = std::move(out);
+}
+
 void TrimIncompleteUtf8Tail(std::string& s)
 {
     if (s.empty()) return;
@@ -940,15 +922,7 @@ void TrimIncompleteUtf8Tail(std::string& s)
         s.resize(start);
 }
 
-void CancelThreadSynchronousIoLocal(HANDLE threadHandle)
-{
-    if (!threadHandle) return;
-    using Fn = BOOL (WINAPI *)(HANDLE);
-    HMODULE kernel = GetModuleHandleW(L"kernel32.dll");
-    if (!kernel) return;
-    auto* fn = reinterpret_cast<Fn>(GetProcAddress(kernel, "CancelSynchronousIo"));
-    if (fn) fn(threadHandle);
-}
+using lb_win::CancelThreadSynchronousIo;   // lb_win_process.h
 
 // Pipe reader: drains `readEnd` into `dest`, stopping early after
 // kMaxOutputBytes have been accepted.  Further bytes are discarded but the
@@ -1051,7 +1025,7 @@ enum class JobDescendantState {
 // a same-named executable in the workspace is not a compiler helper.
 bool IsMsvcCleanupHelperLocal(const std::wstring& imagePath)
 {
-    std::string path = LowerForOutputLocal(WideToUtf8(imagePath));
+    std::string path = LbLowerAscii(path_safety::WideToUtf8(imagePath));
     std::replace(path.begin(), path.end(), '/', '\\');
     if (path.size() < 3 || path[1] != ':' || path[2] != '\\') return false;
     const std::string marker = "\\vc\\tools\\msvc\\";
@@ -1153,7 +1127,7 @@ JobDescendantState QueryJobDescendantsLocal(
                         if (!IsMsvcCleanupHelperLocal(path))
                             allLiveAreBuildHelpers = false;
                         const size_t slash = path.find_last_of(L"\\/");
-                        report(pid, WideToUtf8(slash == std::wstring::npos
+                        report(pid, path_safety::WideToUtf8(slash == std::wstring::npos
                             ? path : path.substr(slash + 1)) + " (running)");
                     } else {
                         allLiveAreBuildHelpers = false;
@@ -1297,7 +1271,7 @@ private:
         std::wstring wCmdLine =
             L"\"" + psExe + L"\" -NoProfile -NonInteractive "
             L"-OutputFormat Text -EncodedCommand " +
-            Utf8ToWide(b64);
+            path_safety::Utf8ToWide(b64);
 
         // 2. Create two inheritable pipes (stdout + stderr).
         SECURITY_ATTRIBUTES sa = {};
@@ -1380,7 +1354,7 @@ private:
             // existence here — CreateProcessW will fail with a clear
             // error if the directory is bogus, and the worker surfaces
             // that as a stderr line in the result.
-            cwd = Utf8ToWide(m_cwd);
+            cwd = path_safety::Utf8ToWide(m_cwd);
         }
         if (cwd.empty()) cwd = ResolveUserProfileDir();
         LPCWSTR cwdArg = cwd.empty() ? nullptr : cwd.c_str();
@@ -1410,7 +1384,7 @@ private:
         if (!ok) {
             DWORD err = GetLastError();
             result.stderrText = "CreateProcess(PowerShell) failed for " +
-                                WideToUtf8(psExe) + ", error=" + std::to_string(err);
+                                path_safety::WideToUtf8(psExe) + ", error=" + std::to_string(err);
             result.exitCode = -1;
             return;
         }
@@ -1538,9 +1512,9 @@ private:
         if (forcedReaderStop) {
             stopReaders.store(true);
             if (outThread.joinable() && !stdoutReaderDone.load())
-                CancelThreadSynchronousIoLocal(outThread.native_handle());
+                CancelThreadSynchronousIo(outThread.native_handle());
             if (errThread.joinable() && !stderrReaderDone.load())
-                CancelThreadSynchronousIoLocal(errThread.native_handle());
+                CancelThreadSynchronousIo(errThread.native_handle());
         }
 
         // Drain readers. They have either seen EOF after the job closed or
@@ -1560,6 +1534,8 @@ private:
         result.truncated = result.stdoutTruncated || result.stderrTruncated;
         if (result.stdoutTruncated) TrimIncompleteUtf8Tail(result.stdoutText);
         if (result.stderrTruncated) TrimIncompleteUtf8Tail(result.stderrText);
+        RepairNonUtf8StreamLocal(result.stdoutText);
+        RepairNonUtf8StreamLocal(result.stderrText);
 
         // Strip PowerShell CLIXML serialization noise from both streams.
         // Must happen BEFORE the cancel/timeout breadcrumb below — we

@@ -1,5 +1,6 @@
 // server_manager.cpp
 #include "server_manager.h"
+#include "lb_string_utils.h"
 #include "lb_ascii.h"
 #include "background_work.h"   // lb::BeginBackgroundWork (drained in MyApp::OnExit)
 #include "server_log_hints.h"   // plain-language startup failure hints
@@ -144,13 +145,6 @@ static std::string ReadLogTail(const std::string& path, size_t maxBytes = 4096)
 // ═══════════════════════════════════════════════════════════════════
 //  ServerHealthThread — polls /health until 200 or timeout
 
-static std::string ToLowerAscii(std::string s)
-{
-    std::transform(s.begin(), s.end(), s.begin(),
-                   [](unsigned char c) { return static_cast<char>(lb_ascii::ToLower(c)); });
-    return s;
-}
-
 static bool ContainsAny(const std::string& haystack,
                         std::initializer_list<const char*> needles)
 {
@@ -207,7 +201,7 @@ static bool IsBundledModelPath(const std::string& ggufPath)
 // problems such as a bad model path, CUDA/DLL failure, or port conflict.
 static bool LooksLikeMtpFailure(const std::string& error)
 {
-    const std::string e = ToLowerAscii(error);
+    const std::string e = LbLowerAscii(error);
 
     // Prefer direct llama.cpp startup diagnostics when present.
     if (ContainsAny(e, {
@@ -265,7 +259,7 @@ static bool LooksLikeMtpFailure(const std::string& error)
 
 static bool LooksLikeJinjaOrTemplateFailure(const std::string& error)
 {
-    const std::string e = ToLowerAscii(error);
+    const std::string e = LbLowerAscii(error);
 
     if (ContainsAny(e, {"--jinja", "jinja"})) {
         return true;
@@ -1530,7 +1524,7 @@ std::string ServerManager::ModelDisplayName(const std::string& ggufPath)
     // historical short-label behavior by returning only their final path
     // segment.  Actual GGUF paths continue through the existing bundle/
     // loose-file logic below.
-    const std::string lower = ToLowerAscii(ggufPath);
+    const std::string lower = LbLowerAscii(ggufPath);
     const bool isGgufPath =
         lower.size() >= 5 &&
         lower.compare(lower.size() - 5, 5, ".gguf") == 0;

@@ -17,6 +17,7 @@
 #include "reasoning_policy.h"
 #include "repetition_guard.h"
 #include "chatgpt_auth_core.h"   // plan-route namespace + error vocabulary
+#include "utf8_scrub.h"          // repair invalid UTF-8 before Poco parses it
 #include <Poco/JSON/Array.h>
 #include <Poco/JSON/Object.h>
 #include <Poco/JSON/Parser.h>
@@ -288,8 +289,11 @@ inline void AppendAssistantToolTurn(Array::Ptr input,
 // converter's behavior for every Responses target.
 inline std::string BuildChatRequest(const std::string& chatJson, bool chatgptPlan = false)
 {
+    // Poco's parser rejects invalid UTF-8, and this runs on the whole
+    // history every request.  Chats saved before the tool-result scrub
+    // can still hold a bad byte; repair instead of failing forever.
     Poco::JSON::Parser parser;
-    const auto chat = parser.parse(chatJson).extract<Object::Ptr>();
+    const auto chat = parser.parse(lb_utf8::Scrub(chatJson)).extract<Object::Ptr>();
     if (!chat) throw std::runtime_error("Invalid chat request.");
     if (chat->has("modalities") || chat->has("functions"))
         throw std::runtime_error("This Responses connection supports text chat and function tools only.");

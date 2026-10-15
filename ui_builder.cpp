@@ -7,6 +7,9 @@
 #include "lb_icons.h"
 #include "lb_scroll_rail.h"
 
+#include <wx/wrapsizer.h>
+#include <algorithm>
+
 namespace UIBuilder {
 
 TopBarWidgets BuildTopBar(wxWindow* parent, wxBoxSizer* mainSizer,
@@ -266,14 +269,35 @@ InputAreaWidgets BuildInputArea(wxWindow* parent, wxBoxSizer* parentSizer,
     LbIcons::ApplyFlatButton(w.attachButton, LbIcons::Id::Attach,
                              theme, theme.bgInputArea);
     w.attachButton->SetCursor(wxCURSOR_HAND);
-    w.inputSizer->Add(w.attachButton, 0, wxALIGN_CENTER_VERTICAL | wxLEFT, 6);
+    // Bottom-aligned (not centred): when thumbnails make the input card
+    // taller, the buttons stay level with the text line, like Claude's
+    // composer.  For a one-line composer this is identical to centring.
+    w.inputSizer->Add(w.attachButton, 0, wxALIGN_BOTTOM | wxLEFT, 6);
+
+    // Input card: the visible "box".  Attachment thumbnails go in a tray
+    // at its top; the text field fills the rest.  Without attachments the
+    // tray is hidden and the card looks exactly like the old bare field.
+    w.inputCard = new wxPanel(w.inputContainer, wxID_ANY);
+    w.inputCard->SetBackgroundColour(theme.bgInputField);
+    auto* cardSizer = new wxBoxSizer(wxVERTICAL);
+
+    w.attachTray = new wxPanel(w.inputCard, wxID_ANY);
+    w.attachTray->SetBackgroundColour(theme.bgInputField);
+    // NOT the default flags: wxWRAPSIZER_DEFAULT_FLAGS includes
+    // wxEXTEND_LAST_ON_EACH_LINE, which stretches the last card on each row
+    // across the full width of the (now full-width) tray.
+    w.attachTraySizer = new wxWrapSizer(wxHORIZONTAL, wxREMOVE_LEADING_SPACES);
+    w.attachTray->SetSizer(w.attachTraySizer);
+    w.attachTray->Hide();
+    cardSizer->Add(w.attachTray, 0, wxEXPAND | wxLEFT | wxTOP | wxRIGHT,
+                   w.inputCard->FromDIP(8));
 
     // Text input field (ChatInputCtrl intercepts WM_PASTE for image clipboard).
     // It lives in a clip panel so MyFrame's LbScrollRail can push the native
     // vertical scrollbar out of view and draw the themed rail beside it,
     // like the transcript and sidebar.  The clip follows the control's min
     // height, so SetMinSize() auto-grow / drag-resize keep working.
-    w.inputClip = new LbFollowClip(w.inputContainer);
+    w.inputClip = new LbFollowClip(w.inputCard);
     w.inputClip->SetBackgroundColour(theme.bgInputField);
     w.userInputCtrl = new ChatInputCtrl(w.inputClip, wxID_ANY, wxEmptyString,
         wxDefaultPosition, wxDefaultSize,
@@ -284,7 +308,9 @@ InputAreaWidgets BuildInputArea(wxWindow* parent, wxBoxSizer* parentSizer,
     w.inputClip->SetFollowed(w.userInputCtrl);
     w.inputFieldRow = new wxBoxSizer(wxHORIZONTAL);
     w.inputFieldRow->Add(w.inputClip, 1, wxEXPAND);
-    w.inputSizer->Add(w.inputFieldRow, 1, wxEXPAND | wxTOP | wxBOTTOM, 6);
+    cardSizer->Add(w.inputFieldRow, 1, wxEXPAND);
+    w.inputCard->SetSizer(cardSizer);
+    w.inputSizer->Add(w.inputCard, 1, wxEXPAND | wxTOP | wxBOTTOM, 6);
 
     // Send button — the primary action
     w.sendButton = new wxButton(w.inputContainer, wxID_ANY, "Send",
@@ -295,7 +321,14 @@ InputAreaWidgets BuildInputArea(wxWindow* parent, wxBoxSizer* parentSizer,
     btnFont.SetPointSize(LbUiPt(11));
     btnFont.SetWeight(wxFONTWEIGHT_MEDIUM);
     w.sendButton->SetFont(btnFont);
-    w.inputSizer->Add(w.sendButton, 0, wxALIGN_CENTER_VERTICAL | wxLEFT | wxRIGHT, 6);
+    // Send/Stop share one bottom-aligned column.  The bottom border centres
+    // the 36 px button against the attach button's height, so a one-line
+    // composer looks exactly as it did with wxALIGN_CENTER_VERTICAL (at any
+    // DPI), while a taller card keeps the button beside the text line.
+    const int actionPad = std::max(0,
+        (w.attachButton->GetSize().y - w.sendButton->GetSize().y) / 2);
+    auto* actionCol = new wxBoxSizer(wxVERTICAL);
+    actionCol->Add(w.sendButton, 0, wxBOTTOM, actionPad);
 
     // Stop button — red, hidden by default, replaces Send
     w.stopButton = new wxButton(w.inputContainer, wxID_ANY, "Stop",
@@ -304,7 +337,8 @@ InputAreaWidgets BuildInputArea(wxWindow* parent, wxBoxSizer* parentSizer,
     w.stopButton->SetForegroundColour(theme.stopButtonText);
     w.stopButton->SetFont(btnFont);
     w.stopButton->Hide();
-    w.inputSizer->Add(w.stopButton, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 6);
+    actionCol->Add(w.stopButton, 0, wxBOTTOM, actionPad);
+    w.inputSizer->Add(actionCol, 0, wxALIGN_BOTTOM | wxLEFT | wxRIGHT, 6);
 
     outerSizer->Add(w.inputSizer, 0, wxEXPAND | wxALL, 4);
     w.inputContainer->SetSizer(outerSizer);

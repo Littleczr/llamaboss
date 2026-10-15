@@ -1,6 +1,7 @@
 // tool_edit.cpp
 
 #include "tool_edit.h"
+#include "lb_string_utils.h"
 #include "lb_ascii.h"
 #include "tool_path.h"
 #include "tool_path_safety.h"   // IsUnderAllowedWriteRoot, Basename
@@ -40,33 +41,6 @@ const std::string kOldSentinel = "<<<OLD>>>";
 const std::string kNewSentinel = "<<<NEW>>>";
 
 // ─── Helpers (file-local) ────────────────────────────────────────
-
-std::string HumanBytes(size_t b)
-{
-    std::ostringstream ss;
-    ss << std::fixed;
-    if (b < 1024) {
-        ss << b << " B";
-    } else if (b < 1024 * 1024) {
-        ss.precision(1);
-        ss << (b / 1024.0) << " KB";
-    } else {
-        ss.precision(2);
-        ss << (b / (1024.0 * 1024.0)) << " MB";
-    }
-    return ss.str();
-}
-
-std::string ElapsedChip(std::chrono::steady_clock::time_point t0)
-{
-    double elapsed = std::chrono::duration<double>(
-        std::chrono::steady_clock::now() - t0).count();
-    std::ostringstream ts;
-    ts << std::fixed;
-    ts.precision(elapsed < 10.0 ? 2 : 1);
-    ts << elapsed << "s";
-    return ts.str();
-}
 
 // ─── Heredoc args parsing ────────────────────────────────────────
 //
@@ -580,7 +554,7 @@ EditResult EditFile(const std::string& argsBlob,
     if (!parsed.ok) {
         r.chips.push_back("failed");
         r.errorBody = parsed.error;
-        r.chips.push_back(ElapsedChip(t0));
+        r.chips.push_back(LbElapsedChip(t0));
         return r;
     }
 
@@ -588,7 +562,7 @@ EditResult EditFile(const std::string& argsBlob,
     if (ctx.cwd.empty()) {
         r.chips.push_back("blocked");
         r.errorBody = "No working directory set; refuse to edit.";
-        r.chips.push_back(ElapsedChip(t0));
+        r.chips.push_back(LbElapsedChip(t0));
         return r;
     }
 
@@ -596,7 +570,7 @@ EditResult EditFile(const std::string& argsBlob,
     if (resolved.empty()) {
         r.chips.push_back("failed");
         r.errorBody = "Could not resolve path: " + parsed.path;
-        r.chips.push_back(ElapsedChip(t0));
+        r.chips.push_back(LbElapsedChip(t0));
         return r;
     }
 
@@ -609,7 +583,7 @@ EditResult EditFile(const std::string& argsBlob,
                       tool_path_safety::AllowedWriteRootsDiagnostic(
                           ctx.cwd, ctx.activeProjectRoot, ctx.skillsRoot,
                           ctx.additionalWriteRoots);
-        r.chips.push_back(ElapsedChip(t0));
+        r.chips.push_back(LbElapsedChip(t0));
         return r;
     }
 
@@ -621,7 +595,7 @@ EditResult EditFile(const std::string& argsBlob,
         r.errorBody = mutation.Error();
         if (mutation.MissingFolder())
             r.errorBody += tool_path_safety::ConversationLaneWriteHint(parsed.path, ctx.cwd);
-        r.chips.push_back(ElapsedChip(t0));
+        r.chips.push_back(LbElapsedChip(t0));
         return r;
     }
 
@@ -632,7 +606,7 @@ EditResult EditFile(const std::string& argsBlob,
         r.chips.push_back("blocked");
         r.errorBody = "Filename '" + basename + "' has characters or "
                       "a shape that aren't safe on Windows.";
-        r.chips.push_back(ElapsedChip(t0));
+        r.chips.push_back(LbElapsedChip(t0));
         return r;
     }
 
@@ -660,7 +634,7 @@ EditResult EditFile(const std::string& argsBlob,
                       "scriptable extensions (PowerShell .ps1 scripts are "
                       "the exception, after approval). If the user wants "
                       "this, they can edit the file manually.";
-        r.chips.push_back(ElapsedChip(t0));
+        r.chips.push_back(LbElapsedChip(t0));
         return r;
     }
 
@@ -673,7 +647,7 @@ EditResult EditFile(const std::string& argsBlob,
             r.errorBody = "File does not exist: " + resolved +
                           ".\nUse write to create new files.";
         }
-        r.chips.push_back(ElapsedChip(t0));
+        r.chips.push_back(LbElapsedChip(t0));
         return r;
     }
 
@@ -682,7 +656,7 @@ EditResult EditFile(const std::string& argsBlob,
     if (wPath.empty()) {
         r.chips.push_back("failed");
         r.errorBody = "Path conversion failed: " + resolved;
-        r.chips.push_back(ElapsedChip(t0));
+        r.chips.push_back(LbElapsedChip(t0));
         return r;
     }
 
@@ -690,21 +664,21 @@ EditResult EditFile(const std::string& argsBlob,
     if (!f.is_open()) {
         r.chips.push_back("failed");
         r.errorBody = "Could not open file for reading: " + resolved;
-        r.chips.push_back(ElapsedChip(t0));
+        r.chips.push_back(LbElapsedChip(t0));
         return r;
     }
     std::streamsize fileSize = f.tellg();
     if (fileSize < 0) {
         r.chips.push_back("failed");
         r.errorBody = "Could not determine file size: " + resolved;
-        r.chips.push_back(ElapsedChip(t0));
+        r.chips.push_back(LbElapsedChip(t0));
         return r;
     }
     if ((size_t)fileSize > kEditMaxBytes) {
         r.chips.push_back("too large");
-        r.errorBody = "File too large to edit: " + HumanBytes((size_t)fileSize) +
-                      " (max " + HumanBytes(kEditMaxBytes) + ").";
-        r.chips.push_back(ElapsedChip(t0));
+        r.errorBody = "File too large to edit: " + LbToolHumanBytes((size_t)fileSize) +
+                      " (max " + LbToolHumanBytes(kEditMaxBytes) + ").";
+        r.chips.push_back(LbElapsedChip(t0));
         return r;
     }
 
@@ -718,9 +692,9 @@ EditResult EditFile(const std::string& argsBlob,
 
             r.chips.push_back("failed");
             r.errorBody = "Could not read the complete file: " + resolved +
-                          " (expected " + HumanBytes((size_t)fileSize) +
-                          ", read " + HumanBytes(got > 0 ? (size_t)got : 0) + ").";
-            r.chips.push_back(ElapsedChip(t0));
+                          " (expected " + LbToolHumanBytes((size_t)fileSize) +
+                          ", read " + LbToolHumanBytes(got > 0 ? (size_t)got : 0) + ").";
+            r.chips.push_back(LbElapsedChip(t0));
             return r;
         }
     }
@@ -730,7 +704,7 @@ EditResult EditFile(const std::string& argsBlob,
         r.chips.push_back("blocked");
         r.errorBody = "Refuses to edit files that appear to be binary or "
                       "UTF-16 encoded (NUL bytes found): " + resolved;
-        r.chips.push_back(ElapsedChip(t0));
+        r.chips.push_back(LbElapsedChip(t0));
         return r;
     }
 
@@ -755,7 +729,7 @@ EditResult EditFile(const std::string& argsBlob,
                       "indentation or whitespace different from "
                       "your OLD block, copy the exact text from a "
                       "read of the file first.";
-        r.chips.push_back(ElapsedChip(t0));
+        r.chips.push_back(LbElapsedChip(t0));
         return r;
     }
     if (hits >= 2) {
@@ -775,7 +749,7 @@ EditResult EditFile(const std::string& argsBlob,
                       " (lines " + lineList.str() + ").\n"
                       "Add more surrounding context to your OLD "
                       "block so it identifies exactly one location.";
-        r.chips.push_back(ElapsedChip(t0));
+        r.chips.push_back(LbElapsedChip(t0));
         return r;
     }
 
@@ -798,9 +772,9 @@ EditResult EditFile(const std::string& argsBlob,
     if (outputBytes.size() > kEditMaxBytes) {
         r.chips.push_back("too large");
         r.errorBody = "Result of edit would exceed cap: " +
-                      HumanBytes(outputBytes.size()) +
-                      " (max " + HumanBytes(kEditMaxBytes) + ").";
-        r.chips.push_back(ElapsedChip(t0));
+                      LbToolHumanBytes(outputBytes.size()) +
+                      " (max " + LbToolHumanBytes(kEditMaxBytes) + ").";
+        r.chips.push_back(LbElapsedChip(t0));
         return r;
     }
 
@@ -835,7 +809,7 @@ EditResult EditFile(const std::string& argsBlob,
         if (!tmp.path.empty()) {
             r.errorBody += "\nLast attempted temp path: " + tmp.path;
         }
-        r.chips.push_back(ElapsedChip(t0));
+        r.chips.push_back(LbElapsedChip(t0));
         return r;
     }
 
@@ -860,7 +834,7 @@ EditResult EditFile(const std::string& argsBlob,
                 r.errorBody = "WriteFile failed (Win32 error " +
                               std::to_string(err) + ").";
                 attachAttemptedDiff();
-                r.chips.push_back(ElapsedChip(t0));
+                r.chips.push_back(LbElapsedChip(t0));
                 return r;
             }
             data    += written;
@@ -876,7 +850,7 @@ EditResult EditFile(const std::string& argsBlob,
         r.errorBody = "FlushFileBuffers on tmp failed (Win32 error " +
                       std::to_string(err) + ").";
         attachAttemptedDiff();
-        r.chips.push_back(ElapsedChip(t0));
+        r.chips.push_back(LbElapsedChip(t0));
         return r;
     }
 
@@ -887,7 +861,7 @@ EditResult EditFile(const std::string& argsBlob,
                       std::to_string(err) +
                       "); tmp file preserved at: " + tmpPath;
         attachAttemptedDiff();
-        r.chips.push_back(ElapsedChip(t0));
+        r.chips.push_back(LbElapsedChip(t0));
         return r;
     }
 
@@ -897,7 +871,7 @@ EditResult EditFile(const std::string& argsBlob,
         r.chips.push_back("conflict");
         r.errorBody = mutation.Error() + "\nThe attempted edit is preserved at: " + tmpPath;
         attachAttemptedDiff();
-        r.chips.push_back(ElapsedChip(t0));
+        r.chips.push_back(LbElapsedChip(t0));
         return r;
     }
     mutation.ReleaseTargetForCommit();
@@ -912,7 +886,7 @@ EditResult EditFile(const std::string& argsBlob,
                       ").\nThe edited content is preserved at: " +
                       tmpPath;
         attachAttemptedDiff();
-        r.chips.push_back(ElapsedChip(t0));
+        r.chips.push_back(LbElapsedChip(t0));
         return r;
     }
 
@@ -926,7 +900,7 @@ EditResult EditFile(const std::string& argsBlob,
         if (!tmp.path.empty()) {
             r.errorBody += "\nLast attempted temp path: " + tmp.path;
         }
-        r.chips.push_back(ElapsedChip(t0));
+        r.chips.push_back(LbElapsedChip(t0));
         return r;
     }
     const std::string& tmpPath = tmp.path;
@@ -938,7 +912,7 @@ EditResult EditFile(const std::string& argsBlob,
         r.chips.push_back("failed");
         r.errorBody = std::string("Writing the temp file failed (") + std::strerror(err) + ").";
         attachAttemptedDiff();
-        r.chips.push_back(ElapsedChip(t0));
+        r.chips.push_back(LbElapsedChip(t0));
         return r;
     }
     if (::close(tmp.fd) != 0) {
@@ -948,7 +922,7 @@ EditResult EditFile(const std::string& argsBlob,
         r.errorBody = std::string("Closing the temp file failed (") + std::strerror(err) +
                       "); tmp file preserved at: " + tmpPath;
         attachAttemptedDiff();
-        r.chips.push_back(ElapsedChip(t0));
+        r.chips.push_back(LbElapsedChip(t0));
         return r;
     }
     tmp.fd = -1;
@@ -957,7 +931,7 @@ EditResult EditFile(const std::string& argsBlob,
         r.chips.push_back("conflict");
         r.errorBody = mutation.Error() + "\nThe attempted edit is preserved at: " + tmpPath;
         attachAttemptedDiff();
-        r.chips.push_back(ElapsedChip(t0));
+        r.chips.push_back(LbElapsedChip(t0));
         return r;
     }
     mutation.ReleaseTargetForCommit();
@@ -966,7 +940,7 @@ EditResult EditFile(const std::string& argsBlob,
         r.errorBody = std::string("Rename failed (") + std::strerror(err) +
                       ").\nThe edited content is preserved at: " + tmpPath;
         attachAttemptedDiff();
-        r.chips.push_back(ElapsedChip(t0));
+        r.chips.push_back(LbElapsedChip(t0));
         return r;
     }
 #endif
@@ -977,6 +951,6 @@ EditResult EditFile(const std::string& argsBlob,
     r.chips.push_back(std::to_string(plusLines) + "+");
     r.body     = diffBody;
     r.bodyLang = "diff";
-    r.chips.push_back(ElapsedChip(t0));
+    r.chips.push_back(LbElapsedChip(t0));
     return r;
 }

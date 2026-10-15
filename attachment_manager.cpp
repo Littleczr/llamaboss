@@ -3,6 +3,7 @@
 // Supports multiple simultaneous attachments.
 
 #include "attachment_manager.h"
+#include "lb_string_utils.h"
 #include "lb_ascii.h"
 #include "var_store.h"
 #include "path_safety.h"
@@ -19,14 +20,6 @@
 
 
 namespace {
-
-std::string LowerAscii(std::string s)
-{
-    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char ch) {
-        return static_cast<char>(lb_ascii::ToLower(ch));
-    });
-    return s;
-}
 
 bool IsAsciiWordChar(char ch)
 {
@@ -79,7 +72,7 @@ std::string FenceForContent(const std::string& content)
 
 bool LooksLikePdfFormFillRequest(const std::string& userText)
 {
-    const std::string t = LowerAscii(userText);
+    const std::string t = LbLowerAscii(userText);
 
     // Keep this heuristic deliberately narrow and product-neutral.  Project-
     // specific form routing vocabulary belongs in project/workflow guidance,
@@ -1158,7 +1151,7 @@ bool AttachmentManager::IsTextFile(const std::string& path)
 
 std::string AttachmentManager::GuessMimeType(const std::string& filename)
 {
-    std::string lowerName = LowerAscii(filename);
+    std::string lowerName = LbLowerAscii(filename);
     size_t slash = lowerName.find_last_of("/\\");
     std::string base = (slash == std::string::npos) ? lowerName : lowerName.substr(slash + 1);
 

@@ -5,6 +5,7 @@
 
 #include "tool_python_syntax.h"
 #include "path_safety.h"   // Utf8ToWide
+#include "utf8_scrub.h"    // checker output -> valid UTF-8
 
 #include "lb_windows.h"
 
@@ -132,8 +133,14 @@ SyntaxCheckResult CheckFile(const std::string& filePath)
     // -I (isolated): no cwd / user-site on sys.path, PYTHON* env ignored,
     // so a stray sys.py or traceback.py can't hijack the checker.
     // -B: belt and braces; compile() itself never writes bytecode.
+    // -X utf8: REQUIRED.  -I ignores PYTHONUTF8/PYTHONIOENCODING, so
+    // without it stderr to a pipe uses the ANSI code page and a curly
+    // apostrophe in the echoed source line arrives as raw cp1252 0x92.
+    // That byte reached the chat history and broke every later request
+    // ("JSON Exception: invalid UTF-8 character").  -X is honoured under
+    // -I, and matches python_runner.cpp / python_session.cpp.
     const std::wstring args =
-        L" -I -B -c " + QuoteWinArg(kCompileCheckProgram) + L" " + QuoteWinArg(wPath);
+        L" -I -B -X utf8 -c " + QuoteWinArg(kCompileCheckProgram) + L" " + QuoteWinArg(wPath);
     std::vector<std::wstring> commands = {
         L"py.exe -3" + args,
         L"python.exe" + args,
@@ -196,7 +203,9 @@ SyntaxCheckResult CheckFile(const std::string& filePath)
         // pipe drained so the child can always make progress and exit.
         std::string output;
         std::thread reader([readPipe, &output]() {
-            output = ReadAllFromPipe(readPipe);
+            // Scrubbed even with -X utf8: the py launcher's own messages
+            // and the 64 KiB truncation cut are not guaranteed UTF-8.
+            output = lb_utf8::Scrub(ReadAllFromPipe(readPipe));
         });
 
         DWORD wait = ::WaitForSingleObject(pi.hProcess, 10000);

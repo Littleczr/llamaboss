@@ -51,6 +51,14 @@ struct InputAreaWidgets {
     // in inputClip; MyFrame adds its LbScrollRail to inputFieldRow.
     LbFollowClip*  inputClip;
     wxBoxSizer*    inputFieldRow;
+    // The input "card": one bgInputField surface holding the pending-
+    // attachment tray (top, hidden until something is queued) and the
+    // text field row (bottom) -- thumbnails sit INSIDE the input box,
+    // like Claude's composer.  inputFieldRow's windows (clip + MyFrame's
+    // scroll rail) must be children of inputCard.
+    wxPanel*       inputCard;
+    wxPanel*       attachTray;
+    wxSizer*       attachTraySizer;
 };
 
 // Creates the input row: [📎] [TextInput] [Send/Stop].

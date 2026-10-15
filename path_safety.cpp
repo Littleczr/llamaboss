@@ -185,10 +185,11 @@ std::string SanitizeFilename(const std::string& raw,
 //  UTF-8 <-> wide conversion (see header for rationale)
 // ═══════════════════════════════════════════════════════════════════
 //
-// Note: identical helpers exist (file-locally) in cmd_executor.cpp,
-// server_manager.cpp, tool_grep.cpp, tool_ls.cpp, tool_open.cpp, and
-// tool_path.cpp.  Those duplicates can be migrated to call these in
-// a future cleanup pass; new code should use these directly.
+// These are the shared converters.  The tool_*.cpp, cmd_executor.cpp and
+// python_runner/python_session copies were removed in the 20261014 lean
+// pass.  Two intentional variants remain: tool_web_fetch.cpp (falls back to
+// CP_ACP for non-UTF-8 input) and workspace_delta.h (header-only so the
+// standalone tests build without this file).  New code should use these.
 
 #ifndef _WIN32
 std::wstring Utf8ToWide(const std::string& in) { return lb_utf::Utf8ToWide(in); }

@@ -5,6 +5,8 @@
 // Windows process model but narrows the command surface to fixed helpers.
 
 #include "python_runner.h"
+#include "lb_win_process.h"
+#include "lb_string_utils.h"
 #include "lb_ascii.h"
 
 #include "python_arg_policy.h"
@@ -43,16 +45,6 @@ wxDEFINE_EVENT(wxEVT_PYTHON_ERROR,    wxCommandEvent);
 
 // (portable worker: Win32-only pieces are fenced individually below)
 namespace {
-
-std::wstring Utf8ToWide(const std::string& s)
-{
-    return path_safety::Utf8ToWide(s);
-}
-
-std::string WideToUtf8(const std::wstring& s)
-{
-    return path_safety::WideToUtf8(s);
-}
 
 // Strict UTF-8 probe used by NormalizeProcessOutputUtf8().
 bool IsStrictUtf8(const std::string& bytes)
@@ -178,7 +170,7 @@ std::string DecodeWithCodePageToUtf8(UINT codePage,
         return std::string();
     }
 
-    return WideToUtf8(wide);
+    return path_safety::WideToUtf8(wide);
 }
 #endif
 
@@ -304,7 +296,6 @@ std::string ParentDirOf(const std::string& path)
     return s.substr(0, pos);
 }
 
-std::string LowerLocal(std::string s);
 
 std::string BuiltInHelperScriptsDir()
 {
@@ -405,7 +396,7 @@ std::string ScanRootForCwd(const std::string& cwd)
 #ifdef _WIN32
 bool FileExistsRegular(const std::string& path)
 {
-    DWORD attrs = GetFileAttributesW(Utf8ToWide(path).c_str());
+    DWORD attrs = GetFileAttributesW(path_safety::Utf8ToWide(path).c_str());
     return attrs != INVALID_FILE_ATTRIBUTES &&
            (attrs & FILE_ATTRIBUTE_DIRECTORY) == 0;
 }
@@ -452,7 +443,7 @@ bool CreateUniqueSidecarForWrite(const std::string& targetPath,
             return false;
         }
 
-        HANDLE h = CreateFileW(Utf8ToWide(candidate).c_str(),
+        HANDLE h = CreateFileW(path_safety::Utf8ToWide(candidate).c_str(),
                                GENERIC_WRITE,
                                0,
                                nullptr,
@@ -519,15 +510,15 @@ bool WriteBytesAtomic(const std::string& targetPath,
     CloseHandle(h);
 
     if (!ok) {
-        DeleteFileW(Utf8ToWide(tmpPath).c_str());
+        DeleteFileW(path_safety::Utf8ToWide(tmpPath).c_str());
         return false;
     }
 
-    if (!MoveFileExW(Utf8ToWide(tmpPath).c_str(),
-                     Utf8ToWide(targetPath).c_str(),
+    if (!MoveFileExW(path_safety::Utf8ToWide(tmpPath).c_str(),
+                     path_safety::Utf8ToWide(targetPath).c_str(),
                      MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
         DWORD err = GetLastError();
-        DeleteFileW(Utf8ToWide(tmpPath).c_str());
+        DeleteFileW(path_safety::Utf8ToWide(tmpPath).c_str());
         errorOut = "Could not install file atomically: " + targetPath +
                    ", error=" + std::to_string(err);
         return false;
@@ -581,7 +572,7 @@ bool WriteUtf8ArgTempFile(const std::string& prefix,
     CloseHandle(h);
 
     if (!ok) {
-        DeleteFileW(Utf8ToWide(pathOut).c_str());
+        DeleteFileW(path_safety::Utf8ToWide(pathOut).c_str());
         pathOut.clear();
         return false;
     }
@@ -735,20 +726,13 @@ bool WriteUtf8ArgTempFile(const std::string& prefix,
 
 #endif
 
-std::string LowerLocal(std::string s)
-{
-    std::transform(s.begin(), s.end(), s.begin(),
-                   [](unsigned char c){ return static_cast<char>(lb_ascii::ToLower(c)); });
-    return s;
-}
-
 std::string ExtensionLower(const std::string& path)
 {
     size_t slash = path.find_last_of("/\\");
     std::string base = (slash == std::string::npos) ? path : path.substr(slash + 1);
     size_t dot = base.find_last_of('.');
     if (dot == std::string::npos) return std::string();
-    return LowerLocal(base.substr(dot));
+    return LbLowerAscii(base.substr(dot));
 }
 
 std::string LanguageForFile(const std::string& path)
@@ -795,7 +779,7 @@ std::string NormalizePathForCompare(std::string path)
     return path;
 #else
     if (!path.empty()) {
-        std::wstring w = Utf8ToWide(path);
+        std::wstring w = path_safety::Utf8ToWide(path);
         DWORD needed = GetFullPathNameW(w.c_str(), 0, nullptr, nullptr);
         if (needed > 0) {
             std::vector<wchar_t> buf(static_cast<size_t>(needed) + 1, L'\0');
@@ -804,7 +788,7 @@ std::string NormalizePathForCompare(std::string path)
                                          buf.data(),
                                          nullptr);
             if (len > 0 && len < buf.size()) {
-                path = WideToUtf8(std::wstring(buf.data(), len));
+                path = path_safety::WideToUtf8(std::wstring(buf.data(), len));
             }
         }
     }
@@ -941,7 +925,7 @@ std::string TrimArtifactValue(const std::string& raw)
         size_t open = s.find_last_of('(');
         if (open != std::string::npos && open > 0 && s[open - 1] == ' ') {
             std::string token = s.substr(open + 1, s.size() - open - 2);
-            std::string key = LowerLocal(token);
+            std::string key = LbLowerAscii(token);
             bool statusLike = !key.empty() && key.size() <= 32;
             for (char ch : key) {
                 if (!((ch >= 'a' && ch <= 'z') || ch == ' ' || ch == '-' || ch == '_')) {
@@ -1018,7 +1002,7 @@ bool AttachExplicitPythonRunArtifacts(PythonRunResult& result,
     while (std::getline(lines, line)) {
         if (!line.empty() && line.back() == '\r') line.pop_back();
 
-        std::string key = LowerLocal(line);
+        std::string key = LbLowerAscii(line);
         size_t colon = line.find(':');
         if (colon == std::string::npos) continue;
 
@@ -1072,7 +1056,7 @@ bool WriteHelperScript(const std::string& helperName,
         static std::set<std::string> s_writtenScriptPaths;
         std::lock_guard<std::mutex> lock(s_writtenMutex);
 
-        const std::string cacheKey = LowerLocal(scriptPathOut);
+        const std::string cacheKey = LbLowerAscii(scriptPathOut);
         if (s_writtenScriptPaths.count(cacheKey) > 0) {
             if (FileExistsRegular(scriptPathOut)) {
                 return true;   // already written and still present
@@ -1161,7 +1145,7 @@ bool JsonStringField(const std::string& json,
 size_t FileSizeBytes(const std::string& path)
 {
     try {
-        std::ifstream f(std::filesystem::path(Utf8ToWide(path)), std::ios::binary | std::ios::ate);
+        std::ifstream f(std::filesystem::path(path_safety::Utf8ToWide(path)), std::ios::binary | std::ios::ate);
         if (!f) return 0;
         return static_cast<size_t>(f.tellg());
     } catch (...) {
@@ -1172,7 +1156,7 @@ size_t FileSizeBytes(const std::string& path)
 int CountFileLines(const std::string& path)
 {
     try {
-        std::ifstream f(std::filesystem::path(Utf8ToWide(path)), std::ios::binary);
+        std::ifstream f(std::filesystem::path(path_safety::Utf8ToWide(path)), std::ios::binary);
         if (!f) return 0;
         std::string data((std::istreambuf_iterator<char>(f)),
                          std::istreambuf_iterator<char>());
@@ -1231,7 +1215,7 @@ std::string UniqueToolOutputPath(const std::string& dir,
         struct stat st {};
         if (::lstat(path.c_str(), &st) != 0) return path;
 #else
-        DWORD attrs = GetFileAttributesW(Utf8ToWide(path).c_str());
+        DWORD attrs = GetFileAttributesW(path_safety::Utf8ToWide(path).c_str());
         if (attrs == INVALID_FILE_ATTRIBUTES) return path;
 #endif
     }
@@ -1298,7 +1282,7 @@ std::string BuildHeadTailPreviewForOutput(const std::string& text,
 bool WriteUtf8TextFileForOutput(const std::string& path, const std::string& content)
 {
     try {
-        std::ofstream f(std::filesystem::path(Utf8ToWide(path)), std::ios::binary | std::ios::trunc);
+        std::ofstream f(std::filesystem::path(path_safety::Utf8ToWide(path)), std::ios::binary | std::ios::trunc);
         if (!f) return false;
         f.write(content.data(), static_cast<std::streamsize>(content.size()));
         return f.good();
@@ -1346,7 +1330,9 @@ void ExternalizeOnePythonStream(PythonRunResult& result,
     f.lineCount   = static_cast<int>(CountTextLinesForOutput(fileBody));
     result.presentedFiles.push_back(std::move(f));
 
-    streamText = BuildHeadTailPreviewForOutput(streamText, displayName, streamWasCapped);
+    // Full path: a bare name does not resolve from the Workspace (the file
+    // lives in the chat's ToolOutputs folder), so "read <name>" failed.
+    streamText = BuildHeadTailPreviewForOutput(streamText, path, streamWasCapped);
 }
 
 void ApplyLargePythonRunOutputHandling(PythonRunResult& result, const std::string& cwd)
@@ -1570,7 +1556,7 @@ void SplitPythonRunScriptInvocation(const std::string& raw,
     // common model form "helper.py C:\\path\\to\\input" by treating everything
     // after a terminal ".py" plus whitespace as one argument. It remains
     // safe because ResolveRunnableScriptPath still validates the script lane.
-    std::string lower = LowerLocal(oneLine);
+    std::string lower = LbLowerAscii(oneLine);
     size_t search = 0;
     while (true) {
         size_t py = lower.find(".py", search);
@@ -1618,7 +1604,7 @@ bool ResolveRunnableScriptPath(const std::string& requested,
     {
         std::string pathish = name;
         std::replace(pathish.begin(), pathish.end(), '/', '\\');
-        std::string key = LowerLocal(pathish);
+        std::string key = LbLowerAscii(pathish);
         const std::string p1 = "workflows\\";
         const std::string p2 = "project\\workflows\\";
 
@@ -1674,7 +1660,7 @@ bool ResolveRunnableScriptPath(const std::string& requested,
             if (dot == std::string::npos) {
                 workflowName += ".py";
                 workflowLeaf += ".py";
-            } else if (LowerLocal(workflowLeaf.substr(dot)) != ".py") {
+            } else if (LbLowerAscii(workflowLeaf.substr(dot)) != ".py") {
                 errorOut = "python_run_script Workflows\\... paths must point to a .py file.";
                 return false;
             }
@@ -1711,7 +1697,7 @@ bool ResolveRunnableScriptPath(const std::string& requested,
     {
         std::string pathish = name;
         std::replace(pathish.begin(), pathish.end(), '/', '\\');
-        std::string key = LowerLocal(pathish);
+        std::string key = LbLowerAscii(pathish);
         const std::string p1 = "skills\\";
 
         if (key.rfind(p1, 0) == 0) {
@@ -1758,7 +1744,7 @@ bool ResolveRunnableScriptPath(const std::string& requested,
             size_t dot = skillName.find_last_of('.');
             if (dot == std::string::npos) {
                 skillName += ".py";
-            } else if (LowerLocal(skillName.substr(dot)) != ".py") {
+            } else if (LbLowerAscii(skillName.substr(dot)) != ".py") {
                 errorOut = "python_run_script Skills\\... paths must point to a .py file.";
                 return false;
             }
@@ -1787,10 +1773,10 @@ bool ResolveRunnableScriptPath(const std::string& requested,
             // resolve into the runPod skill folder, not a same-named
             // script that happens to live in another skill.
             if (!pinnedSkillFolder.empty()) {
-                std::string resolvedLower = LowerLocal(script.path);
+                std::string resolvedLower = LbLowerAscii(script.path);
                 std::replace(resolvedLower.begin(), resolvedLower.end(), '/', '\\');
                 const std::string needle =
-                    "\\" + LowerLocal(pinnedSkillFolder) + "\\";
+                    "\\" + LbLowerAscii(pinnedSkillFolder) + "\\";
                 if (resolvedLower.find(needle) == std::string::npos) {
                     errorOut = "Skill script " + skillName +
                                " resolved outside the requested Skills\\" +
@@ -1817,7 +1803,7 @@ bool ResolveRunnableScriptPath(const std::string& requested,
     {
         std::string pathish = name;
         std::replace(pathish.begin(), pathish.end(), '/', '\\');
-        std::string key = LowerLocal(pathish);
+        std::string key = LbLowerAscii(pathish);
         const std::string p1 = "scripts\\";
 
         if (key.rfind(p1, 0) == 0) {
@@ -1844,7 +1830,7 @@ bool ResolveRunnableScriptPath(const std::string& requested,
             size_t dot = scriptName.find_last_of('.');
             if (dot == std::string::npos) {
                 scriptName += ".py";
-            } else if (LowerLocal(scriptName.substr(dot)) != ".py") {
+            } else if (LbLowerAscii(scriptName.substr(dot)) != ".py") {
                 errorOut = "python_run_script Scripts\\... paths must point to a .py file.";
                 return false;
             }
@@ -1885,7 +1871,7 @@ bool ResolveRunnableScriptPath(const std::string& requested,
 
     if (pathShaped) {
         size_t dot = name.find_last_of('.');
-        if (dot == std::string::npos || LowerLocal(name.substr(dot)) != ".py") {
+        if (dot == std::string::npos || LbLowerAscii(name.substr(dot)) != ".py") {
             errorOut = "python_run_script path arguments must point to a .py file.";
             return false;
         }
@@ -1955,7 +1941,7 @@ bool ResolveRunnableScriptPath(const std::string& requested,
     size_t dot = name.find_last_of('.');
     if (dot == std::string::npos) {
         name += ".py";
-    } else if (LowerLocal(name.substr(dot)) != ".py") {
+    } else if (LbLowerAscii(name.substr(dot)) != ".py") {
         errorOut = "python_run_script only runs .py files from the conversation Scripts folder, the active project Workflows folder, or the LlamaBoss Skills folder. Use the bare filename (e.g. report.py), or pin a lane with Scripts\\name.py, Workflows\\name.py (active project), or Skills\\name.py.";
         return false;
     }
@@ -2025,7 +2011,7 @@ bool ResolveRunnableScriptPath(const std::string& requested,
 
 bool ShouldSkipPythonArtifactScanDir(const std::string& name)
 {
-    std::string key = LowerLocal(name);
+    std::string key = LbLowerAscii(name);
     return key == ".git" ||
            key == ".hg" ||
            key == ".svn" ||
@@ -2069,7 +2055,7 @@ void CollectFilesRecursive(const std::string& dir,
     }
     ::closedir(d);
 #else
-    std::wstring pattern = Utf8ToWide(JoinPath(dir, "*"));
+    std::wstring pattern = path_safety::Utf8ToWide(JoinPath(dir, "*"));
     WIN32_FIND_DATAW fd = {};
     HANDLE h = FindFirstFileW(pattern.c_str(), &fd);
     if (h == INVALID_HANDLE_VALUE) return;
@@ -2080,7 +2066,7 @@ void CollectFilesRecursive(const std::string& dir,
         std::wstring nameW = fd.cFileName;
         if (nameW == L"." || nameW == L"..") continue;
 
-        std::string name = WideToUtf8(nameW);
+        std::string name = path_safety::WideToUtf8(nameW);
         std::string path = JoinPath(dir, name);
 
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
@@ -2148,10 +2134,13 @@ void AttachNewFilesUnderLlamaBoss(PythonRunResult& result,
     }
 
     if (extra > 0) {
-        if (!result.stderrText.empty() && result.stderrText.back() != '\n')
-            result.stderrText += "\r\n";
-        result.stderrText += "[LlamaBoss detected additional created files but only attached the first " +
-                             std::to_string(kMaxAttach) + " artifact cards.]\r\n";
+        // A LlamaBoss note, not the script's stderr: in the stderr pane it
+        // read as if a successful script had reported an error.
+        if (!result.stdoutText.empty() && result.stdoutText.back() != '\n')
+            result.stdoutText += "\r\n";
+        result.stdoutText += "[LlamaBoss: " + std::to_string(extra) +
+                             " more created file(s) exist but only the first " +
+                             std::to_string(kMaxAttach) + " got artifact cards.]\r\n";
     }
 
     // Workspace-change manifest, INCLUDING the explicit negative.
@@ -2184,17 +2173,7 @@ void AttachNewFilesUnderLlamaBoss(PythonRunResult& result,
 }
 
 #ifdef _WIN32
-struct HandleGuard {
-    HANDLE h = nullptr;
-    HandleGuard() = default;
-    explicit HandleGuard(HANDLE handle) : h(handle) {}
-    ~HandleGuard() {
-        if (h && h != INVALID_HANDLE_VALUE) CloseHandle(h);
-    }
-    HandleGuard(const HandleGuard&) = delete;
-    HandleGuard& operator=(const HandleGuard&) = delete;
-    HANDLE release() { HANDLE r = h; h = nullptr; return r; }
-};
+using lb_win::HandleGuard;   // lb_win_process.h
 
 // Unblock a reader thread that is parked in a synchronous ReadFile.
 //
@@ -2210,15 +2189,7 @@ struct HandleGuard {
 // Resolved dynamically for the same reason cmd_executor.cpp does it:
 // keeps the import table clean and degrades to a no-op rather than a
 // load failure if the export is ever absent.
-void CancelThreadSynchronousIoLocal(HANDLE threadHandle)
-{
-    if (!threadHandle) return;
-    using Fn = BOOL (WINAPI *)(HANDLE);
-    HMODULE kernel = GetModuleHandleW(L"kernel32.dll");
-    if (!kernel) return;
-    auto* fn = reinterpret_cast<Fn>(GetProcAddress(kernel, "CancelSynchronousIo"));
-    if (fn) fn(threadHandle);
-}
+using lb_win::CancelThreadSynchronousIo;   // lb_win_process.h
 
 void ReaderLoop(HANDLE readEnd,
                 std::string& dest,
@@ -2244,32 +2215,7 @@ void ReaderLoop(HANDLE readEnd,
     }
 }
 
-std::wstring QuoteArg(const std::wstring& arg)
-{
-    // Full Windows CRT argv quoting.  The old minimal wrapper escaped
-    // quotes but did not double trailing backslashes.  A rare argument
-    // ending in \ could escape the closing quote and merge argv items.
-    std::wstring out = L"\"";
-    size_t backslashes = 0;
-
-    for (wchar_t ch : arg) {
-        if (ch == L'\\') {
-            ++backslashes;
-        } else if (ch == L'\"') {
-            out.append(backslashes * 2 + 1, L'\\');
-            out.push_back(L'\"');
-            backslashes = 0;
-        } else {
-            out.append(backslashes, L'\\');
-            backslashes = 0;
-            out.push_back(ch);
-        }
-    }
-
-    out.append(backslashes * 2, L'\\');
-    out.push_back(L'\"');
-    return out;
-}
+using lb_win::QuoteArg;   // lb_win_process.h
 
 #endif // _WIN32
 
@@ -2282,11 +2228,11 @@ struct PythonCandidate {
 std::vector<PythonCandidate> BuildCandidates(const std::string& scriptPath,
                                              const std::vector<std::string>& helperArgs)
 {
-    std::wstring script = QuoteArg(Utf8ToWide(scriptPath));
+    std::wstring script = QuoteArg(path_safety::Utf8ToWide(scriptPath));
     std::wstring argText;
     for (const std::string& a : helperArgs) {
         argText += L" ";
-        argText += QuoteArg(Utf8ToWide(a));
+        argText += QuoteArg(path_safety::Utf8ToWide(a));
     }
 
     // -B  : skip writing .pyc files so the bundled helper directory stays
@@ -2323,7 +2269,7 @@ std::vector<PythonCandidate> BuildCandidates(const std::string& scriptPath,
 
 std::vector<PythonCandidate> BuildPipInstallCandidates(const std::string& packageName)
 {
-    const std::wstring pkg = QuoteArg(Utf8ToWide(packageName));
+    const std::wstring pkg = QuoteArg(path_safety::Utf8ToWide(packageName));
     const std::wstring pyCommon = L" -3 -X utf8 -B -m pip install --user --disable-pip-version-check " + pkg;
     const std::wstring common   = L" -X utf8 -B -m pip install --user --disable-pip-version-check " + pkg;
 
@@ -2422,7 +2368,7 @@ private:
         auto cleanupTempArgFiles = [&]() {
             for (const auto& path : tempArgFiles) {
 #ifdef _WIN32
-                DeleteFileW(Utf8ToWide(path).c_str());
+                DeleteFileW(path_safety::Utf8ToWide(path).c_str());
 #else
                 ::unlink(path.c_str());
 #endif
@@ -2629,7 +2575,7 @@ private:
 
         std::string cwd = m_cwd.empty() ? ServerManager::GetWorkspaceDir() : m_cwd;
 #ifdef _WIN32
-        std::wstring wCwd = Utf8ToWide(cwd);
+        std::wstring wCwd = path_safety::Utf8ToWide(cwd);
         LPCWSTR cwdArg = wCwd.empty() ? nullptr : wCwd.c_str();
 #else
         if (isPackageInstall) {
@@ -3001,9 +2947,9 @@ private:
                 // pipe open.  Cancel the in-flight ReadFile calls so the
                 // joins below cannot park this detached worker forever.
                 if (outThread.joinable())
-                    CancelThreadSynchronousIoLocal(outThread.native_handle());
+                    CancelThreadSynchronousIo(outThread.native_handle());
                 if (errThread.joinable())
-                    CancelThreadSynchronousIoLocal(errThread.native_handle());
+                    CancelThreadSynchronousIo(errThread.native_handle());
             }
         }
 

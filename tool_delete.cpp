@@ -1,6 +1,7 @@
 // tool_delete.cpp
 
 #include "tool_delete.h"
+#include "lb_string_utils.h"
 #include "tool_path.h"
 #include "tool_path_safety.h"   // IsUnderAllowedWriteRoot, SamePath, Basename
 #include "tool_open.h"          // ClassifyForOpen, FileRisk
@@ -13,33 +14,6 @@
 #endif
 
 namespace {
-
-std::string HumanBytes(size_t b)
-{
-    std::ostringstream ss;
-    ss << std::fixed;
-    if (b < 1024) {
-        ss << b << " B";
-    } else if (b < 1024 * 1024) {
-        ss.precision(1);
-        ss << (b / 1024.0) << " KB";
-    } else {
-        ss.precision(2);
-        ss << (b / (1024.0 * 1024.0)) << " MB";
-    }
-    return ss.str();
-}
-
-std::string ElapsedChip(std::chrono::steady_clock::time_point t0)
-{
-    double elapsed = std::chrono::duration<double>(
-        std::chrono::steady_clock::now() - t0).count();
-    std::ostringstream ts;
-    ts << std::fixed;
-    ts.precision(elapsed < 10.0 ? 2 : 1);
-    ts << elapsed << "s";
-    return ts.str();
-}
 
 std::string Trim(const std::string& s)
 {
@@ -151,14 +125,14 @@ DeleteResult DeleteEntry(const std::string& pathIn,
     if (requested.empty()) {
         r.chips.push_back("failed");
         r.errorBody = "delete requires a path in <args>.";
-        r.chips.push_back(ElapsedChip(t0));
+        r.chips.push_back(LbElapsedChip(t0));
         return r;
     }
 
     if (ctx.cwd.empty()) {
         r.chips.push_back("blocked");
         r.errorBody = "No working directory set; refuse to delete.";
-        r.chips.push_back(ElapsedChip(t0));
+        r.chips.push_back(LbElapsedChip(t0));
         return r;
     }
 
@@ -166,7 +140,7 @@ DeleteResult DeleteEntry(const std::string& pathIn,
     if (resolved.empty()) {
         r.chips.push_back("failed");
         r.errorBody = "Could not resolve path: " + requested;
-        r.chips.push_back(ElapsedChip(t0));
+        r.chips.push_back(LbElapsedChip(t0));
         return r;
     }
 
@@ -180,7 +154,7 @@ DeleteResult DeleteEntry(const std::string& pathIn,
                       tool_path_safety::AllowedWriteRootsDiagnostic(
                           ctx.cwd, ctx.activeProjectRoot, ctx.skillsRoot,
                           ctx.additionalWriteRoots);
-        r.chips.push_back(ElapsedChip(t0));
+        r.chips.push_back(LbElapsedChip(t0));
         return r;
     }
 
@@ -192,7 +166,7 @@ DeleteResult DeleteEntry(const std::string& pathIn,
         r.errorBody = mutation.Error();
         if (mutation.MissingFolder())
             r.errorBody += tool_path_safety::ConversationLaneWriteHint(requested, ctx.cwd);
-        r.chips.push_back(ElapsedChip(t0));
+        r.chips.push_back(LbElapsedChip(t0));
         return r;
     }
 
@@ -206,7 +180,7 @@ DeleteResult DeleteEntry(const std::string& pathIn,
             r.chips.push_back("blocked");
             r.errorBody = "Refuses to delete the working directory "
                           "itself: " + resolved;
-            r.chips.push_back(ElapsedChip(t0));
+            r.chips.push_back(LbElapsedChip(t0));
             return r;
         }
         if (!ctx.activeProjectRoot.empty() &&
@@ -214,7 +188,7 @@ DeleteResult DeleteEntry(const std::string& pathIn,
             r.chips.push_back("blocked");
             r.errorBody = "Refuses to delete the active project root "
                           "itself: " + resolved;
-            r.chips.push_back(ElapsedChip(t0));
+            r.chips.push_back(LbElapsedChip(t0));
             return r;
         }
         for (const std::string& root : ctx.additionalWriteRoots) {
@@ -224,7 +198,7 @@ DeleteResult DeleteEntry(const std::string& pathIn,
                 r.chips.push_back("blocked");
                 r.errorBody = "Refuses to delete a chat-granted write root "
                               "itself: " + resolved;
-                r.chips.push_back(ElapsedChip(t0));
+                r.chips.push_back(LbElapsedChip(t0));
                 return r;
             }
         }
@@ -238,7 +212,7 @@ DeleteResult DeleteEntry(const std::string& pathIn,
         r.errorBody = "Filename '" + basename +
                       "' has characters or a shape that aren't "
                       "safe on Windows; refuse to operate on it.";
-        r.chips.push_back(ElapsedChip(t0));
+        r.chips.push_back(LbElapsedChip(t0));
         return r;
     }
 
@@ -249,7 +223,7 @@ DeleteResult DeleteEntry(const std::string& pathIn,
     if (!isFile && !isDir) {
         r.chips.push_back("not found");
         r.errorBody = "Path does not exist: " + resolved;
-        r.chips.push_back(ElapsedChip(t0));
+        r.chips.push_back(LbElapsedChip(t0));
         return r;
     }
 
@@ -261,7 +235,7 @@ DeleteResult DeleteEntry(const std::string& pathIn,
         r.errorBody = "Refuses to delete files with executable or "
                       "scriptable extensions. If the user wants this, "
                       "they can delete the file manually.";
-        r.chips.push_back(ElapsedChip(t0));
+        r.chips.push_back(LbElapsedChip(t0));
         return r;
     }
 
@@ -269,7 +243,7 @@ DeleteResult DeleteEntry(const std::string& pathIn,
     if (wPath.empty()) {
         r.chips.push_back("failed");
         r.errorBody = "Path conversion failed: " + resolved;
-        r.chips.push_back(ElapsedChip(t0));
+        r.chips.push_back(LbElapsedChip(t0));
         return r;
     }
 
@@ -280,7 +254,7 @@ DeleteResult DeleteEntry(const std::string& pathIn,
         if (!mutation.VerifyUnchanged()) {
             r.chips.push_back("conflict");
             r.errorBody = mutation.Error();
-            r.chips.push_back(ElapsedChip(t0));
+            r.chips.push_back(LbElapsedChip(t0));
             return r;
         }
         mutation.ReleaseTargetForCommit();
@@ -297,20 +271,20 @@ DeleteResult DeleteEntry(const std::string& pathIn,
             r.chips.push_back("failed");
             r.errorBody = std::string("Delete failed (") + std::strerror(err) + ").";
 #endif
-            r.chips.push_back(ElapsedChip(t0));
+            r.chips.push_back(LbElapsedChip(t0));
             return r;
         }
 
         r.chips.push_back("deleted");
         if (bytes != (size_t)-1 && bytes > 0) {
-            r.chips.push_back(HumanBytes(bytes));
+            r.chips.push_back(LbToolHumanBytes(bytes));
         }
         r.body = "Deleted " +
                  (bytes != (size_t)-1 && bytes > 0
-                      ? HumanBytes(bytes) + " file: "
+                      ? LbToolHumanBytes(bytes) + " file: "
                       : std::string("file: ")) +
                  resolved + "\n";
-        r.chips.push_back(ElapsedChip(t0));
+        r.chips.push_back(LbElapsedChip(t0));
         return r;
     }
 
@@ -326,14 +300,14 @@ DeleteResult DeleteEntry(const std::string& pathIn,
                       ".\nDelete its contents first (one ls + one "
                       "delete per entry), then retry deleting the "
                       "directory.";
-        r.chips.push_back(ElapsedChip(t0));
+        r.chips.push_back(LbElapsedChip(t0));
         return r;
     }
 
     if (!mutation.VerifyUnchanged()) {
         r.chips.push_back("conflict");
         r.errorBody = mutation.Error();
-        r.chips.push_back(ElapsedChip(t0));
+        r.chips.push_back(LbElapsedChip(t0));
         return r;
     }
     mutation.ReleaseTargetForCommit();
@@ -364,13 +338,13 @@ DeleteResult DeleteEntry(const std::string& pathIn,
             r.errorBody = std::string("Remove directory failed (") + std::strerror(err) + ").";
 #endif
         }
-        r.chips.push_back(ElapsedChip(t0));
+        r.chips.push_back(LbElapsedChip(t0));
         return r;
     }
 
     r.chips.push_back("deleted");
     r.chips.push_back("directory");
     r.body = "Deleted directory: " + resolved + "\n";
-    r.chips.push_back(ElapsedChip(t0));
+    r.chips.push_back(LbElapsedChip(t0));
     return r;
 }

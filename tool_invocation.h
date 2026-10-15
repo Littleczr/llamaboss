@@ -102,6 +102,14 @@ struct ToolInvocation {
     // an error chip so it can self-correct.
     std::string invalidReason;
 
+    // True when the call itself was well-formed (valid JSON, known tool,
+    // recognised parameter names) but a VALUE failed validation: a
+    // reversed or zero line range, an empty path, wait 5.  That is an
+    // ordinary tool error the model can fix, not a broken protocol, so
+    // it does not count toward the 3-strike malformed-call stop and it
+    // counts toward the normal tool-step cap instead.
+    bool        argumentError = false;
+
     // Id of the model-emitted tool call this invocation was
     // synthesized from.  Empty for XML-protocol invocations (no ids
     // exist in that protocol).  When non-empty, the dispatched result

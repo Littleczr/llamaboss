@@ -78,6 +78,9 @@ std::vector<NoteFileInfo> ListNoteFiles();
 // and the legacy NOTES.md pointer when that file still exists.  Bounded
 // in size; falls back to per-folder counts when the full index is large.
 std::string BuildNotesIndexBlock();
+// Same block from a listing the caller already has (the context builder
+// lists the folder once per probe and reuses it here).
+std::string BuildNotesIndexBlock(const std::vector<NoteFileInfo>& files);
 
 // Static notes guidance for the agent prompts (both protocols).  Byte-
 // stable so it does not disturb prompt caching.

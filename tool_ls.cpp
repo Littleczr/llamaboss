@@ -1,6 +1,8 @@
 // tool_ls.cpp
 
 #include "tool_ls.h"
+#include "path_safety.h"
+#include "lb_string_utils.h"
 #include "tool_path.h"
 #include "tool_path_safety.h"
 
@@ -42,42 +44,6 @@ constexpr size_t kMinNameColWidth = 20;   // soft floor — ensures tidy look on
 constexpr size_t kSizeColWidth    = 10;   // enough for "1023.9 MB"
 
 // ─── Helpers ─────────────────────────────────────────────────────
-// Local UTF-8 ↔ UTF-16 helpers, duplicated from tool_path.cpp for
-// file-private use.  Will be extracted to a shared header once /grep
-// needs them too (YAGNI until then).
-std::wstring Utf8ToWide(const std::string& s)
-{
-#ifndef _WIN32
-    return lb_utf::Utf8ToWide(s);
-#else
-    if (s.empty()) return L"";
-    int len = ::MultiByteToWideChar(CP_UTF8, 0, s.data(),
-                                    (int)s.size(), nullptr, 0);
-    if (len <= 0) return L"";
-    std::wstring w((size_t)len, L'\0');
-    ::MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(),
-                          &w[0], len);
-    return w;
-#endif
-}
-
-std::string WideToUtf8(const std::wstring& w)
-{
-#ifndef _WIN32
-    return lb_utf::WideToUtf8(w);
-#else
-    if (w.empty()) return "";
-    int len = ::WideCharToMultiByte(CP_UTF8, 0, w.data(),
-                                    (int)w.size(),
-                                    nullptr, 0, nullptr, nullptr);
-    if (len <= 0) return "";
-    std::string s((size_t)len, '\0');
-    ::WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(),
-                          &s[0], len, nullptr, nullptr);
-    return s;
-#endif
-}
-
 // Human-readable byte count — duplicated from tool_read.cpp for the
 // same reason as the UTF-8 helpers.
 std::string HumanBytes(uint64_t b)
@@ -151,18 +117,6 @@ bool NameLess(const std::string& a, const std::string& b)
     return a.size() < b.size();
 }
 
-// Elapsed-time chip — "0.02s" / "12.3s", same format as /cmd and /read.
-std::string ElapsedChip(std::chrono::steady_clock::time_point t0)
-{
-    double elapsed = std::chrono::duration<double>(
-        std::chrono::steady_clock::now() - t0).count();
-    std::ostringstream ts;
-    ts << std::fixed;
-    ts.precision(elapsed < 10.0 ? 2 : 1);
-    ts << elapsed << "s";
-    return ts.str();
-}
-
 struct LsEntry {
     std::string  name;
     bool         isDirectory;
@@ -187,7 +141,7 @@ LsResult ListDirectory(const std::string& inputPath, const ToolContext& ctx)
     if (resolved.empty()) {
         r.chips.push_back("failed");
         r.errorBody = "Could not resolve path: " + target;
-        r.chips.push_back(ElapsedChip(t0));
+        r.chips.push_back(LbElapsedChip(t0));
         return r;
     }
     if (usedConversationLane) r.chips.push_back("conversation lane");
@@ -200,7 +154,7 @@ LsResult ListDirectory(const std::string& inputPath, const ToolContext& ctx)
         } else {
             r.errorBody = "Directory not found: " + resolved;
         }
-        r.chips.push_back(ElapsedChip(t0));
+        r.chips.push_back(LbElapsedChip(t0));
         return r;
     }
 
@@ -208,7 +162,7 @@ LsResult ListDirectory(const std::string& inputPath, const ToolContext& ctx)
     // ── Enumerate via FindFirstFileW ─────────────────────────────
     // Pattern "<dir>\*" yields every entry; we filter . and .. as
     // we go.  UNC paths ("\\server\share\*") work identically.
-    std::wstring wPattern = Utf8ToWide(resolved) + L"\\*";
+    std::wstring wPattern = path_safety::Utf8ToWide(resolved) + L"\\*";
     WIN32_FIND_DATAW fd{};
     HANDLE hFind = ::FindFirstFileW(wPattern.c_str(), &fd);
     if (hFind == INVALID_HANDLE_VALUE) {
@@ -217,7 +171,7 @@ LsResult ListDirectory(const std::string& inputPath, const ToolContext& ctx)
         r.errorBody = "Could not read directory: " + resolved;
         if (err == ERROR_ACCESS_DENIED)       r.errorBody += " (access denied)";
         else if (err == ERROR_FILE_NOT_FOUND) r.errorBody += " (no entries)";
-        r.chips.push_back(ElapsedChip(t0));
+        r.chips.push_back(LbElapsedChip(t0));
         return r;
     }
 
@@ -238,7 +192,7 @@ LsResult ListDirectory(const std::string& inputPath, const ToolContext& ctx)
         }
 
         LsEntry e;
-        e.name = WideToUtf8(wname);
+        e.name = path_safety::WideToUtf8(wname);
         e.isDirectory = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
         e.sizeBytes = e.isDirectory ? 0
             : (((uint64_t)fd.nFileSizeHigh << 32) | fd.nFileSizeLow);
@@ -257,7 +211,7 @@ LsResult ListDirectory(const std::string& inputPath, const ToolContext& ctx)
         r.errorBody = "Could not read directory: " + resolved;
         if (err == EACCES || err == EPERM) r.errorBody += " (access denied)";
         else if (err == ENOENT)            r.errorBody += " (no entries)";
-        r.chips.push_back(ElapsedChip(t0));
+        r.chips.push_back(LbElapsedChip(t0));
         return r;
     }
 
@@ -401,6 +355,6 @@ LsResult ListDirectory(const std::string& inputPath, const ToolContext& ctx)
 
     r.body = ss.str();
     r.bodyLang = "";  // plain fixed-width text
-    r.chips.push_back(ElapsedChip(t0));
+    r.chips.push_back(LbElapsedChip(t0));
     return r;
 }

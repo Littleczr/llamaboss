@@ -1,6 +1,7 @@
 // chat_display.cpp
 #include "chat_display.h"
 #include "lb_ui_font.h"   // LbUiPt: macOS point-size parity
+#include "lb_string_utils.h"
 #include "lb_ascii.h"
 #include "chat_display_ctrl.h"
 #include "markdown_renderer.h"
@@ -214,12 +215,6 @@ bool LoadImageThumbnailCached(const std::string& imgPath,
     return true;
 }
 
-std::string ToLowerAscii(std::string s)
-{
-    for (char& ch : s) ch = static_cast<char>(lb_ascii::ToLower(static_cast<unsigned char>(ch)));
-    return s;
-}
-
 std::string GetBestFileName(const PresentedFile& file)
 {
     if (!file.displayName.empty()) return file.displayName;
@@ -233,12 +228,12 @@ std::string GetBestFileName(const PresentedFile& file)
 std::string GetFileExtensionLower(const PresentedFile& file)
 {
     wxFileName fn(wxString::FromUTF8(GetBestFileName(file)));
-    return ToLowerAscii(fn.GetExt().ToStdString());
+    return LbLowerAscii(fn.GetExt().ToStdString());
 }
 
 bool IsLikelyCodeFile(const PresentedFile& file)
 {
-    std::string lang = ToLowerAscii(file.language);
+    std::string lang = LbLowerAscii(file.language);
     if (lang == "cpp" || lang == "c++" || lang == "c" || lang == "h" ||
         lang == "hpp" || lang == "python" || lang == "py" || lang == "js" ||
         lang == "javascript" || lang == "ts" || lang == "typescript" ||
@@ -260,7 +255,7 @@ bool IsLikelyCodeFile(const PresentedFile& file)
 
 bool IsMarkdownDocumentFile(const PresentedFile& file)
 {
-    const std::string lang = ToLowerAscii(file.language);
+    const std::string lang = LbLowerAscii(file.language);
     if (lang == "markdown" || lang == "md") return true;
 
     const std::string ext = GetFileExtensionLower(file);
@@ -289,7 +284,7 @@ std::string HumanFileSize(std::size_t bytes)
 std::string DescribePresentedFileKind(const PresentedFile& file)
 {
     const std::string ext = GetFileExtensionLower(file);
-    const std::string lang = ToLowerAscii(file.language);
+    const std::string lang = LbLowerAscii(file.language);
 
     if (ext == "cpp" || ext == "cc" || ext == "cxx" || lang == "cpp" || lang == "c++") return "C++ source";
     if (ext == "h" || ext == "hpp" || ext == "hh" || ext == "hxx") return "C/C++ header";
@@ -330,7 +325,7 @@ std::string DescribePresentedFileMeta(const PresentedFile& file)
 std::string DescribePresentedFileCardLabel(const PresentedFile& file)
 {
     const std::string ext = GetFileExtensionLower(file);
-    const std::string lang = ToLowerAscii(file.language);
+    const std::string lang = LbLowerAscii(file.language);
 
     if (ext == "docx") return "Word Document";
     if (ext == "xlsx") return "Spreadsheet";

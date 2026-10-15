@@ -1,6 +1,7 @@
 // tool_grep.cpp
 
 #include "tool_grep.h"
+#include "path_safety.h"
 #include "tool_path.h"
 
 #include <deque>
@@ -79,39 +80,6 @@ std::string ClampMatchLine(const std::string& text)
     const size_t keep = ClampToUtf8Boundary(
         text.data(), GrepExecutor::kMaxLineLength - 3);
     return text.substr(0, keep) + "...";
-}
-
-std::wstring Utf8ToWide(const std::string& s)
-{
-#ifndef _WIN32
-    return lb_utf::Utf8ToWide(s);
-#else
-    if (s.empty()) return L"";
-    int len = ::MultiByteToWideChar(CP_UTF8, 0, s.data(),
-                                    (int)s.size(), nullptr, 0);
-    if (len <= 0) return L"";
-    std::wstring w((size_t)len, L'\0');
-    ::MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(),
-                          &w[0], len);
-    return w;
-#endif
-}
-
-std::string WideToUtf8(const std::wstring& w)
-{
-#ifndef _WIN32
-    return lb_utf::WideToUtf8(w);
-#else
-    if (w.empty()) return "";
-    int len = ::WideCharToMultiByte(CP_UTF8, 0, w.data(),
-                                    (int)w.size(),
-                                    nullptr, 0, nullptr, nullptr);
-    if (len <= 0) return "";
-    std::string s((size_t)len, '\0');
-    ::WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(),
-                          &s[0], len, nullptr, nullptr);
-    return s;
-#endif
 }
 
 // ─── Dir-skip policy ─────────────────────────────────────────────
@@ -325,7 +293,7 @@ bool SearchFile(const std::string& absPath,
     // Open in binary mode so we see \r explicitly (and can strip it
     // reliably from getline output on Windows line endings).  MSVC
     // accepts std::wstring paths as an extension.
-    std::ifstream f(std::filesystem::path(Utf8ToWide(absPath)), std::ios::binary);
+    std::ifstream f(std::filesystem::path(path_safety::Utf8ToWide(absPath)), std::ios::binary);
     if (!f) {
         ++s.skippedUnreadable;   // permissions, transient IO — skip, keep walking
         return true;
@@ -510,7 +478,7 @@ bool WalkAndSearch(const std::string& absDir,
     if (!CheckLimits(s)) return false;
 
 #ifdef _WIN32
-    std::wstring wPat = Utf8ToWide(absDir) + L"\\*";
+    std::wstring wPat = path_safety::Utf8ToWide(absDir) + L"\\*";
     WIN32_FIND_DATAW fd{};
     HANDLE hFind = ::FindFirstFileW(wPat.c_str(), &fd);
     if (hFind == INVALID_HANDLE_VALUE) {
@@ -526,7 +494,7 @@ bool WalkAndSearch(const std::string& absDir,
         if (wname == L"." || wname == L"..") continue;
 
         bool isDir = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
-        std::string name = WideToUtf8(wname);
+        std::string name = path_safety::WideToUtf8(wname);
 
         if (isDir) {
             if (ShouldSkipDir(name)) { ++s.prunedDirs; continue; }

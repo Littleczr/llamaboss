@@ -1922,8 +1922,14 @@ void ConversationController::ReplayConversation()
                     displayContent = (cut == std::string::npos)
                         ? std::string()
                         : displayContent.substr(cut + 2);
-                    if (displayContent.empty()) continue;
                 }
+                // A message sent with attachments and an empty input box
+                // has no text once the header is stripped.  Keep it when
+                // it carries attachments (the picture IS the message);
+                // skip only a truly empty row.
+                const bool hasAttachmentMeta =
+                    msg->has("attachments") && !msg->isNull("attachments");
+                if (displayContent.empty() && !hasAttachmentMeta) continue;
                 std::vector<std::string> imagePaths;
 
                 if (msg->has("attachments") && !msg->isNull("attachments")) {
@@ -1967,10 +1973,13 @@ void ConversationController::ReplayConversation()
                             }
                         }
                         if (!prefix.empty())
-                            displayContent = "[" + prefix + "] " + displayContent;
+                            displayContent = displayContent.empty()
+                                ? "[" + prefix + "]"
+                                : "[" + prefix + "] " + displayContent;
                     }
                 }
 
+                if (displayContent.empty() && imagePaths.empty()) continue;
                 m_chatDisplay->DisplayUserMessage(displayContent, target, imagePaths);
             }
             else if (role == "assistant") {
