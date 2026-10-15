@@ -209,6 +209,18 @@ bool EchoPointsInsideWorkspace(const std::string& echo,
     if (tok.empty()) return false;
 
     std::error_code ec;
+#ifndef _WIN32
+    // Lane paths are written with backslashes (Vars\cmd_0001.txt); on macOS
+    // that is a filename character, so read it as a separator unless a file
+    // with that literal name exists (same rule as ResolveToolPath).
+    if (tok.find('\\') != std::string::npos && !tok.empty() && tok[0] != '/') {
+        const std::filesystem::path literal =
+            std::filesystem::path(workspaceDirUtf8) / tok;
+        if (!std::filesystem::exists(literal, ec))
+            std::replace(tok.begin(), tok.end(), '\\', '/');
+        ec.clear();
+    }
+#endif
     std::filesystem::path p = std::filesystem::path(path_safety::Utf8ToWide(tok));
     if (p.is_relative())
         p = std::filesystem::path(path_safety::Utf8ToWide(workspaceDirUtf8)) / p;
@@ -234,8 +246,10 @@ bool EchoPointsInsideWorkspace(const std::string& echo,
         // Workspace-relative, backslash-joined — the exact form the
         // model should pass back to read/grep.
         std::wstring relW = canonW.substr(varsW.size() + 1);
+#ifdef _WIN32
         for (auto& ch : relW)
             if (ch == L'/') ch = L'\\';
+#endif
         *relOut = path_safety::WideToUtf8(relW);
     }
     return true;

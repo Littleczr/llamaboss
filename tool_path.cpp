@@ -169,6 +169,7 @@ bool IsFile(const std::string& absPath)
 
 #else  // ── macOS / POSIX ──────────────────────────────────────────────
 
+#include <algorithm>
 #include <cstdlib>
 #include <filesystem>
 #include <sys/stat.h>
@@ -256,6 +257,18 @@ std::string ResolveToolPath(const std::string& input,
         fs::path base(cwd);
         if (base.is_relative()) return "";
         p = base / p;
+        // The shared prompt and tool results write chat lane paths with
+        // backslashes (Vars\cmd_0001.txt, Scripts\x.py).  On macOS '\' is
+        // an ordinary filename character, so read it as a separator unless
+        // a file with that literal name exists.
+        if (normalized.find('\\') != std::string::npos) {
+            std::error_code ec;
+            if (!fs::exists(p, ec)) {
+                std::string slashed = normalized;
+                std::replace(slashed.begin(), slashed.end(), '\\', '/');
+                p = base / fs::path(slashed);
+            }
+        }
     }
     p = p.lexically_normal();
     std::string out = p.string();
