@@ -2793,6 +2793,18 @@ ConversationSidebar::CreateRow(const ConversationEntry& entry)
 
     // ── Selection / open handling ───────────────────────────────
     auto clickHandler = [this](wxMouseEvent& evt) {
+#ifdef __WXMAC__
+        // wxOSX delivers LEFT_UP twice to a wxStaticText (title and time
+        // labels) for one click, with the same timestamp; without this the
+        // chat was loaded, and its KV slot restored, twice per click.
+        static wxObject* lastObject = nullptr;
+        static long lastTimestamp = -1;
+        if (evt.GetEventObject() == lastObject &&
+            evt.GetTimestamp() == lastTimestamp)
+            return;
+        lastObject = evt.GetEventObject();
+        lastTimestamp = evt.GetTimestamp();
+#endif
         std::string path = PathFromWidget(
             dynamic_cast<wxWindow*>(evt.GetEventObject()), m_listWindow);
         if (path.empty()) return;
