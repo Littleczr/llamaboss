@@ -58,6 +58,9 @@
 
 // ── File-local support modules (extracted helpers) ───────────────
 #include "lb_string_utils.h"
+#ifdef __WXMAC__
+#include "lb_mac_clipboard.h"   // LbMacClipboardImagePng: Cmd+V pictures
+#endif
 #include "skill_authoring_support.h"
 #include "agent_prompt_builder.h"
 #include "python_package_recovery.h"
@@ -6946,6 +6949,12 @@ private:
 
     bool TryPasteImageFromClipboard()
     {
+#ifdef __WXMAC__
+        // wxOSX does not see pasteboard PNG/TIFF as wxDF_BITMAP.
+        std::vector<unsigned char> rawData;
+        if (!LbMacClipboardImagePng(rawData)) return false;
+        const size_t dataSize = rawData.size();
+#else
         if (!wxTheClipboard->Open()) return false;
 
         bool hasImage = wxTheClipboard->IsSupported(wxDF_BITMAP);
@@ -6964,6 +6973,7 @@ private:
         size_t dataSize = memStream.GetSize();
         std::vector<unsigned char> rawData(dataSize);
         memStream.CopyTo(rawData.data(), dataSize);
+#endif
 
         std::ostringstream base64Stream;
         Poco::Base64Encoder encoder(base64Stream);

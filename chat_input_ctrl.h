@@ -16,7 +16,25 @@ public:
         const wxSize& size = wxDefaultSize,
         long style = 0)
         : wxTextCtrl(parent, id, value, pos, size, style)
+#ifdef __WXMSW__
     {}
+#else
+    {
+        // macOS: there is no WM_PASTE, and wxOSX sends no wxEVT_TEXT_PASTE
+        // for Cmd+V (the NSTextView pastes natively), so the shortcut is
+        // caught as a key.  Same order as the Windows hook: image first,
+        // then large-text attachment, else the native paste.  Cmd+Shift+V
+        // and the Edit menu item keep the plain native paste.
+        Bind(wxEVT_KEY_DOWN, [this](wxKeyEvent& evt) {
+            if (evt.GetKeyCode() == 'V' && evt.GetModifiers() == wxMOD_CMD &&
+                !m_pasteAsText && IsEnabled() && IsEditable()) {
+                if (m_imagePasteHandler && m_imagePasteHandler()) return;
+                if (m_textPasteHandler && m_textPasteHandler()) return;
+            }
+            evt.Skip();
+        });
+    }
+#endif
 
     void SetImagePasteHandler(std::function<bool()> handler) {
         m_imagePasteHandler = handler;

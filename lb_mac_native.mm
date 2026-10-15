@@ -1,6 +1,7 @@
 // lb_mac_native.mm — see lb_mac_native.h.
 #include "lb_mac_native.h"
 #include "lb_mac_confirm.h"
+#include "lb_mac_clipboard.h"
 
 #import <Cocoa/Cocoa.h>
 
@@ -14,6 +15,7 @@
 
 #include <cmath>
 #include <unordered_map>
+#include <vector>
 
 #include "app.h"
 #include "app_state.h"
@@ -322,4 +324,33 @@ int LbMacConfirm(const wxString& message, const wxString& caption,
     const NSModalResponse actionResponse =
         cancelDefault ? NSAlertSecondButtonReturn : NSAlertFirstButtonReturn;
     return r == actionResponse ? wxYES : wxNO;
+}
+
+// ── Clipboard image (lb_mac_clipboard.h) ───────────────────────────
+bool LbMacClipboardImagePng(std::vector<unsigned char>& png)
+{
+    @autoreleasepool {
+        NSPasteboard* pb = [NSPasteboard generalPasteboard];
+        // A Finder copy carries the file's icon as an image too; that is
+        // not a picture the user meant to attach.
+        if ([pb canReadObjectForClasses:@[[NSURL class]]
+                                options:@{NSPasteboardURLReadingFileURLsOnlyKey: @YES}])
+            return false;
+        if (![pb canReadObjectForClasses:@[[NSImage class]] options:nil])
+            return false;
+
+        NSData* data = [pb dataForType:NSPasteboardTypePNG];
+        if (!data) {
+            NSImage* image = [[NSImage alloc] initWithPasteboard:pb];
+            if (!image) return false;
+            CGImageRef cg = [image CGImageForProposedRect:nullptr context:nil hints:nil];
+            if (!cg) return false;
+            NSBitmapImageRep* rep = [[NSBitmapImageRep alloc] initWithCGImage:cg];
+            data = [rep representationUsingType:NSBitmapImageFileTypePNG properties:@{}];
+        }
+        if (!data || data.length == 0) return false;
+        const auto* bytes = static_cast<const unsigned char*>(data.bytes);
+        png.assign(bytes, bytes + data.length);
+        return true;
+    }
 }
