@@ -813,8 +813,11 @@ checkout of 8814026; the 9e8b3d3 packages are refused there. Those are kept in
 
 1. **When the PC is on:** copy `dist/LlamaBoss-0.1.25-macOS.dmg` (+ `_SHA256.txt`),
    `PC_FINDINGS_0.1.26.md` and this file to the share (`Releases/Mac/`, root).
-2. **Needs the user:** approve publishing Mac 0.1.25 (R2 upload, site + version.json
-   `mac_*` fields). Nothing has been uploaded.
+2. **Approved by the user 2026-10-15; waiting for the PC** (the Cloudflare token is on the
+   share): upload the DMG to R2 as `LlamaBoss_Beta_v0.1.25_macOS.dmg`, then site 0.2.11
+   (`~/Desktop/LlamaBoss_Website_work/v0_2_11` = live 0.2.10 from the PC's Windows 0.1.25
+   deploy + Mac 0.1.25 versions, links, docs and `mac_*` fields; Windows fields unchanged)
+   to a preview, then production. The Qwen 3.5 4B MTP test model stays (user, 2026-10-15).
 3. **Needs the user:** fresh-account test with `/Users/Shared/LlamaBoss-FreshTest` (checklist
    inside): create a standard user account and log in to it.
 4. **Needs the user:** rotate the Cloudflare Pages API token (it was printed into a session
