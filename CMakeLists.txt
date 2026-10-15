@@ -190,6 +190,12 @@ if(APPLE)
         list(GET _llama_default_dirs 0 _llama_default)
     endif()
     set(LLAMABOSS_LLAMA_DIR "${_llama_default}" CACHE PATH "Unpacked llama.cpp macOS release")
+    # A build dir configured before a llama.cpp update caches the old folder;
+    # once that is gone, use the current one instead of silently bundling none.
+    if(LLAMABOSS_LLAMA_DIR AND NOT EXISTS "${LLAMABOSS_LLAMA_DIR}/llama-server" AND _llama_default)
+        message(STATUS "LLAMABOSS_LLAMA_DIR ${LLAMABOSS_LLAMA_DIR} is gone; using ${_llama_default}")
+        set(LLAMABOSS_LLAMA_DIR "${_llama_default}" CACHE PATH "Unpacked llama.cpp macOS release" FORCE)
+    endif()
     if(LLAMABOSS_LLAMA_DIR AND EXISTS "${LLAMABOSS_LLAMA_DIR}/llama-server")
         message(STATUS "Bundling llama-server from ${LLAMABOSS_LLAMA_DIR}")
         file(GLOB _llama_dylibs "${LLAMABOSS_LLAMA_DIR}/*.dylib")

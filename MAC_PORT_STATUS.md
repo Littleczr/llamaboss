@@ -113,16 +113,16 @@ Intended divergences from Windows. Features that are simply not ported yet are l
 | Build | CMake 4.3.1 + Ninja (Homebrew) |
 | wxWidgets | Homebrew `wxwidgets@3.2` (`wx-config-3.2`) |
 | Poco | Homebrew `poco` 1.15.3 (OpenSSL 3.6) |
-| llama.cpp | release `b11539`, `llama-b11539-bin-macos-arm64.tar.gz` (Metal) |
+| llama.cpp | release `b11429` = v0.6.0 (matches Windows 0.1.25), `llama-b11429-bin-macos-arm64.tar.gz` (Metal), minimum macOS 13.3 |
 
 ## Build
 
 ```sh
 # one-time: unpack a llama.cpp macOS release (git-ignored)
 mkdir -p third_party/llama.cpp
-curl -L -o third_party/llama-b11539-bin-macos-arm64.tar.gz \
-  https://github.com/ggml-org/llama.cpp/releases/download/b11539/llama-b11539-bin-macos-arm64.tar.gz
-tar -xzf third_party/llama-b11539-bin-macos-arm64.tar.gz -C third_party/llama.cpp
+curl -L -o third_party/llama-b11429-bin-macos-arm64.tar.gz \
+  https://github.com/ggml-org/llama.cpp/releases/download/b11429/llama-b11429-bin-macos-arm64.tar.gz
+tar -xzf third_party/llama-b11429-bin-macos-arm64.tar.gz -C third_party/llama.cpp
 
 cmake -S . -B build_macos -G Ninja
 cmake --build build_macos
@@ -156,7 +156,7 @@ When the login keychain has an "Apple Development" (or, failing that, a self-sig
 | 5 | Remote endpoint streams; stop works | **Verified** streaming with OpenRouter GPT 6 Luna (2026-10-11 onward). Stop during a remote stream verified (2026-10-13) |
 | 6 | Shell and Python tools | **Done**: zsh shell tool (2026-10-11), Python helpers and scripts (2026-10-11), `py` session (2026-10-12), web fetch (2026-10-12), bundled Python runtime (2026-10-13) |
 | 7 | File-tool boundaries, protected credentials, packaged app | Credentials in the Keychain **verified**; packaged, notarized app **done** (2026-10-12). File-tool boundary cases (symlinks, case-sensitive volumes) implemented, not systematically tested |
-| 8 | Public Mac release | **Done 2026-10-12**: Beta 0.1.23 on R2 and llamaboss.com. 0.1.24 with the bundled Python notarized and published 2026-10-13 (R2 + site 0.2.9) |
+| 8 | Public Mac release | **Done 2026-10-12**: Beta 0.1.23 on R2 and llamaboss.com. 0.1.24 with the bundled Python notarized and published 2026-10-13 (R2 + site 0.2.9). 0.1.25 notarized 2026-10-15, **not published** |
 
 ## Implemented for macOS (compiles; runtime verification pending unless noted)
 
@@ -201,7 +201,7 @@ When the login keychain has an "Apple Development" (or, failing that, a self-sig
 - The single-instance "open a new window" signal is Windows-only. On Mac a second
   direct launch shows a message and exits (no duplicate server). Normal Finder/Dock
   launches just activate the running app.
-- Tests: the native test project (`Tests/`) has no CMake target yet.
+- Tests: the native test project (`Tests/`) has no CMake target; it is built against the app objects by a scratch script (see "Merge of main 91bb2db").
 
 ## Small follow-ups found while testing
 
@@ -736,13 +736,91 @@ checkout of 8814026; the 9e8b3d3 packages are refused there. Those are kept in
 - The released 0.1.23 Mac app predates the Mac feed fields (it reads the Windows `version`), so
   it will not announce 0.1.24; Mac builds from 0.1.24 on will announce later Mac releases.
 
+## Merge of `main` 91bb2db (Windows 0.1.25) — 2026-10-15
+
+- **Merge** `f5bbc19`. main brought llama.cpp v0.6.0, agent retries (`transient_error.h`)
+  with the Agent Status card, `utf8_scrub.h`, harness fixes, lean passes 1-2 (prompt
+  section functions, `lb_string_utils.h`, `path_safety` helpers, `lb_win_process.h`),
+  the `tool_read.cpp` range rewrite and the attachment tray inside the input box.
+  Conflicts in 10 files, Mac code kept in each:
+  - `agent_prompt_builder.cpp`: main's new layout taken verbatim; each PowerShell line has
+    a zsh/macOS twin under `#ifdef _WIN32 / #else` (18 fences; `AppendPowerShell` body ->
+    "SHELL (ZSH)"). The Mac prompt also drops the `.ps1` edit exception (no
+    `write_powershell_script` on the Mac) and says Finder, not File Explorer.
+  - `cmd_executor`, `python_runner`, `python_session`, `tool_grep`, `tool_ls`, `tool_open`:
+    main removed the file-local UTF-8 helpers; Mac branches now call the portable
+    `path_safety::` ones. `project_manager`: main's `file_size()`.
+  - Mac-only callers of removed helpers renamed (`ElapsedChip` -> `LbElapsedChip`).
+  - `lb_win_process.h` is wholly inside `#ifdef _WIN32`; every `using lb_win::...` sits in
+    an existing Windows fence. Nothing from it compiles on the Mac.
+  - Windows view (`unifdef -D_WIN32 -D__WXMSW__`): the same long-standing differences as
+    before the merge, nothing new (checked file by file against main).
+- **llama.cpp** now `b11429` (v0.6.0), the Windows 0.1.25 build. Upstream's macOS arm64
+  asset has minimum macOS **13.3** (`vtool`: minos 13.3, SDK 26.5), so no source build
+  was needed. The Mac had `b11539` (also libllama 0.6.0, 4 days newer); it is kept in
+  `third_party/dl/superseded/`. Note: b11539 already had session v11 / state-seq v4, so
+  Mac 0.1.23/0.1.24 users never had old-format caches; Windows users (b11146, v10/v3) do.
+  CMake now replaces a cached `LLAMABOSS_LLAMA_DIR` that no longer exists with the
+  current folder (a stale cache would have bundled no llama-server).
+- **Native tests** (`macos/run_native_tests.zsh`, new): 14 standalone suites, 13 pass in
+  full (announced_step 30/30, copy_line_fold 17/17, elision_budget 43/43,
+  export_metrics 39/39, python_resources 122/122, tool_call_elision 35/35, zsh policy,
+  tool_call_parser, transient_error, turn_stats, workspace_delta, chat_folders,
+  prompt_prewarm). `command_policy_tests` (PowerShell policy) 30/43: not applicable on the
+  Mac, whose shell policy is zsh. `Tests/` runner **104/112**: 7 expect `Vars\`
+  separators (Mac returns `Vars/`, intended), 1 is the known stale R0_S3 prompt test.
+- **Mac fixes** (Windows view unchanged in each):
+  - `da63f8c` lane paths with backslashes (`Vars\cmd_0001.txt`, as the shared prompt
+    writes them) resolve on the Mac, a whole-file read of an existing Vars spool no longer
+    writes a duplicate, and reuse cards quote `Vars/...` (found by the Tests/ suite).
+  - `450fdae` Cmd+V pastes pictures (and large text) as attachments. It never worked on
+    the Mac: the paste hook was Windows' `WM_PASTE`, wxOSX sends no paste event for Cmd+V,
+    and wx cannot read pasteboard PNG/TIFF. New `lb_mac_clipboard.h` reads NSPasteboard.
+    Edit > Paste from the menu still pastes text only.
+  - `6fad0ec` one sidebar click opened a chat twice (wxOSX sends LEFT_UP twice to a
+    wxStaticText), restoring its KV slot twice.
+- **Verified in the app** (dev build, Qwen 3.5 4B MTP from unsloth, now in the models
+  folder; GPT 6 Luna not used):
+  - Local chat with MTP: "creating MTP draft context", draft acceptance 0.80-0.89,
+    ~36-42 tok/s; vision projector loaded.
+  - Agent turn: shell `sw_vers` + `ls`, correct answer.
+  - Old slot cache: a real format-3 file (made with upstream b11146) under a saved chat's
+    cache name. Reopen: HTTP 400 logged as "full reprocess fallback", no error shown; the
+    next message rebuilt the context (16.9k tokens, 53 s) and answered; not stuck busy.
+    New saves are format 4 and restore in ~45 ms.
+  - Paste: thumbnail inside the input box (square crop, not stretched), attach/agent/Send
+    on the text line; picture sent with an empty box (no default text), described by the
+    model; chat reopened with the picture.
+  - PDF form: inspect 0.88 s, fill 0.11 s with bundled pypdf 6.20.1; read back
+    `full_name` = Mac Tester, `address.city` = Cupertino.
+  - Retry: a fault proxy in front of llama-server (test endpoint, since removed). 503 ->
+    "Retrying in 3 s (attempt 1 of 2)" -> completed. Stream closed before any data ->
+    retried -> completed. Stream cut after one reasoning token -> not retried, Agent Status
+    card "stopped · model request failed" (see PC findings #2).
+- **PC findings:** `PC_FINDINGS_0.1.26.md` (6 items; no shared-file package needed).
+
+- **Release 0.1.25 (not published):** `macos/package.sh --notarize LlamaBoss-notary` from
+  the merge plus the fixes above. Notarization `05998afb-1d8a-4dd2-aa49-7271ea45cd4d`
+  **Accepted**, ticket stapled; `spctl`: "accepted, Notarized Developer ID". Bundle 0.1.25,
+  LSMinimumSystemVersion 13.3, llama-server b11429 (minos 13.3), Python 3.13.16, pypdf
+  6.20.1, openpyxl 3.1.5. Launched from the mounted DMG: no prompts, TLS verifying,
+  OpenRouter model activated. `dist/LlamaBoss-0.1.25-macOS.dmg`, 57,341,367 bytes,
+  SHA-256 `1f284f22ae266aec6808a69334b80ba96e75e5ceeb0c8355e66fe21bec0bea67`
+  (`_SHA256.txt` beside it). Log: `dist/package-0.1.25.log`. **Not yet on the share:** the
+  PC was offline (SMB connect timed out), so copy it to `Releases/Mac/` when it is back.
+
 ## Next task
 
-1. **Needs the user:** fresh-account test with `/Users/Shared/LlamaBoss-FreshTest` (checklist
+1. **When the PC is on:** copy `dist/LlamaBoss-0.1.25-macOS.dmg` (+ `_SHA256.txt`),
+   `PC_FINDINGS_0.1.26.md` and this file to the share (`Releases/Mac/`, root).
+2. **Needs the user:** approve publishing Mac 0.1.25 (R2 upload, site + version.json
+   `mac_*` fields). Nothing has been uploaded.
+3. **Needs the user:** fresh-account test with `/Users/Shared/LlamaBoss-FreshTest` (checklist
    inside): create a standard user account and log in to it.
-2. **Needs the user:** rotate the Cloudflare Pages API token (it was printed into a session
+4. **Needs the user:** rotate the Cloudflare Pages API token (it was printed into a session
    transcript on 2026-10-13; not sent anywhere else) and update the credentials file on the share.
-3. When the PC next deploys the site, start from site 0.2.9 or keep the `mac_*` fields in
+5. When the PC next deploys the site, start from site 0.2.9 or keep the `mac_*` fields in
    version.json, or the Mac feed and buttons fall back to 0.1.23.
-4. File-tool boundary cases on the Mac (symlinks, case-sensitive volume), milestone 7.
-5. Skipped: the `Tests/` suite is for the Windows side (user decision 2026-10-12).
+6. File-tool boundary cases on the Mac (symlinks, case-sensitive volume), milestone 7.
+7. The `Tests/` suite now also runs on the Mac (`macos/run_native_tests.zsh`); see the
+   0.1.25 section for the expected non-Mac failures.
