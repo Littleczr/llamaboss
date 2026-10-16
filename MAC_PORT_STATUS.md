@@ -83,6 +83,28 @@ share is the single changelog between releases.
 - Changed but not verified: a line under `## Not yet tested`.
 - Never remove lines Claude did not write. Keep the file's BOM and line endings.
 
+**Website (standing rule, user 2026-10-15; the PC enforces it too):**
+- Build any site change from the package named in `D:\ForMacMini\Websites\LATEST.json`,
+  never an older zip.
+- Before deploying, confirm the live site still matches that package. If it does not, stop
+  and tell the user. Checker: scratchpad `tools/site_live_check.py <folder>` compares every
+  file. It ignores the Cloudflare Web Analytics beacon tag that Cloudflare injects into
+  served HTML.
+- After a successful production deploy:
+  1. Zip the exact deployed folder with the files at the zip root (no wrapping folder) to
+     `Websites\LlamaBoss_Website_v<site>_mac_v<macver>_<yyyyMMdd_HHmmss>.zip`.
+  2. Overwrite `LATEST.json` with `{"package": "<full D:\ path>", "sha256": "<UPPERCASE>",
+     "site_version", "app_windows", "app_mac" (both from live version.json), "by": "mac",
+     "recorded": "<ISO time>"}`.
+
+**Mac release role (after the PC publishes Windows):**
+1. Merge main.
+2. Build, notarize and staple the Mac DMG.
+3. Upload it to R2.
+4. Update the docs from the repo's `PATCH_NOTES.md` (both platforms).
+5. Deploy the site per the website rule.
+6. Add the Mac lines to `NEXT_RELEASE.md`.
+
 ## Mac differences (deliberate)
 
 Intended divergences from Windows. Features that are simply not ported yet are listed under
@@ -832,9 +854,9 @@ checkout of 8814026; the 9e8b3d3 packages are refused there. Those are kept in
    inside): create a standard user account and log in to it.
 2. **Needs the user:** rotate the Cloudflare Pages API token (it was printed into a session
    transcript on 2026-10-13; not sent anywhere else) and update the credentials file on the share.
-3. When the PC next deploys the site, start from site 0.2.11
-   (`Websites/LlamaBoss_Website_v0_2_11_mac_v0_1_25.zip`) or keep the `mac_*` fields in
-   version.json, or the Mac feed and buttons fall back to an older Mac version.
+3. Site deploys from either side start from `Websites/LATEST.json`. As of 2026-10-15 it names
+   `LlamaBoss_Website_v0_2_11_mac_v0_1_25_20261015_190520.zip` (site 0.2.11, Windows 0.1.25,
+   Mac 0.1.25; live checked identical, 27/27 files).
 4. PC findings for 0.1.26: `## Known issues` in the share's `NEXT_RELEASE.md`.
 5. File-tool boundary cases on the Mac (symlinks, case-sensitive volume), milestone 7.
 6. The `Tests/` suite now also runs on the Mac (`macos/run_native_tests.zsh`); see the
