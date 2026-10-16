@@ -74,6 +74,15 @@ the Windows view of every touched file stays identical to main (checked with `un
 The Mac may behave differently from Windows where that suits Mac users; ideas for the
 Windows version go into this file as suggestions, not code.
 
+**Running changelog (standing rule, user 2026-10-15):** `D:\ForMacMini\NEXT_RELEASE.md` on the
+share is the single changelog between releases.
+- Each Mac change: one plain-English line under `## Mac`: date · what changed for users ·
+  commit hash.
+- PC-side findings go under `## Known issues` as `- [ ] <issue> (file:line)`. No separate
+  PC_FINDINGS files.
+- Changed but not verified: a line under `## Not yet tested`.
+- Never remove lines Claude did not write. Keep the file's BOM and line endings.
+
 ## Mac differences (deliberate)
 
 Intended divergences from Windows. Features that are simply not ported yet are listed under
@@ -797,7 +806,8 @@ checkout of 8814026; the 9e8b3d3 packages are refused there. Those are kept in
     "Retrying in 3 s (attempt 1 of 2)" -> completed. Stream closed before any data ->
     retried -> completed. Stream cut after one reasoning token -> not retried, Agent Status
     card "stopped · model request failed" (see PC findings #2).
-- **PC findings:** `PC_FINDINGS_0.1.26.md` (6 items; no shared-file package needed).
+- **PC findings:** 6 items, now under `## Known issues` in the share's `NEXT_RELEASE.md`
+  with file:line and suggested fix (no shared-file package needed).
 
 - **Release 0.1.25 (published 2026-10-15):** `macos/package.sh --notarize LlamaBoss-notary` from
   the merge plus the fixes above. Notarization `05998afb-1d8a-4dd2-aa49-7271ea45cd4d`
@@ -825,7 +835,7 @@ checkout of 8814026; the 9e8b3d3 packages are refused there. Those are kept in
 3. When the PC next deploys the site, start from site 0.2.11
    (`Websites/LlamaBoss_Website_v0_2_11_mac_v0_1_25.zip`) or keep the `mac_*` fields in
    version.json, or the Mac feed and buttons fall back to an older Mac version.
-4. PC findings for 0.1.26: `PC_FINDINGS_0.1.26.md` (also on the share root).
+4. PC findings for 0.1.26: `## Known issues` in the share's `NEXT_RELEASE.md`.
 5. File-tool boundary cases on the Mac (symlinks, case-sensitive volume), milestone 7.
 6. The `Tests/` suite now also runs on the Mac (`macos/run_native_tests.zsh`); see the
    0.1.25 section for the expected non-Mac failures. The Qwen 3.5 4B MTP test model stays.
