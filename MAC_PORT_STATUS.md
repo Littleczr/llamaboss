@@ -156,7 +156,7 @@ When the login keychain has an "Apple Development" (or, failing that, a self-sig
 | 5 | Remote endpoint streams; stop works | **Verified** streaming with OpenRouter GPT 6 Luna (2026-10-11 onward). Stop during a remote stream verified (2026-10-13) |
 | 6 | Shell and Python tools | **Done**: zsh shell tool (2026-10-11), Python helpers and scripts (2026-10-11), `py` session (2026-10-12), web fetch (2026-10-12), bundled Python runtime (2026-10-13) |
 | 7 | File-tool boundaries, protected credentials, packaged app | Credentials in the Keychain **verified**; packaged, notarized app **done** (2026-10-12). File-tool boundary cases (symlinks, case-sensitive volumes) implemented, not systematically tested |
-| 8 | Public Mac release | **Done 2026-10-12**: Beta 0.1.23 on R2 and llamaboss.com. 0.1.24 with the bundled Python notarized and published 2026-10-13 (R2 + site 0.2.9). 0.1.25 notarized 2026-10-15, **not published** |
+| 8 | Public Mac release | **Done 2026-10-12**: Beta 0.1.23 on R2 and llamaboss.com. 0.1.24 with the bundled Python notarized and published 2026-10-13 (R2 + site 0.2.9). 0.1.25 notarized and published 2026-10-15 (R2 + site 0.2.11) |
 
 ## Implemented for macOS (compiles; runtime verification pending unless noted)
 
@@ -799,31 +799,33 @@ checkout of 8814026; the 9e8b3d3 packages are refused there. Those are kept in
     card "stopped · model request failed" (see PC findings #2).
 - **PC findings:** `PC_FINDINGS_0.1.26.md` (6 items; no shared-file package needed).
 
-- **Release 0.1.25 (not published):** `macos/package.sh --notarize LlamaBoss-notary` from
+- **Release 0.1.25 (published 2026-10-15):** `macos/package.sh --notarize LlamaBoss-notary` from
   the merge plus the fixes above. Notarization `05998afb-1d8a-4dd2-aa49-7271ea45cd4d`
   **Accepted**, ticket stapled; `spctl`: "accepted, Notarized Developer ID". Bundle 0.1.25,
   LSMinimumSystemVersion 13.3, llama-server b11429 (minos 13.3), Python 3.13.16, pypdf
   6.20.1, openpyxl 3.1.5. Launched from the mounted DMG: no prompts, TLS verifying,
   OpenRouter model activated. `dist/LlamaBoss-0.1.25-macOS.dmg`, 57,341,367 bytes,
   SHA-256 `1f284f22ae266aec6808a69334b80ba96e75e5ceeb0c8355e66fe21bec0bea67`
-  (`_SHA256.txt` beside it). Log: `dist/package-0.1.25.log`. **Not yet on the share:** the
-  PC was offline (SMB connect timed out), so copy it to `Releases/Mac/` when it is back.
+  (`_SHA256.txt` beside it). Log: `dist/package-0.1.25.log`. Copied to the share
+  `Releases/Mac/` (hash checked there).
+- **Published 2026-10-15 (user approved):** R2 `llamaboss-releases/LlamaBoss_Beta_v0.1.25_macOS.dmg`,
+  public URL re-downloaded and hash-matched. Site 0.2.11 = live 0.2.10 (the PC's Windows 0.1.25
+  deploy, re-checked byte-identical just before deploying) + Mac 0.1.25 links, `data-ver-mac`,
+  docs/FAQ Mac versions and `mac_*` fields in version.json; Windows fields unchanged. Preview
+  `mac-0-1-25.llamaboss.pages.dev` checked, then production: llamaboss.com/version.json
+  serves Windows 0.1.25 (`eb4b6e3f…`) + mac 0.1.25 (`1f284f22…`). Package on the share:
+  `Websites/LlamaBoss_Website_v0_2_11_mac_v0_1_25.zip`.
 
 ## Next task
 
-1. **When the PC is on:** copy `dist/LlamaBoss-0.1.25-macOS.dmg` (+ `_SHA256.txt`),
-   `PC_FINDINGS_0.1.26.md` and this file to the share (`Releases/Mac/`, root).
-2. **Approved by the user 2026-10-15; waiting for the PC** (the Cloudflare token is on the
-   share): upload the DMG to R2 as `LlamaBoss_Beta_v0.1.25_macOS.dmg`, then site 0.2.11
-   (`~/Desktop/LlamaBoss_Website_work/v0_2_11` = live 0.2.10 from the PC's Windows 0.1.25
-   deploy + Mac 0.1.25 versions, links, docs and `mac_*` fields; Windows fields unchanged)
-   to a preview, then production. The Qwen 3.5 4B MTP test model stays (user, 2026-10-15).
-3. **Needs the user:** fresh-account test with `/Users/Shared/LlamaBoss-FreshTest` (checklist
+1. **Needs the user:** fresh-account test with `/Users/Shared/LlamaBoss-FreshTest` (checklist
    inside): create a standard user account and log in to it.
-4. **Needs the user:** rotate the Cloudflare Pages API token (it was printed into a session
+2. **Needs the user:** rotate the Cloudflare Pages API token (it was printed into a session
    transcript on 2026-10-13; not sent anywhere else) and update the credentials file on the share.
-5. When the PC next deploys the site, start from site 0.2.9 or keep the `mac_*` fields in
-   version.json, or the Mac feed and buttons fall back to 0.1.23.
-6. File-tool boundary cases on the Mac (symlinks, case-sensitive volume), milestone 7.
-7. The `Tests/` suite now also runs on the Mac (`macos/run_native_tests.zsh`); see the
-   0.1.25 section for the expected non-Mac failures.
+3. When the PC next deploys the site, start from site 0.2.11
+   (`Websites/LlamaBoss_Website_v0_2_11_mac_v0_1_25.zip`) or keep the `mac_*` fields in
+   version.json, or the Mac feed and buttons fall back to an older Mac version.
+4. PC findings for 0.1.26: `PC_FINDINGS_0.1.26.md` (also on the share root).
+5. File-tool boundary cases on the Mac (symlinks, case-sensitive volume), milestone 7.
+6. The `Tests/` suite now also runs on the Mac (`macos/run_native_tests.zsh`); see the
+   0.1.25 section for the expected non-Mac failures. The Qwen 3.5 4B MTP test model stays.
