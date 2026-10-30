@@ -70,7 +70,8 @@ void ContextHud::RebuildButtons()
     m_hoverButton = -1;
 
     Button copy;
-    copy.label  = "[ Copy stats ]";
+    const bool retro = m_theme.name == "retro-hi-fi";
+    copy.label  = retro ? "Copy stats" : "[ Copy stats ]";
     copy.action = [this]() {
         if (wxTheClipboard->Open()) {
             wxTheClipboard->SetData(new wxTextDataObject(U8(m_model.plainText)));
@@ -84,14 +85,14 @@ void ContextHud::RebuildButtons()
 
     if (m_actions.openLog) {
         Button log;
-        log.label  = "[ Open log ]";
+        log.label  = retro ? "Open log" : "[ Open log ]";
         // Stays open: the panel is pinned, the log opens in its own app.
         log.action = [this]() { if (m_actions.openLog) m_actions.openLog(); };
         m_buttons.push_back(log);
     }
 
     Button close;
-    close.label      = "[ Close ]";
+    close.label      = retro ? "Close" : "[ Close ]";
     close.alignRight = true;
     // The owner destroys us; CallAfter so we never die inside our own handler.
     close.action = [this]() {
@@ -131,7 +132,8 @@ wxSize ContextHud::Measure()
     m_pad   = FromDIP(14);
     m_gap   = FromDIP(14);
     m_barW  = FromDIP(96);
-    m_barH  = FromDIP(6);
+    const bool retro = m_theme.name == "retro-hi-fi";
+    m_barH  = FromDIP(retro ? 10 : 6);
     m_lineH = dc.GetCharHeight() + FromDIP(5);
 
     // Column widths: labels, then values of rows that carry a bar (the
@@ -165,7 +167,7 @@ wxSize ContextHud::Measure()
 
     int buttons = 0;
     for (const Button& b : m_buttons)
-        buttons += dc.GetTextExtent(b.label).x + m_gap;
+        buttons += dc.GetTextExtent(b.label).x + m_gap + (retro ? FromDIP(16) : 0);
 
     const int barred = m_labelW + m_gap + m_valueW + m_gap + m_barW;
     const int inner  = std::max({ barred, longest, buttons, FromDIP(360) });
@@ -180,7 +182,7 @@ wxSize ContextHud::Measure()
         sh += m_lineH * static_cast<int>(s.rows.size());
     }
     m_sectionsH = sh;
-    m_footerH   = FromDIP(10) + m_lineH;
+    m_footerH   = FromDIP(10) + m_lineH + (retro ? FromDIP(8) : 0);
     return wxSize(m_width, m_pad + m_sectionsH + m_footerH + m_pad);
 }
 
@@ -272,6 +274,12 @@ void ContextHud::ApplyTheme(const ThemeData& theme)
 {
     m_theme = theme;
     SetBackgroundColour(m_theme.bgDialogSurface);
+    // Retro meters and button padding change the natural size. Re-measure
+    // while open so theme switching neither clips the footer nor moves its
+    // hit targets away from the visible controls.
+    RebuildButtons();
+    SetSize(FittedSize());
+    Reposition();
     Refresh();
 }
 
@@ -279,6 +287,7 @@ void ContextHud::OnPaint(wxPaintEvent&)
 {
     wxAutoBufferedPaintDC dc(this);
     const wxSize sz = GetClientSize();
+    const bool retro = m_theme.name == "retro-hi-fi";
 
     dc.SetBackground(wxBrush(m_theme.bgDialogSurface));
     dc.Clear();
@@ -303,10 +312,30 @@ void ContextHud::OnPaint(wxPaintEvent&)
         dc.DrawText(t, x, y + (m_lineH - dc.GetCharHeight()) / 2);
     };
     auto bar = [&](int x, int y, int w, double frac, const wxColour& fill) {
+        if (w <= 0) return;
+        const int fw = static_cast<int>(w * std::min(1.0, std::max(0.0, frac)) + 0.5);
         dc.SetPen(*wxTRANSPARENT_PEN);
+        if (retro) {
+            // No timers or animation: draw only when the HUD already repaints.
+            // A partially lit segment preserves the actual fraction; a zero
+            // reading leaves every segment dark.
+            const int segments = std::max(1, std::min(64, w / FromDIP(8)));
+            const int gap = std::min(FromDIP(2), std::max(0, w / segments - 1));
+            for (int i = 0; i < segments; ++i) {
+                const int sx = w * i / segments;
+                const int sw = std::max(1, w * (i + 1) / segments - sx - gap);
+                dc.SetBrush(wxBrush(track));
+                dc.DrawRectangle(x + sx, y, sw, m_barH);
+                const int lit = std::min(sw, std::max(0, fw - sx));
+                if (lit > 0) {
+                    dc.SetBrush(wxBrush(fill));
+                    dc.DrawRectangle(x + sx, y, lit, m_barH);
+                }
+            }
+            return;
+        }
         dc.SetBrush(wxBrush(track));
         dc.DrawRectangle(x, y, w, m_barH);
-        const int fw = static_cast<int>(w * std::min(1.0, std::max(0.0, frac)) + 0.5);
         if (fw > 0) {
             dc.SetBrush(wxBrush(fill));
             dc.DrawRectangle(x, y, std::max(fw, FromDIP(2)), m_barH);
@@ -339,16 +368,22 @@ void ContextHud::OnPaint(wxPaintEvent&)
             const int rw = std::min(dc.GetTextExtent(r).x, (right - left) / 2);
             text(r, right - rw, y,
                  s.headerBar >= 0 && s.headerTone != HudRow::Good
-                     ? ToneColour(s.headerTone) : m_theme.textMuted, rw);
+                     ? ToneColour(s.headerTone) : (retro ? m_theme.mdCode : m_theme.textMuted), rw);
             titleRoom -= rw + m_gap;
         }
         dc.SetFont(m_bold);
-        text(U8(s.title), left, y, m_theme.textPrimary, std::max(1, titleRoom));
+        text(U8(s.title), left, y, retro ? LbInteractiveAccent(m_theme) : m_theme.textPrimary,
+             std::max(1, titleRoom));
         dc.SetFont(m_font);
         y += m_lineH;
 
         if (s.headerBar >= 0) {
             bar(left, y + FromDIP(2), right - left, s.headerBar, ToneColour(s.headerTone));
+            if (retro && s.headerMarker >= 0 && s.headerMarker <= 1 && right > left) {
+                const int markerX = left + static_cast<int>((right - left - 1) * s.headerMarker);
+                dc.SetPen(wxPen(m_theme.mdCode, std::max(1, FromDIP(1))));
+                dc.DrawLine(markerX, y, markerX, y + m_barH + FromDIP(4));
+            }
             y += m_barH + FromDIP(8);
         }
 
@@ -393,13 +428,23 @@ void ContextHud::OnPaint(wxPaintEvent&)
     int x = left;
     for (size_t i = 0; i < m_buttons.size(); ++i) {
         Button& b = m_buttons[i];
-        const wxString label = (i == 0 && m_showCopied) ? wxString("[ Copied ]") : b.label;
+        const wxString label = (i == 0 && m_showCopied)
+            ? wxString(retro ? "Copied" : "[ Copied ]") : b.label;
         const wxSize ext = dc.GetTextExtent(b.label);
-        const int bx = b.alignRight ? right - ext.x : x;
-        b.rect = wxRect(bx, y, ext.x, m_lineH);
-        text(label, bx, y, static_cast<int>(i) == m_hoverButton
-                               ? LbInteractiveAccent(m_theme) : m_theme.textMuted);
-        if (!b.alignRight) x += ext.x + m_gap;
+        const int padX = retro ? FromDIP(8) : 0;
+        const int padY = retro ? FromDIP(4) : 0;
+        const int bw = ext.x + 2 * padX;
+        const int bx = b.alignRight ? right - bw : x;
+        b.rect = wxRect(bx, y, bw, m_lineH + 2 * padY);
+        const bool hover = static_cast<int>(i) == m_hoverButton;
+        if (retro) {
+            dc.SetPen(wxPen(hover || i == 0 ? LbInteractiveAccent(m_theme) : m_theme.borderSubtle));
+            dc.SetBrush(wxBrush(hover ? m_theme.modelPillBg : m_theme.bgInputField));
+            dc.DrawRoundedRectangle(b.rect, FromDIP(4));
+        }
+        text(label, bx + padX, y + padY, hover || (retro && i == 0)
+            ? LbInteractiveAccent(m_theme) : (retro ? m_theme.textPrimary : m_theme.textMuted));
+        if (!b.alignRight) x += bw + m_gap;
     }
 }
 

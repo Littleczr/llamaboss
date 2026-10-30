@@ -137,6 +137,50 @@ int main()
         check(!Has(oldMd, " Finish |") && !Has(oldMd, " Prefix |") && !Has(oldMd, "Uncached"),
               "old logs: no new columns or rows");
     }
+    {
+        // 2026-10-25 schema: stopped_by.  First case is the real chat that
+        // prompted it: one Qwen reply cut off by the repetition guard after
+        // 42 s of thinking -- no usage, no finish_reason, no calibration row.
+        const std::string th = std::string(kTurnHeader).substr(0, std::string(kTurnHeader).size() - 1) +
+            "\tcache_write_tokens\tcost_usd\tfinish_reason\tthink_bytes\treply_bytes\ttool_calls\tstopped_by\n";
+        const std::string stopped =
+            "2026-10-25 08:07:17\tC:\\m\\qwen.gguf\t\t\t\t\t1000\t1100\t42200\t\t\t0\t\t\t\t\t\t0\t\t\t\t17900\t0\t0\trepetition\n";
+        const std::string md = BuildMetricsMarkdown(th + stopped, "");
+        check(!Has(md, "predate it"), "repetition stop: no old-build note");
+        check(Has(md, "_No request makeup: LlamaBoss logs it only for replies that end with the "
+                      "server's token-usage report, and no reply in this chat had one (1 stopped by "
+                      "LlamaBoss because the model kept repeating itself)._"), "repetition stop: makeup note says why");
+        check(Has(md, "| Stopped by LlamaBoss | 1 (the model kept repeating"), "repetition stop: summary row");
+        check(Has(md, "| Finish reasons | repetition stop 1 |"), "repetition stop: finish tally");
+        check(Has(md, " Finish |") && Has(md, "| 42.2 | repetition stop | 0 | 17.5 | 0.0 |"),
+              "repetition stop: row shows it in the Finish column");
+        check(Has(md, "| Requests logged | 1 (0 with token usage) |"), "repetition stop: usage count kept");
+
+        // Mixed chat: a normal reply with usage + makeup, then a stopped one.
+        const std::string ch = std::string(kCalNew).substr(0, std::string(kCalNew).size() - 1) +
+            "\tprefix_hash\tcache_control\n";
+        const std::string turns = th +
+            "2026-10-25 08:05:00\tC:\\m\\qwen.gguf\t18096\t10833\t15817\t\t900\t1100\t88900\t\t\t0\t\t\t\t\t\t0\t\t\tstop\t32900\t10500\t0\t\n" +
+            stopped;
+        const std::string cal = ch +
+            "2026-10-25 08:05:00\tC:\\m\\qwen.gguf\t78336\t18096\t18000\t4.33\t0\t0\t0\t35123\t42189\t410\t0\t0\t0\t0\tf5bd6b4c\t0\n";
+        const std::string mixed = BuildMetricsMarkdown(turns, cal);
+        check(Has(mixed, "### Largest request makeup"), "mixed: makeup from the normal reply");
+        check(!Has(mixed, "predate it") && !Has(mixed, "_No request makeup"), "mixed: no misleading makeup note");
+        check(Has(mixed, "| Finish reasons | repetition stop 1, stop 1 |"), "mixed: both finishes tallied");
+        check(Has(mixed, "_1 request(s) have no token counts or request makeup: the server sent no usage "
+                         "report (1 stopped by LlamaBoss because the model kept repeating itself)._"),
+              "mixed: footnote explains the blank row");
+
+        // A reply with no usage that was NOT stopped (e.g. a provider that
+        // never reports usage): explained without blaming repetition.
+        const std::string plain =
+            "2026-10-25 09:00:00\tsome/remote\t\t\t\t\t500\t600\t3000\t\t\t0\t\t\t\t\t\t1\t\t\tstop\t0\t800\t0\t\n";
+        const std::string pmd = BuildMetricsMarkdown(th + plain, "");
+        check(Has(pmd, "and no reply in this chat had one._") && !Has(pmd, "Stopped by LlamaBoss") &&
+              !Has(pmd, "repetition"), "no usage, not stopped: neutral note");
+        check(Has(pmd, "| Finish reasons | stop 1 |"), "no usage, not stopped: real finish kept");
+    }
 
     std::printf("\n%d/%d passed\n", passes, passes + fails);
     return fails ? 1 : 0;

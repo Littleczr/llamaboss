@@ -73,6 +73,9 @@ struct TurnStats
 
     // The reply was cut off by LlamaBoss because the model was repeating
     // the same block of text (repetition_guard.h), not ended by the model.
+    // Logged in turn_stats.tsv as stopped_by = "repetition" (blank when the
+    // reply ended normally).  Such a reply usually has no usage report or
+    // finish_reason: LlamaBoss left the stream before the server sent them.
     bool stoppedForRepetition = false;
 
     // Generation speed read back from turn_stats.tsv (FromTsvRow) for a
@@ -195,7 +198,7 @@ struct TurnStats
                "\tserver_prompt_n\tserver_cache_n\tserver_predicted_n"
                "\tserver_prompt_ms\tserver_predicted_ms\tmodel_remote"
                "\tcache_write_tokens\tcost_usd\tfinish_reason"
-               "\tthink_bytes\treply_bytes\ttool_calls";
+               "\tthink_bytes\treply_bytes\ttool_calls\tstopped_by";
     }
 
     std::string TsvRow(const std::string& time, const std::string& model) const
@@ -227,7 +230,8 @@ struct TurnStats
                (modelRemote == 0 ? "0" : modelRemote == 1 ? "1" : "") + '\t' +
                cnt(cacheWriteTokens) + '\t' + num(costUsd, "%.6f") + '\t' +
                fin + '\t' + cnt(thinkBytes) + '\t' + cnt(replyBytes) + '\t' +
-               (toolCalls < 0 ? std::string() : std::to_string(toolCalls));
+               (toolCalls < 0 ? std::string() : std::to_string(toolCalls)) + '\t' +
+               (stoppedForRepetition ? "repetition" : "");
     }
 
     // ── Reading turn_stats.tsv back (HUD after loading an old chat) ──
@@ -286,6 +290,8 @@ struct TurnStats
         out.thinkBytes         = L("think_bytes");
         out.replyBytes         = L("reply_bytes");
         out.toolCalls          = static_cast<int>(L("tool_calls"));
+        if (const std::string* sb = col("stopped_by"))
+            out.stoppedForRepetition = (*sb == "repetition");
         out.firstByteMs        = D("first_byte_ms");
         out.firstTokenMs       = D("first_token_ms");
         out.totalMs            = D("total_ms");

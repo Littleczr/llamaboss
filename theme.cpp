@@ -46,6 +46,7 @@ ThemeData ThemeManager::GetThemeByName(const std::string& name)
     if (name == "nord")              return GetNordTheme();
     if (name == "nord-light")        return GetNordLightTheme();
     if (name == "one-dark")          return GetOneDarkTheme();
+    if (name == "retro-hi-fi")       return GetRetroHiFiTheme();
     if (name == "rose-pine-moon")    return GetRosePineMoonTheme();
     if (name == "rose-pine-dawn")    return GetRosePineDawnTheme();
     if (name == "tokyo-night")       return GetTokyoNightTheme();
@@ -70,6 +71,7 @@ ThemeManager::GetThemeChoices()
         { "nord",             "Nord"             },
         { "nord-light",       "Nord Light"       },
         { "one-dark",         "One Dark"         },
+        { "retro-hi-fi",      "Retro Hi-Fi"      },
         { "rose-pine-moon",   "Rose Pine Moon"   },
         { "rose-pine-dawn",   "Rose Pine Dawn"   },
         { "tokyo-night",      "Tokyo Night"      },
@@ -88,6 +90,49 @@ std::string ThemeManager::DetectSystemTheme()
     }
 #endif
     return "dark";  // Fallback
+}
+
+// Retro Hi-Fi: a restrained cassette-deck / VFD palette. Keep body text
+// neutral and readable; cyan identifies actions, amber identifies code and
+// readouts. Existing widgets consume these slots without layout changes.
+ThemeData ThemeManager::GetRetroHiFiTheme()
+{
+    ThemeData t;
+    t.name = "retro-hi-fi";
+
+    t.bgMain           = wxColour(19, 22, 25);
+    t.bgToolbar        = wxColour(27, 31, 35);
+    t.bgSidebar        = wxColour(23, 27, 30);
+    t.bgInputField     = wxColour(32, 38, 42);
+    t.bgInputArea      = wxColour(27, 31, 35);
+    t.bgDialogSurface  = wxColour(29, 34, 38);
+    t.modalScrim       = wxColour(0, 0, 0);
+
+    t.textPrimary      = wxColour(232, 237, 234);
+    t.textMuted        = wxColour(159, 177, 181);
+    t.accentButton     = wxColour(81, 220, 231);
+    t.accentButtonText = wxColour(12, 28, 31);
+    t.stopButton       = wxColour(239, 130, 132);
+    t.stopButtonText   = wxColour(35, 16, 18);
+    t.borderSubtle     = wxColour(72, 86, 92);
+
+    t.modelPillBg      = wxColour(32, 65, 71);
+    t.sidebarHover     = wxColour(33, 45, 49);
+    t.sidebarSelected  = wxColour(37, 71, 78);
+    t.attachIndicator  = wxColour(81, 220, 231);
+    t.attachChipBg     = wxColour(33, 49, 54);
+
+    t.chatUser         = wxColour(123, 222, 230);
+    t.chatAssistant    = t.textPrimary;
+    t.chatAssistantB   = wxColour(234, 195, 130);
+    t.chatSystem       = t.textMuted;
+    t.chatThought      = wxColour(169, 185, 181);
+
+    t.mdCode           = wxColour(244, 197, 111);
+    t.mdHeading        = wxColour(123, 222, 230);
+    t.mdCodeLabel      = wxColour(159, 177, 181);
+    t.mdHorizontalRule = wxColour(72, 86, 92);
+    return t;
 }
 // ═══════════════════════════════════════════════════════════════════
 //  Dark Theme — Telegram-inspired (original LlamaBoss colors)
@@ -268,7 +313,7 @@ ThemeData ThemeManager::GetNordTheme()
     // Markdown
     t.mdCode            = wxColour(235, 203, 139);   // #EBCB8B aurora yellow (nord13)
     t.mdHeading         = wxColour(236, 239, 244);   // #ECEFF4 nord6
-    t.mdCodeLabel       = wxColour(76, 86, 106);     // #4C566A nord3 comment/dim text
+    t.mdCodeLabel       = wxColour(118, 129, 152);   // nord3 lifted: #4C566A was ~1.7:1 on bg, unreadable
     t.mdHorizontalRule  = wxColour(67, 76, 94);      // #434C5E nord2
 
     return t;
@@ -515,7 +560,7 @@ ThemeData ThemeManager::GetOneDarkTheme()
     // Markdown
     t.mdCode            = wxColour(229, 192, 123);   // #e5c07b yellow
     t.mdHeading         = wxColour(198, 120, 221);   // #c678dd magenta
-    t.mdCodeLabel       = wxColour(92, 99, 112);     // #5c6370 comment gray
+    t.mdCodeLabel       = wxColour(118, 126, 142);   // #5c6370 lifted: was ~2.3:1 on bg
     t.mdHorizontalRule  = wxColour(62, 68, 82);      // #3e4452 menu/visual gray
 
     return t;
@@ -776,7 +821,7 @@ ThemeData ThemeManager::GetRosePineDawnTheme()
     // Markdown
     t.mdCode            = wxColour(215, 130, 126);   // #d7827e rose
     t.mdHeading         = wxColour(144, 122, 169);   // #907aa9 iris
-    t.mdCodeLabel       = wxColour(152, 147, 165);   // #9893a5 muted
+    t.mdCodeLabel       = wxColour(130, 125, 155);   // #9893a5 deepened: was ~2.7:1 on bg
     t.mdHorizontalRule  = wxColour(223, 218, 217);   // #dfdad9 highlight med
 
     return t;

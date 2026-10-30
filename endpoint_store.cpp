@@ -263,6 +263,12 @@ bool EndpointStore::Load()
                                 model.showInPicker = mo->getValue<bool>("show_in_picker");
                             } catch (...) { /* non-bool — keep visible */ }
                         }
+                        if (mo->has("context_limit")) {
+                            try {
+                                const auto n = mo->get("context_limit").convert<Poco::Int64>();
+                                if (n >= 4096 && n <= 2097152) model.contextLimit = (int)n;
+                            } catch (...) { /* not a number — use the default */ }
+                        }
                         ep.models.push_back(std::move(model));
                     }
                 }
@@ -329,6 +335,7 @@ bool EndpointStore::Save()
             if (m.imageOutput) mo->set("image_output", true);
             if (m.noTools)     mo->set("no_tools", true);
             if (!m.showInPicker) mo->set("show_in_picker", false);
+            if (m.contextLimit > 0) mo->set("context_limit", m.contextLimit);
             models->add(mo);
         }
         obj->set("models", models);

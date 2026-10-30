@@ -22,6 +22,13 @@
 
 // wxWidgets for paths and file system
 #include <wx/datetime.h>   // chat folder date prefix
+#include <wx/image.h>      // send-time image downscale
+#include <wx/mstream.h>    // in-memory JPEG/PNG re-encode
+#include <wx/log.h>        // wxLogNull: no error popups from image decode
+
+#include <algorithm>
+#include <cstdint>
+#include <vector>
 
 // File format version: 9 (last bump added fields for the since-retired
 // Goals feature; v9 files are still read, their "goal" block ignored).
@@ -175,24 +182,205 @@ void ApplyLocalLlamaSampling(Poco::JSON::Object::Ptr root,
 // paths correctly on Windows; std::ifstream would not.  Base64 is
 // emitted without line wrapping — Poco inserts a newline every 72
 // chars by default and providers reject wrapped payloads.
+// ─── Send-time image downscale ───────────────────────────────────
+//
+// Phone photos (12 MP+, multi-MB) cost far more than they are worth on
+// the wire.  A local vision encoder's work grows with pixel count (and
+// faster than linearly — its attention is quadratic in patches), so a
+// full-size photo can take minutes on a CPU-resident projector; remote
+// providers downscale to roughly this size on their side anyway.
+//
+// So: decode, and if the long edge exceeds kSendImageMaxEdge or the
+// file is simply large, rescale to fit and re-encode (JPEG q90, or PNG
+// when the image has transparency).  Only the WIRE copy changes — the
+// persisted attachment on disk is never touched, and the data-URI cache
+// below stores the downscaled result so this runs once per image.
+//
+// EXIF orientation is applied before re-encoding, because re-encoding
+// drops the EXIF block that told a viewer to rotate.  (llama.cpp's
+// stb_image ignores EXIF entirely, so local models also gain upright
+// images from this.)
+//
+// Anything that fails — unknown format, decode error, animated GIF —
+// falls back to the original bytes, exactly as before.
+namespace {
+
+constexpr int    kSendImageMaxEdge       = 1600;
+constexpr size_t kSendImageKeepBytes     = 1536u * 1024u;  // small enough: send as-is
+constexpr int    kSendImageJpegQuality   = 90;
+
+// Returns 1..8 (EXIF orientation), 1 when absent/unparseable.
+int ReadJpegExifOrientation(const std::vector<unsigned char>& d)
+{
+    const size_t n = d.size();
+    if (n < 4 || d[0] != 0xFF || d[1] != 0xD8) return 1;
+    size_t i = 2;
+    while (i + 4 <= n) {
+        if (d[i] != 0xFF) return 1;
+        const unsigned char marker = d[i + 1];
+        if (marker == 0xDA || marker == 0xD9) return 1;   // scan / EOI
+        const size_t segLen = (size_t(d[i + 2]) << 8) | d[i + 3];
+        if (segLen < 2 || i + 2 + segLen > n) return 1;
+        const size_t seg = i + 4;                          // payload start
+        if (marker == 0xE1 && segLen >= 16 &&
+            std::equal(d.begin() + seg, d.begin() + seg + 6,
+                       "Exif\0\0")) {
+            const size_t tiff = seg + 6;
+            const size_t end  = i + 2 + segLen;
+            const bool le = d[tiff] == 'I' && d[tiff + 1] == 'I';
+            const bool be = d[tiff] == 'M' && d[tiff + 1] == 'M';
+            if (!le && !be) return 1;
+            auto rd16 = [&](size_t o) -> uint32_t {
+                if (o + 2 > end) return 0;
+                return le ? (uint32_t(d[o]) | (uint32_t(d[o + 1]) << 8))
+                          : ((uint32_t(d[o]) << 8) | uint32_t(d[o + 1]));
+            };
+            auto rd32 = [&](size_t o) -> uint32_t {
+                if (o + 4 > end) return 0;
+                return le ? (uint32_t(d[o]) | (uint32_t(d[o + 1]) << 8) |
+                             (uint32_t(d[o + 2]) << 16) | (uint32_t(d[o + 3]) << 24))
+                          : ((uint32_t(d[o]) << 24) | (uint32_t(d[o + 1]) << 16) |
+                             (uint32_t(d[o + 2]) << 8) | uint32_t(d[o + 3]));
+            };
+            const size_t ifd = tiff + rd32(tiff + 4);
+            if (ifd + 2 > end) return 1;
+            const uint32_t count = rd16(ifd);
+            for (uint32_t k = 0; k < count; ++k) {
+                const size_t e = ifd + 2 + size_t(k) * 12;
+                if (e + 12 > end) return 1;
+                if (rd16(e) == 0x0112) {                   // Orientation
+                    const uint32_t v = rd16(e + 8);
+                    return (v >= 1 && v <= 8) ? int(v) : 1;
+                }
+            }
+            return 1;
+        }
+        i += 2 + segLen;
+    }
+    return 1;
+}
+
+wxImage ApplyExifOrientation(const wxImage& img, int o)
+{
+    switch (o) {
+        case 2: return img.Mirror(true);
+        case 3: return img.Rotate180();
+        case 4: return img.Mirror(false);
+        case 5: return img.Rotate90(true).Mirror(true);
+        case 6: return img.Rotate90(true);
+        case 7: return img.Rotate90(false).Mirror(true);
+        case 8: return img.Rotate90(false);
+        default: return img;
+    }
+}
+
+// On success fills outBytes/outMime with the wire copy and returns
+// true.  Returns false to mean "send the original bytes unchanged".
+bool DownscaleImageForSend(const std::vector<unsigned char>& bytes,
+                           const std::string& mimeType,
+                           std::vector<unsigned char>& outBytes,
+                           std::string& outMime)
+{
+    if (bytes.empty()) return false;
+    // Animated GIFs would lose all but the first frame; leave them be.
+    if (mimeType == "image/gif") return false;
+
+    wxLogNull quiet;   // wx image handlers report errors via wxLogError
+    wxMemoryInputStream in(bytes.data(), bytes.size());
+    wxImage img;
+    if (!img.LoadFile(in, wxBITMAP_TYPE_ANY) || !img.IsOk()) return false;
+
+    const bool isJpeg = bytes.size() > 2 && bytes[0] == 0xFF && bytes[1] == 0xD8;
+    const int orientation = isJpeg ? ReadJpegExifOrientation(bytes) : 1;
+
+    const int w = img.GetWidth();
+    const int h = img.GetHeight();
+    const int longEdge = std::max(w, h);
+    const bool tooBig  = longEdge > kSendImageMaxEdge;
+
+    // Small, upright, modest file: nothing to gain, avoid a lossy pass.
+    if (!tooBig && orientation == 1 && bytes.size() <= kSendImageKeepBytes)
+        return false;
+
+    if (tooBig) {
+        const double s = double(kSendImageMaxEdge) / double(longEdge);
+        const int nw = std::max(1, int(w * s + 0.5));
+        const int nh = std::max(1, int(h * s + 0.5));
+        img.Rescale(nw, nh, wxIMAGE_QUALITY_HIGH);
+    }
+    if (orientation != 1)
+        img = ApplyExifOrientation(img, orientation);
+
+    const bool keepAlpha = img.HasAlpha() || img.HasMask();
+    wxMemoryOutputStream out;
+    bool saved = false;
+    if (keepAlpha) {
+        saved   = img.SaveFile(out, wxBITMAP_TYPE_PNG);
+        outMime = "image/png";
+    } else {
+        img.SetOption(wxIMAGE_OPTION_QUALITY, kSendImageJpegQuality);
+        saved   = img.SaveFile(out, wxBITMAP_TYPE_JPEG);
+        outMime = "image/jpeg";
+    }
+    if (!saved) return false;
+
+    const size_t len = static_cast<size_t>(out.GetSize());
+    if (len == 0) return false;
+    // Pure re-encode (no resize, no rotation) that came out larger:
+    // the original is the better wire copy.
+    if (!tooBig && orientation == 1 && len >= bytes.size()) return false;
+
+    outBytes.resize(len);
+    out.CopyTo(outBytes.data(), len);
+    return true;
+}
+
+std::string Base64NoWrap(const unsigned char* p, size_t n)
+{
+    std::ostringstream b64;
+    Poco::Base64Encoder enc(b64);
+    enc.rdbuf()->setLineLength(0);
+    enc.write(reinterpret_cast<const char*>(p), static_cast<std::streamsize>(n));
+    enc.close();   // flush base64 padding
+    return b64.str();
+}
+
+} // namespace
+
 std::string LoadImageAsDataUri(const std::string& absPath,
                                const std::string& mimeType)
 {
-    std::ostringstream b64;
+    std::vector<unsigned char> bytes;
     try {
         Poco::FileInputStream in(absPath);
-        Poco::Base64Encoder enc(b64);
-        enc.rdbuf()->setLineLength(0);
-        Poco::StreamCopier::copyStream(in, enc);
-        enc.close();   // flush base64 padding
+        std::ostringstream raw;
+        Poco::StreamCopier::copyStream(in, raw);
+        const std::string s = raw.str();
+        bytes.assign(s.begin(), s.end());
     } catch (...) {
         return std::string();
     }
-    if (b64.str().empty()) return std::string();
+    if (bytes.empty()) return std::string();
 
-    const std::string mime = mimeType.empty()
+    std::string mime = mimeType.empty()
         ? std::string("image/png") : mimeType;
-    return "data:" + mime + ";base64," + b64.str();
+
+    std::vector<unsigned char> wire;
+    std::string wireMime;
+    std::string b64;
+    try {
+        if (DownscaleImageForSend(bytes, mime, wire, wireMime)) {
+            b64  = Base64NoWrap(wire.data(), wire.size());
+            mime = wireMime;
+        }
+    } catch (...) {
+        b64.clear();   // any surprise in the image path → original bytes
+    }
+    if (b64.empty())
+        b64 = Base64NoWrap(bytes.data(), bytes.size());
+    if (b64.empty()) return std::string();
+
+    return "data:" + mime + ";base64," + b64;
 }
 
 // ─── Data-URI cache ──────────────────────────────────────────────

@@ -220,8 +220,25 @@ bool ModelSwitcher::SessionUsesLocalServer() const
 
 int ModelSwitcher::ConversationContextTokens() const
 {
-    return ContextTokensForLane(!SessionUsesLocalServer(),
-                                m_appState.GetCtxSize());
+    const bool remote = !SessionUsesLocalServer();
+    if (remote) {
+        // A per-model limit set in the provider dialog (a local Strata at
+        // 128K, say) replaces the remote lane's fixed budget.
+        const std::string& key = m_conversationSelectionKey.empty()
+            ? m_service.GetActiveSelectionKey()
+            : m_conversationSelectionKey;
+        std::string endpointId, wireModel;
+        if (ParseRemoteModelKey(key, endpointId, wireModel)) {
+            if (EndpointStore* endpoints = m_appState.GetEndpointStore()) {
+                if (const auto* ep = endpoints->FindEndpoint(endpointId)) {
+                    for (const auto& model : ep->models)
+                        if (model.id == wireModel && model.contextLimit > 0)
+                            return model.contextLimit;
+                }
+            }
+        }
+    }
+    return ContextTokensForLane(remote, m_appState.GetCtxSize());
 }
 
 std::string ModelSwitcher::ExplicitSelectionMessage() const

@@ -29,10 +29,15 @@
 #include <wx/msgdlg.h>
 #include <wx/panel.h>
 #include <wx/display.h>
+#include <wx/timer.h>
+#include <wx/clipbrd.h>
 
 #include <Poco/Net/HTTPMessage.h>
 
 #include <stdexcept>
+#include <cstdio>
+#include <map>
+#include <set>
 
 // ─── Event table ────────────────────────────────────────────────
 
@@ -109,8 +114,6 @@ wxPanel* MakeHairline(wxWindow* parent, const ThemeData& t)
 const std::string kCheck = "\xE2\x9C\x93 ";
 const std::string kCross = "\xE2\x9C\x97 ";
 
-// Label-column width shared by every form grid in the edit dialog.
-constexpr int kLabelWidth = 118;
 
 // Endpoint ids, secret provider/key names: lowercase letters, digits,
 // underscores — same identifier rule the Connections dialog uses.
@@ -193,14 +196,68 @@ EndpointStore::Endpoint MakeProviderPreset(int selection)
         ep.secretProvider = "chatgpt";
         ep.secretKey      = "account";
     }
+    else if (selection == 4) {
+        // Local server: an OpenAI-compatible server on this PC (Strata,
+        // LM Studio, Ollama, a second llama-server ...).  No key; the
+        // address normally comes from the port scan.  OpenAI-style
+        // reasoning_effort is what Strata and llama-server accept.
+        ep.id               = "local_server";
+        ep.displayName      = "Local server";
+        ep.baseUrl          = "http://127.0.0.1:8080";
+        ep.authScheme       = EndpointStore::AuthScheme::None;
+        ep.secretProvider   = "local";
+        ep.reasoningDialect = "openai";
+    }
     // selection 2 is Custom: retain the safe struct defaults and let the
     // user fill only the values that genuinely vary by provider.
     return ep;
 }
 
-// Provider combo index for an endpoint.  ChatGPT shares api.openai.com
-// with the OpenAI API-key preset, so the auth scheme decides first.
-constexpr int kPresetChatGpt = 3;
+// Preset indices (stable: endpoints.json never stores them, but the
+// helpers above key on them).  ChatGPT shares api.openai.com with the
+// OpenAI API-key preset, so the auth scheme decides first.
+constexpr int kPresetOpenAI     = 0;
+constexpr int kPresetOpenRouter = 1;
+constexpr int kPresetCustom     = 2;
+constexpr int kPresetChatGpt    = 3;
+constexpr int kPresetLocal      = 4;
+
+// Provider row order as shown in the dialog.
+constexpr int kPresetDisplayOrder[] = { kPresetLocal, kPresetOpenRouter, kPresetOpenAI,
+                                        kPresetChatGpt, kPresetCustom };
+const char* const kPresetDisplayNames[] = { "Local server", "OpenRouter", "OpenAI",
+                                            "ChatGPT plan", "Custom" };
+
+// "131072" -> "128K", "1000000" -> "1M", "200000" -> "200K".
+std::string FormatContextTokens(int n)
+{
+    if (n <= 0) return {};
+    if (n % 1048576 == 0) return std::to_string(n / 1048576) + "M";
+    if (n % 1000000 == 0) return std::to_string(n / 1000000) + "M";
+    if (n % 1024 == 0)    return std::to_string(n / 1024) + "K";
+    if (n % 1000 == 0)    return std::to_string(n / 1000) + "K";
+    return std::to_string(n);
+}
+
+// Accepts "131072", "131,072", "128K", "128k", "1M".  Empty -> 0 (use
+// the default).  Returns false for anything else or out of range.
+bool ParseContextTokens(const std::string& raw, int& out)
+{
+    std::string s;
+    for (char c : raw) if (c != ',' && c != ' ' && c != '_') s += c;
+    out = 0;
+    if (s.empty()) return true;
+    long long mult = 1;
+    const char last = (char)lb_ascii::ToLower((unsigned char)s.back());
+    if (last == 'k') { mult = 1024; s.pop_back(); }
+    else if (last == 'm') { mult = 1048576; s.pop_back(); }
+    if (s.empty() || s.size() > 9) return false;
+    for (char c : s) if (c < '0' || c > '9') return false;
+    const long long v = std::stoll(s) * mult;
+    if (v < 4096 || v > 2097152) return false;
+    out = (int)v;
+    return true;
+}
 
 // ── Model-list text <-> vector ───────────────────────────────────
 // The edit dialog presents the model list as one line per model:
@@ -420,7 +477,12 @@ void MergePickerModels(std::vector<EndpointStore::Model>& records,
         auto existing = std::find_if(records.begin(), records.end(),
             [&](const auto& item) { return item.id == model.id; });
         if (existing == records.end()) records.push_back(model);
-        else *existing = model;
+        else {
+            // The raw text format has no context field: keep the record's.
+            const int keepCtx = existing->contextLimit;
+            *existing = model;
+            if (existing->contextLimit <= 0) existing->contextLimit = keepCtx;
+        }
     }
 }
 
@@ -472,7 +534,33 @@ struct FetchModelsResult {
     // (the ChatGPT plan catalog does); empty otherwise.
     std::vector<std::string> names;
     bool credentialsVerified = false;
+    // Context window per id when the catalog reports one (OpenRouter's
+    // context_length, vLLM's max_model_len, llama-server's meta.n_ctx).
+    std::map<std::string, int> contexts;
+    std::string ownedBy;                // first entry's owned_by, if any
 };
+
+// Context window advertised for one catalog entry, 0 when absent.
+// n_ctx_train is deliberately ignored: it is the training length, not
+// what the server was started with.
+int ContextFromModelEntry(const Poco::JSON::Object::Ptr& o)
+{
+    if (!o) return 0;
+    auto num = [](const Poco::JSON::Object::Ptr& obj, const char* key) -> long long {
+        if (!obj || !obj->has(key) || obj->isNull(key)) return 0;
+        try { return obj->get(key).convert<Poco::Int64>(); } catch (...) { return 0; }
+    };
+    for (const char* key : { "max_model_len", "context_length", "context_window",
+                             "max_context_length", "n_ctx" }) {
+        const long long v = num(o, key);
+        if (v > 0 && v < (1LL << 31)) return (int)v;
+    }
+    if (const auto meta = o->getObject("meta")) {
+        const long long v = num(meta, "n_ctx");
+        if (v > 0 && v < (1LL << 31)) return (int)v;
+    }
+    return 0;
+}
 
 wxDEFINE_EVENT(wxEVT_EP_MODELS_FETCHED, wxThreadEvent);
 
@@ -486,7 +574,8 @@ FetchModelsResult FetchModelIds(
     const std::string& url,
     const std::string& authHeaderName,     // empty = send without auth
     const std::string& authHeaderValue,
-    const std::vector<std::pair<std::string, std::string>>& extraHeaders, bool inspectKey = false)
+    const std::vector<std::pair<std::string, std::string>>& extraHeaders, bool inspectKey = false,
+    int timeoutSeconds = 15)
 {
     FetchModelsResult out;
     try {
@@ -505,7 +594,7 @@ FetchModelsResult FetchModelIds(
         }
         // Hard bound on the whole exchange — this is what makes the
         // detached worker safe to abandon at dialog close.
-        sess->setTimeout(Poco::Timespan(15, 0));
+        sess->setTimeout(Poco::Timespan(timeoutSeconds, 0));
 
         std::string path = uri.getPathAndQuery();
         if (path.empty()) path = "/";
@@ -607,7 +696,11 @@ FetchModelsResult FetchModelIds(
             if (!o || !o->has("id")) continue;
             try {
                 std::string id = o->getValue<std::string>("id");
-                if (!id.empty()) ids.insert(std::move(id));
+                if (id.empty()) continue;
+                if (const int ctx = ContextFromModelEntry(o)) out.contexts[id] = ctx;
+                if (out.ownedBy.empty())
+                    out.ownedBy = o->optValue<std::string>("owned_by", "");
+                ids.insert(std::move(id));
             } catch (...) { /* non-string id — skip */ }
         }
         out.ids.assign(ids.begin(), ids.end());
@@ -658,6 +751,132 @@ FetchModelsResult FetchConnectionCatalog(const std::string& base, const std::str
     auto result = FetchModelIds(url, headerName, headerValue, extra);
     result.credentialsVerified = result.ok && !noAuth && (openRouter || openAI);
     return result;
+}
+
+// Runtime context of a llama-server style host (GET /props), 0 when the
+// server has no such route.  Worker thread only.
+int FetchPropsContext(const std::string& base)
+{
+    try {
+        Poco::URI uri(base + "/props");
+        int port = uri.getPort();
+        if (port == 0) port = 80;
+        Poco::Net::HTTPClientSession sess(uri.getHost(), (Poco::UInt16)port);
+        sess.setTimeout(Poco::Timespan(3, 0));
+        Poco::Net::HTTPRequest req(Poco::Net::HTTPRequest::HTTP_GET, uri.getPathAndQuery(),
+                                   Poco::Net::HTTPMessage::HTTP_1_1);
+        req.set("Accept", "application/json");
+        sess.sendRequest(req);
+        Poco::Net::HTTPResponse resp;
+        std::istream& in = sess.receiveResponse(resp);
+        if (resp.getStatus() != Poco::Net::HTTPResponse::HTTP_OK) return 0;
+        std::string body;
+        char buf[4096];
+        while (in.good() && body.size() < 512u * 1024) {
+            in.read(buf, sizeof(buf));
+            if (in.gcount() <= 0) break;
+            body.append(buf, (size_t)in.gcount());
+        }
+        Poco::JSON::Parser parser;
+        const auto root = parser.parse(body).extract<Poco::JSON::Object::Ptr>();
+        if (!root) return 0;
+        if (const int n = ContextFromModelEntry(root->getObject("default_generation_settings"))) return n;
+        return ContextFromModelEntry(root);
+    } catch (...) { return 0; }
+}
+
+// ── Local server discovery ───────────────────────────────────────
+struct LocalServerInfo {
+    int port = 0;
+    std::string baseUrl;                 // http://127.0.0.1:<port>
+    std::string name;                    // best guess, user can rename
+    std::vector<std::string> ids;
+    std::map<std::string, int> contexts;
+};
+
+wxDEFINE_EVENT(wxEVT_EP_LOCAL_SCAN_DONE, wxThreadEvent);
+
+// Ports used by common OpenAI-compatible servers.  LlamaBoss's own
+// llama-server (8384 by default) is deliberately absent: it is already
+// the local lane in the model picker.
+constexpr int kLocalScanPorts[] = { 8080, 8081, 1234, 1919, 8000, 11434 };
+const char* const kLocalScanPortsText = "8080, 8081, 1234, 1919, 8000 and 11434";
+
+std::string LocalServerName(int port, const std::string& ownedBy)
+{
+    std::string o = ownedBy;
+    std::transform(o.begin(), o.end(), o.begin(),
+                   [](unsigned char c) { return (char)lb_ascii::ToLower(c); });
+    if (o == "llamacpp" || o == "llama.cpp") return "llama.cpp server";
+    if (o == "vllm") return "vLLM";
+    if (port == 1234)  return "LM Studio";
+    if (port == 11434) return "Ollama";
+    if (port == 1919)  return "FreeToken";
+    static const std::set<std::string> generic = {
+        "", "openai", "system", "user", "organization", "organization_owner",
+        "owner", "library", "local", "me" };
+    if (!generic.count(o)) return PrettyNameFromId(ownedBy);
+    return "Local server";
+}
+
+// Worker thread only.  Closed ports on 127.0.0.1 refuse at once, so the
+// whole sweep is normally well under a second.
+LocalServerInfo ProbeLocalPort(int port)
+{
+    LocalServerInfo s;
+    s.baseUrl = "http://127.0.0.1:" + std::to_string(port);
+    FetchModelsResult r = FetchModelIds(s.baseUrl + "/v1/models", "", "", {}, false, 3);
+    if (!r.ok || r.ids.empty()) return s;           // port stays 0: nothing there
+    s.port = port;
+    s.ids = r.ids;
+    s.contexts = r.contexts;
+    if (s.ids.size() == 1 && !s.contexts.count(s.ids.front())) {
+        if (const int n = FetchPropsContext(s.baseUrl)) s.contexts[s.ids.front()] = n;
+    }
+    s.name = LocalServerName(port, r.ownedBy);
+    return s;
+}
+
+// Worker thread only.  All ports at once: on Windows a closed localhost
+// port can take a couple of seconds to refuse, so one after another
+// would add up to ten seconds or more.
+std::vector<LocalServerInfo> ScanLocalServers()
+{
+    constexpr size_t n = sizeof(kLocalScanPorts) / sizeof(kLocalScanPorts[0]);
+    std::vector<LocalServerInfo> slots(n);
+    std::vector<std::thread> probes;
+    probes.reserve(n);
+    for (size_t i = 0; i < n; ++i)
+        probes.emplace_back([&slots, i]() { slots[i] = ProbeLocalPort(kLocalScanPorts[i]); });
+    for (auto& t : probes) t.join();
+    std::vector<LocalServerInfo> found;
+    for (auto& s : slots) if (s.port != 0) found.push_back(std::move(s));
+    return found;
+}
+
+// Same host and port, treating localhost and 127.0.0.1 as one.
+bool SameLocalBase(std::string a, std::string b)
+{
+    auto norm = [](std::string v) {
+        v = NormalizeBaseUrl(v);
+        std::transform(v.begin(), v.end(), v.begin(),
+                       [](unsigned char c) { return (char)lb_ascii::ToLower(c); });
+        const std::string lh = "://localhost";
+        const size_t at = v.find(lh);
+        if (at != std::string::npos) v.replace(at, lh.size(), "://127.0.0.1");
+        return v;
+    };
+    return norm(std::move(a)) == norm(std::move(b));
+}
+
+// "sk-or-v1-abcdef...a91f" -> "sk-or-••••••••a91f".  Never shows more
+// than the leading 6 and trailing 4 characters, and nothing for short keys.
+std::string MaskKey(const std::string& key)
+{
+    const std::string dots = "\xE2\x80\xA2\xE2\x80\xA2\xE2\x80\xA2\xE2\x80\xA2"
+                             "\xE2\x80\xA2\xE2\x80\xA2\xE2\x80\xA2\xE2\x80\xA2";
+    if (key.size() < 20) return dots;
+    return key.substr(0, 6) + dots + key.substr(key.size() - 4);
 }
 
 // ── Test connection ──────────────────────────────────────────────
@@ -883,6 +1102,29 @@ void RedactProbeError(std::string& message, const std::string& key)
     if (message.size() > 900) message.resize(900);
 }
 
+// ─── Add / Edit AI provider dialog ──────────────────────────────
+//
+// One window, no wizard.  A provider row across the top; the
+// connection on the left, the models on the right, a fixed footer.
+//
+//   * Local server  - scans the usual ports on 127.0.0.1 and lists
+//                     what answers; picking one loads its models.  No
+//                     key fields at all.
+//   * OpenRouter / OpenAI - a saved-key card ("Replace key"), or the
+//                     key box when no key is saved yet.
+//   * ChatGPT plan  - the browser sign-in panel.
+//   * Custom        - Base URL + key, Advanced opens by itself.
+//
+// Before the first successful connect (Add mode) the accent button is
+// "Connect"; afterwards it is "Save and use <model>".  Edit mode starts
+// connected.  A failed connect never resets anything the user typed;
+// for key-free servers that refuse the connection, an optional 5 s
+// retry fills the window in once the server comes up.
+//
+// Fetch models: GET <base>/v1/models with the endpoint's own auth, on a
+// detached worker thread.  Checking/unchecking changes membership on
+// structured model records; the advanced text editor projects selected
+// records and imports its final draft on save or return to the list.
 class EndpointEditDialog : public wxDialog
 {
 public:
@@ -896,13 +1138,14 @@ public:
                        SecretsStore* secretsStore,
                        const ThemeData& theme,
                        bool isNew, EndpointStore* endpointStore,
-                       const wxString& modelSearch = wxEmptyString)
+                       const wxString& modelSearch = wxEmptyString,
+                       int initialPreset = -1)
         : wxDialog(parent, wxID_ANY, title,
                    wxDefaultPosition, wxDefaultSize,
                    wxDEFAULT_DIALOG_STYLE | wxRESIZE_BORDER)
         , m_isNew(isNew)
         , m_editMode(!isNew)
-        , m_seedDisplayName(wxString::FromUTF8(seed.displayName))
+        , m_theme(&theme)
         , m_endpointStore(endpointStore)
         , m_secretsStore(secretsStore)
         , m_extraHeaders(seed.extraHeaders)
@@ -918,86 +1161,377 @@ public:
         base.SetPointSize(11);
         SetFont(base);
 
-        // Two steps share the same underlying editor and persistence path.
-        // The form scrolls independently; navigation stays reachable.
+        m_preset = initialPreset >= 0 ? initialPreset
+                 : seed.authScheme == EndpointStore::AuthScheme::ChatGpt
+                     ? kPresetChatGpt : DetectPreset(seed.baseUrl, seed.authScheme);
+
         auto* outer = new wxBoxSizer(wxVERTICAL);
-        m_stepLabel = new wxStaticText(this, wxID_ANY, "1 of 2 - Connect a provider");
-        wxFont heading = GetFont(); heading.SetWeight(wxFONTWEIGHT_BOLD);
-        m_stepLabel->SetFont(heading);
-        outer->Add(m_stepLabel, 0, wxEXPAND | wxALL, FromDIP(12));
-        m_pages = new wxSimplebook(this, wxID_ANY);
-        auto* credentials = new wxScrolledWindow(m_pages, wxID_ANY);
-        credentials->SetScrollRate(0, FromDIP(12));
-        m_credentialsPage = credentials;
-        auto* first = new wxBoxSizer(wxVERTICAL);
-        auto label = [&](wxWindow* parent, wxSizer* sizer, const wxString& text) {
-            auto* result = new wxStaticText(parent, wxID_ANY, text);
-            result->Wrap(FromDIP(560));
-            result->SetMinSize(wxSize(FromDIP(40), -1));
-            sizer->Add(result, 0, wxEXPAND | wxTOP | wxBOTTOM, FromDIP(6));
-            return result;
-        };
-        auto mutedText = [&](wxWindow* parent, const wxString& text) {
-            auto* result = new wxStaticText(parent, wxID_ANY, text,
-                wxDefaultPosition, wxDefaultSize, wxST_ELLIPSIZE_END);
-            result->SetMinSize(wxSize(FromDIP(40), -1));
-            m_hints.push_back(result);
-            return result;
-        };
-        label(credentials, first, "Provider");
-        wxArrayString providers; providers.Add("OpenAI"); providers.Add("OpenRouter");
-        providers.Add("Custom compatible service");
-        providers.Add("ChatGPT plan (Plus or Pro - sign in, no API key)");   // kPresetChatGpt
-        m_providerChoice = new wxChoice(credentials, wxID_ANY,
-            wxDefaultPosition, wxDefaultSize, providers);
-        first->Add(m_providerChoice, 0, wxEXPAND);
 
-        // ── ChatGPT plan sign-in (shown only for that provider) ──────
-        m_chatgptPanel = new wxPanel(credentials, wxID_ANY);
-        {
-            auto* cg = new wxBoxSizer(wxVERTICAL);
-            auto* intro = new wxStaticText(m_chatgptPanel, wxID_ANY,
-                "Use your ChatGPT Plus or Pro plan in LlamaBoss instead of an API key. "
-                "Requests count toward your plan's usage (the same allowance as Codex); "
-                "you can cap LlamaBoss under ChatGPT Settings > Usage.");
-            intro->Wrap(FromDIP(560));
-            m_hints.push_back(intro);
-            cg->Add(intro, 0, wxEXPAND | wxTOP | wxBOTTOM, FromDIP(8));
-            auto* row = new wxBoxSizer(wxHORIZONTAL);
-            m_chatgptSignInBtn = MakeAccentButton(m_chatgptPanel, wxID_ANY,
-                "Continue with ChatGPT", theme, FromDIP(34));
-            m_chatgptSignInBtn->SetToolTip("Opens ChatGPT in your browser to sign in and allow LlamaBoss to use your plan.");
-            m_chatgptSignOutBtn = MakeFlatButton(m_chatgptPanel, wxID_ANY, "Sign out", theme);
-            m_chatgptSignOutBtn->SetToolTip("Forget this ChatGPT sign-in on this computer and revoke it.");
-            row->Add(m_chatgptSignInBtn, 0, wxRIGHT, FromDIP(10));
-            row->Add(m_chatgptSignOutBtn, 0);
-            cg->Add(row, 0, wxTOP, FromDIP(4));
-            m_chatgptStatus = new wxStaticText(m_chatgptPanel, wxID_ANY, wxEmptyString);
-            m_chatgptStatus->SetMinSize(wxSize(FromDIP(40), -1));
-            cg->Add(m_chatgptStatus, 0, wxEXPAND | wxTOP, FromDIP(10));
-            m_chatgptPanel->SetSizer(cg);
+        // ── Provider row ─────────────────────────────────────────
+        auto* header = new wxBoxSizer(wxHORIZONTAL);
+        header->Add(SectionLabel(this, "PROVIDER"), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, FromDIP(14));
+        m_presetTrack = new wxPanel(this, wxID_ANY);
+        auto* track = new wxBoxSizer(wxHORIZONTAL);
+        for (size_t i = 0; i < sizeof(kPresetDisplayOrder) / sizeof(kPresetDisplayOrder[0]); ++i) {
+            auto* b = new wxButton(m_presetTrack, wxID_ANY, kPresetDisplayNames[i],
+                                   wxDefaultPosition, wxSize(-1, FromDIP(30)), wxBORDER_NONE);
+            wxFont bf = b->GetFont(); bf.SetPointSize(10); bf.SetWeight(wxFONTWEIGHT_SEMIBOLD); b->SetFont(bf);
+            // Room for the bold (selected) label plus side padding.
+            b->SetMinSize(wxSize(b->GetTextExtent(kPresetDisplayNames[i]).x + FromDIP(28), FromDIP(30)));
+            const int preset = kPresetDisplayOrder[i];
+            b->Bind(wxEVT_BUTTON, [this, preset](wxCommandEvent&) { OnPresetClicked(preset); });
+            track->Add(b, 0, wxALL, FromDIP(3));
+            m_presetBtns.push_back(b);
         }
-        first->Add(m_chatgptPanel, 0, wxEXPAND);
+        m_presetTrack->SetSizer(track);
+        header->Add(m_presetTrack, 0, wxALIGN_CENTER_VERTICAL);
+        outer->Add(header, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, FromDIP(16));
+        outer->Add(MakeHairline(this, theme), 0, wxEXPAND | wxTOP, FromDIP(12));
 
-        m_apiKeyLabel = label(credentials, first, "API key");
-        m_apiKeyField = new wxTextCtrl(credentials, wxID_ANY, wxEmptyString,
-            wxDefaultPosition, wxDefaultSize, wxTE_PASSWORD);
-        m_apiKeyField->SetHint("Paste your API key, or leave blank to use your saved key");
-        first->Add(m_apiKeyField, 0, wxEXPAND);
-        auto* showKey = new wxCheckBox(credentials, wxID_ANY, "Show key");
-        first->Add(showKey, 0, wxTOP, FromDIP(6));
-        m_showKeyBox = showKey;
-        auto* getKey = MakeFlatButton(credentials, wxID_ANY, "Get an API key in your browser", theme);
-        first->Add(getKey, 0, wxTOP, FromDIP(6));
-        m_getKeyBtn = getKey;
-        getKey->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) {
-            const int preset = m_providerChoice->GetSelection();
-            if (preset == 2) {
-                SetFetchStatus("Get an API key from your custom provider's website, then paste it here."); return;
-            }
-            wxLaunchDefaultBrowser(preset == 0 ? "https://platform.openai.com/api-keys" : "https://openrouter.ai/settings/keys");
+        // ── Body: connection | models ────────────────────────────
+        auto* body = new wxBoxSizer(wxHORIZONTAL);
+        BuildLeftPane(seed, theme);
+        body->Add(m_leftPane, 0, wxEXPAND);
+        auto* divider = new wxPanel(this, wxID_ANY, wxDefaultPosition, wxSize(1, -1));
+        divider->SetBackgroundColour(theme.borderSubtle);
+        body->Add(divider, 0, wxEXPAND);
+        BuildRightPane(seed, theme, modelSearch);
+        body->Add(m_rightPane, 1, wxEXPAND);
+        outer->Add(body, 1, wxEXPAND);
+
+        // ── Footer ───────────────────────────────────────────────
+        outer->Add(MakeHairline(this, theme), 0, wxEXPAND);
+        auto* footer = new wxBoxSizer(wxHORIZONTAL);
+        // One line, cut with "..." when it doesn't fit; Details shows all of it.
+        m_fetchStatus = new wxStaticText(this, wxID_ANY, wxEmptyString, wxDefaultPosition,
+                                         wxDefaultSize, wxST_ELLIPSIZE_END | wxST_NO_AUTORESIZE);
+        m_fetchStatus->SetMinSize(FromDIP(wxSize(100, -1)));
+        footer->Add(m_fetchStatus, 1, wxALIGN_CENTER_VERTICAL | wxRIGHT, FromDIP(8));
+        m_statusDetails = MakeFlatButton(this, wxID_ANY, "Details...", theme);
+        footer->Add(m_statusDetails, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, FromDIP(8));
+        m_statusDetails->Hide();
+        m_statusDetails->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) {
+            wxMessageBox(wxString::FromUTF8(m_statusText), "Connection details", wxOK | wxICON_INFORMATION, this);
         });
-        showKey->Bind(wxEVT_CHECKBOX, [this](wxCommandEvent& event) {
+        m_cancelBtn = MakeFlatButton(this, wxID_CANCEL, "Cancel", theme);
+        // "Save" keeps the checked list (and any new key) without touching
+        // the current chat's model.  The accent button is "Connect" until
+        // a connection is checked, then "Save and use <model>".
+        m_saveBtn = MakeFlatButton(this, wxID_ANY, "Save", theme);
+        m_saveBtn->SetToolTip("Save the checked models and connection without changing the current chat's model");
+        m_finishBtn = MakeAccentButton(this, wxID_OK, "Connect", theme);
+        footer->Add(m_cancelBtn, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, FromDIP(8));
+        footer->Add(m_saveBtn, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, FromDIP(8));
+        footer->Add(m_finishBtn, 0, wxALIGN_CENTER_VERTICAL);
+        outer->Add(footer, 0, wxEXPAND | wxALL, FromDIP(12));
+
+        // ── Wiring ──────────────────────────────────────────────
+        m_saveBtn->Bind(wxEVT_BUTTON, &EndpointEditDialog::OnSaveOnly, this);
+        m_finishBtn->Bind(wxEVT_BUTTON, &EndpointEditDialog::OnOK, this);
+        m_modelList->Bind(wxEVT_LISTBOX, [this](wxCommandEvent&) { LoadModelOptions(); });
+        m_modelList->Bind(wxEVT_CHECKLISTBOX, &EndpointEditDialog::OnModelToggled, this);
+        // Clicking a row's name adds it to the picker.  The checkbox
+        // itself still toggles both ways (wx handles that click before
+        // the deferred check below runs, and the check sees the result).
+        m_modelList->Bind(wxEVT_LEFT_DOWN, [this](wxMouseEvent& e) {
+            e.Skip();
+            if (m_rawMode) return;
+            const int row = m_modelList->HitTest(e.GetPosition());
+            if (row < 0 || row >= (int)m_rowModelIds.size()) return;
+            if (m_modelList->IsChecked((unsigned)row)) return;
+            const std::string id = m_rowModelIds[(size_t)row];
+            CallAfter([this, id]() { if (!IsInPicker(id)) SetInPicker(id, true); });
+        });
+        m_modelNameField->Bind(wxEVT_TEXT, [this](wxCommandEvent&) { SaveModelOptions(); });
+        m_ctxField->Bind(wxEVT_TEXT, [this](wxCommandEvent&) { SaveModelOptions(); });
+        m_allowTools->Bind(wxEVT_CHECKBOX, [this](wxCommandEvent&) { SaveModelOptions(); });
+        m_imageOutput->Bind(wxEVT_CHECKBOX, [this](wxCommandEvent&) { SaveModelOptions(); });
+        m_testEffort->Bind(wxEVT_CHOICE, [this](wxCommandEvent&) { InvalidateTest(); });
+
+        m_nameField->Bind(wxEVT_TEXT, [this](wxCommandEvent&) { SyncIdFromName(); });
+        m_idField->Bind(wxEVT_TEXT, [this](wxCommandEvent&) {
+            // Only USER edits reach here; programmatic updates use
+            // ChangeValue.  From now on the id is theirs.
+            m_idEditedByUser = true;
+        });
+        m_baseUrlField->Bind(wxEVT_TEXT, [this](wxCommandEvent&) {
+            // The catalog is keyed on the base URL: editing it orphans
+            // any in-flight fetch and any scanned-server selection.
+            for (auto* rb : m_scanRadios) rb->SetValue(false);
+            InvalidateFetch();
+            UpdateResolvedUrl();
+        });
+        m_chatPathField->Bind(wxEVT_TEXT, [this](wxCommandEvent&) { InvalidateTest(); UpdateResolvedUrl(); });
+        m_providerField->Bind(wxEVT_COMBOBOX, &EndpointEditDialog::OnProviderChanged, this);
+        m_providerField->Bind(wxEVT_TEXT, &EndpointEditDialog::OnProviderChanged, this);
+        m_keyField->Bind(wxEVT_COMBOBOX, &EndpointEditDialog::OnKeyChanged, this);
+        m_keyField->Bind(wxEVT_TEXT, &EndpointEditDialog::OnKeyChanged, this);
+        m_apiKeyField->Bind(wxEVT_TEXT, [this](wxCommandEvent&) {
+            InvalidateFetch();
+            UpdateKeyCard();
+        });
+        {
+            // Switching the auth scheme changes the catalog's credential
+            // identity (the fetch doubles as the auth test) and whether
+            // the key fields matter at all.
+            auto onAuthScheme = [this](wxCommandEvent&) {
+                InvalidateFetch();
+                UpdateAuthFieldEnables();
+                ApplyProviderMode();
+            };
+            m_bearerRadio ->Bind(wxEVT_RADIOBUTTON, onAuthScheme);
+            m_xApiKeyRadio->Bind(wxEVT_RADIOBUTTON, onAuthScheme);
+            m_noAuthRadio ->Bind(wxEVT_RADIOBUTTON, onAuthScheme);
+        }
+        m_dialectChoice->Bind(wxEVT_CHOICE, [this](wxCommandEvent&) {
+            m_originalDialect.clear(); InvalidateTest(); UpdateAdvancedSummary();
+        });
+        m_nativeRadio->Bind(wxEVT_RADIOBUTTON, [this](wxCommandEvent&) { InvalidateTest(); UpdateAdvancedSummary(); });
+        m_xmlRadio->Bind(wxEVT_RADIOBUTTON, [this](wxCommandEvent&) { InvalidateTest(); UpdateAdvancedSummary(); });
+        m_chatgptSignInBtn->Bind(wxEVT_BUTTON, &EndpointEditDialog::OnChatGptSignIn, this);
+        m_chatgptSignOutBtn->Bind(wxEVT_BUTTON, &EndpointEditDialog::OnChatGptSignOut, this);
+        Bind(wxEVT_EP_CHATGPT_SIGNED_IN, &EndpointEditDialog::OnChatGptSignedIn, this);
+        m_fetchBtn->Bind(wxEVT_BUTTON, &EndpointEditDialog::OnFetchModels, this);
+        Bind(wxEVT_EP_MODELS_FETCHED, &EndpointEditDialog::OnModelsFetched, this);
+        Bind(wxEVT_EP_LOCAL_SCAN_DONE, &EndpointEditDialog::OnLocalScanDone, this);
+        m_testBtn->Bind(wxEVT_BUTTON, &EndpointEditDialog::OnTestConnection, this);
+        Bind(wxEVT_EP_CONNECTION_TESTED, &EndpointEditDialog::OnConnectionTested, this);
+        m_filterField->Bind(wxEVT_TEXT, [this](wxCommandEvent&) { RefreshModelChecklist(); });
+        m_modelsField->Bind(wxEVT_TEXT, [this](wxCommandEvent&) {
+            if (!m_syncingModels) {
+                // Import only the completed draft. Importing every
+                // keystroke would retain partially typed IDs as hidden models.
+                m_rawModelsDirty = true;
+                InvalidateTest();
+            }
+        });
+        m_rawToggleBtn->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { ToggleRawEditor(); });
+        m_advancedPane->Bind(wxEVT_COLLAPSIBLEPANE_CHANGED,
+            [this](wxCollapsiblePaneEvent&) { RefreshLayout(); });
+        m_scanBtn->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { if (!m_scanInFlight) StartLocalScan(); });
+        m_rescanTimer.SetOwner(this);
+        Bind(wxEVT_TIMER, [this](wxTimerEvent&) {
+            if (!m_scanInFlight && !m_connected && !m_fetchInFlight) StartLocalScan(/*quiet*/ true);
+        }, m_rescanTimer.GetId());
+        m_retryTimer.SetOwner(this);
+        Bind(wxEVT_TIMER, [this](wxTimerEvent&) {
+            if (!m_fetchInFlight && m_keepChecking->GetValue()) {
+                wxCommandEvent e;
+                OnFetchModels(e);
+            }
+        }, m_retryTimer.GetId());
+        m_keepChecking->Bind(wxEVT_CHECKBOX, [this](wxCommandEvent& e) {
+            if (!e.IsChecked()) m_retryTimer.Stop();
+            else if (m_retryPanel->IsShown() && !m_fetchInFlight) m_retryTimer.StartOnce(5000);
+        });
+
+        // ── Initial state ───────────────────────────────────────
+        m_chatgptAccount = seed.chatgptAccount;
+        UpdatePresetButtons();
+        UpdateAuthFieldEnables();
+        ApplyProviderMode(/*relayout*/ false);
+        UpdateResolvedUrl();
+        UpdateAdvancedSummary();
+        UpdateKeyCard();
+        SetFetchStatus(m_editMode ? std::string() : std::string("Connect to check the connection and load models."));
+        RefreshModelChecklist();
+        if (m_preset == kPresetCustom && m_isNew) m_advancedPane->Expand();
+
+        SetSizer(outer);
+
+        int winW = FromDIP(940), winH = FromDIP(680);
+        const int displayIndex = wxDisplay::GetFromWindow(
+            GetParent() ? GetParent() : static_cast<wxWindow*>(this));
+        if (displayIndex != wxNOT_FOUND) {
+            const wxRect workArea =
+                wxDisplay(static_cast<unsigned>(displayIndex)).GetClientArea();
+            winW = std::min(winW, workArea.GetWidth()  * 9 / 10);
+            winH = std::min(winH, workArea.GetHeight() * 9 / 10);
+        }
+        SetSize(wxSize(winW, winH));
+        SetMinSize(wxSize(std::min(winW, FromDIP(760)), std::min(winH, FromDIP(520))));
+        Layout();
+        AlignAdvancedLabels();
+        m_finishBtn->SetDefault();
+
+        // ── Theming ─────────────────────────────────────────────
+        ApplyDialogThemeRecursive(this, theme.textPrimary, theme.bgInputField, theme.textPrimary);
+        ApplyThemeColors();
+        ApplyDarkTitleBar(this, theme.name != "light");
+
+        if (m_editMode) {
+            // A provider that already works: refresh its catalog, which
+            // doubles as the credential check.
+            if (IsChatGpt()) {
+                if (ChatGptSignedIn()) {
+                    SetModelStatus("Loading your ChatGPT models...", StatusTone::Neutral);
+                    CallAfter([this]() { if (!m_fetchInFlight) { wxCommandEvent e; OnFetchModels(e); } });
+                } else {
+                    SetModelStatus(kCross + "Not signed in to ChatGPT. Sign in on the left.", StatusTone::Bad);
+                }
+            } else if (UsingNoAuth() || !EffectiveApiKey().empty()) {
+                SetModelStatus("Loading the model catalog...", StatusTone::Neutral);
+                CallAfter([this]() { if (!m_fetchInFlight) { wxCommandEvent e; OnFetchModels(e); } });
+            } else {
+                SetModelStatus(kCross + "No saved key for this connection. Paste one on the left.", StatusTone::Bad);
+            }
+        } else if (m_preset == kPresetLocal) {
+            SetModelStatus("Models show up here once a server answers.", StatusTone::Neutral);
+            CallAfter([this]() { StartLocalScan(); });
+        } else {
+            SetModelStatus(IsChatGpt() ? "Sign in to load your ChatGPT models."
+                                       : "Connect to load the model catalog.", StatusTone::Neutral);
+            if (!IsChatGpt() && m_apiKeyField->IsShown()) m_apiKeyField->SetFocus();
+        }
+        UpdateSaveButtons();
+    }
+
+    ~EndpointEditDialog() override
+    {
+        m_retryTimer.Stop();
+        m_rescanTimer.Stop();
+        // Gate for the detached workers.  MUST go through
+        // LbMarkUiEventTargetDead — it shares a mutex with
+        // LbQueueEventIfAlive, closing the window where the worker has
+        // passed the alive check but not yet queued the event to this
+        // (about-to-be-destroyed) handler.
+        LbMarkUiEventTargetDead(m_alive);
+        // A browser sign-in still waiting: stop its loopback listener.
+        if (m_signInAttempt) lb_chatgpt::Auth::CancelSignIn(m_signInAttempt);
+    }
+
+private:
+    enum class StatusTone { Neutral, Good, Bad };
+
+    // ── Layout builders ─────────────────────────────────────────
+    wxStaticText* SectionLabel(wxWindow* parent, const wxString& text)
+    {
+        auto* l = new wxStaticText(parent, wxID_ANY, text);
+        wxFont f = l->GetFont(); f.SetPointSize(9); f.SetWeight(wxFONTWEIGHT_SEMIBOLD); l->SetFont(f);
+        m_sectionLabels.push_back(l);
+        return l;
+    }
+
+    wxStaticText* Muted(wxWindow* parent, const wxString& text, int wrap = 0)
+    {
+        auto* l = new wxStaticText(parent, wxID_ANY, text);
+        wxFont f = l->GetFont(); f.SetPointSize(9); l->SetFont(f);
+        if (wrap > 0) l->Wrap(wrap);
+        m_hints.push_back(l);
+        return l;
+    }
+
+    void BuildLeftPane(const EndpointStore::Endpoint& seed, const ThemeData& theme)
+    {
+        auto* left = new wxScrolledWindow(this, wxID_ANY, wxDefaultPosition, wxSize(FromDIP(350), -1));
+        left->SetScrollRate(0, FromDIP(12));
+        left->SetMinSize(wxSize(FromDIP(350), -1));
+        m_leftPane = left;
+        const int wrap = FromDIP(310);
+        auto* L = new wxBoxSizer(wxVERTICAL);
+
+        // Local server: what answered on this PC.
+        m_scanGroup = new wxPanel(left, wxID_ANY);
+        {
+            auto* g = new wxBoxSizer(wxVERTICAL);
+            auto* head = new wxBoxSizer(wxHORIZONTAL);
+            head->Add(SectionLabel(m_scanGroup, "SERVERS FOUND ON THIS PC"), 1, wxALIGN_CENTER_VERTICAL);
+            m_scanBtn = MakeFlatButton(m_scanGroup, wxID_ANY, "Scan again", theme, FromDIP(26));
+            head->Add(m_scanBtn, 0, wxALIGN_CENTER_VERTICAL);
+            g->Add(head, 0, wxEXPAND | wxBOTTOM, FromDIP(6));
+            m_scanList = new wxPanel(m_scanGroup, wxID_ANY);
+            m_scanList->SetSizer(new wxBoxSizer(wxVERTICAL));
+            g->Add(m_scanList, 0, wxEXPAND);
+            m_scanHint = Muted(m_scanGroup, wxString::Format(
+                "Checked ports %s. LlamaBoss's own local server is left out.", kLocalScanPortsText), wrap);
+            g->Add(m_scanHint, 0, wxEXPAND | wxTOP, FromDIP(6));
+            m_scanGroup->SetSizer(g);
+        }
+        L->Add(m_scanGroup, 0, wxEXPAND | wxBOTTOM, FromDIP(14));
+
+        // Address (Local) / Base URL (Custom).
+        m_baseUrlLabel = SectionLabel(left, "BASE URL");
+        L->Add(m_baseUrlLabel, 0, wxBOTTOM, FromDIP(4));
+        m_baseUrlField = new wxTextCtrl(left, wxID_ANY, wxString::FromUTF8(seed.baseUrl));
+        m_baseUrlField->SetHint("https://api.example.com");
+        L->Add(m_baseUrlField, 0, wxEXPAND | wxBOTTOM, FromDIP(10));
+
+        // Nothing answered: what to do, and an optional auto-retry.
+        m_retryPanel = new wxPanel(left, wxID_ANY);
+        {
+            auto* r = new wxBoxSizer(wxVERTICAL);
+            m_retryTitle = new wxStaticText(m_retryPanel, wxID_ANY, wxEmptyString);
+            wxFont tf = m_retryTitle->GetFont(); tf.SetWeight(wxFONTWEIGHT_SEMIBOLD); m_retryTitle->SetFont(tf);
+            r->Add(m_retryTitle, 0, wxEXPAND | wxBOTTOM, FromDIP(4));
+            m_retryBody = new wxStaticText(m_retryPanel, wxID_ANY,
+                "The server isn't running, or it stopped when its window closed. "
+                "Start it, wait for its ready line, then retry.");
+            m_retryBody->Wrap(wrap - FromDIP(20));
+            r->Add(m_retryBody, 0, wxEXPAND | wxBOTTOM, FromDIP(6));
+            m_keepChecking = new wxCheckBox(m_retryPanel, wxID_ANY, "Keep checking every 5 seconds");
+            m_keepChecking->SetValue(true);
+            r->Add(m_keepChecking, 0);
+            auto* pad = new wxBoxSizer(wxVERTICAL);
+            pad->Add(r, 1, wxEXPAND | wxALL, FromDIP(10));
+            m_retryPanel->SetSizer(pad);
+        }
+        L->Add(m_retryPanel, 0, wxEXPAND | wxBOTTOM, FromDIP(12));
+        m_retryPanel->Hide();
+
+        // API key: saved-key card, or the key box.
+        m_keyGroup = new wxPanel(left, wxID_ANY);
+        {
+            auto* k = new wxBoxSizer(wxVERTICAL);
+            k->Add(SectionLabel(m_keyGroup, "API KEY"), 0, wxBOTTOM, FromDIP(4));
+            m_keyCard = new wxPanel(m_keyGroup, wxID_ANY);
+            {
+                auto* c = new wxBoxSizer(wxVERTICAL);
+                m_keyCardTitle = new wxStaticText(m_keyCard, wxID_ANY, wxEmptyString);
+                c->Add(m_keyCardTitle, 0, wxBOTTOM, FromDIP(2));
+                m_keyCardMasked = new wxStaticText(m_keyCard, wxID_ANY, wxEmptyString);
+                m_keyCardMasked->SetFont(wxFont(wxFontInfo(10).Family(wxFONTFAMILY_TELETYPE)));
+                c->Add(m_keyCardMasked, 0, wxBOTTOM, FromDIP(2));
+                m_keyCardDetail = Muted(m_keyCard, wxEmptyString);
+                c->Add(m_keyCardDetail, 0, wxBOTTOM, FromDIP(6));
+                m_replaceKeyBtn = MakeFlatButton(m_keyCard, wxID_ANY, "Replace key", theme, FromDIP(26));
+                c->Add(m_replaceKeyBtn, 0);
+                auto* pad = new wxBoxSizer(wxVERTICAL);
+                pad->Add(c, 1, wxEXPAND | wxALL, FromDIP(10));
+                m_keyCard->SetSizer(pad);
+            }
+            k->Add(m_keyCard, 0, wxEXPAND | wxBOTTOM, FromDIP(6));
+            m_keyEntry = new wxPanel(m_keyGroup, wxID_ANY);
+            {
+                auto* e = new wxBoxSizer(wxVERTICAL);
+                m_apiKeyField = new wxTextCtrl(m_keyEntry, wxID_ANY, wxEmptyString,
+                    wxDefaultPosition, wxDefaultSize, wxTE_PASSWORD);
+                m_apiKeyField->SetHint("Paste your API key");
+                e->Add(m_apiKeyField, 0, wxEXPAND | wxBOTTOM, FromDIP(6));
+                auto* row = new wxBoxSizer(wxHORIZONTAL);
+                m_showKeyBox = new wxCheckBox(m_keyEntry, wxID_ANY, "Show key");
+                row->Add(m_showKeyBox, 0, wxALIGN_CENTER_VERTICAL);
+                row->AddStretchSpacer();
+                m_getKeyBtn = MakeFlatButton(m_keyEntry, wxID_ANY, "Get a key", theme, FromDIP(26));
+                row->Add(m_getKeyBtn, 0, wxALIGN_CENTER_VERTICAL);
+                e->Add(row, 0, wxEXPAND);
+                m_keyEntry->SetSizer(e);
+            }
+            k->Add(m_keyEntry, 0, wxEXPAND);
+            k->Add(Muted(m_keyGroup, "Keys are typed here only, never in chat.", wrap), 0, wxTOP, FromDIP(6));
+            m_keyGroup->SetSizer(k);
+        }
+        L->Add(m_keyGroup, 0, wxEXPAND | wxBOTTOM, FromDIP(14));
+        m_replaceKeyBtn->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) {
+            m_replacingKey = true;
+            UpdateKeyCard();
+            m_apiKeyField->SetFocus();
+        });
+        m_getKeyBtn->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) {
+            if (m_preset == kPresetOpenAI) wxLaunchDefaultBrowser("https://platform.openai.com/api-keys");
+            else if (m_preset == kPresetOpenRouter) wxLaunchDefaultBrowser("https://openrouter.ai/settings/keys");
+            else SetFetchStatus("Get an API key from your provider's website, then paste it here.");
+        });
+        m_showKeyBox->Bind(wxEVT_CHECKBOX, [this](wxCommandEvent& event) {
 #ifdef __WXMSW__
             ::SendMessage((HWND)m_apiKeyField->GetHandle(), EM_SETPASSWORDCHAR,
                 event.IsChecked() ? 0 : 0x25CF, 0);
@@ -1008,34 +1542,59 @@ public:
 #endif
             m_apiKeyField->Refresh();
         });
-        m_connectionStatus = mutedText(credentials, wxEmptyString);
-        first->Add(m_connectionStatus, 0, wxEXPAND | wxTOP, FromDIP(8));
-        auto* keyHelp = label(credentials, first,
-            "Your key stays out of chat and is saved when you finish setup.");
-        keyHelp->Wrap(FromDIP(600));
-        m_hints.push_back(keyHelp);
-        m_keyHelp = keyHelp;
 
-        m_advancedPane = new wxCollapsiblePane(credentials, wxID_ANY, "Advanced",
+        // ChatGPT plan sign-in.
+        m_chatgptPanel = new wxPanel(left, wxID_ANY);
+        {
+            auto* cg = new wxBoxSizer(wxVERTICAL);
+            cg->Add(SectionLabel(m_chatgptPanel, "CHATGPT PLAN"), 0, wxBOTTOM, FromDIP(4));
+            auto* intro = Muted(m_chatgptPanel,
+                "Use your ChatGPT Plus or Pro plan instead of an API key. Requests count toward "
+                "your plan's usage (the same allowance as Codex); you can cap LlamaBoss under "
+                "ChatGPT Settings > Usage.", wrap);
+            cg->Add(intro, 0, wxEXPAND | wxBOTTOM, FromDIP(8));
+            auto* row = new wxBoxSizer(wxHORIZONTAL);
+            m_chatgptSignInBtn = MakeAccentButton(m_chatgptPanel, wxID_ANY, "Continue with ChatGPT", theme, FromDIP(32));
+            m_chatgptSignInBtn->SetToolTip("Opens ChatGPT in your browser to sign in and allow LlamaBoss to use your plan.");
+            m_chatgptSignOutBtn = MakeFlatButton(m_chatgptPanel, wxID_ANY, "Sign out", theme);
+            m_chatgptSignOutBtn->SetToolTip("Forget this ChatGPT sign-in on this computer and revoke it.");
+            row->Add(m_chatgptSignInBtn, 0, wxRIGHT, FromDIP(8));
+            row->Add(m_chatgptSignOutBtn, 0);
+            cg->Add(row, 0);
+            m_chatgptStatus = new wxStaticText(m_chatgptPanel, wxID_ANY, wxEmptyString);
+            cg->Add(m_chatgptStatus, 0, wxEXPAND | wxTOP, FromDIP(8));
+            m_chatgptPanel->SetSizer(cg);
+        }
+        L->Add(m_chatgptPanel, 0, wxEXPAND | wxBOTTOM, FromDIP(14));
+
+        // Name shown in the picker.
+        L->Add(SectionLabel(left, "NAME IN THE PICKER"), 0, wxBOTTOM, FromDIP(4));
+        m_nameField = new wxTextCtrl(left, wxID_ANY, wxString::FromUTF8(seed.displayName));
+        L->Add(m_nameField, 0, wxEXPAND | wxBOTTOM, FromDIP(14));
+
+        // Advanced.
+        m_advancedPane = new wxCollapsiblePane(left, wxID_ANY, "Advanced",
             wxDefaultPosition, wxDefaultSize, wxCP_DEFAULT_STYLE | wxCP_NO_TLW_RESIZE);
         wxWindow* adv = m_advancedPane->GetPane();
         auto* advSizer = new wxBoxSizer(wxVERTICAL);
         auto* grid = new wxFlexGridSizer(2, FromDIP(8), FromDIP(8));
         grid->AddGrowableCol(1);
+        m_advGrid = grid;
         auto fieldLabel = [&](const wxString& text) {
-            grid->Add(new wxStaticText(adv, wxID_ANY, text), 0, wxALIGN_CENTER_VERTICAL);
+            // Explicit width: inside a collapsed pane the native best size
+            // can come back short and clip the label.
+            auto* l = new wxStaticText(adv, wxID_ANY, text);
+            l->SetMinSize(wxSize(l->GetTextExtent("Reasoning").x + FromDIP(12), -1));
+            grid->Add(l, 0, wxALIGN_CENTER_VERTICAL);
         };
-        auto field = [&](const wxString& text, const std::string& value) {
-            fieldLabel(text);
-            auto* control = new wxTextCtrl(adv, wxID_ANY, wxString::FromUTF8(value));
-            grid->Add(control, 1, wxEXPAND); return control;
-        };
-        m_nameField = field("Display name", seed.displayName);
-        m_idField = field("Connection id", seed.id);
+        fieldLabel("Id");
+        m_idField = new wxTextCtrl(adv, wxID_ANY, wxString::FromUTF8(seed.id));
+        m_idField->Enable(m_isNew);
+        grid->Add(m_idField, 1, wxEXPAND);
         m_originalDialect = seed.reasoningDialect;
-        m_idField->Enable(isNew);
-        m_baseUrlField = field("Base URL", seed.baseUrl);
-        m_chatPathField = field("Chat path", seed.chatPath);
+        fieldLabel("Chat path");
+        m_chatPathField = new wxTextCtrl(adv, wxID_ANY, wxString::FromUTF8(seed.chatPath));
+        grid->Add(m_chatPathField, 1, wxEXPAND);
         wxArrayString savedProviders, savedKeys;
         std::set<std::string> seen;
         for (const auto& connection : m_connections) {
@@ -1044,7 +1603,7 @@ public:
             if (connection.provider == seed.secretProvider)
                 savedKeys.Add(wxString::FromUTF8(connection.key));
         }
-        fieldLabel("Saved connection");
+        fieldLabel("Key set");
         m_providerField = new wxComboBox(adv, wxID_ANY, wxString::FromUTF8(seed.secretProvider),
             wxDefaultPosition, wxDefaultSize, savedProviders, wxCB_DROPDOWN);
         grid->Add(m_providerField, 1, wxEXPAND);
@@ -1052,374 +1611,202 @@ public:
         m_keyField = new wxComboBox(adv, wxID_ANY, wxString::FromUTF8(seed.secretKey),
             wxDefaultPosition, wxDefaultSize, savedKeys, wxCB_DROPDOWN);
         grid->Add(m_keyField, 1, wxEXPAND);
-        fieldLabel("Authentication");
+        fieldLabel("Key type");
         auto* auth = new wxBoxSizer(wxVERTICAL);
         m_bearerRadio = new wxRadioButton(adv, wxID_ANY, "Bearer token",
             wxDefaultPosition, wxDefaultSize, wxRB_GROUP);
         m_xApiKeyRadio = new wxRadioButton(adv, wxID_ANY, "x-api-key header");
-        m_noAuthRadio = new wxRadioButton(adv, wxID_ANY, "No authentication (local server)");
+        m_noAuthRadio = new wxRadioButton(adv, wxID_ANY, "No key (local server)");
         m_bearerRadio->SetValue(seed.authScheme == EndpointStore::AuthScheme::Bearer);
         m_xApiKeyRadio->SetValue(seed.authScheme == EndpointStore::AuthScheme::XApiKey);
         m_noAuthRadio->SetValue(seed.authScheme == EndpointStore::AuthScheme::None);
         for (auto* control : {m_bearerRadio, m_xApiKeyRadio, m_noAuthRadio}) auth->Add(control, 0, wxBOTTOM, FromDIP(4));
         grid->Add(auth, 0, wxEXPAND);
-        fieldLabel("Tool protocol");
+        fieldLabel("Tool calls");
         auto* protocol = new wxBoxSizer(wxVERTICAL);
         m_nativeRadio = new wxRadioButton(adv, wxID_ANY, "Native function calls",
             wxDefaultPosition, wxDefaultSize, wxRB_GROUP);
         m_xmlRadio = new wxRadioButton(adv, wxID_ANY, "XML fallback");
         m_nativeRadio->SetValue(seed.protocol != ToolProtocol::Xml);
         m_xmlRadio->SetValue(seed.protocol == ToolProtocol::Xml);
-        protocol->Add(m_nativeRadio); protocol->Add(m_xmlRadio);
+        protocol->Add(m_nativeRadio, 0, wxBOTTOM, FromDIP(4)); protocol->Add(m_xmlRadio);
         grid->Add(protocol, 0, wxEXPAND);
-        fieldLabel("Reasoning format");
+        fieldLabel("Reasoning");
         wxArrayString dialects;
         dialects.Add("Auto (detect from host)"); dialects.Add("OpenAI");
         dialects.Add("OpenRouter"); dialects.Add("Chat template");
         m_dialectChoice = new wxChoice(adv, wxID_ANY, wxDefaultPosition, wxDefaultSize, dialects);
-        m_dialectChoice->SetSelection(seed.reasoningDialect == "openai" ? 1 :
-            seed.reasoningDialect == "openrouter" ? 2 : seed.reasoningDialect == "template" ? 3 : 0);
+        m_dialectChoice->SetSelection(DialectIndex(seed.reasoningDialect));
         grid->Add(m_dialectChoice, 0, wxEXPAND);
-        advSizer->Add(grid, 0, wxEXPAND | wxALL, FromDIP(8));
-        m_resolvedUrlLabel = mutedText(adv, wxEmptyString);
-        advSizer->Add(m_resolvedUrlLabel, 0, wxEXPAND | wxALL, FromDIP(8));
-        auto* manualModels = MakeFlatButton(adv, wxID_ANY, "Enter model IDs without connecting...", theme);
-        manualModels->SetToolTip("For services without a model catalog. Credentials will not be verified by this shortcut.");
-        advSizer->Add(manualModels, 0, wxALL, FromDIP(8));
+        advSizer->Add(grid, 0, wxEXPAND | wxTOP | wxBOTTOM, FromDIP(8));
+        m_resolvedUrlLabel = Muted(adv, wxEmptyString);
+        advSizer->Add(m_resolvedUrlLabel, 0, wxEXPAND | wxBOTTOM, FromDIP(8));
+        auto* manualModels = MakeFlatButton(adv, wxID_ANY, "Type model IDs without connecting...", theme);
+        manualModels->SetToolTip("For services without a model catalog. The connection is not checked by this shortcut.");
+        advSizer->Add(manualModels, 0, wxBOTTOM, FromDIP(8));
         manualModels->Bind(wxEVT_BUTTON, [this](wxCommandEvent& event) {
             m_manualModelsRequested = true;
             OnOK(event);
             m_manualModelsRequested = false;
         });
+        m_manualModelsBtn = manualModels;
         adv->SetSizer(advSizer);
-        first->Add(m_advancedPane, 0, wxEXPAND | wxTOP, FromDIP(12));
-        auto* firstMargins = new wxBoxSizer(wxVERTICAL);
-        firstMargins->Add(first, 1, wxEXPAND | wxALL, FromDIP(12));
-        credentials->SetSizer(firstMargins);
-        m_pages->AddPage(credentials, "Connection", true);
+        L->Add(m_advancedPane, 0, wxEXPAND);
 
-        auto* right = new wxScrolledWindow(m_pages, wxID_ANY);
-        right->SetScrollRate(0, FromDIP(12));
-        m_modelsPage = right;
-        auto* rightSizer = new wxBoxSizer(wxVERTICAL);
-        // Edit mode opens here.  The connection is summarised on one
-        // line with a way back to the credentials page; Add mode keeps
-        // the wizard order and never shows the button.
-        auto* connRow = new wxBoxSizer(wxHORIZONTAL);
+        auto* margins = new wxBoxSizer(wxVERTICAL);
+        margins->Add(L, 1, wxEXPAND | wxALL, FromDIP(16));
+        left->SetSizer(margins);
+    }
+
+    void BuildRightPane(const EndpointStore::Endpoint& seed, const ThemeData& theme, const wxString& modelSearch)
+    {
+        auto* right = new wxPanel(this, wxID_ANY);
+        m_rightPane = right;
+        auto* R = new wxBoxSizer(wxVERTICAL);
+
         m_modelConnectionStatus = new wxStaticText(right, wxID_ANY, wxEmptyString,
             wxDefaultPosition, wxDefaultSize, wxST_ELLIPSIZE_END);
         m_modelConnectionStatus->SetMinSize(wxSize(FromDIP(40), -1));
-        connRow->Add(m_modelConnectionStatus, 1, wxALIGN_CENTER_VERTICAL | wxRIGHT, FromDIP(8));
-        m_connectionBtn = MakeFlatButton(right, wxID_ANY, "Connection...", theme);
-        m_connectionBtn->SetToolTip("Change the API key or advanced connection settings");
-        connRow->Add(m_connectionBtn, 0, wxALIGN_CENTER_VERTICAL);
-        m_connectionBtn->Show(m_editMode);
-        rightSizer->Add(connRow, 0, wxEXPAND | wxTOP | wxBOTTOM, FromDIP(6));
+        R->Add(m_modelConnectionStatus, 0, wxEXPAND | wxBOTTOM, FromDIP(8));
+
         auto* searchRow = new wxBoxSizer(wxHORIZONTAL);
         m_filterField = new wxTextCtrl(right, wxID_ANY, modelSearch);
         m_filterField->SetHint("Search models by name or id");
         searchRow->Add(m_filterField, 1, wxEXPAND | wxRIGHT, FromDIP(8));
-        m_fetchBtn = MakeAccentButton(right, wxID_ANY, "Refresh models", theme);
+        m_fetchBtn = MakeFlatButton(right, wxID_ANY, "Refresh models", theme);
         searchRow->Add(m_fetchBtn, 0);
-        rightSizer->Add(searchRow, 0, wxEXPAND | wxBOTTOM, FromDIP(8));
-        label(right, rightSizer, "Check models to keep in your picker. Highlight a checked model to use in this chat.");
-        m_modelList = new wxCheckListBox(right, wxID_ANY, wxDefaultPosition, FromDIP(wxSize(-1, 170)));
-        rightSizer->Add(m_modelList, 1, wxEXPAND);
+        R->Add(searchRow, 0, wxEXPAND | wxBOTTOM, FromDIP(8));
+
+        m_modelList = new wxCheckListBox(right, wxID_ANY, wxDefaultPosition, FromDIP(wxSize(-1, 150)));
+        R->Add(m_modelList, 1, wxEXPAND);
         m_modelsField = new wxTextCtrl(right, wxID_ANY, ModelsToText(seed.models),
-            wxDefaultPosition, FromDIP(wxSize(-1, 170)), wxTE_MULTILINE | wxHSCROLL);
-        rightSizer->Add(m_modelsField, 1, wxEXPAND); m_modelsField->Hide();
+            wxDefaultPosition, FromDIP(wxSize(-1, 150)), wxTE_MULTILINE | wxHSCROLL);
+        m_modelsField->SetFont(wxFont(wxFontInfo(10).Family(wxFONTFAMILY_TELETYPE)));
+        R->Add(m_modelsField, 1, wxEXPAND); m_modelsField->Hide();
+
         auto* listFooter = new wxBoxSizer(wxHORIZONTAL);
-        m_modelCountLabel = mutedText(right, wxEmptyString);
+        m_modelCountLabel = Muted(right, wxEmptyString);
         listFooter->Add(m_modelCountLabel, 1, wxALIGN_CENTER_VERTICAL);
-        m_rawToggleBtn = MakeFlatButton(right, wxID_ANY, "Advanced: model IDs", theme);
+        m_rawToggleBtn = MakeFlatButton(right, wxID_ANY, "Edit as text", theme, FromDIP(26));
         listFooter->Add(m_rawToggleBtn, 0);
-        rightSizer->Add(listFooter, 0, wxEXPAND | wxTOP, FromDIP(6));
-        m_selectedModelLabel = label(right, rightSizer, "Select a model to edit its options.");
+        R->Add(listFooter, 0, wxEXPAND | wxTOP, FromDIP(4));
+
+        R->Add(MakeHairline(right, theme), 0, wxEXPAND | wxTOP | wxBOTTOM, FromDIP(10));
+
+        // Options for the highlighted model.
+        m_selectedModelLabel = SectionLabel(right, "SELECTED MODEL");
+        R->Add(m_selectedModelLabel, 0, wxEXPAND | wxBOTTOM, FromDIP(6));
+        auto* opts = new wxFlexGridSizer(2, FromDIP(6), FromDIP(16));
+        opts->AddGrowableCol(0, 1);
+        opts->Add(SectionLabel(right, "DISPLAY NAME"), 0);
+        opts->Add(SectionLabel(right, "CONTEXT LIMIT"), 0);
         m_modelNameField = new wxTextCtrl(right, wxID_ANY);
-        m_modelNameField->SetHint("Display name in the model picker");
-        rightSizer->Add(m_modelNameField, 0, wxEXPAND);
-        m_allowTools = new wxCheckBox(right, wxID_ANY, "Allow agent tools");
+        m_modelNameField->SetHint("Name in the model picker");
+        opts->Add(m_modelNameField, 1, wxEXPAND);
+        m_ctxField = new wxTextCtrl(right, wxID_ANY, wxEmptyString, wxDefaultPosition, wxSize(FromDIP(130), -1));
+        m_ctxField->SetHint("256K default");
+        m_ctxField->SetToolTip("Tokens LlamaBoss budgets for this model: 131072 or 128K. "
+                               "Leave empty for the 256K remote default.");
+        opts->Add(m_ctxField, 0);
+        R->Add(opts, 0, wxEXPAND);
+        m_ctxHint = Muted(right, wxEmptyString);
+        R->Add(m_ctxHint, 0, wxEXPAND | wxTOP, FromDIP(4));
+
+        auto* can = new wxBoxSizer(wxHORIZONTAL);
+        m_allowTools = new wxCheckBox(right, wxID_ANY, "Agent tools");
         m_imageOutput = new wxCheckBox(right, wxID_ANY, "Generate images");
-        rightSizer->Add(m_allowTools, 0, wxTOP, FromDIP(6));
-        rightSizer->Add(m_imageOutput, 0, wxTOP, FromDIP(4));
-        m_compatibilityHint = label(right, rightSizer, wxEmptyString);
-        m_compatibilityHint->SetMinSize(wxSize(FromDIP(100), FromDIP(46)));
+        can->Add(m_allowTools, 0, wxRIGHT, FromDIP(18));
+        can->Add(m_imageOutput, 0);
+        R->Add(can, 0, wxTOP, FromDIP(8));
+        m_compatibilityHint = Muted(right, wxEmptyString);
+        R->Add(m_compatibilityHint, 0, wxEXPAND | wxTOP, FromDIP(6));
+
         auto* testRow = new wxBoxSizer(wxHORIZONTAL);
-        testRow->Add(new wxStaticText(right, wxID_ANY, "Test reasoning:"), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, FromDIP(8));
+        m_testBtn = MakeFlatButton(right, wxID_ANY, "Test model", theme);
+        testRow->Add(m_testBtn, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, FromDIP(8));
+        testRow->Add(new wxStaticText(right, wxID_ANY, "at"), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, FromDIP(6));
         wxArrayString efforts; efforts.Add("Auto"); efforts.Add("Off"); efforts.Add("Low"); efforts.Add("Medium"); efforts.Add("High");
         m_testEffort = new wxChoice(right, wxID_ANY, wxDefaultPosition, wxDefaultSize, efforts);
-        m_testEffort->SetSelection(0); testRow->Add(m_testEffort, 0);
-        m_testBtn = MakeFlatButton(right, wxID_ANY, "Test selected model", theme);
-        testRow->Add(m_testBtn, 0, wxLEFT, FromDIP(12));
-        rightSizer->Add(testRow, 0, wxEXPAND | wxTOP, FromDIP(6));
-        auto* testHelp = label(right, rightSizer, "Optional test sends small API requests; normal provider usage charges apply.");
-        m_hints.push_back(testHelp);
-        auto* rightMargins = new wxBoxSizer(wxVERTICAL);
-        rightMargins->Add(rightSizer, 1, wxEXPAND | wxALL, FromDIP(12));
-        right->SetSizer(rightMargins);
-        m_pages->AddPage(right, "Models");
-        outer->Add(m_pages, 1, wxEXPAND);
-        m_pages->SetMinSize(FromDIP(wxSize(100, 100)));
-        auto* statusRow = new wxBoxSizer(wxHORIZONTAL);
-        m_fetchStatus = new wxStaticText(this, wxID_ANY, wxEmptyString);
-        m_fetchStatus->SetMinSize(FromDIP(wxSize(100, 44)));
-        statusRow->Add(m_fetchStatus, 1, wxALIGN_CENTER_VERTICAL | wxRIGHT, FromDIP(8));
-        m_statusDetails = MakeFlatButton(this, wxID_ANY, "Details...", theme);
-        statusRow->Add(m_statusDetails, 0, wxALIGN_CENTER_VERTICAL);
-        m_statusDetails->Hide();
-        m_statusDetails->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) {
-            wxMessageBox(wxString::FromUTF8(m_statusText), "Connection details", wxOK | wxICON_INFORMATION, this);
-        });
-        outer->Add(statusRow, 0, wxEXPAND | wxLEFT | wxRIGHT, FromDIP(12));
-        auto* navigation = new wxBoxSizer(wxHORIZONTAL);
-        m_backBtn = MakeFlatButton(this, wxID_ANY, "Back", theme);
-        navigation->Add(m_backBtn, 0); navigation->AddStretchSpacer();
-        auto* cancelBtn = MakeFlatButton(this, wxID_CANCEL, "Cancel", theme);
-        // "Save" keeps the checked list (and any new key) without touching
-        // the current chat's model.  "Save and use model" additionally
-        // switches to the highlighted checked model and is only enabled
-        // when there is one.  Both exist only on the Models page.
-        m_saveBtn = MakeFlatButton(this, wxID_ANY, "Save", theme);
-        m_saveBtn->SetToolTip("Save the checked models and connection without changing the current chat's model");
-        auto* okBtn = MakeAccentButton(this, wxID_OK, "Connect", theme);
-        m_finishBtn = okBtn;
-        navigation->Add(cancelBtn, 0, wxRIGHT, FromDIP(10));
-        navigation->Add(m_saveBtn, 0, wxRIGHT, FromDIP(10));
-        navigation->Add(okBtn, 0);
-        outer->Add(navigation, 0, wxEXPAND | wxALL, FromDIP(12));
-        // Back: wizard goes to the credentials page; in Edit mode the
-        // credentials page is the detour, so Back returns to Models.
-        m_backBtn->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) {
-            ShowStep(m_editMode && m_pages->GetSelection() == 0 ? 1 : 0);
-        });
-        m_connectionBtn->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { ShowStep(0); });
-        m_saveBtn->Bind(wxEVT_BUTTON, &EndpointEditDialog::OnSaveOnly, this);
-        m_modelList->Bind(wxEVT_LISTBOX, [this](wxCommandEvent&) { LoadModelOptions(); });
-        m_modelNameField->Bind(wxEVT_TEXT, [this](wxCommandEvent&) { SaveModelOptions(); });
-        m_allowTools->Bind(wxEVT_CHECKBOX, [this](wxCommandEvent&) { SaveModelOptions(); });
-        m_imageOutput->Bind(wxEVT_CHECKBOX, [this](wxCommandEvent&) { SaveModelOptions(); });
-        m_testEffort->Bind(wxEVT_CHOICE, [this](wxCommandEvent&) { InvalidateTest(); });
+        m_testEffort->SetSelection(0);
+        m_testEffort->SetToolTip("Reasoning level used for the test");
+        testRow->Add(m_testEffort, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, FromDIP(4));
+        testRow->Add(new wxStaticText(right, wxID_ANY, "reasoning"), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, FromDIP(12));
+        m_testResult = new wxStaticText(right, wxID_ANY, wxEmptyString,
+            wxDefaultPosition, wxDefaultSize, wxST_ELLIPSIZE_END);
+        testRow->Add(m_testResult, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, FromDIP(10));
+        m_testTools = new wxStaticText(right, wxID_ANY, wxEmptyString);
+        testRow->Add(m_testTools, 1, wxALIGN_CENTER_VERTICAL);
+        R->Add(testRow, 0, wxEXPAND | wxTOP, FromDIP(10));
+        m_testHelp = Muted(right, wxEmptyString);
+        R->Add(m_testHelp, 0, wxEXPAND | wxTOP, FromDIP(4));
 
-        // ── Wiring ──────────────────────────────────────────────
-        m_nameField->Bind(wxEVT_TEXT,
-            [this](wxCommandEvent&) { SyncIdFromName(); });
-        m_idField->Bind(wxEVT_TEXT,
-            [this](wxCommandEvent&) {
-                // Only USER edits reach here; programmatic updates use
-                // ChangeValue.  From now on the id is theirs.
-                m_idEditedByUser = true;
-            });
-        m_baseUrlField->Bind(wxEVT_TEXT,
-            [this](wxCommandEvent&) {
-                // The catalog is keyed on the base URL: editing it
-                // orphans any in-flight fetch.
-                InvalidateFetch();
-                UpdateResolvedUrl();
-            });
-        m_chatPathField->Bind(wxEVT_TEXT,
-            [this](wxCommandEvent&) { InvalidateTest(); UpdateResolvedUrl(); });
-        m_providerField->Bind(wxEVT_COMBOBOX,
-            &EndpointEditDialog::OnProviderChanged, this);
-        m_providerField->Bind(wxEVT_TEXT,
-            &EndpointEditDialog::OnProviderChanged, this);
-        m_keyField->Bind(wxEVT_COMBOBOX,
-            &EndpointEditDialog::OnKeyChanged, this);
-        m_keyField->Bind(wxEVT_TEXT,
-            &EndpointEditDialog::OnKeyChanged, this);
-        m_apiKeyField->Bind(wxEVT_TEXT,
-            [this](wxCommandEvent&) {
-                InvalidateFetch();
-                UpdateConnectionStatus();
-            });
-        // Switching the auth scheme changes the catalog's credential
-        // identity (the fetch doubles as the auth test) and whether
-        // the key fields matter at all.
-        {
-            auto onAuthScheme = [this](wxCommandEvent&) {
-                InvalidateFetch();
-                UpdateAuthFieldEnables();
-                UpdateConnectionStatus();
-            };
-            m_bearerRadio ->Bind(wxEVT_RADIOBUTTON, onAuthScheme);
-            m_xApiKeyRadio->Bind(wxEVT_RADIOBUTTON, onAuthScheme);
-            m_noAuthRadio ->Bind(wxEVT_RADIOBUTTON, onAuthScheme);
-        }
-        m_providerChoice->Bind(wxEVT_CHOICE,
-            [this](wxCommandEvent& e) { SeedFromPreset(e.GetSelection()); });
-        m_chatgptSignInBtn->Bind(wxEVT_BUTTON,
-            &EndpointEditDialog::OnChatGptSignIn, this);
-        m_chatgptSignOutBtn->Bind(wxEVT_BUTTON,
-            &EndpointEditDialog::OnChatGptSignOut, this);
-        Bind(wxEVT_EP_CHATGPT_SIGNED_IN,
-             &EndpointEditDialog::OnChatGptSignedIn, this);
-        m_fetchBtn->Bind(wxEVT_BUTTON,
-            &EndpointEditDialog::OnFetchModels, this);
-        Bind(wxEVT_EP_MODELS_FETCHED,
-             &EndpointEditDialog::OnModelsFetched, this);
-        m_testBtn->Bind(wxEVT_BUTTON,
-            &EndpointEditDialog::OnTestConnection, this);
-        Bind(wxEVT_EP_CONNECTION_TESTED,
-             &EndpointEditDialog::OnConnectionTested, this);
-        m_filterField->Bind(wxEVT_TEXT,
-            [this](wxCommandEvent&) { RefreshModelChecklist(); });
-        m_modelList->Bind(wxEVT_CHECKLISTBOX,
-            &EndpointEditDialog::OnModelToggled, this);
-        m_modelsField->Bind(wxEVT_TEXT,
-            [this](wxCommandEvent&) {
-                if (!m_syncingModels) {
-                    // Import only the completed draft. Importing every
-                    // keystroke would retain partially typed IDs as hidden models.
-                    m_rawModelsDirty = true;
-                    InvalidateTest();
-                }
-            });
-        m_rawToggleBtn->Bind(wxEVT_BUTTON,
-            [this](wxCommandEvent&) { ToggleRawEditor(); });
-        m_advancedPane->Bind(wxEVT_COLLAPSIBLEPANE_CHANGED,
-            [this](wxCollapsiblePaneEvent&) { ResizeForStep(); RefreshLayout(); });
-
-        m_dialectChoice->Bind(wxEVT_CHOICE, [this](wxCommandEvent&) { m_originalDialect.clear(); InvalidateTest(); });
-        m_nativeRadio->Bind(wxEVT_RADIOBUTTON, [this](wxCommandEvent&) { InvalidateTest(); });
-        m_xmlRadio->Bind(wxEVT_RADIOBUTTON, [this](wxCommandEvent&) { InvalidateTest(); });
-
-        // Provider selection from the seed's base URL; Add passes an
-        // OpenAI preset, Edit whatever the endpoint actually is.
-        m_providerChoice->SetSelection(
-            seed.authScheme == EndpointStore::AuthScheme::ChatGpt
-                ? kPresetChatGpt : DetectPreset(seed.baseUrl));
-        m_providerChoice->Enable(isNew);
-        m_chatgptAccount = seed.chatgptAccount;
-        ApplyProviderMode(/*relayout*/ false);
-
-        UpdateResolvedUrl();
-        UpdateAuthFieldEnables();
-        UpdateConnectionStatus();
-        SetFetchStatus("Connect to check your credentials and load models.");
-        RefreshModelChecklist();
-
-        if (m_providerChoice->GetSelection() == 2)
-            m_advancedPane->Expand();
-
-        SetSizer(outer);
-
-        // Clamp the wizard to the work area. Both pages can scroll when
-        // Advanced or display scaling makes the content taller than the screen.
-        int winW = FromDIP(700), winH = FromDIP(560);
-        const int displayIndex = wxDisplay::GetFromWindow(
-            GetParent() ? GetParent() : static_cast<wxWindow*>(this));
-        if (displayIndex != wxNOT_FOUND) {
-            const wxRect workArea =
-                wxDisplay(static_cast<unsigned>(displayIndex)).GetClientArea();
-            winW = std::min(winW, workArea.GetWidth()  * 9 / 10);
-            winH = std::min(winH, workArea.GetHeight() * 9 / 10);
-        }
-        SetSize(wxSize(winW, winH));
-        SetMinSize(wxSize(std::min(winW, FromDIP(480)), std::min(winH, FromDIP(400))));
-        Layout();
-        AlignAdvancedLabels();
-
-        okBtn->Bind(wxEVT_BUTTON, &EndpointEditDialog::OnOK, this);
-        okBtn->SetDefault();
-        if (m_editMode) {
-            // A provider that already works opens on the page people
-            // actually come here for.  Credentials are checked by the
-            // catalog fetch itself; a 401 lands in the status line and
-            // "Connection..." is one click away.
-            ShowStep(1);
-            const bool noAuth = m_noAuthRadio->GetValue();
-            if (IsChatGpt()) {
-                if (ChatGptSignedIn()) {
-                    m_modelConnectionStatus->SetLabel("Loading your ChatGPT models...");
-                    CallAfter([this]() {
-                        if (m_fetchInFlight) return;
-                        wxCommandEvent e;
-                        OnFetchModels(e);
-                    });
-                } else {
-                    m_modelConnectionStatus->SetLabel(
-                        wxString::FromUTF8(kCross.c_str()) +
-                        "Not signed in to ChatGPT. Click Connection... to sign in.");
-                    SetFetchStatus("Your checked models are shown. Refreshing them needs a ChatGPT sign-in.");
-                }
-            } else if (noAuth || !EffectiveApiKey().empty()) {
-                m_modelConnectionStatus->SetLabel("Loading the model catalog...");
-                CallAfter([this]() {
-                    if (m_fetchInFlight) return;
-                    wxCommandEvent e;
-                    OnFetchModels(e);
-                });
-            } else {
-                m_modelConnectionStatus->SetLabel(
-                    wxString::FromUTF8(kCross.c_str()) +
-                    "No saved key for this connection. Click Connection... to paste one.");
-                SetFetchStatus("Your checked models are shown. Refreshing the catalog needs an API key.");
-            }
-        } else {
-            ShowStep(0);
-            m_apiKeyField->SetFocus();
-        }
-
-        // ── Theming ─────────────────────────────────────────────
-        ApplyDialogThemeRecursive(this,
-                                  theme.textPrimary,
-                                  theme.bgInputField,
-                                  theme.textPrimary);
-
-        okBtn    ->SetBackgroundColour(theme.accentButton);
-        okBtn    ->SetForegroundColour(theme.accentButtonText);
-        cancelBtn->SetBackgroundColour(theme.bgDialogSurface);
-        cancelBtn->SetForegroundColour(theme.textMuted);
-        m_fetchBtn->SetBackgroundColour(theme.accentButton);
-        m_fetchBtn->SetForegroundColour(theme.accentButtonText);
-        m_rawToggleBtn->SetBackgroundColour(theme.bgDialogSurface);
-        m_rawToggleBtn->SetForegroundColour(theme.textMuted);
-        m_saveBtn->SetBackgroundColour(theme.bgDialogSurface);
-        m_saveBtn->SetForegroundColour(theme.textPrimary);
-        m_connectionBtn->SetBackgroundColour(theme.bgDialogSurface);
-        m_connectionBtn->SetForegroundColour(theme.textMuted);
-        m_testBtn->SetBackgroundColour(theme.bgDialogSurface);
-        m_testBtn->SetForegroundColour(theme.textMuted);
-        m_chatgptPanel->SetBackgroundColour(theme.bgDialogSurface);
-        m_chatgptSignInBtn->SetBackgroundColour(theme.accentButton);
-        m_chatgptSignInBtn->SetForegroundColour(theme.accentButtonText);
-        m_chatgptSignOutBtn->SetBackgroundColour(theme.bgDialogSurface);
-        m_chatgptSignOutBtn->SetForegroundColour(theme.textMuted);
-
-        m_modelList->SetBackgroundColour(theme.bgInputField);
-        m_modelList->SetForegroundColour(theme.textPrimary);
-
-        m_advancedPane->SetBackgroundColour(theme.bgDialogSurface);
-        m_advancedPane->SetForegroundColour(theme.textPrimary);
-        adv->SetBackgroundColour(theme.bgDialogSurface);
-
-        // Recursive theming painted every label textPrimary; restore
-        // the muted ones.
-        for (auto* h : m_hints) h->SetForegroundColour(theme.textMuted);
-
-        for (wxRadioButton* rb : { m_bearerRadio, m_xApiKeyRadio,
-                                   m_nativeRadio, m_xmlRadio }) {
-            rb->SetForegroundColour(theme.textPrimary);
-            rb->SetBackgroundColour(theme.bgDialogSurface);
-        }
-
-        ApplyDarkTitleBar(this, theme.name != "light");
+        auto* margins = new wxBoxSizer(wxVERTICAL);
+        margins->Add(R, 1, wxEXPAND | wxALL, FromDIP(16));
+        right->SetSizer(margins);
     }
-    ~EndpointEditDialog() override
+
+    // Colours the generic recursive pass gets wrong.  Called once after
+    // it, and again whenever the provider selection changes.
+    void ApplyThemeColors()
     {
-        // Gate for the detached fetch worker.  MUST go through
-        // LbMarkUiEventTargetDead — it shares a mutex with
-        // LbQueueEventIfAlive, closing the window where the worker has
-        // passed the alive check but not yet queued the event to this
-        // (about-to-be-destroyed) handler.  A bare store(false) would
-        // reintroduce exactly the race ui_event_post.h exists to stop.
-        LbMarkUiEventTargetDead(m_alive);
-        // A browser sign-in still waiting: stop its loopback listener.
-        // The worker sees the flag within ~250 ms and its result post is
-        // dropped by the alive gate above.
-        if (m_signInAttempt) lb_chatgpt::Auth::CancelSignIn(m_signInAttempt);
+        const ThemeData& t = *m_theme;
+        m_presetTrack->SetBackgroundColour(t.bgMain);
+        UpdatePresetButtons();
+        for (wxWindow* card : { static_cast<wxWindow*>(m_keyCard), static_cast<wxWindow*>(m_retryPanel) })
+            card->SetBackgroundColour(t.bgMain);
+        m_finishBtn->SetBackgroundColour(t.accentButton);
+        m_finishBtn->SetForegroundColour(t.accentButtonText);
+        m_chatgptSignInBtn->SetBackgroundColour(t.accentButton);
+        m_chatgptSignInBtn->SetForegroundColour(t.accentButtonText);
+        for (wxButton* b : { m_cancelBtn, m_statusDetails, m_chatgptSignOutBtn, m_scanBtn,
+                             m_rawToggleBtn, m_manualModelsBtn }) {
+            b->SetBackgroundColour(t.bgDialogSurface);
+            b->SetForegroundColour(t.textMuted);
+        }
+        for (wxButton* b : { m_saveBtn, m_fetchBtn, m_testBtn, m_getKeyBtn }) {
+            b->SetBackgroundColour(t.bgInputField);
+            b->SetForegroundColour(t.textPrimary);
+        }
+        m_replaceKeyBtn->SetBackgroundColour(t.bgMain);
+        m_replaceKeyBtn->SetForegroundColour(t.accentButton);
+        m_retryTitle->SetForegroundColour(t.mdCode);
+        m_modelList->SetBackgroundColour(t.bgInputField);
+        m_modelList->SetForegroundColour(t.textPrimary);
+        m_advancedPane->SetBackgroundColour(t.bgDialogSurface);
+        m_advancedPane->SetForegroundColour(t.textPrimary);
+        m_advancedPane->GetPane()->SetBackgroundColour(t.bgDialogSurface);
+        for (auto* h : m_hints) h->SetForegroundColour(t.textMuted);
+        for (auto* h : m_sectionLabels) h->SetForegroundColour(t.textMuted);
+        for (wxRadioButton* rb : { m_bearerRadio, m_xApiKeyRadio, m_noAuthRadio, m_nativeRadio, m_xmlRadio }) {
+            rb->SetForegroundColour(t.textPrimary);
+            rb->SetBackgroundColour(t.bgDialogSurface);
+        }
+        for (wxCheckBox* cb : { m_showKeyBox, m_allowTools, m_imageOutput }) {
+            cb->SetForegroundColour(t.textPrimary);
+            cb->SetBackgroundColour(t.bgDialogSurface);
+        }
+        m_keepChecking->SetForegroundColour(t.textPrimary);
+        m_keepChecking->SetBackgroundColour(t.bgMain);
+        Refresh();
     }
 
-private:
+    void UpdatePresetButtons()
+    {
+        const ThemeData& t = *m_theme;
+        for (size_t i = 0; i < m_presetBtns.size(); ++i) {
+            const bool on = kPresetDisplayOrder[i] == m_preset;
+            wxButton* b = m_presetBtns[i];
+            b->SetBackgroundColour(on ? t.accentButton : t.bgMain);
+            // Locked (Edit mode) choices read as unavailable.
+            b->SetForegroundColour(on ? t.accentButtonText : m_isNew ? t.textPrimary : t.chatThought);
+            wxFont f = b->GetFont(); f.SetWeight(on ? wxFONTWEIGHT_SEMIBOLD : wxFONTWEIGHT_NORMAL); b->SetFont(f);
+            // The provider is fixed once a connection exists: conversations
+            // key their model entries on its id.
+            b->Enable(m_isNew || on);
+            b->Refresh();
+        }
+    }
+
     // ── Provider presets ────────────────────────────────────────
     // Lowercased host parsed out of a URL — scheme, path, userinfo,
     // and port stripped.  Mirrors the hardened sniff in
@@ -1435,100 +1822,361 @@ private:
         if (cut != std::string::npos) host.erase(cut);
         const size_t at = host.rfind('@');
         if (at != std::string::npos) host.erase(0, at + 1);
-        const size_t port = host.rfind(':');
-        if (port != std::string::npos) host.erase(port);
+        if (!host.empty() && host.front() == '[') {          // [::1]:8080
+            const size_t close = host.find(']');
+            host = close == std::string::npos ? host.substr(1) : host.substr(1, close - 1);
+        } else {
+            const size_t port = host.rfind(':');
+            if (port != std::string::npos) host.erase(port);
+        }
         std::transform(host.begin(), host.end(), host.begin(),
                        [](unsigned char c) { return (char)lb_ascii::ToLower(c); });
         return host;
     }
 
-    static int DetectPreset(const std::string& baseUrl)
+    static int DetectPreset(const std::string& baseUrl,
+                            EndpointStore::AuthScheme auth = EndpointStore::AuthScheme::Bearer)
     {
         const std::string host = HostOfUrl(baseUrl);
-        if (host == "api.openai.com")  return 0;
-        if (host == "openrouter.ai")   return 1;
-        return 2;   // Custom
+        if (host == "api.openai.com")  return kPresetOpenAI;
+        if (host == "openrouter.ai")   return kPresetOpenRouter;
+        if (auth == EndpointStore::AuthScheme::None &&
+            (host == "127.0.0.1" || host == "localhost" || host == "::1"))
+            return kPresetLocal;
+        return kPresetCustom;
+    }
+
+    static int DialectIndex(const std::string& d)
+    {
+        return d == "openai" ? 1 : d == "openrouter" ? 2 : d == "template" ? 3 : 0;
+    }
+
+    bool IsLocal() const { return m_preset == kPresetLocal; }
+    bool UsingNoAuth() const { return m_noAuthRadio && m_noAuthRadio->GetValue(); }
+    bool ReadyToSave() const { return m_editMode || m_connected || m_manualMode; }
+
+    void OnPresetClicked(int preset)
+    {
+        if (!m_isNew || preset == m_preset || m_signInAttempt) return;
+        SeedFromPreset(preset);
     }
 
     void SeedFromPreset(int preset)
     {
+        m_rescanTimer.Stop();
+        ++m_scanGeneration;          // drop a scan still running for the old preset
+        m_scanInFlight = false;
+        m_scanBtn->Enable(true);
+        m_preset = preset;
         auto p = MakeProviderPreset(preset);
-        if (preset == 2) { p.id = "custom"; p.displayName = "Custom provider"; p.secretProvider = "custom"; }
+        if (preset == kPresetCustom) { p.id = "custom"; p.displayName = "Custom provider"; p.secretProvider = "custom"; }
         const auto* configured = m_endpointStore ? m_endpointStore->FindEndpoint(p.id) : nullptr;
         if (configured) p = *configured;
-        const std::string oldProvider =
-            TrimUtf8(m_providerField->GetValue());
+        m_manualMode = false;
+        m_scanResults.clear();
+        RebuildScanList();
+        LoadEndpointFields(p, configured != nullptr);
+        SetModelStatus(preset == kPresetLocal ? "Models show up here once a server answers."
+                     : preset == kPresetChatGpt ? "Sign in to load your ChatGPT models."
+                     : "Connect to load the model catalog.", StatusTone::Neutral);
+        UpdatePresetButtons();
+        if (m_advancedPane->IsExpanded()) m_advancedPane->Collapse();
+        if (preset == kPresetCustom) m_advancedPane->Expand();
+        ApplyProviderMode();
+        if (preset == kPresetLocal) StartLocalScan();
+        else if (m_apiKeyField->IsShown()) m_apiKeyField->SetFocus();
+    }
 
-        // ChangeValue everywhere: apply without firing wxEVT_TEXT, so
-        // the resolved-URL/status/checklist refreshes below run once,
-        // after all fields are consistent.
+    // Puts one endpoint's settings into every field.  Used by the provider
+    // row and by picking a scanned server that is already saved.
+    void LoadEndpointFields(const EndpointStore::Endpoint& p, bool existing)
+    {
+        const std::string oldProvider = TrimUtf8(m_providerField->GetValue());
+
+        // ChangeValue everywhere: apply without firing wxEVT_TEXT, so the
+        // refreshes below run once, after all fields are consistent.
         if (m_isNew) m_idField->ChangeValue(wxString::FromUTF8(p.id));
-        m_nameField   ->ChangeValue(wxString::FromUTF8(p.displayName.c_str()));
-        // A preset re-seeds both identity fields; the id follows the
-        // name again from here (Add mode only).
-        m_idEditedByUser = false;
-        m_baseUrlField->ChangeValue(wxString::FromUTF8(p.baseUrl.c_str()));
-        m_chatPathField->ChangeValue(wxString::FromUTF8(p.chatPath.c_str()));
-
-        const bool xApi = (p.authScheme == EndpointStore::AuthScheme::XApiKey);
+        m_nameField->ChangeValue(wxString::FromUTF8(p.displayName));
+        m_idEditedByUser = existing;   // a saved id never follows the name
+        m_baseUrlField->ChangeValue(wxString::FromUTF8(p.baseUrl));
+        m_chatPathField->ChangeValue(wxString::FromUTF8(p.chatPath));
         m_bearerRadio ->SetValue(p.authScheme == EndpointStore::AuthScheme::Bearer);
-        m_xApiKeyRadio->SetValue(xApi);
+        m_xApiKeyRadio->SetValue(p.authScheme == EndpointStore::AuthScheme::XApiKey);
         m_noAuthRadio ->SetValue(p.authScheme == EndpointStore::AuthScheme::None);
         UpdateAuthFieldEnables();
         m_originalDialect = p.reasoningDialect;
-        if (m_dialectChoice) m_dialectChoice->SetSelection(p.reasoningDialect == "openai" ? 1 :
-            p.reasoningDialect == "openrouter" ? 2 : p.reasoningDialect == "template" ? 3 : 0);
+        m_dialectChoice->SetSelection(DialectIndex(p.reasoningDialect));
         const bool xml = (p.protocol == ToolProtocol::Xml);
         m_nativeRadio->SetValue(!xml);
         m_xmlRadio   ->SetValue(xml);
-
         m_extraHeaders = p.extraHeaders;
 
-        m_providerField->ChangeValue(
-            wxString::FromUTF8(p.secretProvider.c_str()));
-        if (oldProvider != p.secretProvider)
-            m_apiKeyField->ChangeValue(wxEmptyString);
+        m_providerField->ChangeValue(wxString::FromUTF8(p.secretProvider));
+        if (oldProvider != p.secretProvider) m_apiKeyField->ChangeValue(wxEmptyString);
         m_keyField->ChangeValue(wxString::FromUTF8(p.secretKey));
         RebuildKeyChoices();
+        m_replacingKey = false;
+        m_keyVerified = false;
 
-        m_seededExistingId = configured ? p.id : std::string();
-        // The model list is part of the seed too: ids configured for
-        // one provider are not valid on another (OpenAI's bare ids vs
-        // OpenRouter's vendor-prefixed ones), so carrying them across
-        // would save a broken endpoint.  Clearing here is safe because
-        // the dialog is transactional — Cancel discards everything, so
-        // an accidental provider flip during Edit never destroys the
-        // stored endpoint.
+        m_seededExistingId = existing ? p.id : std::string();
+        // Model ids configured for one provider are not valid on another
+        // (OpenAI's bare ids vs OpenRouter's vendor-prefixed ones), so the
+        // list is re-seeded too.  Safe because the dialog is transactional:
+        // Cancel discards everything.
         m_syncingModels = true;
         m_models = p.models;
         m_rawModelsDirty = false;
         m_modelsField->ChangeValue(ModelsToText(m_models));
         m_syncingModels = false;
 
-        // A different provider means a different catalog, and any
-        // in-flight fetch now belongs to the OLD one.
-        m_fetchedIds.clear();
-        InvalidateFetch();
-        RefreshModelChecklist();
-        SetFetchStatus(configured ? "Existing connection loaded. Your selected models are preserved."
-                                  : "Connect to check your credentials and load models.");
-
-        if (m_advancedPane && m_advancedPane->IsExpanded()) {
-            m_advancedPane->Collapse();
-            RefreshLayout();
-        }
-        if (preset == 2) ExpandAdvanced();
         m_chatgptAccount = p.chatgptAccount;
-        ApplyProviderMode();
+        m_fetchedIds.clear();
+        m_fetchedCtx.clear();
+        m_fetchedNames.clear();
+        InvalidateFetch();
+        SetModelStatus(std::string(), StatusTone::Neutral);
+        SetFetchStatus(existing ? "Saved connection loaded. Your models are kept."
+                     : IsChatGpt() ? "Sign in with your ChatGPT account to load your models."
+                     : "Connect to check the connection and load models.");
         UpdateResolvedUrl();
-        UpdateConnectionStatus();
+        UpdateAdvancedSummary();
+        UpdateKeyCard();
+        RefreshModelChecklist();
+    }
+
+    // Shows only what the selected provider needs.
+    void ApplyProviderMode(bool relayout = true)
+    {
+        const bool chatgpt = IsChatGpt();
+        const bool local = IsLocal();
+        const bool noAuth = UsingNoAuth();
+        m_scanGroup->Show(local && m_isNew);
+        m_baseUrlLabel->SetLabel(local ? (m_isNew ? "OR TYPE AN ADDRESS" : "ADDRESS") : "BASE URL");
+        const bool showUrl = local || m_preset == kPresetCustom;
+        m_baseUrlLabel->Show(showUrl);
+        m_baseUrlField->Show(showUrl);
+        m_keyGroup->Show(!chatgpt && !noAuth);
+        m_chatgptPanel->Show(chatgpt);
+        m_advancedPane->Show(!chatgpt);
+        if (!noAuth || chatgpt) HideRetry();
+        m_ctxField->SetHint(local || noAuth ? "server default" : "256K default");
+        UpdateChatGptStatus();
+        UpdateKeyCard();
+        UpdateTestHelp();
+        UpdateSaveButtons();
+        if (relayout) RefreshLayout();
+    }
+
+    // ── Local server scan ───────────────────────────────────────
+    // quiet: the automatic 5 s re-check while nothing has been found.  It
+    // leaves the list alone instead of flashing "Scanning...".
+    void StartLocalScan(bool quiet = false)
+    {
+        if (!IsLocal() || !m_isNew) return;
+        m_rescanTimer.Stop();
+        const unsigned gen = ++m_scanGeneration;
+        m_scanInFlight = true;
+        if (!quiet) {
+            m_scanResults.clear();
+            RebuildScanList();
+            m_scanHint->SetLabel("Looking for servers on this PC...");
+        }
+        m_scanBtn->Enable(false);
+        wxEvtHandler* target = this;
+        std::weak_ptr<std::atomic<bool>> alive = m_alive;
+        std::thread([work = lb::BeginBackgroundWork(), target, alive, gen]() {
+            std::vector<LocalServerInfo> found = ScanLocalServers();
+            auto* ev = new wxThreadEvent(wxEVT_EP_LOCAL_SCAN_DONE);
+            ev->SetPayload(found);
+            ev->SetInt((int)gen);
+            LbQueueEventIfAlive(target, alive, ev);
+        }).detach();
+    }
+
+    void OnLocalScanDone(wxThreadEvent& event)
+    {
+        if ((unsigned)event.GetInt() != m_scanGeneration) return;
+        m_scanInFlight = false;
+        m_scanBtn->Enable(true);
+        if (!IsLocal()) return;
+        m_scanResults = event.GetPayload<std::vector<LocalServerInfo>>();
+        RebuildScanList();
+        // Nothing yet: keep looking, so starting the server is all it takes.
+        const bool keepLooking = m_scanResults.empty() && !m_connected;
+        m_scanHint->SetLabel(wxString::Format(keepLooking
+            ? "Checked ports %s. Still looking every 5 seconds; start your server and it will show up here."
+            : "Checked ports %s. LlamaBoss's own local server is left out.", kLocalScanPortsText));
+        m_scanHint->Wrap(FromDIP(310));
+        if (keepLooking) m_rescanTimer.StartOnce(5000);
+        // Pick the first one unless the user is already typing an address.
+        if (!m_scanResults.empty() && !m_connected && !m_fetchInFlight)
+            SelectScannedServer(0);
+        RefreshLayout();
+    }
+
+    void RebuildScanList()
+    {
+        m_scanList->DestroyChildren();
+        m_scanRadios.clear();
+        auto* s = m_scanList->GetSizer();
+        s->Clear();
+        if (m_scanResults.empty()) {
+            auto* none = new wxStaticText(m_scanList, wxID_ANY,
+                m_scanInFlight ? wxString("Scanning...") : wxString("None answered on the usual ports."));
+            none->SetForegroundColour(m_theme->textPrimary);
+            s->Add(none, 0, wxALL, FromDIP(4));
+        }
+        for (size_t i = 0; i < m_scanResults.size(); ++i) {
+            const auto& srv = m_scanResults[i];
+            auto* rb = new wxRadioButton(m_scanList, wxID_ANY, wxString::FromUTF8(srv.name),
+                wxDefaultPosition, wxDefaultSize, i == 0 ? wxRB_GROUP : 0);
+            wxFont f = rb->GetFont(); f.SetWeight(wxFONTWEIGHT_SEMIBOLD); rb->SetFont(f);
+            rb->SetForegroundColour(m_theme->textPrimary);
+            rb->SetBackgroundColour(m_theme->bgDialogSurface);
+            rb->SetValue(false);
+            rb->Bind(wxEVT_RADIOBUTTON, [this, i](wxCommandEvent&) { SelectScannedServer(i); });
+            s->Add(rb, 0, wxTOP, FromDIP(i == 0 ? 2 : 8));
+            std::string detail = "127.0.0.1:" + std::to_string(srv.port) + "  \xC2\xB7  " +
+                std::to_string(srv.ids.size()) + (srv.ids.size() == 1 ? " model" : " models");
+            if (srv.ids.size() == 1) {
+                const auto ctx = srv.contexts.find(srv.ids.front());
+                if (ctx != srv.contexts.end()) detail += "  \xC2\xB7  " + FormatContextTokens(ctx->second) + " context";
+            }
+            if (const auto* saved = FindSavedServer(srv.baseUrl))
+                detail += "  \xC2\xB7  saved as " + saved->displayName;
+            auto* d = new wxStaticText(m_scanList, wxID_ANY, wxString::FromUTF8(detail));
+            wxFont df = d->GetFont(); df.SetPointSize(9); d->SetFont(df);
+            d->Wrap(FromDIP(280));
+            d->SetForegroundColour(m_theme->textMuted);
+            s->Add(d, 0, wxLEFT, FromDIP(22));
+            m_scanRadios.push_back(rb);
+        }
+        m_scanList->Layout();
+    }
+
+    const EndpointStore::Endpoint* FindSavedServer(const std::string& baseUrl) const
+    {
+        if (!m_endpointStore) return nullptr;
+        for (const auto& ep : m_endpointStore->Endpoints())
+            if (ep.authScheme == EndpointStore::AuthScheme::None && SameLocalBase(ep.baseUrl, baseUrl))
+                return &ep;
+        return nullptr;
+    }
+
+    // The scan already fetched the catalog, so picking a server is a
+    // complete connect: no Connect click needed.
+    void SelectScannedServer(size_t index)
+    {
+        if (index >= m_scanResults.size()) return;
+        m_rescanTimer.Stop();
+        const LocalServerInfo srv = m_scanResults[index];
+        if (index < m_scanRadios.size()) m_scanRadios[index]->SetValue(true);
+        m_retryTimer.Stop();
+        HideRetry();
+
+        if (const auto* saved = FindSavedServer(srv.baseUrl)) {
+            // Already saved: edit that connection rather than add a twin.
+            const EndpointStore::Endpoint copy = *saved;
+            LoadEndpointFields(copy, true);
+        } else {
+            InvalidateFetch();
+            m_baseUrlField->ChangeValue(wxString::FromUTF8(srv.baseUrl));
+            const std::string name = srv.name == "Local server"
+                ? "Local server " + std::to_string(srv.port) : srv.name;
+            m_nameField->ChangeValue(wxString::FromUTF8(name));
+            if (m_isNew && !m_seededExistingId.empty()) {
+                // The preset seed was an existing "local_server" record;
+                // a different server gets its own id.
+                m_seededExistingId.clear();
+                m_idEditedByUser = false;
+            }
+            SyncIdFromName();
+            m_noAuthRadio->SetValue(true);
+            UpdateAuthFieldEnables();
+            m_syncingModels = true;
+            m_models.clear();
+            m_modelsField->ChangeValue(wxEmptyString);
+            m_rawModelsDirty = false;
+            m_syncingModels = false;
+            UpdateResolvedUrl();
+        }
+        // Treat the scan's catalog as fetched.
+        ++m_fetchGeneration;
+        m_fetchedIds = srv.ids;
+        m_fetchedCtx = srv.contexts;
+        m_fetchedNames.clear();
+        if (srv.ids.size() == 1 && !IsInPicker(srv.ids.front()))
+            SetModelPickerVisibility(m_models, srv.ids.front(), true);
+        for (const auto& id : srv.ids) if (IsInPicker(id)) ApplyDetectedContext(id);
+        m_modelsField->ChangeValue(ModelsToText(m_models));
+        m_connected = true;
+        SetModelStatus(kCheck + srv.name + " answered on port " + std::to_string(srv.port) +
+                       ". No key needed.", StatusTone::Good);
+        RefreshModelChecklist();
+        SelectFirstChecked();
+        SetFetchStatus(PickerSummary());
+        ApplyProviderMode();
+    }
+
+    // ── Retry callout (key-free servers that refuse the connection) ─
+    void ShowRetry(const std::string& base)
+    {
+        std::string where = HostOfUrl(base);
+        try { Poco::URI uri(base); where = "port " + std::to_string(uri.getPort()); } catch (...) {}
+        m_retryTitle->SetLabel(wxString::FromUTF8("Nothing is listening on " + where));
+        m_retryPanel->Show();
+        if (m_keepChecking->GetValue()) m_retryTimer.StartOnce(5000);
+        RefreshLayout();
+    }
+
+    void HideRetry()
+    {
+        m_retryTimer.Stop();
+        if (m_retryPanel && m_retryPanel->IsShown()) { m_retryPanel->Hide(); RefreshLayout(); }
+    }
+
+    // ── API key card ────────────────────────────────────────────
+    std::string SavedKey() const
+    {
+        const std::string provider = TrimUtf8(m_providerField->GetValue());
+        const std::string keyName  = TrimUtf8(m_keyField->GetValue());
+        if (m_secretsStore && !provider.empty() && !keyName.empty() &&
+            m_secretsStore->HasSecret(provider, keyName))
+            return m_secretsStore->GetSecret(provider, keyName);
+        return {};
+    }
+
+    std::string ProviderLabel() const
+    {
+        if (m_preset == kPresetOpenAI) return "OpenAI";
+        if (m_preset == kPresetOpenRouter) return "OpenRouter";
+        const std::string n = TrimUtf8(m_nameField->GetValue());
+        return n.empty() ? std::string("the provider") : n;
+    }
+
+    void UpdateKeyCard()
+    {
+        if (!m_keyCard || m_rebuildingKeys) return;
+        const std::string saved = SavedKey();
+        const bool typed = !TrimUtf8(m_apiKeyField->GetValue()).empty();
+        const bool hasSaved = !saved.empty();
+        m_keyCard->Show(hasSaved && !m_replacingKey && !typed);
+        m_keyEntry->Show(!hasSaved || m_replacingKey || typed);
+        m_getKeyBtn->Show(!hasSaved);
+        if (hasSaved) {
+            m_keyCardTitle->SetLabel(wxString::FromUTF8(kCheck + "Saved key"));
+            m_keyCardMasked->SetLabel(wxString::FromUTF8(MaskKey(saved)));
+            m_keyCardDetail->SetLabel(wxString::FromUTF8(m_keyVerified
+                ? "Accepted by " + ProviderLabel() + " just now"
+                : "Saved as " + TrimUtf8(m_providerField->GetValue()) + " / " + TrimUtf8(m_keyField->GetValue())));
+        }
+        m_apiKeyField->SetHint(hasSaved ? "Paste the new key" : "Paste your API key");
+        m_keyGroup->Layout();
+        if (m_leftPane) { m_leftPane->Layout(); m_leftPane->FitInside(); }
     }
 
     // ── ChatGPT plan (Sign in with ChatGPT) ─────────────────────
-    bool IsChatGpt() const
-    {
-        return m_providerChoice && m_providerChoice->GetSelection() == kPresetChatGpt;
-    }
+    bool IsChatGpt() const { return m_preset == kPresetChatGpt; }
 
     bool ChatGptSignedIn(lb_chatgpt::AccountSummary* out = nullptr) const
     {
@@ -1538,28 +2186,6 @@ private:
             a.signedIn && a.planEnabled;
         if (out) *out = a;
         return ok;
-    }
-
-    // ChatGPT has no key, URL or auth choices: swap the key widgets and
-    // the Advanced pane for the sign-in panel.
-    void ApplyProviderMode(bool relayout = true)
-    {
-        const bool chatgpt = IsChatGpt();
-        for (wxWindow* w : { static_cast<wxWindow*>(m_apiKeyLabel),
-                             static_cast<wxWindow*>(m_apiKeyField),
-                             static_cast<wxWindow*>(m_showKeyBox),
-                             static_cast<wxWindow*>(m_getKeyBtn),
-                             static_cast<wxWindow*>(m_connectionStatus),
-                             static_cast<wxWindow*>(m_keyHelp),
-                             static_cast<wxWindow*>(m_advancedPane) }) {
-            if (w) w->Show(!chatgpt);
-        }
-        if (m_chatgptPanel) m_chatgptPanel->Show(chatgpt);
-        if (m_connectionBtn)
-            m_connectionBtn->SetToolTip(chatgpt ? "Sign in to or out of ChatGPT"
-                                                : "Change the API key or advanced connection settings");
-        UpdateChatGptStatus();
-        if (relayout) RefreshLayout();
     }
 
     void UpdateChatGptStatus()
@@ -1574,22 +2200,20 @@ private:
         if (m_signInAttempt)
             text = "Waiting for you to finish in your browser... (sign in, then allow LlamaBoss to use your plan)";
         else if (known && a.signedIn && a.planEnabled)
-            text = kCheck + "Signed in as " + who + ". Requests on this connection use your ChatGPT plan.";
+            text = kCheck + "Signed in as " + who + ".";
         else if (known && a.signedIn)
-            text = kCross + "Signed in as " + who + ", but ChatGPT plan use wasn't allowed. "
+            text = kCross + "Signed in as " + who + ", but plan use wasn't allowed. "
                    "Choose Continue with ChatGPT and allow it.";
         else if (known)
-            text = "Signed out (" + who + "). Choose Continue with ChatGPT to sign in again.";
+            text = "Signed out (" + who + ").";
         else
-            text = "Not signed in. Continue with ChatGPT opens your browser to sign in.";
+            text = "Not signed in.";
         m_chatgptStatus->SetLabel(wxString::FromUTF8(text));
-        m_chatgptStatus->Wrap(FromDIP(560));
+        m_chatgptStatus->Wrap(FromDIP(310));
         m_chatgptStatus->SetToolTip(wxString::FromUTF8(text));
-        if (m_chatgptSignInBtn)
-            m_chatgptSignInBtn->SetLabel(m_signInAttempt ? "Cancel sign-in" : "Continue with ChatGPT");
-        if (m_chatgptSignOutBtn)
-            m_chatgptSignOutBtn->Show(known && a.signedIn && !m_signInAttempt);
-        if (m_chatgptPanel) m_chatgptPanel->Layout();
+        m_chatgptSignInBtn->SetLabel(m_signInAttempt ? "Cancel sign-in" : "Continue with ChatGPT");
+        m_chatgptSignOutBtn->Show(known && a.signedIn && !m_signInAttempt);
+        m_chatgptPanel->Layout();
     }
 
     void OnChatGptSignIn(wxCommandEvent&)
@@ -1667,9 +2291,7 @@ private:
                            "use your plan. Choose Continue with ChatGPT again and allow it.");
             return;
         }
-        // Same path as Connect: load the account's models, then (on the
-        // first page) move on to choosing one.
-        m_connectPending = m_pages && m_pages->GetSelection() == 0;
+        m_connectPending = !ReadyToSave();
         wxCommandEvent e;
         OnFetchModels(e);
     }
@@ -1689,48 +2311,38 @@ private:
         RefreshLayout();
     }
 
-    void ExpandAdvanced()
-    {
-        if (m_advancedPane && !m_advancedPane->IsExpanded()) {
-            m_advancedPane->Expand();
-            RefreshLayout();
-        }
-    }
-
     void RefreshLayout()
     {
-        // The collapsible pane lives inside the left panel; relayout
-        // that panel first so its new height is known to the dialog.
         if (m_advancedPane && m_advancedPane->GetParent())
             m_advancedPane->GetParent()->Layout();
-        if (m_credentialsPage) m_credentialsPage->FitInside();
-        if (m_modelsPage) m_modelsPage->FitInside();
+        if (m_leftPane) m_leftPane->FitInside();
+        if (m_rightPane) m_rightPane->Layout();
         Layout();
         AlignAdvancedLabels();
     }
 
-    // wxCollapsiblePane insets its child panel by a few px (platform
-    // and theme dependent), which would put "Chat path" to the right
-    // of "Base URL".  Measure the real inset once the pane is laid
-    // out and shrink the Advanced label column by exactly that much.
+    // wxCollapsiblePane insets its child panel by a few px (platform and
+    // theme dependent).  Keep the Advanced labels one width regardless.
     void AlignAdvancedLabels()
     {
-        if (!m_advGrid || !m_advancedPane || !m_advancedPane->IsExpanded())
-            return;
-        wxWindow* pane = m_advancedPane->GetPane();
-        wxWindow* left = m_advancedPane->GetParent();
-        if (!pane || !left || !pane->IsShown()) return;
-        const int inset = pane->GetScreenPosition().x -
-                          left->GetScreenPosition().x;
-        const int want = kLabelWidth - inset;
-        if (inset < 0 || inset > kLabelWidth / 2 || want == m_advLabelWidth)
-            return;
-        m_advLabelWidth = want;
-        for (auto* item : m_advGrid->GetChildren()) {
-            if (auto* w = dynamic_cast<wxStaticText*>(item->GetWindow()))
-                w->SetMinSize(wxSize(want, -1));
+        if (!m_advGrid || !m_advancedPane || !m_advancedPane->IsExpanded()) return;
+        m_advancedPane->GetPane()->Layout();
+    }
+
+    void UpdateAdvancedSummary()
+    {
+        if (!m_advancedPane) return;
+        // Short enough for the left pane: only what differs from a plain
+        // native-tools connection is worth a glance.
+        std::string summary = "Advanced";
+        if (!IsChatGpt()) {
+            static const char* names[] = { "auto reasoning", "OpenAI reasoning",
+                                           "OpenRouter reasoning", "template reasoning" };
+            const int d = std::max(0, m_dialectChoice->GetSelection());
+            summary += std::string("  \xC2\xB7  ") + names[d];
+            if (m_xmlRadio->GetValue()) summary += ", XML tools";
         }
-        left->Layout();
+        m_advancedPane->SetLabel(wxString::FromUTF8(summary));
     }
 
     // ── Identity helpers ────────────────────────────────────────
@@ -1774,76 +2386,81 @@ private:
         m_modelList  ->Show(!m_rawMode);
         m_modelsField->Show(m_rawMode);
         m_filterField->Enable(!m_rawMode);
-        m_rawToggleBtn->SetLabel(m_rawMode ? "Show model list" : "Advanced: model IDs");
-        LoadModelOptions();
+        m_rawToggleBtn->SetLabel(m_rawMode ? "Show model list" : "Edit as text");
         if (m_rawMode) {
             m_modelCountLabel->SetLabel(
-                "id = \"literal name\"   [image]   [text]   [no-tools]   "
-                "- one model per line");
-        } else {
-            RefreshModelChecklist();   // re-derives the count label
+                "id = \"name\"   [image]   [text]   [no-tools]   - one model per line");
         }
-        if (m_modelList->GetParent()) m_modelList->GetParent()->Layout();
+        RefreshModelChecklist();   // re-derives the count label and options
+        m_rightPane->Layout();
         if (m_rawMode) m_modelsField->SetFocus();
     }
 
     void UpdateModelCountLabel(size_t configured, size_t shown)
     {
         if (!m_modelCountLabel || m_rawMode) return;
-        wxString text;
-        if (m_fetchedIds.empty()) {
-            text = configured == 1
-                ? wxString("1 model configured")
-                : wxString::Format("%lu models configured",
-                                   (unsigned long)configured);
-        } else {
-            text = wxString::Format("%lu of %lu checked",
-                                    (unsigned long)configured,
-                                    (unsigned long)m_fetchedIds.size());
-        }
-        const bool filtering = !TrimUtf8(m_filterField->GetValue()).empty();
-        if (filtering)
+        wxString text = !m_fetchedIds.empty()
+            ? wxString::Format("%lu of %lu in your picker", (unsigned long)configured,
+                               (unsigned long)m_fetchedIds.size())
+            : configured == 1 ? wxString("1 model in your picker")
+            : wxString::Format("%lu models in your picker", (unsigned long)configured);
+        if (!TrimUtf8(m_filterField->GetValue()).empty())
             text += wxString::Format("  (%lu shown)", (unsigned long)shown);
         m_modelCountLabel->SetLabel(text);
     }
 
-    // The key fields are meaningless under "No authentication";
-    // disabling them says so louder than any status line could.
+    // The key fields are meaningless with no key: disable the Advanced
+    // ones (the key box itself is hidden by ApplyProviderMode).
     void UpdateAuthFieldEnables()
     {
-        const bool useKeys = !(m_noAuthRadio && m_noAuthRadio->GetValue());
-        if (m_providerField) m_providerField->Enable(useKeys);
-        if (m_keyField)      m_keyField->Enable(useKeys);
-        if (m_apiKeyField)   m_apiKeyField->Enable(useKeys);
+        const bool useKeys = !UsingNoAuth();
+        m_providerField->Enable(useKeys);
+        m_keyField->Enable(useKeys);
+        m_apiKeyField->Enable(useKeys);
     }
 
     std::string EffectiveApiKey() const
     {
         // No-auth endpoints never send a key — even one sitting in the
         // fields from before the scheme was switched.
-        if (m_noAuthRadio && m_noAuthRadio->GetValue()) return {};
-
-        const std::string entered =
-            m_apiKeyField ? TrimUtf8(m_apiKeyField->GetValue()) : std::string();
+        if (UsingNoAuth()) return {};
+        const std::string entered = TrimUtf8(m_apiKeyField->GetValue());
         if (!entered.empty()) return entered;
+        return SavedKey();
+    }
 
-        const std::string provider = TrimUtf8(m_providerField->GetValue());
-        const std::string keyName  = TrimUtf8(m_keyField->GetValue());
-        if (m_secretsStore && !provider.empty() && !keyName.empty() &&
-            m_secretsStore->HasSecret(provider, keyName)) {
-            return m_secretsStore->GetSecret(provider, keyName);
-        }
-        return {};
+    // ── Status lines ────────────────────────────────────────────
+    void SetModelStatus(const std::string& text, StatusTone tone)
+    {
+        const wxString label = wxString::FromUTF8(text);
+        m_modelConnectionStatus->SetLabel(label);
+        m_modelConnectionStatus->SetToolTip(label);
+        m_modelConnectionStatus->SetForegroundColour(
+            tone == StatusTone::Good ? wxColour(163, 190, 140)     // aurora green
+          : tone == StatusTone::Bad  ? m_theme->stopButton
+                                     : m_theme->textPrimary);
+        m_modelConnectionStatus->Refresh();
+        if (m_rightPane) m_rightPane->Layout();
+    }
+
+    std::string PickerSummary() const
+    {
+        const size_t n = ModelsForPicker(m_models).size();
+        if (n == 0) return "Click a model to add it to your picker.";
+        return std::to_string(n) + (n == 1 ? " model" : " models") +
+               " in your picker. Click a row to add it, untick to remove it.";
     }
 
     // ── Fetch models ────────────────────────────────────────────
-    // Anything that changes which endpoint/credential a catalog
-    // belongs to bumps the generation; a completed fetch is applied
-    // only if its stamped generation still matches, so a result for
-    // the OLD provider/URL/key can never populate the NEW one.
+    // Anything that changes which endpoint/credential a catalog belongs
+    // to bumps the generation; a completed fetch is applied only if its
+    // stamped generation still matches, so a result for the OLD
+    // provider/URL/key can never populate the NEW one.
     void InvalidateTest()
     {
         ++m_testRevision;
+        if (m_testResult) m_testResult->SetLabel(wxEmptyString);
+        if (m_testTools) m_testTools->SetLabel(wxEmptyString);
         if (m_hasTestResult || m_testInFlight) {
             m_hasTestResult = false;
             SetFetchStatus("Model or test settings changed. Run the model test again to verify them.");
@@ -1855,14 +2472,16 @@ private:
         ++m_fetchGeneration;
         InvalidateTest();
         // A cached catalog and success banner belong to the old URL/key.
-        // Retain user model records, but discard remote catalog entries.
+        // Keep the user's model records, drop the remote catalog.
         m_fetchedIds.clear();
-        if (m_modelConnectionStatus) {
-            m_modelConnectionStatus->SetLabel("Connection changed - not verified. Refresh models to check.");
-            m_modelConnectionStatus->SetToolTip(m_modelConnectionStatus->GetLabel());
-        }
-        SetFetchStatus("Connection changed. Connect or refresh models to verify the new settings.");
+        m_fetchedCtx.clear();
+        if (!m_editMode) m_connected = false;
+        m_keyVerified = false;
+        if (m_modelConnectionStatus && !m_modelConnectionStatus->GetLabel().IsEmpty())
+            SetModelStatus("Connection changed - not checked yet.", StatusTone::Neutral);
+        if (m_editMode) SetFetchStatus("Connection changed. Refresh models to check it.");
         RefreshModelChecklist();
+        UpdateSaveButtons();
     }
 
     void SetFetchStatus(const std::string& text)
@@ -1870,11 +2489,8 @@ private:
         if (!m_fetchStatus) return;
         m_statusText = text;
         const wxString full = wxString::FromUTF8(text);
-        const bool longText = full.length() > 180;
-        wxString summary = full;
-        if (longText) summary = full.Left(177) + "...";
-        m_fetchStatus->SetLabel(summary);
-        m_fetchStatus->Wrap(std::max(FromDIP(240), GetClientSize().x - FromDIP(140)));
+        const bool longText = full.length() > 60;
+        m_fetchStatus->SetLabel(full);
         m_fetchStatus->SetToolTip(full);
         if (m_statusDetails) m_statusDetails->Show(longText);
         if (GetSizer()) Layout();
@@ -1883,6 +2499,7 @@ private:
     void OnFetchModels(wxCommandEvent&)
     {
         if (m_fetchInFlight) return;
+        m_retryTimer.Stop();
 
         if (IsChatGpt()) {
             if (!ChatGptSignedIn()) {
@@ -1911,53 +2528,48 @@ private:
             return;
         }
 
-        const std::string base =
-            NormalizeBaseUrl(TrimUtf8(m_baseUrlField->GetValue()));
-        if (base.rfind("http://", 0) != 0 &&
-            base.rfind("https://", 0) != 0) {
-            SetFetchStatus("Base URL must start with http:// or https://.");
-            m_baseUrlField->SetFocus();
+        const std::string base = NormalizeBaseUrl(TrimUtf8(m_baseUrlField->GetValue()));
+        if (base.rfind("http://", 0) != 0 && base.rfind("https://", 0) != 0) {
+            SetFetchStatus(kCross + "The address must start with http:// or https://.");
+            if (m_baseUrlField->IsShown()) m_baseUrlField->SetFocus();
+            else m_advancedPane->Expand();
             return;
         }
 
         // Resolve auth material HERE — SecretsStore is UI-thread-only,
         // so the worker receives a ready-made header, never the store.
         const std::string key = EffectiveApiKey();
-        if (!m_noAuthRadio->GetValue() && key.empty()) { SetFetchStatus("Paste an API key or choose a saved key first."); return; }
+        if (!UsingNoAuth() && key.empty()) {
+            SetFetchStatus("Paste an API key first.");
+            m_replacingKey = true; UpdateKeyCard(); m_apiKeyField->SetFocus();
+            return;
+        }
         std::string headerName, headerValue;
         if (!key.empty()) {
-            if (m_xApiKeyRadio->GetValue()) {
-                headerName  = "x-api-key";
-                headerValue = key;
-            } else {
-                headerName  = "Authorization";
-                headerValue = "Bearer " + key;
-            }
+            if (m_xApiKeyRadio->GetValue()) { headerName = "x-api-key"; headerValue = key; }
+            else { headerName = "Authorization"; headerValue = "Bearer " + key; }
         }
 
         const std::string url = base + "/v1/models";
         const auto extra = m_extraHeaders;
-
         m_fetchInFlight = true;
         m_fetchBtn->Enable(false);
         UpdateSaveButtons();
-        // Stamp this request with the current generation; the result
-        // handler compares against m_fetchGeneration at arrival time.
         const unsigned gen = m_fetchGeneration;
         m_inFlightGeneration = gen;
-        const bool noAuth = m_noAuthRadio && m_noAuthRadio->GetValue();
+        const bool noAuth = UsingNoAuth();
         if (!m_testInFlight && !m_hasTestResult)
-            SetFetchStatus(m_connectPending ? "Checking connection and loading models..." : "Refreshing models...");
-        // Detached worker: the request is hard-bounded by the 15 s Poco
-        // timeout and the result post goes through the alive-token gate,
-        // so the worst case at dialog close is a short anonymous
-        // lingerer.  (LbBackgroundThreadKeeper is file-local to
-        // LlamaBoss.cpp and not reachable from here.)
+            SetFetchStatus(m_connectPending ? "Checking the connection and loading models..." : "Refreshing models...");
         wxEvtHandler* target = this;
         std::weak_ptr<std::atomic<bool>> alive = m_alive;
         std::thread([work = lb::BeginBackgroundWork(), target, alive, url, headerName, headerValue, extra,
                      gen, key, base, noAuth]() {
             FetchModelsResult r = FetchConnectionCatalog(base, url, headerName, headerValue, extra, noAuth);
+            // A key-free server with one model: ask /props for its window
+            // when the catalog didn't say (llama-server style hosts).
+            if (r.ok && noAuth && r.ids.size() == 1 && !r.contexts.count(r.ids.front())) {
+                if (const int n = FetchPropsContext(base)) r.contexts[r.ids.front()] = n;
+            }
             RedactProbeError(r.error, key);
             auto* ev = new wxThreadEvent(wxEVT_EP_MODELS_FETCHED);
             ev->SetPayload(r);
@@ -1970,98 +2582,117 @@ private:
     {
         const unsigned gen = (unsigned)event.GetInt();
         if (gen != m_inFlightGeneration) return;
-        const bool advance = m_connectPending && m_pages->GetSelection() == 0;
+        const bool wasConnect = m_connectPending;
         m_connectPending = false;
         m_fetchInFlight = false;
-        if (m_fetchBtn) m_fetchBtn->Enable(true);
-        UpdateSaveButtons();
+        m_fetchBtn->Enable(true);
 
-        // Stale: provider/URL/credential changed while this request
-        // was in flight.  Discard rather than populate the wrong
-        // endpoint's checklist.
+        // Stale: provider/URL/credential changed while this request was in
+        // flight.  Discard rather than populate the wrong endpoint's list.
         if (gen != m_fetchGeneration) {
+            UpdateSaveButtons();
             if (!m_testInFlight && !m_hasTestResult)
-                SetFetchStatus("Connection changed during loading. Connect or refresh models again.");
+                SetFetchStatus("The connection changed while loading. Connect or refresh again.");
             return;
         }
 
         FetchModelsResult r = event.GetPayload<FetchModelsResult>();
         if (!r.ok) {
-            if (m_editMode && m_pages->GetSelection() == 1) {
-                // The auto-fetch on open failed: say so where the user is
-                // looking, and point at the fix.  The checked models are
-                // still editable from the configured list.
-                const wxString text = wxString::FromUTF8(kCross.c_str()) +
-                    ((r.status == 401 || r.status == 403)
-                        ? (IsChatGpt() ? "ChatGPT sign-in needs attention. Click Connection... to sign in again."
-                                       : "The saved key was rejected. Click Connection... to paste a new one.")
-                        : "Could not load the catalog. Your checked models are still shown.");
-                m_modelConnectionStatus->SetLabel(text);
-                m_modelConnectionStatus->SetToolTip(text);
-                if (m_modelConnectionStatus->GetParent()) m_modelConnectionStatus->GetParent()->Layout();
-            }
+            UpdateSaveButtons();
+            const bool authFail = r.status == 401 || r.status == 403;
             if (IsChatGpt()) {
-                if (!m_testInFlight && !m_hasTestResult)
-                    SetFetchStatus(kCross + (r.error.empty() ? std::string("Could not load your ChatGPT models.")
-                                                             : r.error));
-            } else if (r.status == 401 || r.status == 403) {
-                if (!m_testInFlight && !m_hasTestResult)
-                    SetFetchStatus(kCross + "Authentication or access check failed (" + r.error +
-                                   "). Chat requests use this same key.");
+                SetModelStatus(kCross + (authFail ? "ChatGPT sign-in needs attention. Sign in again on the left."
+                                                  : "Could not load your ChatGPT models."), StatusTone::Bad);
+                SetFetchStatus(kCross + (r.error.empty() ? std::string("Could not load your ChatGPT models.") : r.error));
+            } else if (authFail) {
+                SetModelStatus(kCross + "The key was rejected. Replace it on the left.", StatusTone::Bad);
+                SetFetchStatus(kCross + "Key check failed (" + r.error + "). Chat requests use this same key.");
+                m_replacingKey = true;
+                UpdateKeyCard();
+            } else if (r.status == 0 && UsingNoAuth()) {
+                // Nothing answered.  Nothing the user typed is touched.
+                SetModelStatus(kCross + "No answer from " +
+                    NormalizeBaseUrl(TrimUtf8(m_baseUrlField->GetValue())) + ".", StatusTone::Bad);
+                SetFetchStatus(kCross + r.error + ". Nothing you typed was lost.");
+                ShowRetry(NormalizeBaseUrl(TrimUtf8(m_baseUrlField->GetValue())));
             } else {
-                if (!m_testInFlight && !m_hasTestResult)
-                    SetFetchStatus(kCross + "Fetch failed: " + r.error);
+                SetModelStatus(kCross + (m_editMode ? "Could not load the catalog. Your checked models are still shown."
+                                                    : "Could not load the catalog."), StatusTone::Bad);
+                SetFetchStatus(kCross + "Fetch failed: " + r.error);
             }
+            (void)wasConnect;
             return;
         }
 
+        HideRetry();
+        m_rescanTimer.Stop();
+        m_connected = true;
         m_fetchedNames.clear();
         for (size_t i = 0; i < r.ids.size() && i < r.names.size(); ++i)
             m_fetchedNames[r.ids[i]] = r.names[i];
         m_fetchedIds = std::move(r.ids);
+        m_fetchedCtx = std::move(r.contexts);
+        // A key-free server with a single model: add it right away.
+        if (UsingNoAuth() && m_fetchedIds.size() == 1 && !IsInPicker(m_fetchedIds.front()))
+            SetModelPickerVisibility(m_models, m_fetchedIds.front(), true);
+        for (const auto& model : ModelsForPicker(m_models)) ApplyDetectedContext(model.id);
+        m_modelsField->ChangeValue(ModelsToText(m_models));
+
+        if (IsChatGpt()) {
+            SetModelStatus(kCheck + "Signed in to ChatGPT.", StatusTone::Good);
+        } else if (UsingNoAuth()) {
+            std::string where = HostOfUrl(TrimUtf8(m_baseUrlField->GetValue()));
+            int port = 0;
+            try { port = Poco::URI(NormalizeBaseUrl(TrimUtf8(m_baseUrlField->GetValue()))).getPort(); } catch (...) {}
+            if (port > 0) where += ":" + std::to_string(port);
+            // Typed address on a new connection: name it after what answered.
+            if (m_isNew && IsLocal() && TrimUtf8(m_nameField->GetValue()) == "Local server") {
+                const std::string guess = LocalServerName(port, r.ownedBy);
+                if (guess != "Local server") { m_nameField->ChangeValue(wxString::FromUTF8(guess)); SyncIdFromName(); }
+            }
+            SetModelStatus(kCheck + where + " answered. No key used.", StatusTone::Good);
+        } else if (r.credentialsVerified) {
+            m_keyVerified = true;
+            m_replacingKey = false;
+            SetModelStatus(kCheck + "Connected to " + ProviderLabel() + ".", StatusTone::Good);
+        } else {
+            SetModelStatus(kCheck + "Catalog loaded. This service doesn't confirm keys separately; "
+                           "Test model checks it.", StatusTone::Good);
+        }
+        UpdateKeyCard();
         RefreshModelChecklist();
-        wxString connectionText;
-        if (IsChatGpt())
-            connectionText = wxString::FromUTF8(kCheck.c_str()) +
-                "Signed in to ChatGPT. Check the models you want in your picker.";
-        else if (r.credentialsVerified && m_editMode)
-            connectionText = wxString::FromUTF8(kCheck.c_str()) + "Connected. Check the models you want in your picker.";
-        else if (r.credentialsVerified)
-            connectionText = "Credentials accepted. Choose a model to start chatting.";
-        else if (m_noAuthRadio->GetValue()) connectionText = "Server reached without authentication. Choose a model.";
-        else connectionText = "Model catalog loaded. This custom service's key has not been independently verified.";
-        m_modelConnectionStatus->SetLabel(connectionText);
-        m_modelConnectionStatus->SetToolTip(connectionText);
-        if (m_modelConnectionStatus->GetParent()) m_modelConnectionStatus->GetParent()->Layout();
-        if (advance) ShowStep(1);
+        SelectFirstChecked();
+        UpdateSaveButtons();
         if (!m_testInFlight && !m_hasTestResult) SetFetchStatus(m_fetchedIds.empty()
-            ? "The catalog is empty. Use Advanced: model IDs if you know the model ID."
-            : "Check models to keep, then Save. To switch this chat, highlight a checked model and click Save and use model.");
+            ? "The catalog is empty. Use Edit as text if you know the model ID."
+            : PickerSummary());
+    }
+
+    // Known context for an id from the last catalog, applied to the
+    // record only for key-free (local) servers: on paid providers the
+    // 256K default is a cost ceiling and a 1M catalog value must not
+    // silently lift it.
+    void ApplyDetectedContext(const std::string& id)
+    {
+        if (!UsingNoAuth()) return;
+        const auto it = m_fetchedCtx.find(id);
+        if (it == m_fetchedCtx.end()) return;
+        for (auto& model : m_models)
+            if (model.id == id && model.contextLimit <= 0 && it->second >= 4096)
+                model.contextLimit = std::min(it->second, 2097152);
     }
 
     // ── Test connection ─────────────────────────────────────────
-    // Independent test revision: model edits invalidate a probe without
-    // invalidating a catalog fetched with unchanged connection settings.
     void OnTestConnection(wxCommandEvent&)
     {
         if (m_testInFlight) return;
-
-        const std::string base =
-            NormalizeBaseUrl(TrimUtf8(m_baseUrlField->GetValue()));
-        if (base.rfind("http://", 0) != 0 &&
-            base.rfind("https://", 0) != 0) {
-            SetFetchStatus(kCross + "Base URL must start with http:// or https://.");
-            m_baseUrlField->SetFocus();
+        const std::string base = NormalizeBaseUrl(TrimUtf8(m_baseUrlField->GetValue()));
+        if (base.rfind("http://", 0) != 0 && base.rfind("https://", 0) != 0) {
+            SetFetchStatus(kCross + "The address must start with http:// or https://.");
             return;
         }
         const auto models = ModelsForPicker(m_models);
-        if (models.empty()) {
-            SetFetchStatus(kCross + "Check or type at least one model to test with.");
-            m_modelList->SetFocus();
-            return;
-        }
-        const int row = m_modelList->GetSelection();
-        const std::string selectedId = row >= 0 && row < (int)m_rowModelIds.size() ? m_rowModelIds[row] : std::string();
+        const std::string selectedId = SelectedRowId();
         auto selected = std::find_if(models.begin(), models.end(), [&](const auto& m) { return m.id == selectedId; });
         if (selected == models.end()) { SetFetchStatus("Select a checked model to test."); return; }
         const std::string model = selected->id;
@@ -2069,44 +2700,41 @@ private:
         const std::string resolvedPath = lb_responses::ResolveChatPath(
             base, TrimUtf8(m_chatPathField->GetValue()), model);
         if (lb_responses::IsResponsesPath(resolvedPath)) {
-            SetFetchStatus("This model uses OpenAI Responses. Test it by sending a chat message (and a tool request with Agent mode on); the connection-test button only speaks Chat Completions.");
+            SetFetchStatus("This model uses OpenAI Responses. Test it by sending a chat message (and a tool "
+                           "request with Agent mode on); this test only speaks Chat Completions.");
             return;
         }
         const bool testTools = !selected->noTools && m_nativeRadio->GetValue();
-        const std::string skipReason = selected->noTools ? "Allow agent tools is off" : "XML fallback is selected";
+        const std::string skipReason = selected->noTools ? "Agent tools is off" : "XML fallback is selected";
         static const char* efforts[] = {"auto", "none", "low", "medium", "high"};
         const std::string effort = efforts[std::max(0, m_testEffort->GetSelection())];
         std::string dialect = GetEndpoint().reasoningDialect;
-        if (dialect.empty()) dialect = DetectPreset(base) == 0 ? "openai" : "openrouter";
+        if (dialect.empty()) dialect = DetectPreset(base) == kPresetOpenAI ? "openai" : "openrouter";
         if (effort == "none" && lb_reasoning::RequiresReasoning(model, dialect == "openai")) {
-            SetFetchStatus("This model requires reasoning. Select Low or Auto under Test reasoning.");
+            SetFetchStatus("This model requires reasoning. Pick Low or Auto for the test.");
             m_testEffort->SetFocus();
             return;
         }
 
         const std::string key = EffectiveApiKey();
-        if (!m_noAuthRadio->GetValue() && key.empty()) { SetFetchStatus("Paste an API key or choose a saved key first."); return; }
+        if (!UsingNoAuth() && key.empty()) { SetFetchStatus("Paste an API key first."); return; }
         std::string headerName, headerValue;
         if (!key.empty()) {
-            if (m_xApiKeyRadio->GetValue()) {
-                headerName  = "x-api-key";
-                headerValue = key;
-            } else {
-                headerName  = "Authorization";
-                headerValue = "Bearer " + key;
-            }
+            if (m_xApiKeyRadio->GetValue()) { headerName = "x-api-key"; headerValue = key; }
+            else { headerName = "Authorization"; headerValue = "Bearer " + key; }
         }
-        const std::string url = JoinEndpointUrl(
-            base, TrimUtf8(m_chatPathField->GetValue()));
+        const std::string url = JoinEndpointUrl(base, TrimUtf8(m_chatPathField->GetValue()));
         const auto extra = m_extraHeaders;
 
         m_testInFlight = true;
         m_hasTestResult = false;
         m_testBtn->Enable(false);
+        m_testResult->SetForegroundColour(m_theme->textMuted);
+        m_testResult->SetLabel("Testing...");
+        m_testTools->SetLabel(wxEmptyString);
         const unsigned gen = m_testRevision;
         m_testGeneration = gen;
-        SetFetchStatus("Testing " + model + " - plain chat, then chat with "
-                       "a tool...");
+        SetFetchStatus("Testing " + model + ": plain chat, then chat with a tool...");
 
         wxEvtHandler* target = this;
         std::weak_ptr<std::atomic<bool>> alive = m_alive;
@@ -2127,7 +2755,9 @@ private:
                     const long firstMs = r.tools.millis;
                     r.tools = PostChatProbe(url, BuildProbeBody(model, true, effort, dialect, r.tools.message, callId), headerName, headerValue, extra);
                     r.tools.millis += firstMs;
-                    if (r.tools.ok && r.tools.text != "LLAMABOSS_PROBE_OK") {
+                    // Models often wrap the marker in a sentence ("The ping
+                    // returned LLAMABOSS_PROBE_OK."); finding it is the proof.
+                    if (r.tools.ok && r.tools.text.find("LLAMABOSS_PROBE_OK") == std::string::npos) {
                         r.tools.ok = false; r.tools.error = "Tool result was sent, but the model did not return the expected marker.";
                     }
                 }
@@ -2150,62 +2780,103 @@ private:
             LoadModelOptions();
         }
         if (gen != m_testRevision) {
-            SetFetchStatus("Discarded a connection test started before "
-                           "the settings changed - test again.");
+            SetFetchStatus("Discarded a test started before the settings changed. Test again.");
             return;
         }
 
         m_hasTestResult = true;
-        const TestConnectionResult r =
-            event.GetPayload<TestConnectionResult>();
-        auto ms = [](long v) { return std::to_string(v) + " ms"; };
+        const TestConnectionResult r = event.GetPayload<TestConnectionResult>();
+        auto secs = [](long ms) {
+            char buf[32]; std::snprintf(buf, sizeof(buf), "%.1f s", ms / 1000.0); return std::string(buf);
+        };
+        const std::string level = r.effort == "none" ? "off" : r.effort;
 
         if (!r.chat.ok) {
             std::string why = r.chat.error;
-            if (r.chat.status == 401 || r.chat.status == 403)
-                why += " (key rejected - check the saved connection)";
-            else if (r.chat.status == 404)
-                why += " (check Base URL and Chat path under Advanced)";
+            if (r.chat.status == 401 || r.chat.status == 403) why += " (key rejected)";
+            else if (r.chat.status == 404) why += " (check the address and the chat path under Advanced)";
+            m_testResult->SetForegroundColour(m_theme->stopButton);
+            m_testResult->SetLabel(wxString::FromUTF8(kCross + "Chat failed"));
+            m_testTools->SetLabel(wxEmptyString);
             SetFetchStatus(kCross + "Chat failed for " + r.model + ": " + why);
             return;
         }
+        const wxColour good(163, 190, 140);
+        m_testResult->SetForegroundColour(good);
+        m_testResult->SetLabel(wxString::FromUTF8(kCheck + "Chat " + secs(r.chat.millis)));
+        std::string tools;
         if (!r.toolsRun) {
-            SetFetchStatus(kCheck + r.model + " - chat passed. Tool test skipped: " + r.skipReason + ".");
+            tools = "tools skipped";
+            m_testTools->SetForegroundColour(m_theme->textMuted);
+            SetFetchStatus(kCheck + r.model + ": chat passed. Tool test skipped: " + r.skipReason + ".");
         } else if (r.tools.ok) {
-            SetFetchStatus(kCheck + r.model + " - chat and tool round trip passed (reasoning " + r.effort +
-                ", " + ms(r.tools.millis) + "). This verifies the ping test, not every agent tool.");
+            tools = kCheck + "Tool call " + secs(r.tools.millis);
+            m_testTools->SetForegroundColour(good);
+            SetFetchStatus(kCheck + r.model + ": chat and tool round trip passed at " + level +
+                           " reasoning. This checks a test tool, not every agent tool.");
         } else {
-            SetFetchStatus("Chat passed; tool round trip failed (reasoning " + r.effort + "): " + r.tools.error);
+            tools = kCross + "Tool call";
+            m_testTools->SetForegroundColour(m_theme->stopButton);
+            SetFetchStatus("Chat passed; the tool round trip failed at " + level + " reasoning: " + r.tools.error);
         }
+        m_testTools->SetLabel(wxString::FromUTF8(tools));
+        m_testTools->SetToolTip(wxString::FromUTF8(r.toolsRun && !r.tools.ok ? r.tools.error : std::string()));
+        m_rightPane->Layout();
     }
 
-    // ── Checklist <-> raw text sync ─────────────────────────────
-    // Structured model records are authoritative. Display checked records
-    // first, retained unchecked records next, and new catalog entries last.
+    void UpdateTestHelp()
+    {
+        std::string text;
+        if (IsChatGpt()) text = "Runs on your ChatGPT plan through OpenAI Responses.";
+        else if (UsingNoAuth()) text = "The test sends two tiny requests to this server.";
+        else text = "The test sends two tiny requests, billed by " + ProviderLabel() + ".";
+        m_testHelp->SetLabel(wxString::FromUTF8(text));
+    }
+
+    // ── Model list ──────────────────────────────────────────────
+    // Structured model records are authoritative. Checked records first,
+    // retained unchecked records next, new catalog entries last.
+    std::string SelectedRowId() const
+    {
+        const int row = m_modelList ? m_modelList->GetSelection() : wxNOT_FOUND;
+        return row >= 0 && row < (int)m_rowModelIds.size() ? m_rowModelIds[(size_t)row] : std::string();
+    }
+
+    bool IsInPicker(const std::string& id) const
+    {
+        return std::any_of(m_models.begin(), m_models.end(),
+            [&](const auto& m) { return m.id == id && m.showInPicker; });
+    }
+
+    int KnownContext(const EndpointStore::Model* record, const std::string& id) const
+    {
+        if (record && record->contextLimit > 0) return record->contextLimit;
+        const auto it = m_fetchedCtx.find(id);
+        return it != m_fetchedCtx.end() ? it->second : 0;
+    }
+
     void RefreshModelChecklist()
     {
         if (!m_modelList) return;
 
         const auto configured = ModelsForPicker(m_models);
-        std::string selectedId;
-        const int previousSelection = m_modelList->GetSelection();
-        if (previousSelection >= 0 && previousSelection < (int)m_rowModelIds.size())
-            selectedId = m_rowModelIds[previousSelection];
+        const std::string selectedId = SelectedRowId();
 
         std::string filter = TrimUtf8(m_filterField->GetValue());
-        std::transform(filter.begin(), filter.end(), filter.begin(),
-                       [](unsigned char c) { return (char)lb_ascii::ToLower(c); });
         auto lower = [](std::string s) {
             std::transform(s.begin(), s.end(), s.begin(),
-                           [](unsigned char c) {
-                               return (char)lb_ascii::ToLower(c);
-                           });
+                           [](unsigned char c) { return (char)lb_ascii::ToLower(c); });
             return s;
         };
+        filter = lower(filter);
         auto matches = [&](const std::string& id, const std::string& name) {
             if (filter.empty()) return true;
-            return lower(id).find(filter)   != std::string::npos ||
+            return lower(id).find(filter) != std::string::npos ||
                    lower(name).find(filter) != std::string::npos;
+        };
+        auto withContext = [&](std::string label, int ctx) {
+            if (ctx > 0) label += "   \xC2\xB7 " + FormatContextTokens(ctx);
+            return label;
         };
 
         m_modelList->Freeze();
@@ -2218,18 +2889,13 @@ private:
             if (!matches(m.id, m.displayName)) return;
             std::string label = m.id;
             if (!m.displayName.empty() && m.displayName != m.id &&
-                m.displayName != PrettyNameFromId(m.id)) {
-                label += " = " + m.displayName;
-            }
-            if (m.imageOutput && !IdLooksLikeImageModel(m.id))
-                label += " [image]";
-            if (!m.imageOutput && IdLooksLikeImageModel(m.id))
-                label += " [text]";
-            if (m.noTools)
-                label += " (chat only)";
-            const int idx = (int)m_modelList->Append(
-                wxString::FromUTF8(label.c_str()));
-            m_modelList->Check(idx, m.showInPicker);
+                m.displayName != PrettyNameFromId(m.id))
+                label += "  =  " + m.displayName;
+            if (m.imageOutput) label += "   [image]";
+            if (m.noTools)     label += "   (chat only)";
+            label = withContext(label, KnownContext(&m, m.id));
+            const int idx = (int)m_modelList->Append(wxString::FromUTF8(label));
+            m_modelList->Check((unsigned)idx, m.showInPicker);
             m_rowModelIds.push_back(m.id);
         };
         for (const auto& model : configured) appendModel(model);
@@ -2239,14 +2905,13 @@ private:
         for (const auto& id : m_fetchedIds) {
             if (configuredIds.count(id)) continue;
             const auto named = m_fetchedNames.find(id);
-            const std::string fetchedName = named != m_fetchedNames.end()
-                ? named->second : PrettyNameFromId(id);
+            const std::string fetchedName = named != m_fetchedNames.end() ? named->second : PrettyNameFromId(id);
             if (!matches(id, fetchedName)) continue;
             std::string rowLabel = id;
-            if (fetchedName != PrettyNameFromId(id)) rowLabel += " = " + fetchedName;
-            const int idx = (int)m_modelList->Append(
-                wxString::FromUTF8(rowLabel.c_str()));
-            m_modelList->Check(idx, false);
+            if (fetchedName != PrettyNameFromId(id)) rowLabel += "  =  " + fetchedName;
+            rowLabel = withContext(rowLabel, KnownContext(nullptr, id));
+            const int idx = (int)m_modelList->Append(wxString::FromUTF8(rowLabel));
+            m_modelList->Check((unsigned)idx, false);
             m_rowModelIds.push_back(id);
         }
 
@@ -2260,140 +2925,82 @@ private:
         UpdateModelCountLabel(configured.size(), m_rowModelIds.size());
     }
 
-    void OnModelToggled(wxCommandEvent& event)
+    void SelectFirstChecked()
     {
-        const int idx = event.GetInt();
-        if (idx < 0 || idx >= (int)m_rowModelIds.size()) return;
+        for (size_t i = 0; i < m_rowModelIds.size(); ++i) {
+            if (m_modelList->IsChecked((unsigned)i)) {
+                m_modelList->SetSelection((int)i);
+                m_modelList->EnsureVisible((int)i);
+                break;
+            }
+        }
+        LoadModelOptions();
+    }
 
-        const std::string id       = m_rowModelIds[(size_t)idx];
-        const bool        nowChecked = m_modelList->IsChecked((unsigned)idx);
-
-        SetModelPickerVisibility(m_models, id, nowChecked);
-        if (nowChecked) {
+    // Adds a model to (or removes it from) the picker and keeps it
+    // highlighted after the list reorders.
+    void SetInPicker(const std::string& id, bool visible)
+    {
+        SetModelPickerVisibility(m_models, id, visible);
+        if (visible) {
             const auto named = m_fetchedNames.find(id);
             if (named != m_fetchedNames.end() && !named->second.empty()) {
                 for (auto& model : m_models)
                     if (model.id == id && model.displayName == PrettyNameFromId(id))
                         model.displayName = named->second;
             }
+            ApplyDetectedContext(id);
         }
         m_modelsField->ChangeValue(ModelsToText(m_models));
-
-        // Keep the toggled model selected after the checked block reorders.
-        m_modelList->SetSelection(idx);
         InvalidateTest();
         RefreshModelChecklist();
+        auto it = std::find(m_rowModelIds.begin(), m_rowModelIds.end(), id);
+        if (it != m_rowModelIds.end()) m_modelList->SetSelection((int)(it - m_rowModelIds.begin()));
+        LoadModelOptions();
+        if (ReadyToSave() && !m_testInFlight && !m_hasTestResult) SetFetchStatus(PickerSummary());
     }
 
-    // ── Existing helpers (unchanged behavior) ───────────────────
+    void OnModelToggled(wxCommandEvent& event)
+    {
+        const int idx = event.GetInt();
+        if (idx < 0 || idx >= (int)m_rowModelIds.size()) return;
+        SetInPicker(m_rowModelIds[(size_t)idx], m_modelList->IsChecked((unsigned)idx));
+    }
+
     void UpdateResolvedUrl()
     {
         if (!m_resolvedUrlLabel) return;
         const std::string resolved = JoinEndpointUrl(
-            TrimUtf8(m_baseUrlField->GetValue()),
-            TrimUtf8(m_chatPathField->GetValue()));
-
-        if (resolved.empty()) {
-            m_resolvedUrlLabel->SetLabel("POST <base URL + chat path>");
-        }
-        else {
-            m_resolvedUrlLabel->SetLabel(
-                wxString::FromUTF8(
-                    (std::string("POST ") + resolved).c_str()));
-        }
+            TrimUtf8(m_baseUrlField->GetValue()), TrimUtf8(m_chatPathField->GetValue()));
+        m_resolvedUrlLabel->SetLabel(resolved.empty() ? wxString("POST <base URL + chat path>")
+                                                      : wxString::FromUTF8("POST " + resolved));
         m_resolvedUrlLabel->SetToolTip(m_resolvedUrlLabel->GetLabel());
-        if (m_resolvedUrlLabel->GetParent())
-            m_resolvedUrlLabel->GetParent()->Layout();
     }
 
     void RebuildKeyChoices()
     {
         if (!m_keyField || m_rebuildingKeys) return;
-
         const std::string provider = TrimUtf8(m_providerField->GetValue());
         const wxString previous = m_keyField->GetValue();
         std::set<std::string> uniqueKeys;
-        for (const auto& row : m_connections) {
-            if (row.provider == provider)
-                uniqueKeys.insert(row.key);
-        }
+        for (const auto& row : m_connections)
+            if (row.provider == provider) uniqueKeys.insert(row.key);
 
         m_rebuildingKeys = true;
         m_keyField->Freeze();
         m_keyField->Clear();
-
         bool previousExists = false;
         for (const auto& key : uniqueKeys) {
             const wxString item = wxString::FromUTF8(key.c_str());
             m_keyField->Append(item);
             if (item == previous) previousExists = true;
         }
-
-        if (previousExists) {
-            m_keyField->SetValue(previous);
-        }
-        else if (m_keyField->GetCount() > 0) {
-            m_keyField->SetSelection(0);
-        }
-        else if (!previous.IsEmpty()) {
-            m_keyField->SetValue(previous);
-        }
-        else {
-            m_keyField->SetValue("api_key");
-        }
-
+        if (previousExists) m_keyField->SetValue(previous);
+        else if (m_keyField->GetCount() > 0) m_keyField->SetSelection(0);
+        else if (!previous.IsEmpty()) m_keyField->SetValue(previous);
+        else m_keyField->SetValue("api_key");
         m_keyField->Thaw();
         m_rebuildingKeys = false;
-    }
-
-    void UpdateConnectionStatus()
-    {
-        if (!m_connectionStatus || m_rebuildingKeys) return;
-
-        const std::string provider = TrimUtf8(m_providerField->GetValue());
-        const std::string key      = TrimUtf8(m_keyField->GetValue());
-        const std::string entered  = m_apiKeyField
-            ? TrimUtf8(m_apiKeyField->GetValue()) : std::string();
-
-        if (m_noAuthRadio && m_noAuthRadio->GetValue()) {
-            m_connectionStatus->SetLabel(
-                "No authentication - requests are sent without a key.");
-        }
-        else if (!m_secretsStore) {
-            m_connectionStatus->SetLabel(
-                "Credential storage is unavailable in this window.");
-        }
-        else if (provider.empty() || key.empty()) {
-            m_connectionStatus->SetLabel(
-                "Choose a saved connection and key name.");
-        }
-        else if (!entered.empty()) {
-            m_connectionStatus->SetLabel(
-                wxString::Format(
-                    "Key entered for %s.",
-                    wxString::FromUTF8(provider.c_str())));
-        }
-        else if (!m_secretsStore->HasSecret(provider, key)) {
-            m_connectionStatus->SetLabel(
-                wxString::FromUTF8(kCross.c_str()) + wxString::Format("No key saved for %s / %s - paste one above.",
-                                 wxString::FromUTF8(provider.c_str()),
-                                 wxString::FromUTF8(key.c_str())));
-        }
-        else if (m_secretsStore->GetSecret(provider, key).empty()) {
-            m_connectionStatus->SetLabel(
-                wxString::FromUTF8(kCross.c_str()) + wxString::Format("%s / %s exists but its value is unavailable.",
-                                 wxString::FromUTF8(provider.c_str()),
-                                 wxString::FromUTF8(key.c_str())));
-        }
-        else {
-            m_connectionStatus->SetLabel(
-                wxString::FromUTF8(kCheck.c_str()) + wxString::Format("Saved key found for %s (leave the API key field blank to reuse it)",
-                                 wxString::FromUTF8(provider.c_str())));
-        }
-
-        m_connectionStatus->SetToolTip(m_connectionStatus->GetLabel());
-        if (m_connectionStatus->GetParent())
-            m_connectionStatus->GetParent()->Layout();
     }
 
     void OnProviderChanged(wxCommandEvent&)
@@ -2402,17 +3009,18 @@ private:
         // fetch doubles as its auth test) — orphan any in-flight fetch.
         InvalidateFetch();
         RebuildKeyChoices();
-        UpdateConnectionStatus();
+        m_replacingKey = false;
+        UpdateKeyCard();
     }
 
     void OnKeyChanged(wxCommandEvent&)
     {
         InvalidateFetch();
-        UpdateConnectionStatus();
+        m_replacingKey = false;
+        UpdateKeyCard();
     }
 
 public:
-
     const std::string& GetModelToUse() const { return m_modelToUse; }
 
     EndpointStore::Endpoint GetEndpoint() const
@@ -2423,18 +3031,16 @@ public:
         if (ep.displayName.empty()) ep.displayName = ep.id;
         ep.baseUrl     = NormalizeBaseUrl(TrimUtf8(m_baseUrlField->GetValue()));
         ep.chatPath    = NormalizeChatPath(TrimUtf8(m_chatPathField->GetValue()));
-        if (m_noAuthRadio && m_noAuthRadio->GetValue())
+        if (UsingNoAuth())
             ep.authScheme = EndpointStore::AuthScheme::None;
         else
-            ep.authScheme = m_xApiKeyRadio->GetValue()
-                                ? EndpointStore::AuthScheme::XApiKey
-                                : EndpointStore::AuthScheme::Bearer;
+            ep.authScheme = m_xApiKeyRadio->GetValue() ? EndpointStore::AuthScheme::XApiKey
+                                                      : EndpointStore::AuthScheme::Bearer;
         ep.secretProvider = TrimUtf8(m_providerField->GetValue());
         ep.secretKey      = TrimUtf8(m_keyField->GetValue());
         if (ep.secretKey.empty()) ep.secretKey = "api_key";
-        ep.protocol    = m_xmlRadio->GetValue() ? ToolProtocol::Xml
-                                                : ToolProtocol::Native;
-        switch (m_dialectChoice ? m_dialectChoice->GetSelection() : 0) {
+        ep.protocol    = m_xmlRadio->GetValue() ? ToolProtocol::Xml : ToolProtocol::Native;
+        switch (m_dialectChoice->GetSelection()) {
             case 1:  ep.reasoningDialect = "openai";     break;
             case 2:  ep.reasoningDialect = "openrouter"; break;
             case 3:  ep.reasoningDialect = "template";   break;
@@ -2462,28 +3068,25 @@ public:
     }
 
 private:
-    // Field checks shared by Connect / Save / Save and use model.  On
-    // failure the credentials page is shown with Advanced open and the
-    // message in the status line; returns false.
+    // Field checks shared by Connect / Save / Save and use.  On failure
+    // the message goes to the status line; returns false.
     bool ValidateConnectionFields(EndpointStore::Endpoint& ep, bool& noAuth)
     {
         ep = GetEndpoint();
-        auto connectionError = [this](const wxString& message) {
-            ShowStep(0);
-            m_advancedPane->Expand();
-            RefreshLayout();
-            SetFetchStatus(TrimUtf8(message));
+        auto connectionError = [this](const std::string& message) {
+            if (!m_advancedPane->IsExpanded()) { m_advancedPane->Expand(); RefreshLayout(); }
+            SetFetchStatus(kCross + message);
         };
         if (!IsSafeIdentifier(wxString::FromUTF8(ep.id))) {
-            connectionError("Choose a connection id using lowercase letters, digits or underscores in Advanced."); return false;
+            connectionError("Choose an id under Advanced using lowercase letters, digits or underscores.");
+            return false;
         }
         if (IsChatGpt()) {
             // No key to check or save: the credential is the sign-in.
             noAuth = true;
             if (!ChatGptSignedIn()) {
-                ShowStep(0);
                 SetFetchStatus("Choose Continue with ChatGPT to sign in first.");
-                if (m_chatgptSignInBtn) m_chatgptSignInBtn->SetFocus();
+                m_chatgptSignInBtn->SetFocus();
                 return false;
             }
             if (!m_endpointStore) {
@@ -2497,16 +3100,21 @@ private:
                 !uri.getUserInfo().empty() || !uri.getQuery().empty() || !uri.getFragment().empty())
                 throw std::runtime_error("Invalid base URL");
         } catch (...) {
-            connectionError("Enter a valid HTTP(S) base URL in Advanced, without credentials, query or fragment."); return false;
+            SetFetchStatus(kCross + "Enter a valid http:// or https:// address, without a user name, query or fragment.");
+            if (m_baseUrlField->IsShown()) m_baseUrlField->SetFocus();
+            return false;
         }
         noAuth = ep.authScheme == EndpointStore::AuthScheme::None;
         if (!noAuth && (!IsSafeIdentifier(wxString::FromUTF8(ep.secretProvider)) ||
-                       !IsSafeIdentifier(wxString::FromUTF8(ep.secretKey)))) {
-            connectionError("Choose a saved-key provider and key name in Advanced (lowercase letters, digits or underscores)."); return false;
+                        !IsSafeIdentifier(wxString::FromUTF8(ep.secretKey)))) {
+            connectionError("Choose a key set and key name under Advanced (lowercase letters, digits or underscores).");
+            return false;
         }
         if (!noAuth && EffectiveApiKey().empty()) {
-            ShowStep(0); SetFetchStatus("Paste your API key to continue, or choose a saved key in Advanced.");
-            m_apiKeyField->SetFocus(); return false;
+            SetFetchStatus("Paste your API key to continue.");
+            m_replacingKey = true; UpdateKeyCard();
+            m_apiKeyField->SetFocus();
+            return false;
         }
         if (!m_endpointStore || (!noAuth && !m_secretsStore)) {
             SetFetchStatus("Connection storage is unavailable. Restart LlamaBoss and try again."); return false;
@@ -2514,8 +3122,8 @@ private:
         return true;
     }
 
-    // Persist the endpoint and (if one was typed) its key, with the same
-    // rollback rules as before.  Returns true when everything is on disk.
+    // Persist the endpoint and (if one was typed) its key, with rollback.
+    // Returns true when everything is on disk.
     bool CommitEndpoint(const EndpointStore::Endpoint& ep, bool noAuth)
     {
         EndpointStore::Endpoint previousEndpoint;
@@ -2523,7 +3131,8 @@ private:
         const bool hadEndpoint = existing != nullptr;
         if (hadEndpoint) previousEndpoint = *existing;
         if (m_isNew && hadEndpoint && m_seededExistingId != ep.id && wxMessageBox(
-            "This connection already exists. Replace its model list and settings? Use Edit to keep its existing models.",
+            "A connection with this id already exists. Replace its models and settings?\n\n"
+            "Choose No and change the name (or the id under Advanced) to keep both.",
             "Replace connection?", wxYES_NO | wxNO_DEFAULT | wxICON_QUESTION, this) != wxYES) return false;
 
         const std::string enteredKey = noAuth ? std::string() : TrimUtf8(m_apiKeyField->GetValue());
@@ -2561,6 +3170,10 @@ private:
     void OnSaveOnly(wxCommandEvent&)
     {
         if (m_fetchInFlight && m_connectPending) return;
+        if (m_rawMode && m_rawModelsDirty) {
+            MergePickerModels(m_models, ParseModelsText(m_modelsField->GetValue()));
+            m_rawModelsDirty = false;
+        }
         EndpointStore::Endpoint ep; bool noAuth = false;
         if (!ValidateConnectionFields(ep, noAuth)) return;
         if (!CommitEndpoint(ep, noAuth)) return;
@@ -2568,25 +3181,25 @@ private:
         EndModal(wxID_OK);
     }
 
-    // Accent button: "Connect" on the credentials page, "Save and use
-    // model" on the Models page.
+    // Accent button: "Connect" until connected, then "Save and use".
     void OnOK(wxCommandEvent&)
     {
         if (m_signInAttempt) return;   // finish (or cancel) the browser sign-in first
-        if (IsChatGpt() && m_pages->GetSelection() == 0 && !ChatGptSignedIn()) {
+        if (IsChatGpt() && !ChatGptSignedIn()) {
             wxCommandEvent e;
             OnChatGptSignIn(e);
             return;
         }
         EndpointStore::Endpoint ep; bool noAuth = false;
         if (!ValidateConnectionFields(ep, noAuth)) return;
-        if (m_pages->GetSelection() == 0) {
+        if (!ReadyToSave() || m_manualModelsRequested) {
             if (m_fetchInFlight) return;
             if (m_manualModelsRequested) {
-                m_modelConnectionStatus->SetLabel("Manual setup: connection and key have not been verified.");
-                ShowStep(1);
+                m_manualMode = true;
+                SetModelStatus("Typed model IDs: the connection hasn't been checked.", StatusTone::Neutral);
                 if (!m_rawMode) ToggleRawEditor();
-                SetFetchStatus("Enter model IDs, then switch to the list and select a checked model to use.");
+                SetFetchStatus("Type one model ID per line, then Show model list to pick the one to use.");
+                UpdateSaveButtons();
                 return;
             }
             m_connectPending = true;
@@ -2596,16 +3209,16 @@ private:
         }
         if (m_rawMode) {
             ToggleRawEditor();
-            SetFetchStatus("Highlight the checked model you want to use, then Save and use model - or click Save to keep the list.");
+            SetFetchStatus("Highlight the checked model to use, then Save and use. Save keeps the list without switching.");
             return;
         }
-        const int selectedRow = m_modelList->GetSelection();
-        if (selectedRow < 0 || selectedRow >= (int)m_rowModelIds.size() ||
-            !m_modelList->IsChecked(selectedRow)) {
-            SetFetchStatus("Highlight a checked model to use. Click Save instead to keep the list without switching."); return;
+        const std::string selectedId = SelectedRowId();
+        const int row = m_modelList->GetSelection();
+        if (selectedId.empty() || !m_modelList->IsChecked((unsigned)row)) {
+            SetFetchStatus("Highlight a checked model to use. Save keeps the list without switching."); return;
         }
-        const std::string selectedId = m_rowModelIds[selectedRow];
-        if (std::none_of(ep.models.begin(), ep.models.end(), [&](const auto& model) { return model.id == selectedId && model.showInPicker; })) {
+        if (std::none_of(ep.models.begin(), ep.models.end(),
+                [&](const auto& model) { return model.id == selectedId && model.showInPicker; })) {
             SetFetchStatus("Select a checked model from the list before saving."); return;
         }
         if (!CommitEndpoint(ep, noAuth)) return;
@@ -2613,200 +3226,253 @@ private:
         EndModal(wxID_OK);
     }
 
-    void ResizeForStep()
-    {
-        const bool expanded = m_pages->GetSelection() == 0 && m_advancedPane->IsExpanded();
-        int height = FromDIP(m_pages->GetSelection() == 1 || expanded ? 780 : 560);
-        const int displayIndex = wxDisplay::GetFromWindow(GetParent() ? GetParent() : this);
-        if (displayIndex != wxNOT_FOUND) {
-            const auto area = wxDisplay(static_cast<unsigned>(displayIndex)).GetClientArea();
-            height = std::min(height, area.GetHeight() * 9 / 10);
-            SetSize(wxSize(std::min(GetSize().x, area.GetWidth() * 9 / 10), height));
-            const auto pos = GetPosition();
-            Move(std::max(area.x, std::min(pos.x, area.GetRight() - GetSize().x + 1)),
-                 std::max(area.y, std::min(pos.y, area.GetBottom() - GetSize().y + 1)));
-        } else SetSize(wxSize(GetSize().x, height));
-    }
-
-    void ShowStep(int step)
-    {
-        m_pages->SetSelection(step);
-        if (m_editMode) {
-            const wxString name = m_seedDisplayName.IsEmpty() ? wxString("Provider") : m_seedDisplayName;
-            m_stepLabel->SetLabel(name + (step == 0 ? " - Connection" : " - Models"));
-            // The credentials page is a detour in Edit mode: Back leads
-            // to Models, and Models itself needs no Back at all.
-            m_backBtn->SetLabel("Back to models");
-            m_backBtn->Show(step == 0);
-        } else {
-            m_stepLabel->SetLabel(step == 0 ? "1 of 2 - Connect a provider" : "2 of 2 - Choose a model");
-            m_backBtn->SetLabel("Back");
-            m_backBtn->Show(step != 0);
-        }
-        m_saveBtn->Show(step == 1);
-        m_finishBtn->SetLabel(step == 0 ? "Connect" : "Save and use model");
-        UpdateSaveButtons();
-        if (step == 1) m_filterField->SetFocus();
-        ResizeForStep();
-        RefreshLayout();
-    }
-
-    // "Save and use model" needs a highlighted, checked row; "Save" never
-    // does.  On the credentials page the accent button is Connect and
-    // always available.  Raw-text mode keeps the accent button live: its
-    // handler flips back to the list so the user can pick.
+    // Footer buttons follow the state: Connect before the first check,
+    // then Save + "Save and use <model>" (needs a highlighted checked row).
     void UpdateSaveButtons()
     {
-        if (!m_finishBtn || !m_pages) return;
+        if (!m_finishBtn) return;
         const bool connecting = m_connectPending && m_fetchInFlight;
-        const bool connectionPage = m_pages->GetSelection() == 0;
-        m_finishBtn->SetLabel(connectionPage
-            ? (connecting ? "Connecting..." : "Connect") : "Save and use model");
-        if (m_saveBtn) m_saveBtn->Enable(!connecting);
-        if (connectionPage) {
+        if (!ReadyToSave()) {
+            m_saveBtn->Hide();
+            m_finishBtn->SetLabel(connecting ? "Connecting..." : IsChatGpt() && !ChatGptSignedIn()
+                                                  ? "Continue with ChatGPT" : "Connect");
             m_finishBtn->Enable(!m_fetchInFlight && !m_signInAttempt);
             m_finishBtn->SetToolTip(wxString());
-            return;
+        } else {
+            m_saveBtn->Show();
+            m_saveBtn->Enable(!connecting);
+            wxString label = "Save and use model";
+            bool usable = m_rawMode;
+            const int row = m_modelList ? m_modelList->GetSelection() : wxNOT_FOUND;
+            if (!m_rawMode && row >= 0 && row < (int)m_rowModelIds.size() && m_modelList->IsChecked((unsigned)row)) {
+                usable = true;
+                for (const auto& m : m_models) {
+                    if (m.id != m_rowModelIds[(size_t)row]) continue;
+                    wxString name = wxString::FromUTF8(m.displayName.empty() ? m.id : m.displayName);
+                    if (name.length() > 26) name = name.Left(25) + wxString::FromUTF8("\xE2\x80\xA6");
+                    label = "Save and use " + name;
+                    break;
+                }
+            }
+            m_finishBtn->SetLabel(label);
+            m_finishBtn->Enable(usable && !connecting);
+            m_finishBtn->SetToolTip(usable ? wxString()
+                : wxString("Highlight a checked model to enable. Save keeps the list without switching."));
         }
-        const int row = m_modelList ? m_modelList->GetSelection() : wxNOT_FOUND;
-        const bool usable = m_rawMode ||
-            (row >= 0 && row < (int)m_rowModelIds.size() && m_modelList->IsChecked(row));
-        m_finishBtn->Enable(usable && !connecting);
-        m_finishBtn->SetToolTip(usable ? wxString() :
-            wxString("Highlight a checked model to enable. Save keeps the list without switching."));
+        if (GetSizer()) Layout();
     }
 
     void LoadModelOptions()
     {
         const int row = m_modelList->GetSelection();
-        const bool valid = row >= 0 && row < (int)m_rowModelIds.size();
-        const bool checked = valid && !m_rawMode && m_modelList->IsChecked(row);
-        const std::string selectedId = valid ? m_rowModelIds[row] : std::string();
+        const bool valid = !m_rawMode && row >= 0 && row < (int)m_rowModelIds.size();
+        const bool checked = valid && m_modelList->IsChecked((unsigned)row);
+        const std::string selectedId = valid ? m_rowModelIds[(size_t)row] : std::string();
         if (m_optionsModelId != selectedId) {
             m_optionsModelId = selectedId;
             InvalidateTest();
         }
         UpdateSaveButtons();
+        m_loadingOptions = true;
         m_modelNameField->Enable(checked);
+        m_ctxField->Enable(checked);
         m_allowTools->Enable(checked);
-        m_imageOutput->Enable(checked);
+        m_imageOutput->Enable(checked && !IsChatGpt());
         m_testBtn->Enable(checked && !m_testInFlight);
-        m_selectedModelLabel->SetLabel(valid ? wxString::FromUTF8(m_rowModelIds[row]) : wxString("Select a model to edit its options."));
+        m_selectedModelLabel->SetLabel(valid ? wxString::FromUTF8(selectedId)
+            : wxString("SELECTED MODEL"));
         m_modelNameField->ChangeValue(wxEmptyString);
+        m_ctxField->ChangeValue(wxEmptyString);
         m_allowTools->SetValue(true);
         m_imageOutput->SetValue(false);
+        std::string ctxHint;
         if (valid) {
-            for (const auto& model : ModelsForPicker(m_models)) {
-                if (model.id != m_rowModelIds[row]) continue;
+            for (const auto& model : m_models) {
+                if (model.id != selectedId || !model.showInPicker) continue;
                 m_modelNameField->ChangeValue(wxString::FromUTF8(model.displayName));
+                m_ctxField->ChangeValue(wxString::FromUTF8(FormatContextTokens(model.contextLimit)));
                 m_allowTools->SetValue(!model.noTools);
                 m_imageOutput->SetValue(model.imageOutput);
                 m_allowTools->Enable(checked && !model.imageOutput);
                 break;
             }
+            const auto detected = m_fetchedCtx.find(selectedId);
+            if (detected != m_fetchedCtx.end())
+                ctxHint = (UsingNoAuth() ? "Read from the server: " : "Provider lists ") +
+                          FormatContextTokens(detected->second) + ".";
+            if (!checked) ctxHint = "Tick the model to set its options.";
         }
-        const bool viaResponses = valid && DetectPreset(TrimUtf8(m_baseUrlField->GetValue())) == 0 &&
+        if (ctxHint.empty() && checked)
+            ctxHint = UsingNoAuth() ? "Empty uses the 256K remote default. Set the server's window."
+                                    : "Empty uses the 256K default, a cost ceiling.";
+        m_ctxHint->SetLabel(wxString::FromUTF8(ctxHint));
+        m_ctxHint->SetForegroundColour(m_theme->textMuted);
+        m_loadingOptions = false;
+
+        const std::string base = TrimUtf8(m_baseUrlField->GetValue());
+        const bool viaResponses = valid && DetectPreset(base) == kPresetOpenAI &&
             !m_imageOutput->GetValue() &&
             lb_responses::IsResponsesPath(lb_responses::ResolveChatPath(
-                TrimUtf8(m_baseUrlField->GetValue()),
-                TrimUtf8(m_chatPathField->GetValue()), m_rowModelIds[row]));
-        if (IsChatGpt()) m_imageOutput->Enable(false);
+                base, TrimUtf8(m_chatPathField->GetValue()), selectedId));
         m_compatibilityHint->SetLabel(IsChatGpt()
-            ? "Runs on your ChatGPT plan through OpenAI Responses: agent tools and reasoning work together. Image generation isn't available on this connection."
+            ? "Runs through OpenAI Responses: tools and reasoning work together. Image generation isn't available here."
             : viaResponses
-            ? "This model is routed through OpenAI Responses: tools and reasoning work together at any /think level. Leave Allow agent tools on."
-            : "Allow agent tools makes tools available when Agent mode is on. Image generation uses a separate, tools-free request.");
-        m_compatibilityHint->Wrap(FromDIP(560));
+            ? "Routed through OpenAI Responses: tools and reasoning work together at any /think level."
+            : "Agent tools are offered when Agent mode is on. Image models use a separate, tools-free request.");
+        m_compatibilityHint->Wrap(std::max(FromDIP(520), m_rightPane->GetClientSize().x - FromDIP(40)));
+        m_rightPane->Layout();
     }
 
     void SaveModelOptions()
     {
+        if (m_loadingOptions) return;
         const int row = m_modelList->GetSelection();
-        if (row < 0 || row >= (int)m_rowModelIds.size() || !m_modelList->IsChecked(row)) return;
+        if (row < 0 || row >= (int)m_rowModelIds.size() || !m_modelList->IsChecked((unsigned)row)) return;
+        int ctx = 0;
+        const bool ctxOk = ParseContextTokens(TrimUtf8(m_ctxField->GetValue()), ctx);
         for (auto& model : m_models) {
-            if (model.id != m_rowModelIds[row]) continue;
+            if (model.id != m_rowModelIds[(size_t)row]) continue;
             model.displayName = TrimUtf8(m_modelNameField->GetValue());
             if (model.displayName.empty()) model.displayName = PrettyNameFromId(model.id);
             model.noTools = !m_allowTools->GetValue();
             model.imageOutput = m_imageOutput->GetValue();
+            if (ctxOk) model.contextLimit = ctx;
             m_allowTools->Enable(!model.imageOutput);
+        }
+        if (!ctxOk) {
+            m_ctxHint->SetLabel("Use a number from 4096 to 2M, such as 131072 or 128K.");
+            m_ctxHint->SetForegroundColour(m_theme->stopButton);
+        } else {
+            m_ctxHint->SetForegroundColour(m_theme->textMuted);
         }
         m_modelsField->ChangeValue(ModelsToText(m_models));
         InvalidateTest();
+        UpdateSaveButtons();
     }
+
+    // ── Members ─────────────────────────────────────────────────
+    const bool m_isNew;               // Add mode: id follows the display name
+    bool m_editMode = false;          // existing provider: starts connected
+    const ThemeData* m_theme = nullptr;
+    EndpointStore* m_endpointStore = nullptr;
+    SecretsStore* m_secretsStore = nullptr;
+    std::vector<SecretsStore::ConnectionRow> m_connections;
+    std::vector<std::pair<std::string, std::string>> m_extraHeaders;
+
+    int  m_preset = kPresetOpenRouter;
+    bool m_connected = false;          // Add mode: a catalog was loaded for these settings
+    bool m_manualMode = false;         // "Type model IDs without connecting"
+    bool m_connectPending = false;
+    bool m_manualModelsRequested = false;
+    bool m_idEditedByUser = false;
+    bool m_replacingKey = false;
+    bool m_keyVerified = false;
+    bool m_loadingOptions = false;
 
     std::vector<EndpointStore::Model> m_models;
     std::string m_optionsModelId;
     std::string m_modelToUse;
-    bool m_editMode = false;          // existing provider: open on Models, connection is a detour
-    wxString m_seedDisplayName;
-    wxButton* m_saveBtn = nullptr;
-    wxButton* m_connectionBtn = nullptr;
-    bool m_connectPending = false;
-    bool m_manualModelsRequested = false;
-    std::string m_statusText;
-    wxButton* m_statusDetails = nullptr;
-    wxStaticText* m_modelConnectionStatus = nullptr;
-
-    wxSimplebook* m_pages = nullptr;
-    wxScrolledWindow* m_credentialsPage = nullptr;
-    wxScrolledWindow* m_modelsPage = nullptr;
-    wxStaticText* m_stepLabel = nullptr;
-    wxStaticText* m_selectedModelLabel = nullptr;
-    wxStaticText* m_compatibilityHint = nullptr;
-    wxTextCtrl* m_modelNameField = nullptr;
-    wxCheckBox* m_allowTools = nullptr;
-    wxCheckBox* m_imageOutput = nullptr;
-    wxChoice* m_testEffort = nullptr;
-    wxButton* m_finishBtn = nullptr;
-    wxButton* m_backBtn = nullptr;
-    EndpointStore* m_endpointStore = nullptr;
     std::string m_originalDialect;
     std::string m_seededExistingId;
+    std::string m_statusText;
 
-    // ── Members ─────────────────────────────────────────────────
-    wxChoice*      m_providerChoice = nullptr;
+    // Provider row.
+    wxPanel* m_presetTrack = nullptr;
+    std::vector<wxButton*> m_presetBtns;
+
+    // Left pane.
+    wxScrolledWindow* m_leftPane = nullptr;
+    wxPanel*      m_scanGroup = nullptr;
+    wxPanel*      m_scanList  = nullptr;
+    wxStaticText* m_scanHint  = nullptr;
+    wxButton*     m_scanBtn   = nullptr;
+    std::vector<wxRadioButton*> m_scanRadios;
+    std::vector<LocalServerInfo> m_scanResults;
+    bool          m_scanInFlight = false;
+    unsigned      m_scanGeneration = 0;
+    wxStaticText* m_baseUrlLabel = nullptr;
+    wxTextCtrl*   m_baseUrlField = nullptr;
+    wxPanel*      m_retryPanel = nullptr;
+    wxStaticText* m_retryTitle = nullptr;
+    wxStaticText* m_retryBody  = nullptr;
+    wxCheckBox*   m_keepChecking = nullptr;
+    wxTimer       m_retryTimer;
+    wxTimer       m_rescanTimer;     // quiet port re-check while nothing is found
+    wxPanel*      m_keyGroup = nullptr;
+    wxPanel*      m_keyCard  = nullptr;
+    wxStaticText* m_keyCardTitle  = nullptr;
+    wxStaticText* m_keyCardMasked = nullptr;
+    wxStaticText* m_keyCardDetail = nullptr;
+    wxButton*     m_replaceKeyBtn = nullptr;
+    wxPanel*      m_keyEntry = nullptr;
+    wxTextCtrl*   m_apiKeyField = nullptr;
+    wxCheckBox*   m_showKeyBox  = nullptr;
+    wxButton*     m_getKeyBtn   = nullptr;
+    wxPanel*      m_chatgptPanel      = nullptr;
+    wxButton*     m_chatgptSignInBtn  = nullptr;
+    wxButton*     m_chatgptSignOutBtn = nullptr;
+    wxStaticText* m_chatgptStatus     = nullptr;
+    std::string   m_chatgptAccount;              // issued client id, "" = none
+    std::shared_ptr<lb_chatgpt::SignInAttempt> m_signInAttempt;
+    unsigned      m_signInGeneration = 0;
+    wxTextCtrl*   m_nameField = nullptr;
+    wxCollapsiblePane* m_advancedPane = nullptr;
+    wxFlexGridSizer*   m_advGrid = nullptr;
     wxTextCtrl*    m_idField       = nullptr;
-    wxTextCtrl*    m_nameField     = nullptr;
-    wxTextCtrl*    m_baseUrlField  = nullptr;
     wxTextCtrl*    m_chatPathField = nullptr;
+    wxComboBox*    m_providerField = nullptr;
+    wxComboBox*    m_keyField      = nullptr;
     wxRadioButton* m_bearerRadio   = nullptr;
     wxRadioButton* m_xApiKeyRadio  = nullptr;
     wxRadioButton* m_noAuthRadio   = nullptr;
-    wxChoice*      m_dialectChoice = nullptr;
-    wxComboBox*    m_providerField = nullptr;
-    wxComboBox*    m_keyField      = nullptr;
-    wxTextCtrl*    m_apiKeyField   = nullptr;
     wxRadioButton* m_nativeRadio   = nullptr;
     wxRadioButton* m_xmlRadio      = nullptr;
-    wxTextCtrl*    m_modelsField   = nullptr;
+    wxChoice*      m_dialectChoice = nullptr;
     wxStaticText*  m_resolvedUrlLabel = nullptr;
-    wxStaticText*  m_connectionStatus = nullptr;
+    wxButton*      m_manualModelsBtn = nullptr;
+    bool           m_rebuildingKeys = false;
 
-    wxCollapsiblePane* m_advancedPane = nullptr;
-    wxFlexGridSizer*   m_advGrid      = nullptr;
-    int                m_advLabelWidth = kLabelWidth;
-    wxButton*          m_fetchBtn     = nullptr;
-    wxStaticText*      m_fetchStatus  = nullptr;   // footer status line
-    wxTextCtrl*        m_filterField  = nullptr;
-    wxCheckListBox*    m_modelList    = nullptr;
-    wxStaticText*      m_modelCountLabel = nullptr;
-    wxButton*          m_rawToggleBtn = nullptr;
-    bool               m_rawMode      = false;   // text editor shown
+    // Right pane.
+    wxPanel*        m_rightPane = nullptr;
+    wxStaticText*   m_modelConnectionStatus = nullptr;
+    wxTextCtrl*     m_filterField  = nullptr;
+    wxButton*       m_fetchBtn     = nullptr;
+    wxCheckListBox* m_modelList    = nullptr;
+    wxTextCtrl*     m_modelsField  = nullptr;
+    wxStaticText*   m_modelCountLabel = nullptr;
+    wxButton*       m_rawToggleBtn = nullptr;
+    bool            m_rawMode      = false;
+    wxStaticText*   m_selectedModelLabel = nullptr;
+    wxTextCtrl*     m_modelNameField = nullptr;
+    wxTextCtrl*     m_ctxField = nullptr;
+    wxStaticText*   m_ctxHint  = nullptr;
+    wxCheckBox*     m_allowTools  = nullptr;
+    wxCheckBox*     m_imageOutput = nullptr;
+    wxStaticText*   m_compatibilityHint = nullptr;
+    wxButton*       m_testBtn = nullptr;
+    wxChoice*       m_testEffort = nullptr;
+    wxStaticText*   m_testResult = nullptr;   // chat half of the test result
+    wxStaticText*   m_testTools  = nullptr;   // tool half, coloured on its own
+    wxStaticText*   m_testHelp = nullptr;
 
-    // Add mode: id follows the display name until edited by hand.
-    const bool m_isNew;
-    bool       m_idEditedByUser = false;
+    // Footer.
+    wxStaticText* m_fetchStatus   = nullptr;
+    wxButton*     m_statusDetails = nullptr;
+    wxButton*     m_cancelBtn = nullptr;
+    wxButton*     m_saveBtn   = nullptr;
+    wxButton*     m_finishBtn = nullptr;
 
-    // Checklist row -> model id, parallel to the visible (filtered)
-    // rows; rebuilt by RefreshModelChecklist.
-    std::vector<std::string> m_rowModelIds;
-    // Catalog returned by the last successful fetch (sorted ids).
-    std::vector<std::string> m_fetchedIds;
+    std::vector<wxStaticText*> m_hints;
+    std::vector<wxStaticText*> m_sectionLabels;
+
+    // Model list state.
+    std::vector<std::string> m_rowModelIds;   // visible row -> model id
+    std::vector<std::string> m_fetchedIds;    // last catalog (sorted)
+    std::map<std::string, std::string> m_fetchedNames;
+    std::map<std::string, int> m_fetchedCtx;
     bool m_syncingModels = false;
     bool m_rawModelsDirty = false;
     bool m_fetchInFlight = false;
-    wxButton* m_testBtn  = nullptr;
     bool      m_testInFlight   = false;
     bool      m_hasTestResult  = false;
     unsigned  m_testGeneration = 0;
@@ -2818,28 +3484,6 @@ private:
     unsigned m_inFlightGeneration = 0;
     std::shared_ptr<std::atomic<bool>> m_alive =
         std::make_shared<std::atomic<bool>>(true);
-
-    SecretsStore* m_secretsStore = nullptr;
-    std::vector<SecretsStore::ConnectionRow> m_connections;
-    std::vector<std::pair<std::string, std::string>> m_extraHeaders;
-    bool m_rebuildingKeys = false;
-    std::vector<wxStaticText*> m_hints;
-
-    // API-key widgets hidden for the ChatGPT plan provider.
-    wxStaticText* m_apiKeyLabel = nullptr;
-    wxCheckBox*   m_showKeyBox  = nullptr;
-    wxButton*     m_getKeyBtn   = nullptr;
-    wxStaticText* m_keyHelp     = nullptr;
-    // ChatGPT plan sign-in.
-    wxPanel*      m_chatgptPanel      = nullptr;
-    wxButton*     m_chatgptSignInBtn  = nullptr;
-    wxButton*     m_chatgptSignOutBtn = nullptr;
-    wxStaticText* m_chatgptStatus     = nullptr;
-    std::string   m_chatgptAccount;              // issued client id, "" = none
-    std::shared_ptr<lb_chatgpt::SignInAttempt> m_signInAttempt;
-    unsigned      m_signInGeneration = 0;
-    // Catalog display names (ChatGPT plan catalog provides them).
-    std::map<std::string, std::string> m_fetchedNames;
 };
 
 }  // anonymous namespace
@@ -3088,15 +3732,16 @@ bool LbShowAIConnectionSetup(wxWindow* parent, EndpointStore* store, SecretsStor
     if (!store) return false;
     if (!LbEnsureConnectionStoresWritable(parent, store, secrets)) return false;
     if (provider != "openrouter" && provider != "openai" && provider != "custom" &&
-        provider != "chatgpt") return false;
-    auto seed = MakeProviderPreset(provider == "openai" ? 0 : provider == "openrouter" ? 1 :
-                                   provider == "chatgpt" ? kPresetChatGpt : 2);
+        provider != "chatgpt" && provider != "local") return false;
+    const int preset = provider == "openai" ? kPresetOpenAI : provider == "openrouter" ? kPresetOpenRouter :
+                       provider == "chatgpt" ? kPresetChatGpt : provider == "local" ? kPresetLocal : kPresetCustom;
+    auto seed = MakeProviderPreset(preset);
     if (provider == "custom") { seed.id = "custom"; seed.displayName = "Custom provider"; seed.secretProvider = "custom"; }
     const auto* existing = store->FindEndpoint(seed.id);
     const bool isNew = existing == nullptr;
     if (existing) seed = *existing;
     EndpointEditDialog dlg(parent, isNew ? "Add AI provider" : "Set up AI provider", seed,
-        secrets, theme, isNew, store, wxString::FromUTF8(modelSearch));
+        secrets, theme, isNew, store, wxString::FromUTF8(modelSearch), isNew ? preset : -1);
     if (dlg.ShowModal() != wxID_OK) return false;
     if (modelToUse) *modelToUse = dlg.GetModelToUse();
     return true;
@@ -3105,9 +3750,12 @@ bool LbShowAIConnectionSetup(wxWindow* parent, EndpointStore* store, SecretsStor
 void EndpointsDialog::OnAdd(wxCommandEvent&)
 {
     if (!m_store) return;
-    auto seed = MakeProviderPreset(1);
+    // Add opens on Local server, which scans this PC straight away; the
+    // provider row is one click from OpenRouter, OpenAI and the rest.
+    auto seed = MakeProviderPreset(kPresetLocal);
     if (const auto* existing = m_store->FindEndpoint(seed.id)) seed = *existing;
-    EndpointEditDialog dlg(this, "Add AI provider", seed, m_secretsStore, *m_theme, true, m_store);
+    EndpointEditDialog dlg(this, "Add AI provider", seed, m_secretsStore, *m_theme, true, m_store,
+                           wxEmptyString, kPresetLocal);
     if (dlg.ShowModal() == wxID_OK && !dlg.GetModelToUse().empty()) {
         m_modelToUse = dlg.GetModelToUse();
         EndModal(wxID_OK);

@@ -2490,13 +2490,17 @@ bool ServerManager::StartServer(const std::string& ggufPath, const ServerConfig&
     // MaybeRetryAfterStartupFailure() handles MTP-looking startup
     // failures by retrying once without MTP while keeping --jinja.
     //
-    // Embedded MTP may be combined with an mmproj.  Treat that path as
-    // experimental because the target model, MTP draft context, image
-    // embeddings, projector, and KV cache all compete for memory.
-    // Keep the projector on the CPU initially to preserve dedicated
-    // GPU memory.  Text generation remains GPU accelerated, while
-    // image encoding may be slower.  An explicit bundle *draft*.gguf
-    // still wins over embedded MTP so speculative modes are not stacked.
+    // Embedded MTP may be combined with an mmproj.  The target model,
+    // MTP draft context, image embeddings, projector, and KV cache all
+    // compete for memory.  The projector stays on the GPU (llama.cpp's
+    // default) up to kMtpVisionGpuCtxLimit; above that the KV cache is
+    // large enough that it moves to the CPU to protect dedicated VRAM.
+    // CPU encoding is SLOW — a full-size phone photo measured ~115 s on
+    // an i5-13400F (20261025) vs ~5 s for a small image — which is why
+    // it is no longer the default at ordinary context sizes.  Send-time
+    // downscaling in chat_history.cpp keeps either path's cost bounded.
+    // An explicit bundle *draft*.gguf still wins over embedded MTP so
+    // speculative modes are not stacked.
     //
     // Use a conservative draft length of 2 for the initial LlamaBoss
     // implementation.  This limits additional memory and verification
@@ -2513,15 +2517,30 @@ bool ServerManager::StartServer(const std::string& ggufPath, const ServerConfig&
             const bool mtpVisionEnabled = !launchMmproj.empty();
 
             if (mtpVisionEnabled) {
-                // llama.cpp offloads the multimodal projector to the GPU
-                // by default.  CPU offload is the safer first setting for
-                // MTP + vision on a 32 GiB card.
-                cmd << " --no-mmproj-offload";
+                // Above this context the KV cache plus the MTP draft
+                // context crowd the projector out of a 32 GiB card, so
+                // it falls back to the CPU there (slow image encoding,
+                // but no silent spill into shared system memory).
+                // TEST BUILD (20261025): raised from 131072 to cover 256k so
+                // MTP + vision keeps the projector on the GPU at every
+                // context the Settings dropdown offers.
+                constexpr int kMtpVisionGpuCtxLimit = 262144;
 
-                if (m_logger) {
-                    m_logger->warning(
-                        "mtp: enabling experimental MTP + vision; "
-                        "mmproj will remain on CPU");
+                if (config.ctxSize > kMtpVisionGpuCtxLimit) {
+                    cmd << " --no-mmproj-offload";
+                    if (m_logger) {
+                        m_logger->warning(
+                            "mtp: MTP + vision at ctx " +
+                            std::to_string(config.ctxSize) + " > " +
+                            std::to_string(kMtpVisionGpuCtxLimit) +
+                            "; mmproj on CPU (image encoding will be slow)");
+                    }
+                }
+                else if (m_logger) {
+                    m_logger->information(
+                        "mtp: MTP + vision at ctx " +
+                        std::to_string(config.ctxSize) +
+                        "; mmproj on GPU");
                 }
             }
 

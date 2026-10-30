@@ -53,5 +53,18 @@ int main(){
  // a tab inside finish_reason cannot break the row
  TurnStats e=d; e.finishReason="a\tb"; auto er=TurnStats::ParseTsv(std::string(TurnStats::TsvHeader())+"\n"+e.TsvRow("t","m")+"\n",10);
  T(er.size()==1 && er[0].finishReason=="a b" && er[0].toolCalls==0);
+ // repetition stop: no usage, no finish_reason, flag survives the round trip
+ TurnStats s; s.firstTokenMs=1100; s.totalMs=42200; s.thinkBytes=17900; s.replyBytes=0; s.toolCalls=0;
+ s.stoppedForRepetition=true;
+ std::string srow=s.TsvRow("t","m");
+ T(srow.size()>11 && srow.compare(srow.size()-11,11,"\trepetition")==0);
+ auto sr=TurnStats::ParseTsv(std::string(TurnStats::TsvHeader())+"\n"+srow+"\n",10);
+ T(sr.size()==1 && sr[0].stoppedForRepetition && sr[0].promptTokens==-1 && sr[0].finishReason.empty());
+ // normal reply: stopped_by blank, reads back false; old headers without the column read false
+ T(!dr[0].stoppedForRepetition && d.TsvRow("t","m").back()=='\t');
+ T(!o[0].stoppedForRepetition && !o[1].stoppedForRepetition);
+ // header and row stay the same width
+ auto cols=[](const std::string& l){ size_t n=1; for(char ch:l) if(ch=='\t') ++n; return n; };
+ T(cols(TurnStats::TsvHeader())==cols(srow) && cols(srow)==cols(d.TsvRow("t","m")));
  printf(fails?"%d failures\n":"all passed\n",fails); return fails;
 }

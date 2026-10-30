@@ -67,6 +67,7 @@ struct HudSection
     double      headerBar = -1; // full-width occupancy bar under the title
     HudRow::Tone headerTone = HudRow::Normal;
     std::vector<HudRow> rows;
+    double headerMarker = -1;  // Optional threshold tick; presentation only
 };
 
 struct HudModel
@@ -153,6 +154,7 @@ inline HudModel BuildContextHudModel(const HudInputs& in)
                       Compact(in.ctxUsed) + " / " + Compact(in.ctxWindow);
         const double frac = in.ctxWindow > 0 ? (double)in.ctxUsed / (double)in.ctxWindow : 0.0;
         s.headerBar = std::min(1.0, std::max(0.0, frac));
+        s.headerMarker = in.elisionFraction;
         s.headerTone = frac >= 0.90 ? HudRow::Danger
                      : frac >= in.elisionFraction ? HudRow::Warn : HudRow::Good;
 
