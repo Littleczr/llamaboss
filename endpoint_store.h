@@ -83,6 +83,14 @@ public:
         // remain available to existing chats and to the provider editor.
         // Absent in older endpoints.json files means visible.
         bool showInPicker = true;
+
+        // Context window LlamaBoss budgets for this model, in tokens.
+        // 0 = the lane default (kRemoteContextTokens for remote models).
+        // Set it for servers whose window is smaller than that default
+        // (a local Strata at 128K) so the meter and elision budget match
+        // what the server accepts.  Persisted as "context_limit" only
+        // when set.
+        int contextLimit = 0;
     };
 
     // How the API key is presented on the wire.

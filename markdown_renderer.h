@@ -48,12 +48,18 @@ public:
     void SetHeadingColor(const wxColour& color)         { m_headingColor = color; }
     void SetCodeLabelColor(const wxColour& color)       { m_codeLabelColor = color; }
     void SetHorizontalRuleColor(const wxColour& color)  { m_horizontalRuleColor = color; }
+    // Bold, accent-coloured "[  Copy  ]". Until a theme sets this, the
+    // renderer falls back to the plain six-cell "Copy  " in the label colour.
+    void SetCopyActionColor(const wxColour& accent)
+    { m_accentCopy = accent.IsOk(); m_copyActionColor = accent; }
 
     // ── Code block copy support ───────────────────────────────────
     struct CopyLink {
         long startPos;       // Character position where "📋 Copy" starts
         long endPos;         // Character position where it ends
         size_t blockIndex;   // Index into m_codeBlocks
+        bool bracketed = false; // 10-cell "[  Copy  ]" vs 6-cell "Copy  "; keeps width stable
+        bool copied = false;    // currently showing "Copied" (at most one link at a time)
     };
     size_t GetCodeBlockCount() const { return m_codeBlocks.size(); }
     const std::string& GetCodeBlock(size_t index) const;
@@ -65,8 +71,11 @@ public:
     // transcripts with no interactive ranges (see the fast path there).
     bool HasCopyLinks() const { return !m_copyLinks.empty(); }
     // Changes the clicked code-block affordance from "Copy" to "Copied".
-    // The rendered affordance reserves six monospace cells ("Copy  "), so
-    // this replacement does not shift any later rich-text ranges.
+    // Only the most recently clicked link shows "Copied": any other link
+    // still showing it is reverted to "Copy" in the same pass, so the
+    // label always points at what is actually on the clipboard.
+    // Each affordance reserves a fixed width (ten cells bracketed, six
+    // plain), so feedback never shifts any later rich-text ranges.
     bool MarkCopyLinkCopied(size_t blockIndex);
 
     // ── Position maintenance ──────────────────────────────────────
@@ -115,6 +124,13 @@ public:
     void SetImageCallback(ImageCallback cb) { m_imageCallback = std::move(cb); }
 
 private:
+    // Rewrites one Copy affordance in place as "Copy" or "Copied" at its
+    // render-time width.  Refuses (returns false) when the document text
+    // at the recorded range is not one of the four known labels, so a
+    // drifted range can never overwrite unrelated transcript text.
+    // Caller owns Freeze/Thaw and insertion-point restore.
+    bool RewriteCopyLinkLabel(CopyLink& link, bool copied);
+
     wxRichTextCtrl* m_ctrl;
 
     // ── Streaming state ──────────────────────────────────────────
@@ -136,6 +152,8 @@ private:
     wxColour m_headingColor;
     wxColour m_codeLabelColor;
     wxColour m_horizontalRuleColor;
+    bool m_accentCopy = false;
+    wxColour m_copyActionColor;
 
     // ── Code block copy tracking ──────────────────────────────────
     std::vector<std::string>  m_codeBlocks;         // Completed code block contents
@@ -183,7 +201,7 @@ private:
     // ── Low-level text output ────────────────────────────────────
     void WriteStyled(const std::string& text, const wxColour& color,
                      bool bold = false, bool italic = false, bool monospace = false,
-                     int fontSizeDelta = 0);
+                     int fontSizeDelta = 0, const wxColour* background = nullptr);
 
     // ── Partial line management ──────────────────────────────────
     void RemovePartialLine();

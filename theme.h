@@ -6,6 +6,7 @@
 #pragma once
 
 #include <wx/colour.h>
+#include <cmath>
 #include <string>
 #include <vector>
 
@@ -73,6 +74,52 @@ inline const wxColour& LbInteractiveAccent(const ThemeData& theme)
     return (theme.name == "dark") ? theme.chatAssistant : theme.accentButton;
 }
 
+// Steps a text colour away from bg (toward black on light backgrounds,
+// white on dark) until it reaches 4.5:1. Colours that already pass come
+// back unchanged.
+inline wxColour LbReadableOn(wxColour c, const wxColour& bgColour)
+{
+    auto lum = [](const wxColour& k) {
+        auto ch = [](unsigned char v) {
+            const double s = v / 255.0;
+            return s <= 0.03928 ? s / 12.92 : std::pow((s + 0.055) / 1.055, 2.4);
+        };
+        return 0.2126 * ch(k.Red()) + 0.7152 * ch(k.Green()) + 0.0722 * ch(k.Blue());
+    };
+    const double bg = lum(bgColour);
+    const int toward = bg > 0.5 ? 0 : 255;
+    for (int step = 0; step < 20; ++step) {
+        const double fg = lum(c);
+        const double hi = fg > bg ? fg : bg, lo = fg > bg ? bg : fg;  // no std::max: Windows macros
+        if ((hi + 0.05) / (lo + 0.05) >= 4.5) break;
+        auto mix = [toward](unsigned char v) {
+            return static_cast<unsigned char>((v * 92 + toward * 8) / 100);
+        };
+        c = wxColour(mix(c.Red()), mix(c.Green()), mix(c.Blue()));
+    }
+    return c;
+}
+
+// Code-block [  Copy  ]: bold, in the theme's accent so it reads as THE
+// action in a code box.  Dark's accent is the mint its replies are written
+// in, so Dark uses the soft blue instead.  Light palettes' accents are
+// button fills and get darkened to read as text.
+inline wxColour LbTranscriptActionColour(const ThemeData& theme)
+{
+    return LbReadableOn((theme.name == "dark") ? wxColour(170, 190, 230)
+                                               : LbInteractiveAccent(theme),
+                        theme.bgMain);
+}
+
+// Quieter click targets in the transcript: tool-card [show details] /
+// [hide details] and chevron, file-chip actions, approval buttons.  The
+// long-standing soft blue (170,190,230), exact on every dark theme;
+// darkened on light themes, where it was ~1.7:1 and near-invisible.
+inline wxColour LbTranscriptLinkColour(const ThemeData& theme)
+{
+    return LbReadableOn(wxColour(170, 190, 230), theme.bgMain);
+}
+
 // ═══════════════════════════════════════════════════════════════════
 //  ThemeManager — preset themes and active theme tracking
 // ═══════════════════════════════════════════════════════════════════
@@ -107,6 +154,7 @@ public:
     static ThemeData GetTokyoNightTheme();        // enkia/tokyo-night (storm variant)
     static ThemeData GetRosePineMoonTheme();      // rosepinetheme.com (moon)
     static ThemeData GetRosePineDawnTheme();      // rosepinetheme.com (dawn)
+    static ThemeData GetRetroHiFiTheme();        // Charcoal, cyan VFD, warm amber
 
     // Active theme management
     void SetActiveTheme(const std::string& themeName);
@@ -117,7 +165,7 @@ public:
     //   "dark", "light", "system",
     //   "ayu-mirage", "cobalt2", "dracula",
     //   "nord", "nord-light", "one-dark",
-    //   "tokyo-night", "rose-pine-moon", "rose-pine-dawn".
+    //   "tokyo-night", "rose-pine-moon", "rose-pine-dawn", "retro-hi-fi".
     // Unknown values fall back to the dark theme.
     static ThemeData GetThemeByName(const std::string& name);
 

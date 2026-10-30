@@ -98,20 +98,32 @@ void MarkdownRenderer::PruneCopyLinksFrom(long pivot)
         m_copyLinks.end());
 }
 
-bool MarkdownRenderer::MarkCopyLinkCopied(size_t blockIndex)
+bool MarkdownRenderer::RewriteCopyLinkLabel(CopyLink& link, bool copied)
 {
     if (!m_ctrl) return false;
+    const long lastPos = m_ctrl->GetLastPosition();
+    if (link.startPos < 0 || link.endPos <= link.startPos || link.endPos > lastPos)
+        return false;
 
-    auto it = std::find_if(m_copyLinks.begin(), m_copyLinks.end(),
-        [blockIndex](const CopyLink& link) { return link.blockIndex == blockIndex; });
-    if (it == m_copyLinks.end()) return false;
+    // Postcondition guard: only ever replace one of our own labels.
+    // Both states are the same width, so a mismatch here means the
+    // recorded range drifted -- leave the document alone.
+    const wxString current = m_ctrl->GetRange(link.startPos, link.endPos);
+    const bool known = link.bracketed
+        ? (current == "[  Copy  ]" || current == "[ Copied ]")
+        : (current == "Copy  "     || current == "Copied");
+    if (!known) return false;
 
-    // The header renders "Copy  " as a six-cell affordance.  Replacing that
-    // exact six-character range with "Copied" keeps every later tracked
-    // range stable (copy links, file chips, and tool-block affordances).
+    const wxString label = link.bracketed
+        ? (copied ? "[ Copied ]" : "[  Copy  ]")
+        : (copied ? "Copied"     : "Copy  ");
+    if (current == label) { link.copied = copied; return true; }
+
+    // Match the width recorded at render time, even if a theme change
+    // happened since. Feedback must not move tool regions or later links.
     wxRichTextAttr attr;
-    attr.SetTextColour(m_codeLabelColor);
-    attr.SetFontWeight(wxFONTWEIGHT_NORMAL);
+    attr.SetTextColour(link.bracketed ? m_copyActionColor : m_codeLabelColor);
+    attr.SetFontWeight(link.bracketed ? wxFONTWEIGHT_BOLD : wxFONTWEIGHT_NORMAL);
     attr.SetFontStyle(wxFONTSTYLE_NORMAL);
     attr.SetFontFaceName(LbFace("Cascadia Code"));
 
@@ -120,14 +132,35 @@ bool MarkdownRenderer::MarkCopyLinkCopied(size_t blockIndex)
     if (baseSize <= 0) baseSize = 14;
     attr.SetFontSize(baseSize);
 
+    m_ctrl->SetInsertionPoint(link.startPos);
+    m_ctrl->Remove(link.startPos, link.endPos);
+    m_ctrl->BeginStyle(attr);
+    m_ctrl->WriteText(label);
+    m_ctrl->EndStyle();
+
+    link.copied = copied;
+    return true;
+}
+
+bool MarkdownRenderer::MarkCopyLinkCopied(size_t blockIndex)
+{
+    if (!m_ctrl) return false;
+
+    auto it = std::find_if(m_copyLinks.begin(), m_copyLinks.end(),
+        [blockIndex](const CopyLink& link) { return link.blockIndex == blockIndex; });
+    if (it == m_copyLinks.end()) return false;
+
     const long oldInsertionPoint = m_ctrl->GetInsertionPoint();
 
     m_ctrl->Freeze();
-    m_ctrl->SetInsertionPoint(it->startPos);
-    m_ctrl->Remove(it->startPos, it->endPos);
-    m_ctrl->BeginStyle(attr);
-    m_ctrl->WriteText("Copied");
-    m_ctrl->EndStyle();
+
+    // Only the latest click shows "Copied": revert any other link that
+    // still says it, so the label never points at stale clipboard text.
+    for (auto& link : m_copyLinks) {
+        if (link.copied && &link != &*it)
+            RewriteCopyLinkLabel(link, /*copied=*/false);
+    }
+    const bool ok = RewriteCopyLinkLabel(*it, /*copied=*/true);
 
     const long lastPos = m_ctrl->GetLastPosition();
     if (oldInsertionPoint >= 0 && oldInsertionPoint <= lastPos) {
@@ -138,7 +171,7 @@ bool MarkdownRenderer::MarkCopyLinkCopied(size_t blockIndex)
     }
     m_ctrl->Thaw();
 
-    return true;
+    return ok;
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -403,15 +436,13 @@ void MarkdownRenderer::RenderCompleteLine(const std::string& line, const wxColou
                 // Header row:  │ </> <n>  <padding>  Copy │
                 //
                 // Cell budget:
-                //   "│ " (2) + "</> " (4) + nameCells + padding + copyCells (6) + " │" (2) = kBoxWidth
+                //   "│ " (2) + "</> " (4) + nameCells + padding + copyCells (6 or 10) + " │" (2) = kBoxWidth
                 //
-                // Plain "Copy" — no emoji.  Emoji rendering width varies across
-                // fonts (1 cell in some, 2 in others, proportional in emoji fonts),
-                // which made header alignment fragile.  Plain ASCII sidesteps the
-                // whole problem and the position itself (top-right of a framed
-                // container) already signals clickability.
+                // Keep ASCII cell widths stable. Themes get a bold, accent-
+                // coloured "[  Copy  ]" (10 cells) so it reads as clickable;
+                // before any theme is applied the plain six-cell form is used.
                 const int prefixCells = 2 + 4;    // "│ " + "</> "
-                const int copyCells   = 6;        // "Copy  " / "Copied" (6)
+                const int copyCells   = m_accentCopy ? 10 : 6;
                 const int suffixCells = 2;        // " │"
                 const int nameCells   = static_cast<int>(displayName.size());
                 int padding = kBoxWidth - prefixCells - nameCells - copyCells - suffixCells;
@@ -432,10 +463,13 @@ void MarkdownRenderer::RenderCompleteLine(const std::string& line, const wxColou
                 // mapping is stable. If the stream is cut off before close, clicks
                 // on this Copy return an empty string (GetCodeBlock is bounds-checked).
                 long linkStart = m_ctrl->GetLastPosition();
-                WriteStyled("Copy  ",
-                    m_codeLabelColor, false, false, true);
+                // Bold accent text, no background box. 10 cells, centred to
+                // match "[ Copied ]" so feedback never shifts later ranges.
+                WriteStyled(m_accentCopy ? "[  Copy  ]" : "Copy  ",
+                    m_accentCopy ? m_copyActionColor : m_codeLabelColor,
+                    m_accentCopy, false, true);
                 long linkEnd = m_ctrl->GetLastPosition();
-                m_copyLinks.push_back({ linkStart, linkEnd, m_codeBlocks.size() });
+                m_copyLinks.push_back({ linkStart, linkEnd, m_codeBlocks.size(), m_accentCopy });
 
                 // Header suffix — close the right side of the header row.
                 WriteStyled(" \xE2\x94\x82\n",     // space + │ + newline
@@ -881,7 +915,7 @@ bool MarkdownRenderer::TryRenderImageLine(const std::string& line,
 
 void MarkdownRenderer::WriteStyled(const std::string& text, const wxColour& color,
     bool bold, bool italic, bool monospace,
-    int fontSizeDelta)
+    int fontSizeDelta, const wxColour* background)
 {
     if (text.empty()) return;
 
@@ -889,6 +923,7 @@ void MarkdownRenderer::WriteStyled(const std::string& text, const wxColour& colo
 
     wxRichTextAttr attr;
     attr.SetTextColour(color);
+    if (background) attr.SetBackgroundColour(*background);
     attr.SetFontWeight(bold ? wxFONTWEIGHT_BOLD : wxFONTWEIGHT_NORMAL);
     attr.SetFontStyle(italic ? wxFONTSTYLE_ITALIC : wxFONTSTYLE_NORMAL);
 

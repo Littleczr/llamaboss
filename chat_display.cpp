@@ -2706,6 +2706,10 @@ void ChatDisplay::ApplyTheme(const ThemeData& theme)
         return wxColour(channel(a.Red(), b.Red()), channel(a.Green(), b.Green()), channel(a.Blue(), b.Blue()));
     };
     m_userColor = blend(theme.chatUser, theme.textPrimary, 45);
+    // Tool-card [show details] + chevron, file-chip actions and approval
+    // buttons all draw in m_fileChipColor: the soft blue, kept readable on
+    // the light themes.
+    m_fileChipColor = LbTranscriptLinkColour(theme);
     if (auto* transcript = dynamic_cast<ChatDisplayCtrl*>(m_displayCtrl))
         transcript->SetUserBubbleColor(blend(theme.bgMain, theme.chatUser, 27));
 
@@ -2714,6 +2718,9 @@ void ChatDisplay::ApplyTheme(const ThemeData& theme)
         m_markdownRenderer->SetHeadingColor(theme.mdHeading);
         m_markdownRenderer->SetCodeLabelColor(theme.mdCodeLabel);
         m_markdownRenderer->SetHorizontalRuleColor(theme.mdHorizontalRule);
+        // Every theme: code-block Copy in the theme's interactive accent so it
+        // reads as clickable, not as another muted label.
+        m_markdownRenderer->SetCopyActionColor(LbTranscriptActionColour(theme));
     }
 }
 

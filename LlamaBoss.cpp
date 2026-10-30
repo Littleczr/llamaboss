@@ -93,7 +93,7 @@
 #include "chat_folders.h"
 
 // ─── Application version ─────────────────────────────────────
-static const char* LLAMABOSS_VERSION = "0.1.25";
+static const char* LLAMABOSS_VERSION = "0.1.27";
 
 // Native menu command ids. Keep above wxID_HIGHEST to avoid collisions
 // with stock wxWidgets commands.
@@ -2367,11 +2367,6 @@ private:
     std::string           m_agentTraceActiveCallId;
     std::string           m_chatFolderEnsuredForFilePath;
     std::string           m_workspaceDirEnsuredForFilePath;
-#ifdef __WXMAC__
-    // Set while the prompt pre-warm builds its system prompt; see
-    // ResolveCurrentCwd.
-    bool                  m_prewarmPromptBuild = false;
-#endif
 
     // ═════════════════════════════════════════════════════════════
     //  HELPERS
@@ -3578,15 +3573,6 @@ private:
     {
         std::string cwd = m_chatHistory->GetToolCwd();
         if (cwd.empty()) {
-#ifdef __WXMAC__
-            // The pre-warm only caches the prompt up to the working-context
-            // heading, and the cwd comes after it.  Giving an untouched New
-            // Chat a file path here would make it saveable, so every launch
-            // left an empty chat in the sidebar and an empty folder in
-            // ~/LlamaBoss/Chats.  Use the Chats root as a stand-in instead.
-            if (m_prewarmPromptBuild && !m_chatHistory->HasFilePath())
-                return ChatHistory::GetChatsRootDir();
-#endif
             EnsureConversationChatFolder();
 
             const std::string convFilePath = m_chatHistory->GetFilePath();
@@ -4063,11 +4049,22 @@ private:
     // on _activeProtocol.  Both branches share workspace context
     // and per-tool behaviour notes via small helper composers.
 
-    std::string BuildAgentSystemPrompt()
+    // sideEffectFree: build the prompt without giving an empty, unsaved
+    // chat an identity.  ResolveCurrentCwd() assigns a conversation path
+    // and creates its Chats\ folder; once a path exists the chat counts
+    // as persistable (ChatHistory::HasPersistableContent), so the New
+    // Chat pre-warm used to turn every "+" click into a saved empty
+    // chat_xxxxxxxx.json plus an empty chat folder.  The cwd line sits
+    // after kAgentWorkingContextHeading — past the pre-warm cut — so a
+    // placeholder there changes nothing that gets cached.
+    std::string BuildAgentSystemPrompt(bool sideEffectFree = false)
     {
         AgentPromptBuilderInput input;
         input.isWorkspace = m_chatHistory->GetToolCwd().empty();
-        input.cwd = ResolveCurrentCwd();
+        if (sideEffectFree && input.isWorkspace && !m_chatHistory->HasFilePath())
+            input.cwd = "(this chat's Workspace folder, created with the first message)";
+        else
+            input.cwd = ResolveCurrentCwd();
         input.activeProjectContextBlock = m_projectContextBuilder->BuildActiveProjectContextBlock();
         input.pendingSkillAuthoringContextBlock = m_skillDraftController->BuildPendingSkillAuthoringContextBlock();
         input.toolSafetySummaryText = BuildToolSafetySummaryText(GetGlobalRouter());
@@ -5032,15 +5029,9 @@ private:
         // user message differs, and it comes after the cut.
         const bool native = (_activeProtocol == ToolProtocol::Native);
         const std::string tools = native ? GetCachedToolsArrayJson() : std::string();
-#ifdef __WXMAC__
-        m_prewarmPromptBuild = true;
-        std::string systemPrompt;
-        try { systemPrompt = BuildAgentSystemPrompt(); }
-        catch (...) { m_prewarmPromptBuild = false; throw; }
-        m_prewarmPromptBuild = false;
-#else
-        const std::string systemPrompt = BuildAgentSystemPrompt();
-#endif
+        // Side-effect free: must not assign this empty chat a path (see
+        // BuildAgentSystemPrompt), or the next New Chat saves it.
+        const std::string systemPrompt = BuildAgentSystemPrompt(/*sideEffectFree=*/true);
         const std::string model = m_modelSwitcher->GetConversationModelForSave();
         int ctxTokens = m_appState->GetCtxSize();
         if (ctxTokens <= 0) ctxTokens = 8192;

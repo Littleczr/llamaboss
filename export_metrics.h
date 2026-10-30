@@ -6,7 +6,9 @@
 //   turn_stats.tsv       one row per completed reply (turn_stats.h): tokens,
 //                        cached / reasoning tokens, first-token and total time;
 //                        from the 2026-10-11 build also cache writes, cost,
-//                        finish_reason, think/reply bytes and tool-call count.
+//                        finish_reason, think/reply bytes and tool-call count;
+//                        from the 2026-10-25 build also stopped_by
+//                        ("repetition" when LlamaBoss cut a looping reply).
 //   ctx_calibration.tsv  one row per reply with an exact usage report: wire
 //                        request bytes, prompt tokens, bytes/token, elided
 //                        count and what the request was made of -- system
@@ -82,9 +84,18 @@ struct Request {
     long long cacheWrite = -1, thinkBytes = -1, replyBytes = -1, toolCalls = -1;
     double cost = -1;
     std::string finish, prefix;
+    std::string stoppedBy;   // turn_stats stopped_by: "repetition" or empty
     int cacheCtl = -1;   // -1 not logged, 0 off, 1 Anthropic cache_control sent
 
     bool HasBreakdown() const { return sysBytes >= 0; }
+    bool StoppedForRepetition() const { return stoppedBy == "repetition"; }
+    // What the Finish column / tally shows: the provider's finish_reason,
+    // or LlamaBoss's own stop when it cut the reply before one arrived.
+    std::string FinishLabel() const
+    {
+        if (StoppedForRepetition()) return "repetition stop";
+        return finish;
+    }
     double Bpt() const { return (reqBytes > 0 && prompt > 0) ? (double)reqBytes / (double)prompt : -1; }
 };
 
@@ -156,6 +167,7 @@ inline std::vector<Request> MergeLogs(const std::vector<Row>& turns,
         q.thinkBytes   = L(t, "think_bytes");
         q.replyBytes   = L(t, "reply_bytes");
         q.toolCalls    = L(t, "tool_calls");
+        q.stoppedBy    = S(t, "stopped_by");
         if (q.prompt > 0) {
             for (size_t k = j; k < calib.size() && k < j + kLookAhead; ++k) {
                 if (!used[k] && L(calib[k], "prompt_tokens") == q.prompt) {
@@ -255,6 +267,9 @@ inline std::string BuildMetricsMarkdown(const std::string& turnStatsTsv,
     bool anyCacheWrite = false, anyCost = false, anyFinish = false, anyShape = false,
          anyPrefix = false;
     long long sumCacheWrite = 0, cacheCtlOn = 0, cacheCtlLogged = 0;
+    // Replies in turn_stats.tsv with no usage report (so no calibration row
+    // and no request makeup), and how many of those LlamaBoss stopped.
+    long long noUsageReplies = 0, repetitionStops = 0;
     double sumCost = 0;
     std::map<std::string, int> finishCount;
     std::map<std::string, std::vector<std::string>> prefixByModel;   // distinct, in order
@@ -277,7 +292,10 @@ inline std::string BuildMetricsMarkdown(const std::string& turnStatsTsv,
         anyBreakdown |= q.HasBreakdown();
         if (q.cacheWrite >= 0) { anyCacheWrite = true; sumCacheWrite += q.cacheWrite; }
         if (q.cost >= 0)       { anyCost = true; sumCost += q.cost; }
-        if (!q.finish.empty()) { anyFinish = true; ++finishCount[q.finish]; }
+        const std::string fin = q.FinishLabel();
+        if (!fin.empty()) { anyFinish = true; ++finishCount[fin]; }
+        if (q.StoppedForRepetition()) ++repetitionStops;
+        if (q.prompt < 0 && q.totalMs >= 0) ++noUsageReplies;   // reply row, no usage
         if (q.toolCalls >= 0 || q.thinkBytes >= 0 || q.replyBytes >= 0) anyShape = true;
         if (!q.prefix.empty()) {
             anyPrefix = true;
@@ -338,6 +356,10 @@ inline std::string BuildMetricsMarkdown(const std::string& turnStatsTsv,
         }
         md += "| Finish reasons | " + f + " |\n";
     }
+    if (repetitionStops > 0)
+        md += "| Stopped by LlamaBoss | " + Thousands(repetitionStops) +
+              " (the model kept repeating the same text; the reply was cut off "
+              "before the server reported token usage) |\n";
     md += "| Output tokens, all requests | " + Thousands(sumOut) +
           (sumReason > 0 ? " (" + Thousands(sumReason) + " reasoning)" : "") + " |\n";
     md += "| Requests with elision | " + Thousands(elidedReqs) +
@@ -382,6 +404,15 @@ inline std::string BuildMetricsMarkdown(const std::string& turnStatsTsv,
             md += "| JSON structure and other | " + Kb(mk->reqBytes - known) + " | " +
                   Pct((double)(mk->reqBytes - known), total) + " |\n";
         md += "\n";
+    } else if (withUsage == 0 && noUsageReplies > 0) {
+        // Not an old build: makeup is only logged alongside a usage report,
+        // and no reply here had one.
+        md += "_No request makeup: LlamaBoss logs it only for replies that end with the "
+              "server's token-usage report, and no reply in this chat had one";
+        if (repetitionStops > 0)
+            md += " (" + Thousands(repetitionStops) + " stopped by LlamaBoss because the model "
+                  "kept repeating itself)";
+        md += "._\n\n";
     } else {
         md += "_Request makeup (system prompt, tools, messages, replayed reasoning) is logged "
               "from the 2026-10-05 build on; this chat's requests predate it._\n\n";
@@ -426,7 +457,7 @@ inline std::string BuildMetricsMarkdown(const std::string& turnStatsTsv,
               " | " + Thousands(q.reasoning) + " | " + Kb(q.reqBytes) + " | " + Fixed(q.Bpt(), "%.2f") +
               " | " + el + " | " + Fixed(q.firstTokenMs / 1000.0, "%.1f") +
               " | " + Fixed(q.totalMs / 1000.0, "%.1f") + " |";
-        if (anyFinish) md += " " + Cell(q.finish) + " |";
+        if (anyFinish) md += " " + Cell(q.FinishLabel()) + " |";
         if (anyShape)
             md += " " + Thousands(q.toolCalls) + " | " + Kb(q.thinkBytes) + " | " + Kb(q.replyBytes) + " |";
         if (anyCost)   md += " " + Fixed(q.cost, "%.5f") + " |";
@@ -439,6 +470,16 @@ inline std::string BuildMetricsMarkdown(const std::string& turnStatsTsv,
     if (unpaired > 0 && !turns.empty())
         md += "\n_" + std::to_string(unpaired) + " request(s) appear only in ctx_calibration.tsv "
               "(no matching reply row); timing columns are blank for them._\n";
+    // Mixed chats: say why some rows have no tokens or makeup.  (When no
+    // row has usage, the makeup note above already explains it.)
+    if (noUsageReplies > 0 && withUsage > 0) {
+        md += "\n_" + Thousands(noUsageReplies) + " request(s) have no token counts or request "
+              "makeup: the server sent no usage report";
+        if (repetitionStops > 0)
+            md += " (" + Thousands(repetitionStops) + " stopped by LlamaBoss because the model "
+                  "kept repeating itself)";
+        md += "._\n";
+    }
     return md;
 }
 
