@@ -685,8 +685,18 @@ FetchModelsResult FetchModelIds(
                     out.names.push_back(name.empty() ? PrettyNameFromId(slug) : name);
                 } catch (...) { /* non-string fields: skip the entry */ }
             }
+#ifdef __WXMAC__
+            // llama.cpp server (v0.6.0+) also sends an Ollama-style "models"
+            // list (name/model, no slug or id) beside the standard "data"
+            // array.  When this branch found nothing, read "data" instead.
+            if (!out.ids.empty() || !rootObj->getArray("data")) {
+#endif
             out.ok = true;
             return out;
+#ifdef __WXMAC__
+            }
+            out.names.clear();
+#endif
         }
         Poco::JSON::Array::Ptr data = rootObj->getArray("data");
         if (!data) {
@@ -1439,7 +1449,11 @@ private:
         {
             auto* g = new wxBoxSizer(wxVERTICAL);
             auto* head = new wxBoxSizer(wxHORIZONTAL);
+#ifdef __WXMAC__
+            head->Add(SectionLabel(m_scanGroup, "SERVERS FOUND ON THIS MAC"), 1, wxALIGN_CENTER_VERTICAL);
+#else
             head->Add(SectionLabel(m_scanGroup, "SERVERS FOUND ON THIS PC"), 1, wxALIGN_CENTER_VERTICAL);
+#endif
             m_scanBtn = MakeFlatButton(m_scanGroup, wxID_ANY, "Scan again", theme, FromDIP(26));
             head->Add(m_scanBtn, 0, wxALIGN_CENTER_VERTICAL);
             g->Add(head, 0, wxEXPAND | wxBOTTOM, FromDIP(6));
@@ -1983,7 +1997,11 @@ private:
         if (!quiet) {
             m_scanResults.clear();
             RebuildScanList();
+#ifdef __WXMAC__
+            m_scanHint->SetLabel("Looking for servers on this Mac...");
+#else
             m_scanHint->SetLabel("Looking for servers on this PC...");
+#endif
         }
         m_scanBtn->Enable(false);
         wxEvtHandler* target = this;
