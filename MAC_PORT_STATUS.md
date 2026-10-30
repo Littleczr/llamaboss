@@ -134,6 +134,8 @@ Intended divergences from Windows. Features that are simply not ported yet are l
 | New window | second launch hands off to the running app | Dock icon menu "New Window" (Finder/Dock never start a second copy) | Mac convention; verified by the user 2026-10-12 |
 | Sidebar selection | stays on the last clicked row after New Chat | a single selection follows the open chat | Mac list convention (Mail, Notes) |
 | Control appearance | n/a | app appearance (dark/light Aqua) set from the theme's background at startup | Native controls match the theme on a system in the other mode |
+| MTP + vision projector | on the GPU up to `kMtpVisionGpuCtxLimit` (262144), CPU (`--no-mmproj-offload`) above it | always on the GPU (Metal) | Unified memory: moving the projector to the CPU frees nothing and only slows image encoding (2026-10-30) |
+| Provider dialog scan wording | "SERVERS FOUND ON THIS PC", "Looking for servers on this PC..." | "... THIS MAC", "... on this Mac..." | Platform name (2026-10-30) |
 
 ## Toolchain (verified 2026-10-09)
 
@@ -848,15 +850,54 @@ checkout of 8814026; the 9e8b3d3 packages are refused there. Those are kept in
   serves Windows 0.1.25 (`eb4b6e3f…`) + mac 0.1.25 (`1f284f22…`). Package on the share:
   `Websites/LlamaBoss_Website_v0_2_11_mac_v0_1_25.zip`.
 
+## Merge of `main` 6c163f2 (Windows 0.1.27) and Mac 0.1.27 release — 2026-10-30
+
+- **Merge** `3cde471`. main brought the one-window Add/Edit AI provider dialog
+  (`endpoints_dialog.cpp` rewrite: provider row, local-server port scan, per-model context
+  window, masked keys), send-time image downscale + EXIF rotation (`chat_history.cpp`,
+  portable wxImage; the static wx has the JPEG handler), Retro Hi-Fi theme and accent
+  `[ Copy ]`, "Copied" only on the latest block, no empty saved chat on New Chat, context
+  HUD layout, repetition stop in metrics export. Windows view of the touched files:
+  the same long-standing helper differences as before, nothing new.
+- **MTP + vision** (`server_manager.cpp`): main's `kMtpVisionGpuCtxLimit` is CUDA-oriented,
+  so it sits under `#else`; the Mac keeps llama.cpp's default (projector on the GPU) at
+  every context. Verified in the log with Qwen3.5-4B-MTP + mmproj at 131072:
+  `mmproj on GPU (Metal, unified memory)`, no `--no-mmproj-offload` (0.1.25 always had it).
+  Note: `app_state.cpp` clamps ctx to 262144, so main's CPU branch is unreachable today.
+- **Provider scan fix** `c08465a` (Mac-fenced): llama-server's `/v1/models` also returns an
+  Ollama-style `"models"` array (name/model only). The ChatGPT-catalog branch took it, found
+  no slug/id and returned an empty list. On the Mac it now falls through to `"data"` when
+  that branch found nothing. Verified: a llama-server on 8081 is listed under "SERVERS FOUND
+  ON THIS MAC" with its model and "Read from the server: 4K". Same bug on Windows: logged in
+  NEXT_RELEASE Known issues (suggestion only). Cosmetic: the footer hint is cut off with
+  "…" at the default dialog width (not changed).
+- **Retro Hi-Fi** checked on the Mac: theme applies to the main window; code block shows the
+  amber code and accent `[ Copy ]`.
+- **Native tests**: unchanged baseline (command_policy PowerShell 13 N/A; Tests/ 104/112 =
+  7 `Vars\` separator cases + stale R0_S3); export_metrics now 51/51.
+- **Published** (user asked in the 0.1.27 release request): `dist/LlamaBoss-0.1.27-macOS.dmg`,
+  57,049,768 bytes, SHA-256 `ffab898931ae6f6de1a1934131d3691bf61428118b2b097f16c8a9e2d9f09f7a`,
+  notarized (Accepted), stapled, Gatekeeper "Notarized Developer ID". R2
+  `LlamaBoss_Beta_v0.1.27_macOS.dmg`, public URL re-downloaded and hash-matched. Copied to the
+  share `Releases/Mac/`. Log: `dist/package-0.1.27.log`.
+- **Site 0.2.12** = LATEST package `LlamaBoss_Website_v0_2_11_win_v0_1_27_20261030_081922.zip`
+  (live checked identical, 26 files + 404) + docs: "New in 0.1.27" on Start here, the
+  provider window callout on AI providers, Retro Hi-Fi on Settings, FAQ/Start here now
+  "0.1.27 for Windows and Mac. Updated October 30, 2026", Mac 0.1.27 links and `mac_*` in
+  version.json (Windows fields unchanged). Preview `mac-0-1-27.llamaboss.pages.dev`, then
+  production; live re-checked identical. Package
+  `Websites/LlamaBoss_Website_v0_2_12_mac_v0_1_27_20261030_085554.zip`, LATEST.json updated
+  (no `treehash`: the PC's recipe isn't documented; asked in NEXT_RELEASE).
+
 ## Next task
 
 1. **Needs the user:** fresh-account test with `/Users/Shared/LlamaBoss-FreshTest` (checklist
    inside): create a standard user account and log in to it.
 2. **Needs the user:** rotate the Cloudflare Pages API token (it was printed into a session
    transcript on 2026-10-13; not sent anywhere else) and update the credentials file on the share.
-3. Site deploys from either side start from `Websites/LATEST.json`. As of 2026-10-15 it names
-   `LlamaBoss_Website_v0_2_11_mac_v0_1_25_20261015_190520.zip` (site 0.2.11, Windows 0.1.25,
-   Mac 0.1.25; live checked identical, 27/27 files).
+3. Site deploys from either side start from `Websites/LATEST.json`. As of 2026-10-30 it names
+   `LlamaBoss_Website_v0_2_12_mac_v0_1_27_20261030_085554.zip` (site 0.2.12, Windows 0.1.27,
+   Mac 0.1.27; live checked identical).
 4. PC findings for 0.1.26: `## Known issues` in the share's `NEXT_RELEASE.md`.
 5. File-tool boundary cases on the Mac (symlinks, case-sensitive volume), milestone 7.
 6. The `Tests/` suite now also runs on the Mac (`macos/run_native_tests.zsh`); see the
