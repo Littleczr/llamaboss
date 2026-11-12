@@ -76,19 +76,38 @@ std::string BackupUnreadableFile(const wxString& path)
     return std::string();
 }
 
-// Atomic-ish write: write to <path>.tmp then rename over <path>.
+// Atomic write: write <path>.tmp, flush and close it, confirm the byte
+// count on disk, then rename over <path>.  Every step is checked BEFORE
+// the rename.  The old version left the final flush to the ofstream
+// destructor, whose failure is silent, so on a full disk an empty or
+// short .tmp still replaced the real file.
 bool WriteWholeFileAtomic(const wxString& path, const std::string& body)
 {
-    wxString tmpPath = path + ".tmp";
+    const wxString tmpPath = path + ".tmp";
+    bool ok = false;
     {
         std::ofstream f(tmpPath.fn_str(),
                         std::ios::out | std::ios::binary | std::ios::trunc);
-        if (!f) return false;
-        f.write(body.data(), static_cast<std::streamsize>(body.size()));
-        if (!f) return false;
+        if (f) {
+            f.write(body.data(), static_cast<std::streamsize>(body.size()));
+            f.flush();
+            ok = f.good();
+            f.close();
+            ok = ok && !f.fail();
+        }
+    }
+    if (ok) {
+        const wxULongLong onDisk = wxFileName::GetSize(tmpPath);
+        ok = onDisk != wxInvalidSize &&
+             onDisk.GetValue() == static_cast<unsigned long long>(body.size());
     }
     // wxRenameFile overwrites on Windows when the third arg is true.
-    return wxRenameFile(tmpPath, path, true);
+    if (ok) ok = wxRenameFile(tmpPath, path, true);
+    if (!ok && wxFileExists(tmpPath)) {
+        wxLogNull quiet;
+        wxRemoveFile(tmpPath);
+    }
+    return ok;
 }
 
 // Accept common forms users may paste into the env-ref field:

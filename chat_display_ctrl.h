@@ -138,6 +138,19 @@ public:
         // OnSizeKeepView for why.
         Bind(wxEVT_SIZE, &ChatDisplayCtrl::OnSizeKeepView, this);
 
+        // Keep the theme colours when Windows broadcasts WM_SYSCOLORCHANGE.
+        // wxRichTextCtrl's own handler (static event table) resets the
+        // background to wxSYS_COLOUR_WINDOW and the basic text colour to
+        // wxSYS_COLOUR_WINDOWTEXT -- white/black -- while every span we
+        // wrote keeps its explicit theme colour, so a dark theme turns into
+        // near-white text on a white page until restart.  Windows sends the
+        // message on colour/theme changes and after display-driver / DWM
+        // resets (seen after unloading a model in another GPU app).
+        // Bound handlers run before the static table; not calling Skip()
+        // keeps the base reset from running.  The frame owns the colours
+        // (ApplyThemeToUI), so there is nothing to re-derive here.
+        Bind(wxEVT_SYS_COLOUR_CHANGED, &ChatDisplayCtrl::OnSysColourChangedKeepTheme, this);
+
 #ifdef __WXMSW__
         // Middle-click auto-scroll is a Windows convention; keep the
         // feature MSW-only so the control matches native expectations
@@ -565,6 +578,11 @@ private:
             m_viewportNotifyPending = false;
             if (m_viewportChangedHandler) m_viewportChangedHandler();
         });
+    }
+
+    void OnSysColourChangedKeepTheme(wxSysColourChangedEvent& WXUNUSED(evt)) {
+        // Deliberately no evt.Skip(): see the Bind in the constructor.
+        Refresh();
     }
 
     void OnFocusGained(wxFocusEvent& evt) {

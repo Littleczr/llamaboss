@@ -184,7 +184,9 @@ def coerce_value(value, allow_formulas=False):
                 f = '=' + f
             if allow_formulas:
                 return f[1:] if f.startswith("'=") else f
-            return "'" + f if f.startswith(('=', '+', '-', '@')) else f
+            # Returned verbatim; build_workbook's final literal sweep stores
+            # it as a text cell (no visible apostrophe) when not authorized.
+            return f
 
         # Common shape for richer future cells: {"value": 123, "format":"currency"}.
         for key in ('value', 'text', 'label'):
@@ -213,21 +215,34 @@ def coerce_value(value, allow_formulas=False):
     s = str(value)
     stripped = s.strip()
 
-    if allow_formulas and stripped.startswith("'="):
-        # Some model outputs pre-escape allowed formulas.  Only unescape an
-        # explicit Excel formula when formulas were requested by the user.
+    if stripped.startswith("'="):
+        # Some model outputs pre-escape formulas with a leading apostrophe.
+        # openpyxl would store that apostrophe as a visible character, so
+        # drop it.  Without allow_formulas the literal sweep in
+        # build_workbook still keeps the result as text.
         return stripped[1:]
 
-    if not allow_formulas and stripped.startswith(('=', '+', '-', '@')):
-        return "'" + s
-
-    if re.fullmatch(r'-?(?:0|[1-9]\d*)(?:\.\d+)?', stripped):
+    # Numeric strings first, so "-5" / "-12.50" become numbers instead of
+    # being caught by formula protection.  Identifiers longer than Excel's
+    # 15 significant digits stay text so no digits are lost.
+    if re.fullmatch(r'-?(?:0|[1-9]\d*)(?:\.\d+)?', stripped) and not too_many_digits(stripped):
         try:
             return float(stripped) if '.' in stripped else int(stripped)
         except Exception:
             pass
 
+    # Formula-looking text is returned verbatim.  Formula protection is
+    # enforced centrally by build_workbook's literal sweep, which stores any
+    # unauthorized '=' cell (body, title, or header) as plain text.  The old
+    # "'" prefix was written into the cell as a visible character.
     return s
+
+
+def too_many_digits(s):
+    """True when a numeric string carries more significant digits than an
+    Excel number can hold (15), e.g. long account or reference IDs."""
+    digits = re.sub(r'\D', '', str(s))
+    return len(digits.lstrip('0')) > 15
 
 def rows_from_sheet(sheet_spec, headers):
     raw_rows = sheet_spec.get('rows', [])
@@ -298,13 +313,25 @@ def parse_percent_like(value):
         return value
 
 
+def _integral_or_float(n):
+    # Integer formatting is presentation only: whole values become int,
+    # fractional values are preserved exactly (1.75 stays 1.75).
+    if isinstance(n, float) and n.is_integer():
+        return int(n)
+    return n
+
+
 def parse_number_like(value, integer=False):
+    if isinstance(value, bool):
+        return value
     if isinstance(value, (int, float)):
-        return int(value) if integer else value
+        return _integral_or_float(value) if integer else value
     s = str(value or '').strip()
     if not s:
         return value
-    if s.startswith("'"):
+    if s.startswith(("'", '=')):
+        return value
+    if too_many_digits(s):
         return value
     negative = False
     if s.startswith('(') and s.endswith(')'):
@@ -315,7 +342,7 @@ def parse_number_like(value, integer=False):
         n = float(s)
         if negative:
             n = -n
-        return int(n) if integer else n
+        return _integral_or_float(n) if integer else n
     except Exception:
         return value
 
@@ -425,10 +452,19 @@ def collect_column_format_refs(headers, sheet_spec):
     return targets
 
 
-def apply_column_formats(ws, headers, sheet_spec, first_data_row, last_data_row):
+def normalize_percent_scale(value):
+    v = str(value or '').strip().lower()
+    if v in ('whole', 'whole_percent', 'percent', 'points', '100'):
+        return 'whole'
+    if v in ('decimal', 'fraction', 'ratio', '1'):
+        return 'decimal'
+    return 'auto'
+
+
+def apply_column_formats(ws, headers, sheet_spec, first_data_row, last_data_row, percent_scale='auto'):
     """Apply per-column number formats. Returns a dict of adjustment counts
     so the helper output can surface what was auto-normalized."""
-    adjustments = {'percent_auto_decimal': 0}
+    adjustments = {'percent_auto_decimal': 0, 'warnings': []}
     if last_data_row < first_data_row:
         return adjustments
 
@@ -447,44 +483,75 @@ def apply_column_formats(ws, headers, sheet_spec, first_data_row, last_data_row)
                 continue
 
             if key == 'percent_columns':
-                # Pass 1: parse "92%" / "0.92" strings into numbers.
+                label = headers[idx - 1] if 0 < idx <= len(headers) else ref
+                # Pass 1: explicit "92%" strings convert exactly once and are
+                # never rescaled again.  Remember which cells were bare
+                # numbers (the only ones whose scale is ambiguous).
+                bare_rows = []
                 for row in range(first_data_row, last_data_row + 1):
                     cell = ws.cell(row=row, column=idx)
-                    cell.value = parse_percent_like(cell.value)
-                # Pass 2: column-wide inference. If any value in the
-                # column is numeric and outside [-1, 1], the column was
-                # almost certainly authored in whole-percent form (e.g.
-                # 92 meaning 92%, which 0.00% would otherwise render as
-                # 9200%). Divide every numeric cell in the column by 100.
-                whole_form = False
-                for row in range(first_data_row, last_data_row + 1):
-                    v = ws.cell(row=row, column=idx).value
-                    if isinstance(v, bool):
-                        continue
-                    if isinstance(v, (int, float)) and (v > 1 or v < -1):
-                        whole_form = True
-                        break
-                if whole_form:
-                    for row in range(first_data_row, last_data_row + 1):
-                        cell = ws.cell(row=row, column=idx)
-                        v = cell.value
-                        if isinstance(v, bool):
-                            continue
-                        if isinstance(v, (int, float)):
-                            cell.value = v / 100.0
-                            adjustments['percent_auto_decimal'] += 1
+                    v = cell.value
+                    explicit = isinstance(v, str) and v.strip().endswith('%')
+                    cell.value = parse_percent_like(v)
+                    nv = cell.value
+                    if not explicit and isinstance(nv, (int, float)) and not isinstance(nv, bool):
+                        bare_rows.append(row)
+
+                # Pass 2: decide the scale of bare numbers.
+                #   decimal -> 0.92 means 92% (the documented default form)
+                #   whole   -> 92 means 92%
+                #   auto    -> whole only when EVERY non-zero bare value is
+                #              outside [-1, 1]; a mix is left untouched and
+                #              flagged instead of guessed.
+                bare_vals = [ws.cell(row=r, column=idx).value for r in bare_rows]
+                nonzero = [v for v in bare_vals if v != 0]
+                if percent_scale == 'whole':
+                    divide = bool(bare_rows)
+                elif percent_scale == 'decimal':
+                    divide = False
+                else:
+                    big = [v for v in nonzero if abs(v) > 1]
+                    small = [v for v in nonzero if abs(v) <= 1]
+                    divide = bool(big) and not small
+                    if big and small:
+                        adjustments['warnings'].append(
+                            f'Percent column "{label}" mixes decimal-looking values (e.g. {small[0]}) '
+                            f'and whole-percent-looking values (e.g. {big[0]}); values were left unchanged. '
+                            'Re-send with "percent_scale": "decimal" (0.92 = 92%) or "whole" (92 = 92%) '
+                            'if any of them display wrong.')
+                if divide:
+                    for r in bare_rows:
+                        cell = ws.cell(row=r, column=idx)
+                        cell.value = cell.value / 100.0
+                        adjustments['percent_auto_decimal'] += 1
+                    if percent_scale != 'whole':
+                        adjustments['warnings'].append(
+                            f'Percent column "{label}": {len(bare_rows)} value(s) looked like whole percents '
+                            f'and were divided by 100 (e.g. {bare_vals[0]} -> {bare_vals[0] / 100.0}). '
+                            'If they were already decimals (1.5 = 150%), re-send with "percent_scale": "decimal".')
                 for row in range(first_data_row, last_data_row + 1):
                     ws.cell(row=row, column=idx).number_format = fmt
             else:
+                fraction_kept = 0
                 for row in range(first_data_row, last_data_row + 1):
                     cell = ws.cell(row=row, column=idx)
+                    cell_fmt = fmt
                     if key == 'date_columns':
                         cell.value = parse_date_like(cell.value)
                     elif key == 'integer_columns':
                         cell.value = parse_number_like(cell.value, integer=True)
+                        if isinstance(cell.value, float) and not cell.value.is_integer():
+                            # Keep the real value and show it; never truncate.
+                            cell_fmt = '0.###'
+                            fraction_kept += 1
                     elif key in ('number_columns', 'currency_columns'):
                         cell.value = parse_number_like(cell.value, integer=False)
-                    cell.number_format = fmt
+                    cell.number_format = cell_fmt
+                if fraction_kept:
+                    label = headers[idx - 1] if 0 < idx <= len(headers) else ref
+                    adjustments['warnings'].append(
+                        f'Integer column "{label}" contains {fraction_kept} fractional value(s); '
+                        'they were kept exactly (not rounded) and shown with decimals.')
 
     # Optional precise cell formatting for mixed summary sheets, e.g.
     # "cell_formats": {"B5": "currency", "B2": "number"}
@@ -908,33 +975,44 @@ def _norm_label(value):
 
 
 def _to_number(value):
+    """Numeric value of a source cell, or None when it cannot be verified
+    (blank-safe zero for empty cells; None for formulas and text)."""
     if isinstance(value, bool):
         return 1.0 if value else 0.0
     if isinstance(value, (int, float)):
         return float(value)
+    if isinstance(value, dict):
+        return None  # structured formula/value cell -- can't verify here
     s = str(value or '').strip().replace('$', '').replace(',', '')
     if not s:
         return 0.0
+    if s.startswith('='):
+        return None
     try:
         return float(s)
     except Exception:
-        return 0.0
+        return None
 
 
-def auto_correct_common_summary(spec):
-    """Best-effort correction for common Metric/Value summary sheets.
+def check_common_summary(spec):
+    """Check-only: compare a Metric/Value "Summary" sheet against ONE data
+    sheet with the staffing headers and report discrepancies.
 
-    The model should compute summaries, but small local models occasionally make
-    arithmetic mistakes.  If the workbook has a data sheet with these common
-    headers, and a Summary sheet with Metric/Value rows, correct matching
-    values deterministically before writing the xlsx.
+    Small local models occasionally make arithmetic mistakes, so this flags
+    them -- but it never rewrites the model's values.  It used to overwrite
+    them, which corrupted correct multi-sheet totals (last matching sheet
+    won) and replaced explicit formulas with hard-coded numbers.  When the
+    aggregation scope is ambiguous (several matching data sheets) or a source
+    value cannot be verified (formula/text), it stays silent rather than
+    guess.  Returns (discrepancies, notes).
     """
-    adjustments = []
+    discrepancies = []
+    notes = []
     sheets = spec.get('sheets') if isinstance(spec, dict) else None
     if not isinstance(sheets, list):
-        return adjustments
+        return discrepancies, notes
 
-    data_sheet = None
+    data_sheets = []
     summary_sheet = None
     required = {'scheduled hours', 'actual hours', 'overtime hours', 'overtime cost', 'status'}
 
@@ -945,32 +1023,41 @@ def auto_correct_common_summary(spec):
         headers = [_norm_label(h) for h in (sh.get('headers') or [])]
         if name_norm == 'summary':
             summary_sheet = sh
-        if required.issubset(set(headers)):
-            data_sheet = sh
+        elif required.issubset(set(headers)):
+            data_sheets.append(sh)
 
-    if not data_sheet or not summary_sheet:
-        return adjustments
+    if not summary_sheet or not data_sheets:
+        return discrepancies, notes
+    if len(data_sheets) > 1:
+        notes.append('Summary totals were not checked: more than one data sheet matches, '
+                     'so the intended aggregation scope is ambiguous.')
+        return discrepancies, notes
+    data_sheet = data_sheets[0]
 
     headers = [_norm_label(h) for h in (data_sheet.get('headers') or [])]
     col = {h: i for i, h in enumerate(headers)}
     rows = data_sheet.get('rows') or []
     if not isinstance(rows, list):
-        return adjustments
+        return discrepancies, notes
 
     def sum_col(name):
         idx = col.get(name)
         if idx is None:
-            return 0.0
+            return None
         total = 0.0
         for r in rows:
-            if isinstance(r, list) and idx < len(r):
-                total += _to_number(r[idx])
+            v = None
+            if isinstance(r, list):
+                v = r[idx] if idx < len(r) else ''
             elif isinstance(r, dict):
-                # Fall back to original header spelling when object rows are used.
                 for raw_h in data_sheet.get('headers') or []:
                     if _norm_label(raw_h) == name:
-                        total += _to_number(r.get(raw_h))
+                        v = r.get(raw_h)
                         break
+            n = _to_number(v)
+            if n is None:
+                return None  # unverifiable source cell
+            total += n
         return round(total, 2)
 
     status_idx = col.get('status')
@@ -998,23 +1085,28 @@ def auto_correct_common_summary(spec):
 
     summary_rows = summary_sheet.get('rows') or []
     if not isinstance(summary_rows, list):
-        return adjustments
+        return discrepancies, notes
 
     for r in summary_rows:
         if not isinstance(r, list) or len(r) < 2:
             continue
         label = _norm_label(r[0])
-        new_value = None
+        expected = None
         if label in metric_values:
-            new_value = metric_values[label]
+            expected = metric_values[label]
         else:
             m = re.fullmatch(r'count of (.+?) shifts?', label)
             if m:
-                status_key = _norm_label(m.group(1))
-                new_value = status_counts.get(status_key, 0)
-        if new_value is not None and r[1] != new_value:
-            adjustments.append({'metric': str(r[0]), 'old_value': r[1], 'new_value': new_value})
-            r[1] = new_value
+                expected = status_counts.get(_norm_label(m.group(1)), 0)
+        if expected is None:
+            continue
+        actual = _to_number(r[1])
+        if actual is None:
+            continue  # formula or text in the summary: leave it alone
+        if abs(actual - float(expected)) > 0.005:
+            discrepancies.append({'metric': str(r[0]), 'value_written': r[1],
+                                  'computed_total': expected,
+                                  'data_sheet': str(data_sheet.get('name', ''))})
 
     # Mixed Metric/Value summary sheet: only the overtime-cost value is currency.
     if isinstance(summary_sheet.get('headers'), list) and [_norm_label(h) for h in summary_sheet.get('headers', [])[:2]] == ['metric', 'value']:
@@ -1027,7 +1119,7 @@ def auto_correct_common_summary(spec):
         if cell_formats:
             summary_sheet['cell_formats'] = cell_formats
 
-    return adjustments
+    return discrepancies, notes
 
 
 def build_workbook(spec, out_dir, openpyxl_mod):
@@ -1065,7 +1157,12 @@ def build_workbook(spec, out_dir, openpyxl_mod):
     used_names = set()
     total_cells = 0
     sheet_summaries = []
+    workbook_warnings = []
     workbook_allow_formulas = truthy_flag(spec, FORMULA_FLAG_KEYS, False)
+    # Cells allowed to stay formulas: (sheet title, coordinate).  Only body
+    # cells of a sheet whose formula permission is on ever land here; titles,
+    # headers and everything else are forced literal by the sweep below.
+    authorized_formulas = set()
 
     for sheet_spec in sheets:
         if not isinstance(sheet_spec, dict):
@@ -1114,7 +1211,10 @@ def build_workbook(spec, out_dir, openpyxl_mod):
         first_data_row = row_cursor
         for row in rows:
             for c_idx, value in enumerate(row, start=1):
-                cell = ws.cell(row=row_cursor, column=c_idx, value=coerce_value(value, allow_formulas))
+                coerced = coerce_value(value, allow_formulas)
+                cell = ws.cell(row=row_cursor, column=c_idx, value=coerced)
+                if allow_formulas and isinstance(coerced, str) and coerced.startswith('='):
+                    authorized_formulas.add((ws.title, cell.coordinate))
                 cell.border = border
                 cell.alignment = wrap_top
             row_cursor += 1
@@ -1127,7 +1227,9 @@ def build_workbook(spec, out_dir, openpyxl_mod):
                     ws.cell(row=r, column=c).border = border
                     ws.cell(row=r, column=c).alignment = wrap_top
 
-        fmt_adjustments = apply_column_formats(ws, headers, sheet_spec, first_data_row, last_data_row)
+        percent_scale = normalize_percent_scale(sheet_spec.get('percent_scale', spec.get('percent_scale')))
+        fmt_adjustments = apply_column_formats(ws, headers, sheet_spec, first_data_row, last_data_row, percent_scale)
+        workbook_warnings.extend(f'Sheet "{sheet_name}": {w}' for w in fmt_adjustments.get('warnings', []))
 
         if sheet_spec.get('freeze_top_row', True) and header_row:
             ws.freeze_panes = f'A{header_row + 1}'
@@ -1155,8 +1257,30 @@ def build_workbook(spec, out_dir, openpyxl_mod):
             'percent_auto_decimal': fmt_adjustments.get('percent_auto_decimal', 0),
         })
 
+    protected = force_literal_cells(wb, authorized_formulas)
+    if protected:
+        workbook_warnings.append(
+            f'{protected} formula-looking cell(s) were stored as plain text because formulas were not '
+            'authorized for them (titles and headers are always text).')
+
     wb.save(output_path)
-    return output_path, sheet_summaries
+    return output_path, sheet_summaries, workbook_warnings
+
+
+def force_literal_cells(wb, authorized):
+    """Single enforcement point for formula protection.  openpyxl turns any
+    string starting with '=' into a formula when it is assigned, wherever it
+    is written (title, header, body, cell_formats reparse).  After all
+    writes, every formula cell that was not explicitly authorized is
+    re-typed as a plain string so it saves and reloads as literal text."""
+    count = 0
+    for ws in wb.worksheets:
+        for row in ws.iter_rows():
+            for cell in row:
+                if cell.data_type == 'f' and (ws.title, cell.coordinate) not in authorized:
+                    cell.data_type = 's'
+                    count += 1
+    return count
 
 
 def main():
@@ -1181,7 +1305,7 @@ def main():
     except Exception as ex:
         emit({'ok': False, 'helper': 'xlsx_create_workbook', 'error': format_parse_error(raw_spec, str(ex))}, 4)
 
-    summary_adjustments = auto_correct_common_summary(spec)
+    summary_discrepancies, summary_notes = check_common_summary(spec)
 
     openpyxl_mod, import_errors = load_openpyxl()
     if openpyxl_mod is None:
@@ -1193,7 +1317,7 @@ def main():
         }, 8)
 
     try:
-        output_path, sheet_summaries = build_workbook(spec, out_dir, openpyxl_mod)
+        output_path, sheet_summaries, workbook_warnings = build_workbook(spec, out_dir, openpyxl_mod)
     except Exception as ex:
         emit({'ok': False, 'helper': 'xlsx_create_workbook', 'error': 'Could not create workbook: ' + str(ex)}, 6)
 
@@ -1205,9 +1329,19 @@ def main():
         'spreadsheets_dir': str(out_dir),
         'json_repaired': bool(repair_note),
         'repair_note': repair_note or '',
-        'summary_adjustments': summary_adjustments,
+        'summary_discrepancies': summary_discrepancies,
         'sheets': sheet_summaries,
+        'warnings': summary_warnings(summary_discrepancies) + summary_notes + workbook_warnings,
     })
+
+
+def summary_warnings(discrepancies):
+    out = []
+    for d in discrepancies:
+        out.append(f'Summary "{d["metric"]}" is {d["value_written"]} but sheet "{d["data_sheet"]}" totals '
+                   f'{d["computed_total"]}. The workbook was written as given -- '
+                   'recompute and re-create it if the summary is wrong.')
+    return out
 
 
 if __name__ == '__main__':

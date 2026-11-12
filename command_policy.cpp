@@ -5,6 +5,7 @@
 #include "command_policy_zsh.h"
 #endif
 #include "lb_ascii.h"
+#include "secret_access_guard.h"
 
 #include <algorithm>
 #include <array>
@@ -738,6 +739,18 @@ PolicyDecision EvaluatePowerShellCommand(const std::string& cmdIn) {
     if (cmd.empty()) {
         out.reason = "empty command";
         return out;
+    }
+
+    // Hard block, checked before anything else: reading a credential
+    // store is never auto-run and never approval-gated, so "approve for
+    // this chat" cannot let it through.  See secret_access_guard.h.
+    {
+        const std::string secret = DetectSecretStoreAccess(cmd);
+        if (!secret.empty()) {
+            out.reason = "this command " + secret + ". " +
+                         SecretStoreRejectionAdvice();
+            return out;
+        }
     }
 
     ScanResult scan = ScanAndSplitStages(cmd);

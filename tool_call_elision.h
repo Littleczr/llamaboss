@@ -126,10 +126,26 @@ inline std::string SpoolPathFromMarker(const std::string& s)
     return out;
 }
 
+// Whether the spool file a marker names was found.  Unknown when the
+// caller did not (or could not) look; the text then stays as before.
+enum class SpoolState { Unknown, Exists, Missing };
+
 // Model-facing rejection text for a call that carries the marker.
-inline std::string CopiedElisionRejection(const std::string& args)
+inline std::string CopiedElisionRejection(const std::string& args,
+                                          SpoolState state = SpoolState::Unknown)
 {
     const std::string spool = SpoolPathFromMarker(args);
+    if (!spool.empty() && state == SpoolState::Missing) {
+        // No such file: LlamaBoss never wrote this marker.  The model
+        // imitated the shortened form of earlier calls in its history.
+        return "No tool was executed. These arguments contain a "
+               "\"[TRUNCATED: ... elided to fit context]\" marker, but "
+               "LlamaBoss never shortened this call: there is no file at " +
+               spool + ". You wrote the marker yourself, imitating how "
+               "older calls look in the shortened history. Write the "
+               "complete text (the whole file body or the whole command) "
+               "in a new call, with no marker and nothing left out.";
+    }
     std::string msg =
         "No tool was executed. These arguments contain text copied from an "
         "OLD tool call whose arguments were shortened in the conversation "

@@ -7,6 +7,7 @@
 #include <wx/button.h>
 #include <wx/gauge.h>
 #include <atomic>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -28,13 +29,21 @@ struct ThemeData;
 // Delete lives on the list itself — Del key while a row is selected,
 // or right-click context menu. Same pattern as ProjectAttachDialog,
 // so destructive actions don't dominate the action row visually.
+//
+// Eject (optional): when the caller passes onEject, an Eject button sits
+// next to Refresh and unloads the running local model to free VRAM (e.g.
+// before using ComfyUI).  The callback owns the busy/loading checks and
+// the actual stop; it returns false with a user-facing reason when the
+// model can't be ejected right now.  Without onEject (Settings) the
+// button is not created.
 class ModelManagerDialog : public wxDialog
 {
 public:
     ModelManagerDialog(wxWindow* parent,
                        const ThemeData* theme = nullptr,
                        std::string loadedModelPath = {},
-                       std::string configuredModelPath = {});
+                       std::string configuredModelPath = {},
+                       std::function<bool(std::string& why)> onEject = {});
     ~ModelManagerDialog();
 
 private:
@@ -45,6 +54,8 @@ private:
 
     // Event handlers
     void OnDeleteClicked(wxCommandEvent& ev);
+    void OnEjectClicked(wxCommandEvent& ev);
+    void UpdateEjectButton();
     void OnRefreshClicked(wxCommandEvent& ev);
     void OnOpenFolderClicked(wxCommandEvent& ev);
     void OnClose(wxCommandEvent& ev);
@@ -72,6 +83,7 @@ private:
 
     wxListCtrl*   m_modelList     = nullptr;
     wxButton*     m_refreshButton = nullptr;  // solid accent
+    wxButton*     m_ejectButton   = nullptr;  // accent; null when no onEject
     wxStaticText* m_statusText    = nullptr;
     long          m_tipRow        = -2;       // row whose name is the current tooltip
 
@@ -99,6 +111,7 @@ private:
     const ThemeData* m_theme;
     std::string m_loadedModelPath;      // Currently running llama-server model, if any
     std::string m_configuredModelPath;  // App/deferred model selection, if any
+    std::function<bool(std::string& why)> m_onEject;
 
     // Parallel to list rows: full GGUF paths
     std::vector<std::string> m_modelPaths;

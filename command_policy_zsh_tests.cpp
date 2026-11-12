@@ -95,6 +95,18 @@ int main()
     Check("echo 'unterminated", kReject);
     Check("echo \"unterminated", kReject);
 
+    // Credential stores: hard reject, never an approval card.
+    Check("git credential fill", kReject);
+    Check("printf 'protocol=https\\nhost=github.com\\n\\n' | git credential fill", kReject);
+    Check("gh auth token", kReject);
+    Check("cat ~/.git-credentials", kReject);
+    Check("security find-generic-password -s github.com -w", kReject);
+    Check("/usr/bin/security find-internet-password -gs github.com", kReject);
+    Check("security dump-keychain", kReject);
+    Check("security find-generic-password -s github.com", kApprove);
+    Check("security find-identity -v -p codesigning", kApprove);
+    Check("git config --get credential.helper", kApprove);
+
     std::printf("%s (%d failure%s)\n", g_fail ? "FAILED" : "all zsh policy checks passed",
                 g_fail, g_fail == 1 ? "" : "s");
     return g_fail ? 1 : 0;

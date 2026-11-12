@@ -49,17 +49,38 @@ std::string BackupUnreadableFile(const wxString& path)
     return std::string();
 }
 
+// Atomic write: write <path>.tmp, flush and close it, confirm the byte
+// count on disk, then rename over <path>.  Every step is checked BEFORE
+// the rename.  The old version left the final flush to the ofstream
+// destructor, whose failure is silent, so on a full disk an empty or
+// short .tmp still replaced the real file.
 bool WriteWholeFileAtomic(const wxString& path, const std::string& body)
 {
-    wxString tmpPath = path + ".tmp";
+    const wxString tmpPath = path + ".tmp";
+    bool ok = false;
     {
         std::ofstream f(tmpPath.fn_str(),
                         std::ios::out | std::ios::binary | std::ios::trunc);
-        if (!f) return false;
-        f.write(body.data(), static_cast<std::streamsize>(body.size()));
-        if (!f) return false;
+        if (f) {
+            f.write(body.data(), static_cast<std::streamsize>(body.size()));
+            f.flush();
+            ok = f.good();
+            f.close();
+            ok = ok && !f.fail();
+        }
     }
-    return wxRenameFile(tmpPath, path, true);
+    if (ok) {
+        const wxULongLong onDisk = wxFileName::GetSize(tmpPath);
+        ok = onDisk != wxInvalidSize &&
+             onDisk.GetValue() == static_cast<unsigned long long>(body.size());
+    }
+    // wxRenameFile overwrites on Windows when the third arg is true.
+    if (ok) ok = wxRenameFile(tmpPath, path, true);
+    if (!ok && wxFileExists(tmpPath)) {
+        wxLogNull quiet;
+        wxRemoveFile(tmpPath);
+    }
+    return ok;
 }
 
 // ── enum <-> string ──────────────────────────────────────────────
@@ -391,7 +412,8 @@ bool EndpointStore::ResolveTarget(const std::string&  endpointId,
 {
     const Endpoint* ep = FindEndpoint(endpointId);
     if (!ep) {
-        outReason = "Unknown remote endpoint: " + endpointId;
+        outReason = "The AI provider '" + endpointId + "' isn't set up any more. Pick another model, "
+                    "or add the provider again in Settings -> Connections.";
         return false;
     }
     if (wireModelId.empty()) {
@@ -447,9 +469,9 @@ bool EndpointStore::ResolveTarget(const std::string&  endpointId,
         key = secrets.GetSecret(ep->secretProvider, ep->secretKey);
         if (key.empty()) {
             outReason = "No API key for '" + ep->displayName +
-                        "'. Open Settings -> Remote Endpoints, edit the endpoint, "
-                        "and paste the key into its API key field (connection \"" +
-                        ep->secretProvider + "\", key \"" + ep->secretKey + "\").";
+                        "'. Open Settings -> Connections, edit '" + ep->displayName +
+                        "', and paste the key (saved as " + ep->secretProvider + "." +
+                        ep->secretKey + ").";
             return false;
         }
     }

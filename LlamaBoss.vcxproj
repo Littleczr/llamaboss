@@ -299,6 +299,7 @@
     <ClInclude Include="tool_block.h" />
     <ClInclude Include="agent_event.h" />
     <ClInclude Include="command_policy.h" />
+    <ClInclude Include="secret_access_guard.h" />
     <ClInclude Include="agent_controller.h" />
     <ClInclude Include="conversation_sidebar.h" />
     <ClInclude Include="markdown_renderer.h" />

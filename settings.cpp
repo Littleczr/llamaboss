@@ -928,9 +928,9 @@ void SettingsDialog::OnManageEndpoints(wxCommandEvent&)
 {
     if (!m_endpointStore) {
         wxMessageBox(
-            "Endpoint store is not available. Restart LlamaBoss "
+            "Connection settings are not available. Restart LlamaBoss "
             "and try again.",
-            "Remote Endpoints", wxOK | wxICON_INFORMATION, this);
+            "Connections", wxOK | wxICON_INFORMATION, this);
         return;
     }
 

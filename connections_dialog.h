@@ -15,14 +15,18 @@
 #include <wx/listctrl.h>
 
 class SecretsStore;
+class EndpointStore;
 struct ThemeData;
 
 class ConnectionsDialog : public wxDialog
 {
 public:
+    // endpoints (optional): lets Delete/rename warn when an AI provider
+    // uses the key, since its chats would stop working.
     ConnectionsDialog(wxWindow* parent,
                       SecretsStore* store,
-                      const ThemeData& theme);
+                      const ThemeData& theme,
+                      const EndpointStore* endpoints = nullptr);
 
 private:
     void OnAdd(wxCommandEvent& evt);
@@ -37,6 +41,10 @@ private:
     void UpdateButtonState();
     void ApplyTheme();
 
+    // "OpenRouter, OpenAI" for the AI providers that read provider.key;
+    // empty when none does.
+    wxString ProvidersUsingKey(const std::string& provider, const std::string& key) const;
+
     // Opens a small modal to add or edit one connection.  Returns
     // true if the user confirmed; fills outProvider/outKey/outValue/
     // outIsEnvRef accordingly.  When editing, the values are seeded
@@ -50,6 +58,7 @@ private:
 
     SecretsStore*   m_store   = nullptr;
     const ThemeData* m_theme  = nullptr;
+    const EndpointStore* m_endpoints = nullptr;
 
     wxListCtrl* m_list    = nullptr;
     wxButton*   m_addBtn  = nullptr;

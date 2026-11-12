@@ -13,6 +13,13 @@
 #include <sstream>
 
 #include "lb_windows.h"
+#ifndef _WIN32
+// Mac: the notes saver reports errno through the Win32-shaped error slot.
+using DWORD = int;
+constexpr int ERROR_SUCCESS        = 0;
+constexpr int ERROR_ALREADY_EXISTS = EEXIST;
+constexpr int ERROR_FILE_EXISTS    = EEXIST;
+#endif
 
 namespace {
 
@@ -163,16 +170,43 @@ bool ReadFileUtf8(const std::string& path, std::string& out, std::size_t maxByte
     return true;
 }
 
-// Atomic whole-file replace: staged temp + MoveFileExW, matching
-// ChatHistory::SaveToFile.  Staged temp is cleaned up on any failure.
-bool AtomicWriteFile(const std::string& finalPath, const std::string& body)
+// Atomic whole-file replace: staged sibling temp + PromoteSiblingTempFile,
+// the same commit write/edit use.  It must NOT be MoveFileExW: NotesAppend
+// runs under tool_mutation_guard, whose parent-directory pins deny
+// share-write, and a full-path MoveFileEx reopens the destination folder
+// for FILE_WRITE_DATA -- that always failed with ERROR_SHARING_VIOLATION
+// (32), so every notes_append into an existing folder was refused.
+// The staged temp is cleaned up on any failure; *errOut gets the Win32 code.
+bool AtomicWriteFile(const std::string& finalPath, const std::string& body,
+                     bool replaceExisting, DWORD* errOut)
 {
 #ifndef _WIN32
-    return tool_staged_write::AtomicReplaceFile(finalPath, body, /*durable=*/false);
-#else
+    // Mac: same staged sibling temp + rename; RENAME_EXCL keeps the
+    // no-clobber rule when replaceExisting is false.  *errOut gets errno.
     tool_staged_write::StagedTempFile tmp =
         tool_staged_write::CreateStagedTempFile(finalPath);
-    if (tmp.handle == INVALID_HANDLE_VALUE) return false;
+    int err = tmp.error;
+    bool ok = tmp.fd >= 0 &&
+              tool_staged_write::WriteAll(tmp.fd, body.data(), body.size(), err);
+    if (tmp.fd >= 0) {
+        if (::close(tmp.fd) != 0 && ok) { err = errno; ok = false; }
+        tmp.fd = -1;
+    }
+    if (ok) ok = tool_staged_write::PromoteSiblingTempFile(tmp.path, finalPath,
+                                                           replaceExisting, err);
+    if (!ok) {
+        tool_staged_write::DiscardStagedTempFile(tmp);
+        if (errOut) *errOut = err ? err : EIO;
+    }
+    return ok;
+#else
+    auto failWith = [errOut](DWORD err) {
+        if (errOut) *errOut = err;
+        return false;
+    };
+    tool_staged_write::StagedTempFile tmp =
+        tool_staged_write::CreateStagedTempFile(finalPath);
+    if (tmp.handle == INVALID_HANDLE_VALUE) return failWith(tmp.error);
 
     {
         const char* data   = body.data();
@@ -184,30 +218,39 @@ bool AtomicWriteFile(const std::string& finalPath, const std::string& body)
             DWORD written = 0;
             BOOL  ok = ::WriteFile(tmp.handle, data, chunk, &written, nullptr);
             if (!ok || written == 0) {
+                const DWORD err = ok ? ERROR_WRITE_FAULT : ::GetLastError();
                 ::CloseHandle(tmp.handle);
                 ::DeleteFileW(tmp.wPath.c_str());
-                return false;
+                return failWith(err);
             }
             data   += written;
             remain -= written;
         }
     }
 
-    if (!::CloseHandle(tmp.handle)) {
+    if (!::FlushFileBuffers(tmp.handle)) {
+        const DWORD err = ::GetLastError();
+        ::CloseHandle(tmp.handle);
         ::DeleteFileW(tmp.wPath.c_str());
-        return false;
+        return failWith(err);
+    }
+    if (!::CloseHandle(tmp.handle)) {
+        const DWORD err = ::GetLastError();
+        ::DeleteFileW(tmp.wPath.c_str());
+        return failWith(err);
     }
 
     std::wstring wFinal = path_safety::Utf8ToWide(finalPath);
     if (wFinal.empty()) {
         ::DeleteFileW(tmp.wPath.c_str());
-        return false;
+        return failWith(ERROR_INVALID_NAME);
     }
 
-    if (!::MoveFileExW(tmp.wPath.c_str(), wFinal.c_str(),
-                       MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+    if (!tool_staged_write::PromoteSiblingTempFile(tmp.wPath, wFinal,
+                                                   replaceExisting)) {
+        const DWORD err = ::GetLastError();
         ::DeleteFileW(tmp.wPath.c_str());
-        return false;
+        return failWith(err);
     }
     return true;
 #endif
@@ -696,11 +739,22 @@ NotesResult NotesAppend(const std::string& args, const ToolContext& /*ctx*/)
         r.chips.push_back("conflict");
         return r;
     }
+    // A file that appeared after a missing-target snapshot is not clobbered
+    // (same rule as write); an existing target was version-checked above.
+    const bool replaceExisting = mutation.TargetExisted();
     mutation.ReleaseTargetForCommit();
 
-    if (!AtomicWriteFile(path, newBody)) {
-        r.errorBody = "Could not write notes file (atomic save failed): " + path;
-        r.chips.push_back("failed");
+    DWORD saveError = ERROR_SUCCESS;
+    if (!AtomicWriteFile(path, newBody, replaceExisting, &saveError)) {
+#ifdef _WIN32
+        r.errorBody = "Could not write notes file (atomic save failed, Win32 error " +
+#else
+        r.errorBody = "Could not write notes file (atomic save failed, error " +
+#endif
+                      std::to_string(saveError) + "): " + path +
+                      "\nNothing was saved.";
+        r.chips.push_back(saveError == ERROR_ALREADY_EXISTS || saveError == ERROR_FILE_EXISTS
+                              ? "conflict" : "failed");
         return r;
     }
 

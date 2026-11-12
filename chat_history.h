@@ -718,6 +718,14 @@ private:
     // most recent build.  Reset at the start of every build.
     int m_lastBuildArgsElidedCount = 0;
 
+    // Sticky elision prefix: how many of the oldest eligible tool-call
+    // turns / tool results the previous wire build elided.  Re-applied on
+    // every build while the body stays above the low-water target, so the
+    // elided history is byte-identical request to request (prompt cache).
+    // Reset by Clear() and whenever the body falls to the target.
+    int m_stickyArgsElided = 0;
+    int m_stickyResultsElided = 0;
+
     // Elision spool target and content-hash -> Vars\ path cache (skips
     // the filesystem check on every build once a result is spooled).
     std::string m_elisionSpoolWorkspace;

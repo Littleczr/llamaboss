@@ -31,6 +31,17 @@ int main()
     expect(true,  "The mkdir failed (empty args); retrying with the path included.");
     expect(true,  "Step 1: creating the folder \xE2\x80\x94" " retrying with the path included.");
     expect(true,  "Write failed -- let me fix the args.");
+    // Cue BEFORE the dash (Strata IQ3_S 1942 run, 2026-11-10): the clause
+    // split used to keep only the text after the em dash.
+    expect(true,  "Now writing the game \xE2\x80\x94" " a vertical scroller with scrolling ocean/island backdrop, enemy waves, power\xE2\x80\x91ups, and 1942's signature barrel\xE2\x80\x91roll stunt (horizontal + vertical loop that gives brief invulnerability).");
+    expect(true,  "Next, the boss fight -- three attack patterns and an HP bar.");
+    expect(true,  "Let me patch the spawner; the cap is too low.");
+    // Present-progressive promise with no call (Strata IQ3_S, 2026-11-10).
+    expect(true,  "Node is available for syntax-checking. HTML5 canvas is the right call here \xE2\x80\x94" " zero install, runs in any browser, and trivial to tweak. I'm writing an original vertical-scrolling WWII shooter (code and art from scratch, no ripped assets): formations, kamikaze dives, power-ups, the signature loop-the-loop dodge, and boss fights.");
+    expect(true,  "Syntax is clean. I'm building the boss test harness next.");
+    expect(true,  "I am going to add the headless test now.");
+    expect(true,  "Tests pass. I\xE2\x80\x99m writing the cleanup step.");
+    expect(true,  "Let\xE2\x80\x99s read n3.txt.");
     // Long reasoning before a short stall must not hide it (2026-10-11 Q3/Q4 misses).
     {
         std::string withThink = "<think>";
@@ -50,6 +61,11 @@ int main()
     expect(false, "Retried twice and it still fails, so I stopped. The file is locked by another process.");
     expect(false, "All 14 steps done \xE2\x80\x94" " STEPS_DONE=14, sum = 8.");
     expect(false, "Edit 3 matched the final file - every diff was accurate.");
+    expect(false, "Let me know if you want sound \xE2\x80\x94" " it's about 40 lines.");
+    expect(false, "I'm done \xE2\x80\x94" " the game is open in your browser.");
+    expect(false, "I'm not able to take a screenshot here, so I verified it with Node instead.");
+    expect(false, "Done. I'm happy with how the boss fight turned out.");
+    expect(false, "Let me know if you want sound \xE2\x80\x94" " it\xE2\x80\x99s about 40 lines.");
     expect(false, "");
     expect(false, "   \n  ");
     {

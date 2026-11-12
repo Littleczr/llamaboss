@@ -5,6 +5,7 @@
 // a per-stage head allowlist with argument checks for the few read-only
 // programs that also have a writing mode.
 #include "command_policy_zsh.h"
+#include "secret_access_guard.h"
 
 #include <set>
 #include <vector>
@@ -42,6 +43,38 @@ PolicyDecision Reject(const std::string& reason)
     PolicyDecision d;
     d.reason = reason;
     return d;
+}
+
+// `security` subcommands that print or export Keychain secrets.  Listing
+// keychains or looking up an item without -w/-g stays an approval case.
+std::string DetectMacKeychainAccess(const std::string& cmd)
+{
+    std::string lower(cmd);
+    for (char& c : lower) if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+    std::vector<std::string> t;
+    std::string cur;
+    for (char c : lower) {
+        const bool keep = (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+                          c == '-' || c == '_' || c == '.' || c == '/';
+        if (keep) cur.push_back(c);
+        else if (!cur.empty()) { t.push_back(cur); cur.clear(); }
+    }
+    if (!cur.empty()) t.push_back(cur);
+    for (size_t i = 0; i + 1 < t.size(); ++i) {
+        if (t[i] != "security" && t[i] != "/usr/bin/security") continue;
+        const std::string& sub = t[i + 1];
+        if (sub == "dump-keychain" || sub == "export")
+            return "reads the macOS Keychain (`security " + sub + "`)";
+        if (sub.rfind("find-", 0) == 0 && sub.find("-password") != std::string::npos) {
+            for (size_t k = i + 2; k < t.size(); ++k)
+                // -w prints the password, -g prints it to stderr; flags may
+                // be grouped (-gw).
+                if (t[k].size() > 1 && t[k][0] == '-' && t[k][1] != '-' &&
+                    t[k].find_first_of("wg") != std::string::npos)
+                    return "reads a password from the macOS Keychain (`security " + sub + "`)";
+        }
+    }
+    return {};
 }
 
 // One pipeline stage, split into words with quotes removed.
@@ -348,6 +381,17 @@ PolicyDecision EvaluateZshCommand(const std::string& commandIn)
 {
     const std::string cmd = Trim(commandIn);
     if (cmd.empty()) return Reject("empty command");
+
+    // Hard block, checked before anything else (same rule as the Windows
+    // evaluator): reading a credential store is never auto-run and never
+    // approval-gated.  The shared guard covers git/gh/browser stores; the
+    // macOS Keychain CLI is checked here.
+    {
+        std::string secret = DetectSecretStoreAccess(cmd);
+        if (secret.empty()) secret = DetectMacKeychainAccess(cmd);
+        if (!secret.empty())
+            return Reject("this command " + secret + ". " + SecretStoreRejectionAdvice());
+    }
 
     std::vector<Words> stages;
     PolicyDecision early;

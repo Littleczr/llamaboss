@@ -5,6 +5,7 @@
 
 #include "python_package_recovery.h"
 #include "lb_string_utils.h"
+#include "python_arg_policy.h"
 #include "tool_dispatcher.h"   // ToolInvocationResult
 #include "python_runner.h"     // PythonRunResult
 
@@ -19,46 +20,6 @@ std::string LbTrimPackageToken(std::string s)
     if (a == std::string::npos) return std::string();
     size_t b = s.find_last_not_of(" \t\r\n\"'`.,:;()[]{}");
     return s.substr(a, b - a + 1);
-}
-
-// Syntactic-only vetting of a candidate package name.  The historical
-// allowlist has been retired; per-package approval cards (rendered by
-// tool_approval.h for python_install_package) are now the safety
-// boundary, so this helper only needs to confirm the name is
-// syntactically usable as a pip target.  This mirrors the character
-// whitelist enforced authoritatively by NormalizeAllowedPythonPackage
-// in python_runner.cpp.
-bool LbPackageIsAllowed(const std::string& packageName)
-{
-    if (packageName.empty()) return false;
-    if (!((packageName.front() >= 'a' && packageName.front() <= 'z') ||
-          (packageName.front() >= '0' && packageName.front() <= '9'))) {
-        return false;
-    }
-    for (char c : packageName) {
-        const bool ok = (c >= 'a' && c <= 'z') ||
-                        (c >= '0' && c <= '9') ||
-                        c == '-' || c == '.';
-        if (!ok) return false;
-    }
-    return true;
-}
-
-// Map common import names to their actual PyPI package names.
-// Examples: `import docx` is `pip install python-docx`,
-// `import fitz` is `pip install pymupdf`.
-std::string LbNormalizeMissingPackageName(const std::string& raw)
-{
-    std::string p = LbLowerAscii(LbTrimPackageToken(raw));
-    std::replace(p.begin(), p.end(), '_', '-');
-
-    if (p == "docx") p = "python-docx";
-    else if (p == "fitz") p = "pymupdf";
-    else if (p == "pil") p = "pillow";
-    else if (p == "pptx") p = "python-pptx";
-    else if (p == "bs4") p = "beautifulsoup4";
-
-    return p;
 }
 
 // Scan `text` for `token`, then read the package-name-like sequence
@@ -111,8 +72,9 @@ bool LbExtractAfterToken(const std::string& text,
 //      helpers emit when they detect a missing dependency early.
 // On success: importNameOut is the raw import-name candidate,
 // packageNameOut is the normalized PyPI name, and installableOut is
-// true iff the normalized name passes syntactic validation as a pip
-// target.  Returns false if no missing-package signal was found.
+// true iff python_install_package would accept it (same
+// python_arg_policy normalization, so the suggestion always matches
+// what the install tool runs).  Returns false if no missing-package signal was found.
 bool LbFindMissingPythonPackage(const std::string& stdoutText,
                                 const std::string& stderrText,
                                 std::string&       importNameOut,
@@ -127,8 +89,10 @@ bool LbFindMissingPythonPackage(const std::string& stdoutText,
     const std::string lower = LbLowerAscii(text);
 
     std::string candidate;
-    if (!LbExtractAfterToken(text, "No module named", candidate) &&
-        !LbExtractAfterToken(text, "no module named", candidate)) {
+    const bool fromImportError =
+        LbExtractAfterToken(text, "No module named", candidate) ||
+        LbExtractAfterToken(text, "no module named", candidate);
+    if (!fromImportError) {
         if (!LbExtractAfterToken(lower, "pip install --user --disable-pip-version-check", candidate) &&
             !LbExtractAfterToken(lower, "pip install --user", candidate)) {
             if (lower.find("openpyxl python package is required") != std::string::npos) {
@@ -146,12 +110,33 @@ bool LbFindMissingPythonPackage(const std::string& stdoutText,
     candidate = LbTrimPackageToken(candidate);
     if (candidate.empty()) return false;
 
+    // "No module named 'yaml.constructor'" names a module path, but pip
+    // installs the top-level distribution ("yaml" -> pyyaml).  Namespace
+    // roots are the exception: "google" alone is an unrelated PyPI
+    // package, so those keep the full dotted name, as before.
+    if (fromImportError) {
+        const size_t dot = candidate.find('.');
+        if (dot != std::string::npos) {
+            const std::string top = LbLowerAscii(candidate.substr(0, dot));
+            if (top != "google" && top != "azure")
+                candidate = LbTrimPackageToken(candidate.substr(0, dot));
+        }
+        if (candidate.empty()) return false;
+    }
+
     importNameOut = candidate;
-    packageNameOut = LbNormalizeMissingPackageName(candidate);
-    // installableOut is true when the normalized name is a syntactically
-    // valid pip target (no path/URL/version/extras/flags).  The
-    // per-package approval card is the safety boundary.
-    installableOut = LbPackageIsAllowed(packageNameOut);
+
+    std::string normalized;
+    std::string policyError;
+    installableOut = python_arg_policy::NormalizeAllowedPythonPackage(
+        candidate, normalized, policyError);
+    if (installableOut) {
+        packageNameOut = normalized;
+    } else {
+        // Display-only form for the "Unsupported Python Package" card.
+        packageNameOut = LbLowerAscii(candidate);
+        std::replace(packageNameOut.begin(), packageNameOut.end(), '_', '-');
+    }
     return true;
 }
 

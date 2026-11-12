@@ -695,6 +695,29 @@ void ModelSwitcher::OnModelPillClick(wxWindow* popupParent)
     ShowModelPickerMenu(popupParent, models);
 }
 
+bool ModelSwitcher::TryEjectLocalModel(std::string& why)
+{
+    if (m_cb.isBusy && m_cb.isBusy()) {
+        why = "Can't eject while a response is streaming. Stop the response first.";
+        return false;
+    }
+    if (m_service.AnyOtherWindowBusyOnLocalServer(m_parentFrame)) {
+        why = "Can't eject while another window is responding. Stop that response first.";
+        return false;
+    }
+    if (!m_service.IsServerReady() &&
+        m_service.GetLastChange() == ModelServiceChange::LoadingLocal) {
+        why = "Can't eject while the model is loading. Try again when it's ready.";
+        return false;
+    }
+    if (m_serverManager.GetLoadedModel().empty()) {
+        why = "No local model is loaded.";
+        return false;
+    }
+    m_service.StopLocalServer();
+    return true;
+}
+
 void ModelSwitcher::OnModelPillRightClick(wxWindow* parent)
 {
     if (m_cb.isBusy && m_cb.isBusy()) {
@@ -706,10 +729,28 @@ void ModelSwitcher::OnModelPillRightClick(wxWindow* parent)
         ? m_pendingDeferredModel
         : GetConversationModelForSave();
 
+    // Eject: stop llama-server to free VRAM (e.g. before ComfyUI).  The
+    // dialog is modal, so this window can't start a reply while it is
+    // open; the checks cover another window's stream and a load in
+    // flight.  Each attached frame parks its conversation model as
+    // deferred on the Stopped broadcast (OnServiceStateChanged), and the
+    // send path reloads it on the next message.
+    bool ejected = false;
+    auto onEject = [this, &ejected](std::string& why) -> bool {
+        ejected = TryEjectLocalModel(why);
+        return ejected;
+    };
+
     ModelManagerDialog dlg(parent, &m_appState.GetTheme(),
                            m_serverManager.GetLoadedModel(),
-                           configuredModel);
+                           configuredModel,
+                           onEject);
     dlg.ShowModal();
+
+    if (ejected) {
+        m_chatDisplay->DisplaySystemNotice(
+            "Model unloaded. It reloads when you send your next message.");
+    }
 
     // The manager dialog can delete the model that was parked as a deferred
     // load for the current conversation.  Clear that intent immediately so the
@@ -1016,8 +1057,32 @@ bool ModelSwitcher::ActivateRemoteModel(const std::string& remoteKey)
     if (m_cb.updateWindowTitle) m_cb.updateWindowTitle();
 
     // Friendly "<model> ready (remote: <endpoint>)", using configured
-    // display names where available.
+    // display names where available.  An endpoint on this PC (Strata,
+    // LM Studio, a hand-started llama-server) says "local server" instead:
+    // "remote" read as if the model ran somewhere else.
     const EndpointStore::Endpoint* ep = endpoints->FindEndpoint(endpointId);
+    auto isLoopbackUrl = [](std::string url) {
+        const size_t scheme = url.find("://");
+        if (scheme != std::string::npos) url.erase(0, scheme + 3);
+        const size_t cut = url.find_first_of("/?#");
+        if (cut != std::string::npos) url.erase(cut);
+        const size_t at = url.rfind('@');
+        if (at != std::string::npos) url.erase(0, at + 1);
+        if (!url.empty() && url.front() == '[') {               // [::1]:8080
+            const size_t close = url.find(']');
+            url = close == std::string::npos ? url.substr(1) : url.substr(1, close - 1);
+        } else {
+            const size_t port = url.rfind(':');
+            if (port != std::string::npos) url.erase(port);
+        }
+        for (char& c : url) c = (char)lb_ascii::ToLower((unsigned char)c);
+        if (url == "localhost" || url == "::1") return true;
+        // 127.x.y.z only: a host name like "127.example.com" is not loopback.
+        if (url.rfind("127.", 0) != 0) return false;
+        for (char c : url) if (c != '.' && (c < '0' || c > '9')) return false;
+        return true;
+    };
+    const char* where = (ep && isLoopbackUrl(ep->baseUrl)) ? "local server" : "remote";
     std::string endpointDisplay = ep ? ep->displayName : endpointId;
     std::string modelDisplay    = wireModel;
     if (ep) {
@@ -1026,7 +1091,7 @@ bool ModelSwitcher::ActivateRemoteModel(const std::string& remoteKey)
         }
     }
     m_chatDisplay->DisplaySystemMessage(
-        modelDisplay + " ready (remote: " + endpointDisplay + ")" +
+        modelDisplay + " ready (" + where + ": " + endpointDisplay + ")" +
         (continuing ? ". New messages in this chat will use it."
                     : "."));
 

@@ -10,8 +10,11 @@
 #include "tool_python_syntax.h"  // tool_python_syntax::CheckFile
 #include "path_safety.h"
 #include "tool_mutation_guard.h"
+#include "tool_mkdir.h"             // MakeDirectory (write creates missing parents)
 
 #include "lb_windows.h"
+
+#include <memory>
 
 namespace {
 
@@ -108,6 +111,10 @@ struct WriteOptions {
     WriteRiskMode riskMode          = WriteRiskMode::NormalTextOnly;
     bool          pythonSyntaxCheck = true;   // copy writes exact bytes; no gate
     size_t        maxBytes          = kWriteMaxBytes;
+    // Create missing parent folders (inside the allowed write roots) instead
+    // of failing.  The text write/overwrite_file tools turn this on; copy and
+    // write_powershell_script keep the old "parent must exist" rule.
+    bool          createMissingParents = false;
     // Sentence appended to the "already exists" refusal.
     const char*   existsHint =
         "Use overwrite_file to replace the whole file, or edit for a small unique text replacement.";
@@ -168,14 +175,22 @@ WriteResult WriteContentCore(const std::string& requestedPath,
 
     // Coordinate native mutations across chat windows and pin the real
     // directory chain before touching the target. Reparse points fail closed.
-    tool_mutation_guard::Guard mutation;
-    if (!mutation.Begin(resolved)) {
-        r.chips.push_back(mutation.MissingFolder() ? "failed" : "blocked");
-        r.errorBody = mutation.Error();
-        if (mutation.MissingFolder())
-            r.errorBody += tool_path_safety::ConversationLaneWriteHint(requestedPath, ctx.cwd);
-        r.chips.push_back(LbElapsedChip(t0));
-        return r;
+    // A missing parent folder is deferred (not failed) when the caller allows
+    // creating it: the filename and risky-extension checks below run first,
+    // so a write that would be refused never leaves an empty folder behind.
+    auto mutation = std::make_unique<tool_mutation_guard::Guard>();
+    bool createParentLater = false;
+    if (!mutation->Begin(resolved)) {
+        if (opt.createMissingParents && mutation->MissingFolder()) {
+            createParentLater = true;
+        } else {
+            r.chips.push_back(mutation->MissingFolder() ? "failed" : "blocked");
+            r.errorBody = mutation->Error();
+            if (mutation->MissingFolder())
+                r.errorBody += tool_path_safety::ConversationLaneWriteHint(requestedPath, ctx.cwd);
+            r.chips.push_back(LbElapsedChip(t0));
+            return r;
+        }
     }
 
     // ── Filename sanitization ────────────────────────────────────
@@ -224,10 +239,36 @@ WriteResult WriteContentCore(const std::string& requestedPath,
         return r;
     }
 
-    // ── Parent directory must already exist ──────────────────────
-    // Single operations only; no implicit "mkdir -p".  The model
-    // can call mkdir explicitly (or check with ls) before writing
-    // into a new directory.
+    // ── Missing parent folders ───────────────────────────────────
+    // write / overwrite_file create them (2026-11-10: a 30K-token game was
+    // generated into "1942-like/index.html", the write failed on the missing
+    // folder, and the model had to regenerate the whole file after mkdir).
+    // MakeDirectory re-checks the allowed write roots, sanitizes each folder
+    // name and pins every new directory.  It takes the same process-wide
+    // native-mutation lock, so release ours first, then pin afresh.
+    std::string createdFolder;
+    if (createParentLater) {
+        mutation.reset();
+        const std::string missingParent = tool_path_safety::ParentDir(resolved);
+        MkdirResult made = MakeDirectory(missingParent, ctx);
+        if (!made.errorBody.empty()) {
+            r.chips.push_back("failed");
+            r.errorBody = "Could not create the missing folder " + missingParent +
+                          ": " + made.errorBody;
+            r.chips.push_back(LbElapsedChip(t0));
+            return r;
+        }
+        createdFolder = missingParent;
+        mutation = std::make_unique<tool_mutation_guard::Guard>();
+        if (!mutation->Begin(resolved)) {
+            r.chips.push_back(mutation->MissingFolder() ? "failed" : "blocked");
+            r.errorBody = mutation->Error();
+            r.chips.push_back(LbElapsedChip(t0));
+            return r;
+        }
+    }
+
+    // ── Parent directory must exist (copy / scripts; or just created) ─
     std::string parent = tool_path_safety::ParentDir(resolved);
     if (parent.empty() || !IsDirectory(parent)) {
         r.chips.push_back("failed");
@@ -387,16 +428,16 @@ WriteResult WriteContentCore(const std::string& requestedPath,
         }
     }
 
-    if (!mutation.VerifyUnchanged()) {
+    if (!mutation->VerifyUnchanged()) {
         r.chips.push_back("conflict");
-        r.errorBody = mutation.Error() + "\nThe proposed file is preserved at: " + tmpPath;
+        r.errorBody = mutation->Error() + "\nThe proposed file is preserved at: " + tmpPath;
         r.chips.push_back(LbElapsedChip(t0));
         return r;
     }
     // Even overwrite_file must not clobber a file that appeared after a
     // create-new snapshot. Existing targets were version-checked above.
-    const bool replaceExisting = overwriteExisting && mutation.TargetExisted();
-    mutation.ReleaseTargetForCommit();
+    const bool replaceExisting = overwriteExisting && mutation->TargetExisted();
+    mutation->ReleaseTargetForCommit();
 
     BOOL movedOK = tool_staged_write::PromoteSiblingTempFile(
         wTmp, wFinal, replaceExisting);
@@ -469,14 +510,14 @@ WriteResult WriteContentCore(const std::string& requestedPath,
         }
     }
 
-    if (!mutation.VerifyUnchanged()) {
+    if (!mutation->VerifyUnchanged()) {
         r.chips.push_back("conflict");
-        r.errorBody = mutation.Error() + "\nThe proposed file is preserved at: " + tmpPath;
+        r.errorBody = mutation->Error() + "\nThe proposed file is preserved at: " + tmpPath;
         r.chips.push_back(LbElapsedChip(t0));
         return r;
     }
-    const bool replaceExisting = overwriteExisting && mutation.TargetExisted();
-    mutation.ReleaseTargetForCommit();
+    const bool replaceExisting = overwriteExisting && mutation->TargetExisted();
+    mutation->ReleaseTargetForCommit();
 
     if (!tool_staged_write::PromoteSiblingTempFile(tmpPath, resolved, replaceExisting, err)) {
         r.chips.push_back("failed");
@@ -516,6 +557,8 @@ WriteResult WriteContentCore(const std::string& requestedPath,
     r.body = std::string(overwriteExisting ? "Overwrote " : "Wrote ") +
              (bytes == 0 ? std::string("empty file") : LbToolHumanBytes(bytes)) +
              " to " + resolved + "\n";
+    if (!createdFolder.empty())
+        r.body = "Created folder " + createdFolder + "\n" + r.body;
     r.chips.push_back(LbElapsedChip(t0));
     return r;
 }
@@ -543,8 +586,9 @@ WriteResult WriteFileContent(const std::string& argsBlob,
     }
 
     WriteOptions opt;
-    opt.overwriteExisting = overwriteExisting;
-    opt.riskMode          = riskMode;
+    opt.overwriteExisting    = overwriteExisting;
+    opt.riskMode             = riskMode;
+    opt.createMissingParents = riskMode == WriteRiskMode::NormalTextOnly;
     return WriteContentCore(requestedPath, content, ctx, opt, t0);
 }
 

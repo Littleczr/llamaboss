@@ -103,12 +103,57 @@ def as_float(value):
         return None
 
 
+class Uncalculated(str):
+    """Marks a formula cell whose result was never cached (file not
+    recalculated by Excel).  Its value is unknown -- not blank, not zero."""
+
+
+def is_formula(v):
+    if v is None:
+        return False
+    if isinstance(v, str):
+        return v.startswith('=')
+    return type(v).__name__.endswith('Formula')
+
+
+def formula_text(v):
+    if isinstance(v, str):
+        return v
+    return str(getattr(v, 'text', None) or v)
+
+
 def cell_to_value(value):
     if value is None:
         return ''
     if isinstance(value, (str, int, float, bool)):
         return value
     return str(value)
+
+
+def workbook_has_formulas(target):
+    """Cheap pre-scan of the worksheet XML for formula elements (<f> or a
+    namespaced <x:f>), so formula-free files skip the second read pass.
+    Any doubt -> True (do the full check)."""
+    import re as _re
+    import zipfile as _zf
+    pat = _re.compile(rb'<(?:[A-Za-z_][\w.-]*:)?f[\s>/]')
+    try:
+        with _zf.ZipFile(str(target)) as z:
+            for name in z.namelist():
+                if not (name.startswith('xl/worksheets/') and name.endswith('.xml')):
+                    continue
+                tail = b''
+                with z.open(name) as fh:
+                    while True:
+                        chunk = fh.read(1 << 20)
+                        if not chunk:
+                            break
+                        if pat.search(tail + chunk):
+                            return True
+                        tail = chunk[-32:]
+        return False
+    except Exception:
+        return True
 
 
 def main():
@@ -150,6 +195,14 @@ def main():
         wb = load_workbook(filename=str(target), read_only=True, data_only=True)
     except Exception as ex:
         emit({'ok': False, 'helper': 'xlsx_report', 'error': 'Could not open workbook: ' + str(ex), 'path': str(target)}, 6)
+    # Second view with formulas so an uncached formula is not mistaken for a
+    # blank cell (data_only=True returns None for both).
+    try:
+        wbf = load_workbook(filename=str(target), read_only=True, data_only=False) if workbook_has_formulas(target) else None
+    except Exception as ex:
+        wbf = None
+        warnings.append('Could not read formula metadata; formulas without cached values may be '
+                        'counted as blank: ' + str(ex))
 
     max_rows_per_sheet = 100000
     max_sample_data_rows = 10
@@ -165,10 +218,22 @@ def main():
             warnings.append('Could not open sheet "' + sheet_name + '": ' + str(ex))
             continue
 
+        f_iter = None
+        if wbf is not None:
+            try:
+                f_iter = wbf[sheet_name].iter_rows(values_only=True)
+            except Exception:
+                f_iter = None
         rows = []
         try:
             for row in ws.iter_rows(values_only=True):
-                rows.append(list(row))
+                row = list(row)
+                frow = next(f_iter, None) if f_iter is not None else None
+                if frow is not None:
+                    for i, fv in enumerate(frow):
+                        if i < len(row) and row[i] is None and is_formula(fv):
+                            row[i] = Uncalculated('<uncalculated formula: ' + formula_text(fv) + '>')
+                rows.append(row)
                 if len(rows) >= max_rows_per_sheet:
                     warnings.append('Sheet "' + sheet_name + '": stopped scanning at 100000 rows.')
                     break
@@ -197,10 +262,14 @@ def main():
         missing_counts = [0 for _ in range(width)]
         nonempty_counts = [0 for _ in range(width)]
         numeric_values = [[] for _ in range(width)]
+        uncalc_counts = [0 for _ in range(width)]
 
         for row in data_rows:
             for i in range(width):
                 value = row[i] if i < len(row) else None
+                if isinstance(value, Uncalculated):
+                    uncalc_counts[i] += 1
+                    continue
                 if value is None or (isinstance(value, str) and value.strip() == ''):
                     missing_counts[i] += 1
                     continue
@@ -217,14 +286,24 @@ def main():
             if len(vals) / denom < 0.80:
                 continue
             total = sum(vals)
-            numeric_summary.append({
+            entry = {
                 'column': columns[i],
                 'count': len(vals),
                 'sum': round(total, 6),
                 'min': round(min(vals), 6),
                 'max': round(max(vals), 6),
                 'average': round(total / len(vals), 6),
-            })
+                'complete': uncalc_counts[i] == 0,
+            }
+            if uncalc_counts[i]:
+                entry['uncalculated_formula_cells'] = uncalc_counts[i]
+            numeric_summary.append(entry)
+        for i, n in enumerate(uncalc_counts):
+            if n:
+                warnings.append(
+                    f'Sheet "{sheet_name}", column "{columns[i]}": {n} formula cell(s) have no cached value '
+                    '(file not recalculated/saved by Excel). Their values are UNKNOWN; any sum, count, '
+                    'min, max or average for this column is INCOMPLETE and must not be reported as a total.')
 
         # Markdown section for this sheet
         block = []
@@ -241,14 +320,21 @@ def main():
         column_rows = []
         for i, name in enumerate(columns):
             column_rows.append([i + 1, name, nonempty_counts[i], missing_counts[i]])
-        block.append(md_table(['#', 'Column', 'Non-empty', 'Missing/blank'], column_rows))
+        if any(uncalc_counts):
+            for i, r in enumerate(column_rows):
+                r.append(uncalc_counts[i])
+            block.append(md_table(['#', 'Column', 'Non-empty', 'Missing/blank', 'Uncalculated formulas'], column_rows))
+        else:
+            block.append(md_table(['#', 'Column', 'Non-empty', 'Missing/blank'], column_rows))
         block.append('')
 
         if numeric_summary:
             block.append('### Numeric Summary')
             block.append('')
             block.append(md_table(['Column', 'Count', 'Sum', 'Min', 'Max', 'Average'], [
-                [n['column'], n['count'], n['sum'], n['min'], n['max'], n['average']]
+                [n['column'], n['count'],
+                 n['sum'] if n['complete'] else f"INCOMPLETE ({n['sum']} known; {n['uncalculated_formula_cells']} uncalculated formula cells)",
+                 n['min'], n['max'], n['average'] if n['complete'] else 'INCOMPLETE']
                 for n in numeric_summary
             ]))
             block.append('')
@@ -276,10 +362,12 @@ def main():
             'numeric_columns': numeric_summary,
         })
 
-    try:
-        wb.close()
-    except Exception:
-        pass
+    for book in (wb, wbf):
+        try:
+            if book is not None:
+                book.close()
+        except Exception:
+            pass
 
     docs_dir.mkdir(parents=True, exist_ok=True)
     report_name = safe_name(target.stem) + '_report.md'

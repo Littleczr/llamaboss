@@ -76,6 +76,75 @@ def md_escape_line(s):
     return s.replace('\x00', '')
 
 
+FF_RADIO = 1 << 15
+MAX_FORM_FIELDS = 500
+
+
+def _plain(v):
+    if v is None:
+        return None
+    s = str(v)
+    return s[1:] if s.startswith('/') else s
+
+
+def describe_field_value(field):
+    """Human/model-readable value for one AcroForm field."""
+    ft = str(field.get('/FT') or '')
+    v = field.get('/V')
+    if ft == '/Btn':
+        try:
+            ff = int(field.get('/Ff') or 0)
+        except Exception:
+            ff = 0
+        state = _plain(v)
+        if ff & FF_RADIO:
+            return ('radio', 'nothing selected' if state in (None, '', 'Off') else f'selected: {state}',
+                    state not in (None, '', 'Off'))
+        if state in (None, '', 'Off'):
+            return ('checkbox', 'unchecked', False)
+        return ('checkbox', f'checked ({state})', True)
+    if ft == '/Sig':
+        return ('signature', 'signed' if v is not None else 'not signed', v is not None)
+    if ft == '/Ch':
+        if isinstance(v, (list, tuple)):
+            vals = [_plain(x) or '' for x in v]
+            return ('choice', ', '.join(vals) if vals else '(empty)', bool(vals))
+        txt = _plain(v)
+        return ('choice', txt if txt else '(empty)', bool(txt))
+    txt = '' if v is None else str(v)
+    return ('text', txt if txt.strip() else '(empty)', bool(txt.strip()))
+
+
+def collect_form_fields(reader, warnings):
+    """Interactive form values live in the AcroForm, not in page text, so
+    page.extract_text() never sees what was typed into a filled form."""
+    try:
+        getter = getattr(reader, 'get_fields', None) or getattr(reader, 'getFields', None)
+        fields = getter() if getter else None
+    except Exception as ex:
+        warnings.append('Could not read form fields: ' + str(ex))
+        return []
+    if not fields:
+        return []
+    out = []
+    for name, field in fields.items():
+        try:
+            if not hasattr(field, 'get'):
+                continue
+            ft = field.get('/FT')
+            if ft is None and field.get('/V') is None:
+                continue  # non-terminal parent node
+            kind, text, filled = describe_field_value(field)
+        except Exception:
+            continue
+        text = text.replace('\r\n', '\n').replace('\r', '\n').replace('\x00', '')
+        out.append({'name': str(name), 'type': kind, 'value': text, 'filled': filled})
+        if len(out) >= MAX_FORM_FIELDS:
+            warnings.append(f'Only the first {MAX_FORM_FIELDS} form fields are listed.')
+            break
+    return out
+
+
 def main():
     if len(sys.argv) != 3:
         emit({'ok': False, 'helper': 'pdf_extract_text', 'error': 'pdf_extract_text expects exactly two internal arguments: input path and fixed output directory'}, 2)
@@ -137,7 +206,15 @@ def main():
     nonempty_pages = sum(1 for _, text in pages_text if text.strip())
     extracted_chars = sum(len(text) for _, text in pages_text)
 
-    if extracted_chars == 0:
+    form_fields = collect_form_fields(reader, warnings)
+    filled_fields = sum(1 for f in form_fields if f['filled'])
+    if form_fields:
+        warnings.append(
+            f'This PDF has {len(form_fields)} interactive form field(s) ({filled_fields} filled). '
+            'Their values are NOT part of the page text; they are listed in the "Form fields" section '
+            'and form_fields. Use those values when answering about what was entered in the form.')
+
+    if extracted_chars == 0 and not filled_fields:
         emit({
             'ok': False,
             'helper': 'pdf_extract_text',
@@ -180,6 +257,18 @@ def main():
             out.append('[No extractable text on this page]')
         out.append('')
 
+    if form_fields:
+        out.append('## Form fields')
+        out.append('')
+        out.append('Values entered in the interactive form (not part of the page text above).')
+        out.append('')
+        out.append('| Field | Type | Value |')
+        out.append('| --- | --- | --- |')
+        for f in form_fields:
+            cell = lambda s: s.replace('|', '\\|').replace('\n', '<br>')
+            out.append(f"| {cell(f['name'])} | {f['type']} | {cell(f['value'])} |")
+        out.append('')
+
     if warnings:
         out.append('## Warnings')
         out.append('')
@@ -204,6 +293,9 @@ def main():
         'pages_with_text': nonempty_pages,
         'extracted_char_count': extracted_chars,
         'extractor_module': extractor_module,
+        'form_field_count': len(form_fields),
+        'form_fields_filled': filled_fields,
+        'form_fields': form_fields[:100],
         'warnings': warnings,
     })
 

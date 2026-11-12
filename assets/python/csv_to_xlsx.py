@@ -1,5 +1,6 @@
 
 import csv
+import io
 import json
 import re
 import site
@@ -91,12 +92,19 @@ def maybe_number(value):
         digits = plain[1:] if plain[:1] in '+-' else plain
         if len(digits) > 1 and digits.startswith('0'):
             return s
+        # Excel numbers hold 15 significant digits; longer digit strings are
+        # account/reference IDs and would lose digits as numbers.
+        if len(digits.lstrip('0')) > 15:
+            return s
         try:
             return int(plain)
         except Exception:
             return s
 
     if re.fullmatch(r'[+-]?(\d+\.\d*|\.\d+)([eE][+-]?\d+)?', plain) or re.fullmatch(r'[+-]?\d+[eE][+-]?\d+', plain):
+        mantissa = re.split(r'[eE]', plain)[0]
+        if len(re.sub(r'\D', '', mantissa).lstrip('0')) > 15:
+            return s
         try:
             return float(plain)
         except Exception:
@@ -156,7 +164,9 @@ def main():
     max_rows = 100000
     max_excel_cols = 16384
     try:
-        reader = csv.reader(text.splitlines(), delimiter=delimiter)
+        # newline='' lets the csv module see the real line endings, so a
+        # quoted field containing a newline keeps it (splitlines() dropped it).
+        reader = csv.reader(io.StringIO(text, newline=''), delimiter=delimiter)
         for row in reader:
             if len(row) > max_excel_cols:
                 emit({'ok': False, 'helper': 'csv_to_xlsx', 'error': 'CSV has more columns than Excel supports', 'columns': len(row), 'excel_max_columns': max_excel_cols}, 9)
@@ -175,15 +185,27 @@ def main():
     ws.title = 'Data'
 
     max_widths = []
+    literal_formulas = 0
     for r_idx, row in enumerate(rows, start=1):
         for c_idx, value in enumerate(row, start=1):
+            if isinstance(value, str) and '\r' in value:
+                # Excel line breaks inside a cell are LF; normalize CRLF/CR.
+                value = value.replace('\r\n', '\n').replace('\r', '\n')
             converted = maybe_number(value)
-            ws.cell(row=r_idx, column=c_idx, value=converted)
+            cell = ws.cell(row=r_idx, column=c_idx, value=converted)
+            if cell.data_type == 'f':
+                # CSV content is data, never an executable formula.  Keep the
+                # exact text as a literal string cell.
+                cell.data_type = 's'
+                literal_formulas += 1
             text_len = len(str(value)) if value is not None else 0
             if c_idx > len(max_widths):
                 max_widths.append(text_len)
             else:
                 max_widths[c_idx - 1] = max(max_widths[c_idx - 1], text_len)
+
+    if literal_formulas:
+        warnings.append(f'{literal_formulas} cell(s) starting with "=" were kept as literal text, not formulas.')
 
     if rows:
         for cell in ws[1]:

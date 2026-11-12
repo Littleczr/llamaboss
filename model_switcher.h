@@ -67,6 +67,13 @@ public:
     void OnModelPillClick(wxWindow* popupParent);
     void OnModelPillRightClick(wxWindow* parent);
 
+    // ── Eject (free VRAM) ────────────────────────────────────────
+    // Stops the local llama-server unless a reply is streaming (this or
+    // another window) or a model is loading; then returns false with a
+    // user-facing reason.  The next Send reloads the model.  Used by the
+    // Manage Models Eject button and the project strip's eject icon.
+    bool TryEjectLocalModel(std::string& why);
+
     // ── Core switch ──────────────────────────────────────────────
     void SwitchToModel(const std::string& newModel);
 
