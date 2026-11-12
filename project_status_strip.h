@@ -7,6 +7,9 @@
 //   ─ Project: <name> · N sources · M workflows  [ Project v ]  [ Skills v ] ─
 //   ─ [ Project v ]  [ Skills v ] ─
 //
+// An eject icon sits at the right end while a local model is loaded
+// (SetEjectVisible); clicking it unloads the model to free VRAM.
+//
 // The strip never reads ChatHistory / ProjectManager itself.  The frame
 // computes the current State and pushes it via Refresh().  Affordances
 // route back to the frame through the Callbacks.
@@ -45,6 +48,10 @@ public:
         // so the frame can show the same popup actions with Skill actions
         // prioritized at the top.
         std::function<void(wxWindow* anchor)> onSkillMenuRequested;
+
+        // Fired when the user clicks the eject icon (right end).  The
+        // frame decides whether ejecting is allowed right now.
+        std::function<void()> onEjectRequested;
     };
 
     ProjectStatusStrip(wxWindow* parent,
@@ -57,6 +64,9 @@ public:
 
     // ── State updates ───────────────────────────────────────────────
     void Refresh(const State& state);
+
+    // Show the eject icon only while a local model is loaded.
+    void SetEjectVisible(bool visible);
 
     // ── Theming ─────────────────────────────────────────────────────
     void ApplyTheme(const ThemeData& theme);
@@ -75,6 +85,7 @@ private:
     wxStaticText* m_stateLabel       = nullptr;  // project state text
     wxStaticText* m_actionLabel      = nullptr;  // project action ([ Change... ] / [ + Load Project... ])
     wxStaticText* m_skillActionLabel = nullptr;  // shortcut ([ + New Skill ])
+    wxButton*     m_ejectButton      = nullptr;  // right-end icon (unload model)
     wxPanel*      m_separator       = nullptr;  // 1px bottom border
 
     // Current rendered state

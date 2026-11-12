@@ -15,6 +15,7 @@
 #include "lb_ascii.h"
 
 #include "command_policy.h"
+#include "secret_access_guard.h"
 #include "lb_string_utils.h"   // LbUtf8SafeTruncate
 #include "tool_block.h"
 #include "tool_context.h"
@@ -663,6 +664,13 @@ inline bool RequiresApproval(const ToolInvocation& inv,
 {
     out = ApprovalDecision{};
     if (!inv.valid) return false;
+
+    // Calls that read stored credentials never get a card: dispatch
+    // rejects them outright (tool_dispatcher.cpp), so a card would only
+    // invite the user to approve something that cannot run.
+    if (ToolArgsMayReadSecrets(inv.name) &&
+        !DetectSecretStoreAccess(inv.args).empty())
+        return false;
 
     // ── Conditional PowerShell gate ─────────────────────────────
     // Read-only allowlisted commands run immediately.  Broader shell

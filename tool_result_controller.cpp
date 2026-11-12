@@ -21,8 +21,6 @@
 #include "tool_router.h"       // registry-backed helper presentation metadata
 #include "presented_file.h"
 #include "var_store.h"
-#include "artifact_presentation.h"
-#include "python_package_recovery.h"
 
 namespace {
 
@@ -66,6 +64,24 @@ void ToolResultController::FinishToolTurn()
     if (m_cb.setStreamingState) m_cb.setStreamingState(false);
     if (!m_chatHistory->IsEmpty())
         m_convController.AutoSaveConversation();
+}
+
+void ToolResultController::DropUnclaimedResult(const std::string& toolName)
+{
+    // Typed commands are synchronous, so every async result here belongs to
+    // an agent turn.  One the loop did not claim (it ended, or was waiting
+    // on a different tool) is not persisted as a free-standing message.
+    const ToolSpec* spec = GetGlobalRouter().Find(toolName);
+    const std::string label = spec && !spec->displayName.empty()
+        ? spec->displayName
+        : (toolName.empty() ? std::string("A tool") : toolName);
+    m_chatDisplay->DisplaySystemMessage(
+        label + " finished after its agent turn ended; the result was not "
+        "added to the chat.");
+
+    // A still-active loop owns the busy state; leave it alone.
+    if (m_agentController.IsActive()) return;
+    FinishToolTurn();
 }
 
 void ToolResultController::RenderAndPersistSlashResult(const ToolInvocationResult& r)
@@ -139,19 +155,7 @@ void ToolResultController::OnToolWorkerComplete(wxCommandEvent& evt)
         return;
     }
 
-    // Slash-command worker result.  The worker preserves the normal
-    // Completed/Invalid ToolInvocationResult shape, so rendering and history
-    // persistence stay identical to the old inline path.  File operations
-    // are not generally interruptible after their commit point; when Stop was
-    // requested, say so without discarding a result that may have succeeded.
-    ToolInvocationResult result = workerResult.outcome.result;
-    if (workerResult.cancelled &&
-        std::find(result.chips.begin(), result.chips.end(), "stop requested") ==
-            result.chips.end()) {
-        result.chips.push_back("stop requested");
-    }
-    RenderAndPersistSlashResult(result);
-    FinishToolTurn();
+    DropUnclaimedResult(workerResult.toolName);
 }
 
 void ToolResultController::OnWaitComplete(wxCommandEvent& evt)
@@ -212,48 +216,7 @@ void ToolResultController::OnCmdComplete(wxCommandEvent& evt)
         if (consumed) return;
     }
 
-    // ── Slash arm ────────────────────────────────────────────────
-    // Build the same ToolInvocationResult shape the agent's
-    // HandleCmdComplete builds, then render + persist via the
-    // shared helper.  Chip ordering is [status, elapsed]
-    // consistently across display, history, and the agent path.
-    ToolInvocationResult tir;
-    tir.toolTag       = tool_names::kPowerShell;
-    tir.invocationRaw.clear();
-    tir.iconUtf8      = "\xE2\x9A\x99";       // ⚙
-    tir.toolName      = "PowerShell";
-    tir.commandEcho   = r.command;
-    tir.body          = r.stdoutText;
-    tir.errorBody     = r.stderrText;
-    tir.bodyLang      = "powershell";
-    tir.presentedFiles = r.presentedFiles;
-
-    // Status chip (cancelled / timed out / exit N) — mutually
-    // exclusive — followed by elapsed, then truncated if any.
-    if (r.cancelled) {
-        tir.chips.push_back("cancelled");
-    } else if (r.timedOut) {
-        tir.chips.push_back("timed out");
-    } else {
-        std::ostringstream ec;
-        ec << "exit " << r.exitCode;
-        tir.chips.push_back(ec.str());
-    }
-    {
-        std::ostringstream ts;
-        ts << std::fixed;
-        ts.precision(r.elapsedSec < 10.0 ? 2 : 1);
-        ts << r.elapsedSec << "s";
-        tir.chips.push_back(ts.str());
-    }
-    if (r.truncated) tir.chips.push_back("truncated");
-    if (r.descendantsTerminated)
-        tir.chips.push_back(r.buildHelpersCleaned
-            ? "build helpers cleaned" : "background stopped");
-
-    RenderAndPersistSlashResult(tir);
-
-    FinishToolTurn();
+    DropUnclaimedResult(tool_names::kPowerShell);
 }
 
 void ToolResultController::OnCmdError(wxCommandEvent& evt)
@@ -295,153 +258,17 @@ void ToolResultController::OnPythonComplete(wxCommandEvent& evt)
     }
     const PythonRunResult& r = data->GetResult();
 
-    auto TryReadSmallTextFile = [](const std::string& path,
-                                   size_t             maxBytes,
-                                   std::string&       out,
-                                   size_t&            sizeOut) -> bool {
-        out.clear();
-        sizeOut = 0;
-
-#ifdef __WXMSW__
-        std::ifstream file(
-            std::filesystem::path(wxString::FromUTF8(path).ToStdWstring()),
-            std::ios::binary | std::ios::ate);
-#else
-        std::ifstream file(std::filesystem::path(path),
-                           std::ios::binary | std::ios::ate);
-#endif
-        if (!file) return false;
-
-        std::streampos end = file.tellg();
-        if (end == std::streampos(-1)) return false;
-
-        sizeOut = static_cast<size_t>(end);
-        if (sizeOut > maxBytes) return false;
-
-        file.seekg(0, std::ios::beg);
-        std::ostringstream buffer;
-        buffer << file.rdbuf();
-        out = buffer.str();
-        return true;
-    };
-
     if (m_agentController.IsActive()) {
         bool consumed = m_agentController.HandlePythonComplete(r);
         if (consumed) return;
     }
 
-    // PythonRunner carries the canonical helper id. Resolve presentation from
-    // the same ToolSpec registry used by AgentController instead of maintaining
-    // a second helper-name ternary ladder. The old ladder omitted zip_inspect
-    // and zip_extract, so direct slash invocations were rendered and persisted
-    // as Python Health despite carrying ZIP output.
-    std::string helperTag = !r.helperName.empty() ? r.helperName : r.toolName;
-    const ToolSpec* helperSpec = GetGlobalRouter().Find(helperTag);
-    if (!helperSpec) {
-        helperTag = tool_names::kPythonHealth;
-        helperSpec = GetGlobalRouter().Find(helperTag);
-    }
-
-    const bool isPdf        = helperTag == tool_names::kPdfExtractText;
-    const bool isRun        = helperTag == tool_names::kPythonRunScript;
-    const bool isInstall    = helperTag == tool_names::kPythonInstallPackage;
-
-    ToolInvocationResult tir;
-    tir.toolTag       = helperTag;
-    tir.invocationRaw.clear();
-    tir.iconUtf8      = helperSpec && !helperSpec->iconUtf8.empty()
-                         ? helperSpec->iconUtf8
-                         : std::string("\xF0\x9F\x90\x8D");       // 🐍
-    tir.toolName      = helperSpec && !helperSpec->displayName.empty()
-                         ? helperSpec->displayName
-                         : std::string("Python Health");
-    tir.commandEcho   = r.commandEcho.empty()
-                            ? helperTag
-                            : r.commandEcho;
-    tir.body          = r.stdoutText;
-    tir.errorBody     = r.stderrText;
-    tir.bodyLang      = (isRun || isInstall) ? std::string() : std::string("json");
-    tir.presentedFiles = r.presentedFiles;
-    if (isRun && r.exitCode == 0 && !r.cancelled && !r.timedOut) {
-        ApplyArtifactPresentation(tir);
-    }
-    ApplyMissingPythonPackageRecovery(tir, r);
-    ApplyPythonHttpBlockedHint(tir, r);
-
-    if (r.cancelled) {
-        tir.chips.push_back("cancelled");
-    } else if (r.timedOut) {
-        tir.chips.push_back("timed out");
-    } else {
-        std::ostringstream ec;
-        ec << "exit " << r.exitCode;
-        tir.chips.push_back(ec.str());
-    }
-    {
-        std::ostringstream ts;
-        ts << std::fixed;
-        ts.precision(r.elapsedSec < 10.0 ? 2 : 1);
-        ts << r.elapsedSec << "s";
-        tir.chips.push_back(ts.str());
-    }
-    if (!r.pythonCommand.empty()) tir.chips.push_back(r.pythonCommand);
-    if (r.truncated) tir.chips.push_back("truncated");
-    if (!r.connectionsPassed.empty()) {
-        std::string keys = "keys: ";
-        for (size_t i = 0; i < r.connectionsPassed.size(); ++i)
-            keys += (i ? ", " : "") + r.connectionsPassed[i];
-        tir.chips.push_back(keys);
-    }
-
-    // PDF UX polish: card-first policy.  The artifact chip is always
-    // the primary affordance for tool-produced files; for small
-    // extractions we ALSO surface the Markdown body inline as a
-    // courtesy preview, but the [Open] / [Save As] / [Open Folder]
-    // card stays.  Large extractions get a short explanation in the
-    // body and rely on the card alone.  This also generalizes
-    // cleanly to binary-output tools (e.g. pdf_fill_form) where
-    // there is no inline-able body at all.
-    if (isPdf && r.exitCode == 0 && !r.presentedFiles.empty()) {
-        constexpr size_t kMaxInlinePdfMarkdownBytes = 32 * 1024;
-
-        std::string inlineMarkdown;
-        size_t inlineBytes = 0;
-        const std::string artifactPath = r.presentedFiles.front().diskPath;
-
-        if (TryReadSmallTextFile(artifactPath,
-                                 kMaxInlinePdfMarkdownBytes,
-                                 inlineMarkdown,
-                                 inlineBytes)) {
-            tir.body = inlineMarkdown;
-            tir.errorBody.clear();
-            tir.bodyLang = "markdown";
-            // presentedFiles intentionally retained -- card is the
-            // primary deliverable.  No "inline" chip; card + inline
-            // body is now the default success shape.
-        } else if (inlineBytes > kMaxInlinePdfMarkdownBytes) {
-            std::ostringstream msg;
-            msg << "PDF text was extracted successfully, but the extracted "
-                   "Markdown is too large to show inline.\n\n"
-                << "Extracted Markdown size: " << inlineBytes << " bytes\n"
-                << "Inline display limit: " << kMaxInlinePdfMarkdownBytes
-                << " bytes\n\n"
-                << "Use the file chip above to save or open the extracted Markdown.";
-            tir.body = msg.str();
-            tir.errorBody.clear();
-            tir.bodyLang.clear();
-        }
-    }
-
-    RenderAndPersistSlashResult(tir);
-
-    FinishToolTurn();
+    DropUnclaimedResult(!r.helperName.empty() ? r.helperName : r.toolName);
 }
 
 // ── persistent Python session completion (RLM step 2, S2) ────────
 // Same shape as OnPythonComplete: claim payload, bail if closing,
-// offer the result to the agent loop, otherwise render + persist a
-// slash tool card.  Card parts come from BuildPySessionCardParts so
-// this rendering and the agent's can never drift.
+// offer the result to the agent loop.
 void ToolResultController::OnPySessionComplete(wxCommandEvent& evt)
 {
     // Payload ownership -- claim before any early return.
@@ -462,19 +289,7 @@ void ToolResultController::OnPySessionComplete(wxCommandEvent& evt)
         if (consumed) return;
     }
 
-    ToolInvocationResult tir;
-    tir.toolTag     = tool_names::kPy;
-    tir.invocationRaw.clear();
-    tir.iconUtf8    = "\xF0\x9F\x90\x8D";   // 🐍
-    tir.toolName    = "Python Session";
-    tir.commandEcho = r.commandEcho.empty() ? std::string("/py")
-                                            : r.commandEcho;
-    tir.bodyLang.clear();
-    BuildPySessionCardParts(r, tir.body, tir.errorBody, tir.chips);
-
-    RenderAndPersistSlashResult(tir);
-
-    FinishToolTurn();
+    DropUnclaimedResult(tool_names::kPy);
 }
 
 void ToolResultController::OnPythonError(wxCommandEvent& evt)
@@ -523,70 +338,9 @@ void ToolResultController::OnGrepComplete(wxCommandEvent& evt)
     if (m_agentController.IsActive()) {
         bool consumed = m_agentController.HandleGrepComplete(r);
         if (consumed) return;
-        // Fall through only if controller declined (shouldn't
-        // happen in practice since grep only runs via agent or
-        // /grep, never both simultaneously — but defensive).
     }
 
-    // ── Slash arm ────────────────────────────────────────────────
-    // Build a ToolInvocationResult from GrepResult, then render
-    // + persist via the shared helper.  Same shape the agent's
-    // HandleGrepComplete uses (minus the toolCallId threading).
-    ToolInvocationResult tir;
-    tir.toolTag       = tool_names::kGrep;
-    tir.invocationRaw.clear();
-    tir.iconUtf8      = "\xF0\x9F\x94\x8D";   // 🔍
-    tir.toolName      = "Grep";
-    tir.commandEcho   = r.commandEcho;
-    tir.chips         = r.chips;
-    tir.body          = r.body;
-    tir.errorBody     = r.errorBody;
-    tir.bodyLang      = r.bodyLang;
-
-    RenderAndPersistSlashResult(tir);
-
-    FinishToolTurn();
-}
-
-ToolInvocationResult
-ToolResultController::MakeWebFetchToolInvocationResult(const WebFetchResult& r)
-{
-    ToolInvocationResult tir;
-    tir.toolTag       = tool_names::kWebFetchUrl;
-    tir.invocationRaw.clear();
-    tir.iconUtf8      = "\xF0\x9F\x8C\x90";
-    tir.toolName      = "Web Page Inspect";
-    tir.commandEcho   = r.commandEcho;
-    tir.chips         = r.chips;
-    tir.body          = r.body;
-    tir.errorBody     = r.errorBody;
-    tir.bodyLang      = r.bodyLang;
-
-    if (!r.textPath.empty()) {
-        PresentedFile textFile;
-        textFile.displayName = r.textDisplayName.empty()
-            ? std::string("webpage_text.md")
-            : r.textDisplayName;
-        textFile.language  = "markdown";
-        textFile.diskPath  = r.textPath;
-        textFile.sizeBytes = r.textBytes;
-        textFile.lineCount = r.textLineCount;
-        tir.presentedFiles.push_back(std::move(textFile));
-    }
-
-    if (!r.rawHtmlPath.empty()) {
-        PresentedFile htmlFile;
-        htmlFile.displayName = r.rawHtmlDisplayName.empty()
-            ? std::string("webpage_raw.html")
-            : r.rawHtmlDisplayName;
-        htmlFile.language  = "html";
-        htmlFile.diskPath  = r.rawHtmlPath;
-        htmlFile.sizeBytes = r.htmlBytes;
-        htmlFile.lineCount = 0;
-        tir.presentedFiles.push_back(std::move(htmlFile));
-    }
-
-    return tir;
+    DropUnclaimedResult(tool_names::kGrep);
 }
 
 void ToolResultController::OnWebFetchComplete(wxCommandEvent& evt)
@@ -611,10 +365,7 @@ void ToolResultController::OnWebFetchComplete(wxCommandEvent& evt)
         if (consumed) return;
     }
 
-    ToolInvocationResult tir = MakeWebFetchToolInvocationResult(r);
-    RenderAndPersistSlashResult(tir);
-
-    FinishToolTurn();
+    DropUnclaimedResult(tool_names::kWebFetchUrl);
 }
 
 void ToolResultController::OnWebFetchError(wxCommandEvent& evt)

@@ -31,6 +31,11 @@
 #include <wx/display.h>
 #include <wx/timer.h>
 #include <wx/clipbrd.h>
+#include <wx/renderer.h>     // crisp check box on the highlighted model row
+#ifdef __WXMSW__
+#include <wx/msw/dc.h>       // wxDCTemp
+#endif
+#include "lb_scroll_rail.h"  // slim themed scrollbar for the connection pane
 
 #include <Poco/Net/HTTPMessage.h>
 
@@ -109,6 +114,49 @@ wxPanel* MakeHairline(wxWindow* parent, const ThemeData& t)
     line->SetBackgroundColour(t.borderSubtle);
     return line;
 }
+
+// Model checklist.  wxWidgets blends the check box of the HIGHLIGHTED row
+// 50% with the selection colour (ILD_SELECTED in wxDrawStateBitmap), so
+// a ticked model looked unticked exactly on the row being edited.  After
+// the stock row is drawn, the box is painted again at full strength in
+// the same spot.  Everything else about the control is unchanged.
+class LbModelCheckList : public wxCheckListBox
+{
+public:
+    LbModelCheckList(wxWindow* parent, wxWindowID id, const wxSize& size)
+        : wxCheckListBox(parent, id, wxDefaultPosition, size) {}
+
+#ifdef __WXMSW__
+    bool MSWOnDraw(WXDRAWITEMSTRUCT* item) override
+    {
+        if (!wxCheckListBox::MSWOnDraw(item)) return false;
+
+        const DRAWITEMSTRUCT* ds = reinterpret_cast<const DRAWITEMSTRUCT*>(item);
+        if (ds->itemID == static_cast<UINT>(-1) || !(ds->itemState & ODS_SELECTED))
+            return true;
+        if (ds->itemID >= GetCount()) return true;
+
+        // Same geometry as wxCheckListBoxItem::OnDrawItem: 1 px in from
+        // the left edge, centred vertically in the row.
+        const wxSize box = wxRendererNative::Get().GetCheckBoxSize(this);
+        const int rowH = ds->rcItem.bottom - ds->rcItem.top;
+        const wxRect where(ds->rcItem.left + 1,
+                           ds->rcItem.top + (rowH - box.GetHeight()) / 2,
+                           box.GetWidth(), box.GetHeight());
+        int flags = wxCONTROL_FLAT;
+        if (IsChecked(ds->itemID)) flags |= wxCONTROL_CHECKED;
+
+        wxDCTemp dc(static_cast<WXHDC>(ds->hDC));
+        wxRendererNative::Get().DrawCheckBox(this, dc, where, flags);
+        return true;
+    }
+#endif
+};
+
+// Footer line for the Local server tab.  The tab scans by itself, so the
+// generic "Connect to check the connection..." line contradicted it.
+const char* const kLocalFooterHint =
+    "Pick a server, or type its address and press Connect.";
 
 // Status-line glyph prefixes (UTF-8 check mark / ballot x).
 const std::string kCheck = "\xE2\x9C\x93 ";
@@ -681,8 +729,17 @@ FetchModelsResult FetchModelIds(
                     out.names.push_back(name.empty() ? PrettyNameFromId(slug) : name);
                 } catch (...) { /* non-string fields: skip the entry */ }
             }
-            out.ok = true;
-            return out;
+            // llama-server answers BOTH shapes in one body: an Ollama-style
+            // {"models":[{name,model,...}]} whose entries carry neither
+            // slug nor id, plus the standard {"data":[{id,...}]}.  Every
+            // "models" entry is skipped above, so returning here showed an
+            // empty model list for a local server.  Only stop when this
+            // branch found something or there is no "data" array to read.
+            if (!out.ids.empty() || !rootObj->getArray("data")) {
+                out.ok = true;
+                return out;
+            }
+            out.names.clear();
         }
         Poco::JSON::Array::Ptr data = rootObj->getArray("data");
         if (!data) {
@@ -799,8 +856,11 @@ wxDEFINE_EVENT(wxEVT_EP_LOCAL_SCAN_DONE, wxThreadEvent);
 // Ports used by common OpenAI-compatible servers.  LlamaBoss's own
 // llama-server (8384 by default) is deliberately absent: it is already
 // the local lane in the model picker.
-constexpr int kLocalScanPorts[] = { 8080, 8081, 1234, 1919, 8000, 11434 };
-const char* const kLocalScanPortsText = "8080, 8081, 1234, 1919, 8000 and 11434";
+// 8080-8090: servers that run several configs side by side (Strata Daily /
+// Deep / IQ3_S Deep on 8082-8085) step up from 8080.
+constexpr int kLocalScanPorts[] = { 8080, 8081, 8082, 8083, 8084, 8085, 8086, 8087, 8088,
+                                    8089, 8090, 1234, 1919, 8000, 11434 };
+const char* const kLocalScanPortsText = "8080-8090, 1234, 1919, 8000 and 11434";
 
 std::string LocalServerName(int port, const std::string& ownedBy)
 {
@@ -1143,6 +1203,7 @@ public:
         : wxDialog(parent, wxID_ANY, title,
                    wxDefaultPosition, wxDefaultSize,
                    wxDEFAULT_DIALOG_STYLE | wxRESIZE_BORDER)
+        , m_addTitle(title)
         , m_isNew(isNew)
         , m_editMode(!isNew)
         , m_theme(&theme)
@@ -1191,7 +1252,8 @@ public:
         // ── Body: connection | models ────────────────────────────
         auto* body = new wxBoxSizer(wxHORIZONTAL);
         BuildLeftPane(seed, theme);
-        body->Add(m_leftPane, 0, wxEXPAND);
+        body->Add(m_leftClip, 0, wxEXPAND);
+        body->Add(m_leftRail, 0, wxEXPAND);
         auto* divider = new wxPanel(this, wxID_ANY, wxDefaultPosition, wxSize(1, -1));
         divider->SetBackgroundColour(theme.borderSubtle);
         body->Add(divider, 0, wxEXPAND);
@@ -1258,6 +1320,10 @@ public:
             // The catalog is keyed on the base URL: editing it orphans
             // any in-flight fetch and any scanned-server selection.
             for (auto* rb : m_scanRadios) rb->SetValue(false);
+            // The "Nothing is listening on port N" callout and its 5 s
+            // re-check belong to the old address; Refresh shows it again
+            // if the new one doesn't answer either.
+            HideRetry();
             InvalidateFetch();
             UpdateResolvedUrl();
         });
@@ -1333,7 +1399,10 @@ public:
         UpdateResolvedUrl();
         UpdateAdvancedSummary();
         UpdateKeyCard();
-        SetFetchStatus(m_editMode ? std::string() : std::string("Connect to check the connection and load models."));
+        SetFetchStatus(m_editMode ? std::string()
+                     : IsLocal() ? std::string(kLocalFooterHint)
+                     : std::string("Connect to check the connection and load models."));
+        UpdateTitle();
         RefreshModelChecklist();
         if (m_preset == kPresetCustom && m_isNew) m_advancedPane->Expand();
 
@@ -1423,10 +1492,30 @@ private:
 
     void BuildLeftPane(const EndpointStore::Endpoint& seed, const ThemeData& theme)
     {
-        auto* left = new wxScrolledWindow(this, wxID_ANY, wxDefaultPosition, wxSize(FromDIP(350), -1));
+        // The native scrollbar (a bright bar once Advanced is open) is
+        // pushed outside this clip panel and replaced by the same slim
+        // themed rail the sidebar uses (lb_scroll_rail.h).  Scrolling
+        // itself is still the native window.
+        m_leftClip = new wxPanel(this, wxID_ANY, wxDefaultPosition, wxSize(FromDIP(350), -1));
+        m_leftClip->SetMinSize(wxSize(FromDIP(350), -1));
+        m_leftClip->SetBackgroundColour(theme.bgDialogSurface);
+        auto* left = new wxScrolledWindow(m_leftClip, wxID_ANY, wxDefaultPosition,
+                                          wxDefaultSize, wxVSCROLL);
+        left->SetBackgroundColour(theme.bgDialogSurface);
         left->SetScrollRate(0, FromDIP(12));
-        left->SetMinSize(wxSize(FromDIP(350), -1));
         m_leftPane = left;
+        m_leftRail = new LbScrollRail(this, m_leftClip, left,
+            [this]() -> const ThemeData& { return *m_theme; });
+        m_leftRail->SetBackgroundSlot(&ThemeData::bgDialogSurface);
+        // The dialog sizer now sizes the clip, not the pane.  A sizer
+        // forces a size event on its windows at every Layout()
+        // (wxSIZE_FORCE_EVENT), and that event is what re-ran the pane's
+        // own layout after its content changed (scan results, key card,
+        // Advanced).  Pass it on so the pane keeps getting it.
+        m_leftClip->Bind(wxEVT_SIZE, [this](wxSizeEvent& e) {
+            e.Skip();
+            if (m_leftPane) m_leftPane->SendSizeEvent();
+        });
         const int wrap = FromDIP(310);
         auto* L = new wxBoxSizer(wxVERTICAL);
 
@@ -1677,7 +1766,7 @@ private:
         searchRow->Add(m_fetchBtn, 0);
         R->Add(searchRow, 0, wxEXPAND | wxBOTTOM, FromDIP(8));
 
-        m_modelList = new wxCheckListBox(right, wxID_ANY, wxDefaultPosition, FromDIP(wxSize(-1, 150)));
+        m_modelList = new LbModelCheckList(right, wxID_ANY, FromDIP(wxSize(-1, 150)));
         R->Add(m_modelList, 1, wxEXPAND);
         m_modelsField = new wxTextCtrl(right, wxID_ANY, ModelsToText(seed.models),
             wxDefaultPosition, FromDIP(wxSize(-1, 150)), wxTE_MULTILINE | wxHSCROLL);
@@ -1758,11 +1847,18 @@ private:
         m_finishBtn->SetForegroundColour(t.accentButtonText);
         m_chatgptSignInBtn->SetBackgroundColour(t.accentButton);
         m_chatgptSignInBtn->SetForegroundColour(t.accentButtonText);
-        for (wxButton* b : { m_cancelBtn, m_statusDetails, m_chatgptSignOutBtn, m_scanBtn,
-                             m_rawToggleBtn, m_manualModelsBtn }) {
+        for (wxButton* b : { m_cancelBtn, m_chatgptSignOutBtn }) {
             b->SetBackgroundColour(t.bgDialogSurface);
             b->SetForegroundColour(t.textMuted);
         }
+        // Text-only actions sitting among labels: bold accent text, the
+        // same cue as "Replace key", so they read as clickable.
+        for (wxButton* b : { m_statusDetails, m_scanBtn, m_rawToggleBtn, m_manualModelsBtn }) {
+            b->SetBackgroundColour(t.bgDialogSurface);
+            b->SetForegroundColour(t.accentButton);
+            b->SetCursor(wxCursor(wxCURSOR_HAND));
+        }
+        m_replaceKeyBtn->SetCursor(wxCursor(wxCURSOR_HAND));
         for (wxButton* b : { m_saveBtn, m_fetchBtn, m_testBtn, m_getKeyBtn }) {
             b->SetBackgroundColour(t.bgInputField);
             b->SetForegroundColour(t.textPrimary);
@@ -1876,15 +1972,63 @@ private:
         m_scanResults.clear();
         RebuildScanList();
         LoadEndpointFields(p, configured != nullptr);
-        SetModelStatus(preset == kPresetLocal ? "Models show up here once a server answers."
-                     : preset == kPresetChatGpt ? "Sign in to load your ChatGPT models."
-                     : "Connect to load the model catalog.", StatusTone::Neutral);
+
+        // A provider that is already saved and has what it needs (a key,
+        // a sign-in, or no key at all) behaves like Edit: its catalog is
+        // refreshed straight away, which doubles as the credential check.
+        // Before this the list showed the saved models under "Connect to
+        // load the model catalog" with a Connect button, as if nothing
+        // had been set up.
+        const bool saved = configured != nullptr && preset != kPresetLocal;
+        const bool savedAndUsable = saved &&
+            (IsChatGpt() ? ChatGptSignedIn()
+                         : (UsingNoAuth() || !EffectiveApiKey().empty()));
+        if (savedAndUsable) {
+            SetModelStatus(IsChatGpt() ? "Loading your ChatGPT models..."
+                                       : "Loading the model catalog...", StatusTone::Neutral);
+        } else if (saved && !IsChatGpt()) {
+            SetModelStatus(kCross + "No saved key for this connection. Paste one on the left.",
+                           StatusTone::Bad);
+        } else {
+            SetModelStatus(preset == kPresetLocal ? "Models show up here once a server answers."
+                         : preset == kPresetChatGpt ? "Sign in to load your ChatGPT models."
+                         : "Connect to load the model catalog.", StatusTone::Neutral);
+        }
         UpdatePresetButtons();
         if (m_advancedPane->IsExpanded()) m_advancedPane->Collapse();
         if (preset == kPresetCustom) m_advancedPane->Expand();
         ApplyProviderMode();
         if (preset == kPresetLocal) StartLocalScan();
         else if (m_apiKeyField->IsShown()) m_apiKeyField->SetFocus();
+
+        if (savedAndUsable) {
+            // Stamped: clicking another provider (or editing the address
+            // or key) before this runs must not start a fetch for it.
+            const unsigned gen = m_fetchGeneration;
+            CallAfter([this, gen]() {
+                if (m_connected || gen != m_fetchGeneration) return;
+                if (m_fetchInFlight) {
+                    // A fetch for the provider clicked just before is still
+                    // running; its result is discarded, so don't leave
+                    // "Loading..." up with nothing loading.
+                    SetModelStatus("Press Connect to load the model catalog.", StatusTone::Neutral);
+                    return;
+                }
+                m_connectPending = true;
+                wxCommandEvent e;
+                OnFetchModels(e);
+            });
+        }
+    }
+
+    // Add mode can land on a provider that is already saved (the provider
+    // row loads it).  Say "Edit" then, so the title matches what saving
+    // will do.  Local server is left alone: it lists whatever answers.
+    void UpdateTitle()
+    {
+        if (!m_isNew) return;
+        SetTitle(!m_seededExistingId.empty() && !IsLocal() ? wxString("Edit AI provider")
+                                                           : m_addTitle);
     }
 
     // Puts one endpoint's settings into every field.  Used by the provider
@@ -1937,7 +2081,9 @@ private:
         SetModelStatus(std::string(), StatusTone::Neutral);
         SetFetchStatus(existing ? "Saved connection loaded. Your models are kept."
                      : IsChatGpt() ? "Sign in with your ChatGPT account to load your models."
+                     : IsLocal() ? kLocalFooterHint
                      : "Connect to check the connection and load models.");
+        UpdateTitle();
         UpdateResolvedUrl();
         UpdateAdvancedSummary();
         UpdateKeyCard();
@@ -2396,14 +2542,34 @@ private:
         if (m_rawMode) m_modelsField->SetFocus();
     }
 
-    void UpdateModelCountLabel(size_t configured, size_t shown)
+    // True when the last catalog fetched from this server lists the id.
+    bool InFetchedCatalog(const std::string& id) const
+    {
+        return std::find(m_fetchedIds.begin(), m_fetchedIds.end(), id) != m_fetchedIds.end();
+    }
+
+    // Leads with the same total the footer shows ("2 models in your
+    // picker"), then splits it: how many of the server's models are picked,
+    // and how many picked models the server doesn't list (left over from an
+    // old address, or unloaded).  The old "1 of 1 in your picker" read as a
+    // picker total and contradicted the footer's "2 models".
+    void UpdateModelCountLabel(const std::vector<EndpointStore::Model>& configured, size_t shown)
     {
         if (!m_modelCountLabel || m_rawMode) return;
-        wxString text = !m_fetchedIds.empty()
-            ? wxString::Format("%lu of %lu in your picker", (unsigned long)configured,
-                               (unsigned long)m_fetchedIds.size())
-            : configured == 1 ? wxString("1 model in your picker")
-            : wxString::Format("%lu models in your picker", (unsigned long)configured);
+        const size_t n = configured.size();
+        wxString text = n == 1 ? wxString("1 model in your picker")
+                               : wxString::Format("%lu models in your picker", (unsigned long)n);
+        if (!m_fetchedIds.empty()) {
+            size_t offered = 0;
+            for (const auto& m : configured)
+                if (InFetchedCatalog(m.id)) ++offered;
+            const size_t missing = n - offered;
+            const wxString dot = wxString::FromUTF8("  \xC2\xB7  ");
+            text += dot + wxString::Format("%lu of this server's %lu", (unsigned long)offered,
+                                           (unsigned long)m_fetchedIds.size());
+            if (missing > 0)
+                text += dot + wxString::Format("%lu not on this server", (unsigned long)missing);
+        }
         if (!TrimUtf8(m_filterField->GetValue()).empty())
             text += wxString::Format("  (%lu shown)", (unsigned long)shown);
         m_modelCountLabel->SetLabel(text);
@@ -2886,7 +3052,11 @@ private:
         std::set<std::string> configuredIds;
         auto appendModel = [&](const EndpointStore::Model& m) {
             configuredIds.insert(m.id);
-            if (!matches(m.id, m.displayName)) return;
+            // A ticked model this server doesn't list is never hidden by the
+            // search box: it is in the picker but would fail, so keep it in view.
+            const bool staleInPicker = m.showInPicker && !m_fetchedIds.empty() &&
+                                       !InFetchedCatalog(m.id);
+            if (!staleInPicker && !matches(m.id, m.displayName)) return;
             std::string label = m.id;
             if (!m.displayName.empty() && m.displayName != m.id &&
                 m.displayName != PrettyNameFromId(m.id))
@@ -2894,13 +3064,20 @@ private:
             if (m.imageOutput) label += "   [image]";
             if (m.noTools)     label += "   (chat only)";
             label = withContext(label, KnownContext(&m, m.id));
+            // Once the server has answered, flag picker models it doesn't list.
+            if (m.showInPicker && !m_fetchedIds.empty() && !InFetchedCatalog(m.id))
+                label += "   (not on this server)";
             const int idx = (int)m_modelList->Append(wxString::FromUTF8(label));
             m_modelList->Check((unsigned)idx, m.showInPicker);
             m_rowModelIds.push_back(m.id);
         };
         for (const auto& model : configured) appendModel(model);
+        // Unticked records keep their saved name/context so re-ticking restores
+        // them, but they are only listed while this server offers the model.
+        // Otherwise an old address's models lingered as rows forever (an
+        // unticked IQ3_XXS row on the IQ3_S server, 2026-11-10).
         for (const auto& model : m_models)
-            if (!model.showInPicker) appendModel(model);
+            if (!model.showInPicker && InFetchedCatalog(model.id)) appendModel(model);
 
         for (const auto& id : m_fetchedIds) {
             if (configuredIds.count(id)) continue;
@@ -2922,19 +3099,39 @@ private:
         if (m_modelList->GetSelection() == wxNOT_FOUND && !m_rowModelIds.empty()) m_modelList->SetSelection(0);
         m_modelList->Thaw();
         LoadModelOptions();
-        UpdateModelCountLabel(configured.size(), m_rowModelIds.size());
+        UpdateModelCountLabel(configured, m_rowModelIds.size());
     }
 
     void SelectFirstChecked()
     {
+        // Prefer a ticked model the server actually lists, so "Save and
+        // use" doesn't default to one left over from an old address.
+        int pick = -1;
         for (size_t i = 0; i < m_rowModelIds.size(); ++i) {
-            if (m_modelList->IsChecked((unsigned)i)) {
-                m_modelList->SetSelection((int)i);
-                m_modelList->EnsureVisible((int)i);
-                break;
-            }
+            if (!m_modelList->IsChecked((unsigned)i)) continue;
+            if (pick < 0) pick = (int)i;
+            if (m_fetchedIds.empty() || InFetchedCatalog(m_rowModelIds[i])) { pick = (int)i; break; }
+        }
+        if (pick >= 0) {
+            m_modelList->SetSelection(pick);
+            m_modelList->EnsureVisible(pick);
         }
         LoadModelOptions();
+    }
+
+    // The context box keeps its old value while what's typed doesn't
+    // parse, so Save would silently store the old number.  Stop instead.
+    bool ContextFieldValid()
+    {
+        if (m_rawMode || !m_modelList) return true;
+        const int row = m_modelList->GetSelection();
+        if (row < 0 || row >= (int)m_rowModelIds.size() || !m_modelList->IsChecked((unsigned)row))
+            return true;
+        int ctx = 0;
+        if (ParseContextTokens(TrimUtf8(m_ctxField->GetValue()), ctx)) return true;
+        SetFetchStatus(kCross + "Fix the context limit first: a number from 4096 to 2M, such as 131072 or 128K.");
+        m_ctxField->SetFocus();
+        return false;
     }
 
     // Adds a model to (or removes it from) the picker and keeps it
@@ -3174,6 +3371,7 @@ private:
             MergePickerModels(m_models, ParseModelsText(m_modelsField->GetValue()));
             m_rawModelsDirty = false;
         }
+        if (!ContextFieldValid()) return;
         EndpointStore::Endpoint ep; bool noAuth = false;
         if (!ValidateConnectionFields(ep, noAuth)) return;
         if (!CommitEndpoint(ep, noAuth)) return;
@@ -3221,6 +3419,15 @@ private:
                 [&](const auto& model) { return model.id == selectedId && model.showInPicker; })) {
             SetFetchStatus("Select a checked model from the list before saving."); return;
         }
+        // A key-free server's catalog is exactly what it can run, so a
+        // model it doesn't list would fail on the first message.  (Paid
+        // catalogs can omit models, so they aren't checked here.)
+        if (noAuth && !IsChatGpt() && !m_fetchedIds.empty() && !InFetchedCatalog(selectedId)) {
+            SetFetchStatus(kCross + "This server doesn't list " + selectedId +
+                           ". Highlight a model it lists, or untick this one. Save keeps the list without switching.");
+            return;
+        }
+        if (!ContextFieldValid()) return;
         if (!CommitEndpoint(ep, noAuth)) return;
         m_modelToUse = "remote:" + ep.id + "/" + selectedId;
         EndModal(wxID_OK);
@@ -3262,6 +3469,21 @@ private:
         if (GetSizer()) Layout();
     }
 
+    // Windows paints a DISABLED single-line text box in the system
+    // "button face" grey whatever colour it is given
+    // (wxTextCtrl::MSWControlColor), which made the two unusable fields
+    // the brightest things in a dark dialog.  An unavailable field is
+    // therefore left enabled but read-only, in dim theme colours; passing
+    // wxNullColour puts the stock input colours back.
+    void SetFieldAvailable(wxTextCtrl* field, bool available)
+    {
+        if (!field) return;
+        field->SetEditable(available);
+        field->SetBackgroundColour(available ? wxColour() : m_theme->bgMain);
+        field->SetForegroundColour(available ? wxColour() : m_theme->textMuted);
+        field->Refresh();
+    }
+
     void LoadModelOptions()
     {
         const int row = m_modelList->GetSelection();
@@ -3274,8 +3496,8 @@ private:
         }
         UpdateSaveButtons();
         m_loadingOptions = true;
-        m_modelNameField->Enable(checked);
-        m_ctxField->Enable(checked);
+        SetFieldAvailable(m_modelNameField, checked);
+        SetFieldAvailable(m_ctxField, checked);
         m_allowTools->Enable(checked);
         m_imageOutput->Enable(checked && !IsChatGpt());
         m_testBtn->Enable(checked && !m_testInFlight);
@@ -3351,6 +3573,7 @@ private:
     }
 
     // ── Members ─────────────────────────────────────────────────
+    const wxString m_addTitle;        // title the dialog was opened with (see UpdateTitle)
     const bool m_isNew;               // Add mode: id follows the display name
     bool m_editMode = false;          // existing provider: starts connected
     const ThemeData* m_theme = nullptr;
@@ -3382,6 +3605,8 @@ private:
 
     // Left pane.
     wxScrolledWindow* m_leftPane = nullptr;
+    wxPanel*          m_leftClip = nullptr;   // hides the native scrollbar of m_leftPane
+    LbScrollRail*     m_leftRail = nullptr;   // slim themed rail beside it
     wxPanel*      m_scanGroup = nullptr;
     wxPanel*      m_scanList  = nullptr;
     wxStaticText* m_scanHint  = nullptr;
@@ -3566,10 +3791,16 @@ EndpointsDialog::EndpointsDialog(wxWindow* parent,
     root->Add(servicesRow, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, FromDIP(12));
     serviceKeys->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) {
         if (!m_secretsStore) return;
-        ConnectionsDialog dlg(this, m_secretsStore, *m_theme);
+        ConnectionsDialog dlg(this, m_secretsStore, *m_theme, m_store);
         dlg.ShowModal();
         if (!m_secretsStore->Save()) wxMessageBox("Service keys could not be saved to disk. Changes apply only to this session.", "Save failed", wxOK | wxICON_ERROR, this);
-        RebuildList();
+        // Keep the selected provider selected, and keep Edit/Delete in step
+        // with it: rebuilding cleared the selection but left them enabled.
+        const long sel = m_list->GetNextItem(-1, wxLIST_NEXT_ALL, wxLIST_STATE_SELECTED);
+        const wxString keep = (sel >= 0 && sel < (long)m_rowIds.size())
+            ? wxString::FromUTF8(m_rowIds[(size_t)sel].c_str()) : wxString();
+        RebuildList(keep);
+        UpdateButtonState();
     });
 
     SetSizer(root);
@@ -3754,15 +3985,26 @@ void EndpointsDialog::OnAdd(wxCommandEvent&)
     // provider row is one click from OpenRouter, OpenAI and the rest.
     auto seed = MakeProviderPreset(kPresetLocal);
     if (const auto* existing = m_store->FindEndpoint(seed.id)) seed = *existing;
+    std::set<std::string> before;
+    for (const auto& ep : m_store->Endpoints()) before.insert(ep.id);
     EndpointEditDialog dlg(this, "Add AI provider", seed, m_secretsStore, *m_theme, true, m_store,
                            wxEmptyString, kPresetLocal);
-    if (dlg.ShowModal() == wxID_OK && !dlg.GetModelToUse().empty()) {
+    const bool saved = dlg.ShowModal() == wxID_OK;
+    if (saved && !dlg.GetModelToUse().empty()) {
         m_modelToUse = dlg.GetModelToUse();
         EndModal(wxID_OK);
         return;
     }
-    // Cancelled, or a plain Save: stay here with the refreshed list.
-    RebuildList(wxString::FromUTF8(seed.id)); UpdateButtonState();
+    // Cancelled, or a plain Save: stay here with the refreshed list and
+    // highlight what was saved.  The saved id usually follows the name
+    // ("strata_iq3_s"), not the preset seed's ("local_server").
+    std::string selectId;
+    if (saved) {
+        for (const auto& ep : m_store->Endpoints())
+            if (!before.count(ep.id)) { selectId = ep.id; break; }
+        if (selectId.empty()) selectId = dlg.GetEndpoint().id;
+    }
+    RebuildList(wxString::FromUTF8(selectId)); UpdateButtonState();
 }
 
 void EndpointsDialog::OnEdit(wxCommandEvent&)
@@ -3795,7 +4037,9 @@ void EndpointsDialog::OnDelete(wxCommandEvent&)
     const auto* target = m_store->FindEndpoint(id);
     const bool chatgpt = target && target->authScheme == EndpointStore::AuthScheme::ChatGpt &&
                          !target->chatgptAccount.empty();
-    wxString question = wxString::Format("Delete endpoint '%s'?", wxString::FromUTF8(id.c_str()));
+    const std::string shown = target && !target->displayName.empty() ? target->displayName : id;
+    wxString question = wxString::Format("Delete the AI provider '%s' and its models from your picker?",
+                                         wxString::FromUTF8(shown.c_str()));
     if (chatgpt) question += "\n\nThis also signs LlamaBoss out of ChatGPT on this computer.";
     int ans = wxMessageBox(question, "Confirm", wxYES_NO | wxICON_WARNING, this);
     if (ans != wxYES) return;

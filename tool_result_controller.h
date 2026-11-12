@@ -61,8 +61,7 @@ public:
     void OnWaitComplete(wxCommandEvent& evt);
 
     // Renders a tool result as a chat card and appends it to history as a
-    // user-role message.  Shared by the handlers above and the frame's
-    // slash-command dispatch path.
+    // user-role message.  Used by the frame's typed-command dispatch.
     void RenderAndPersistSlashResult(const ToolInvocationResult& r);
 
 private:
@@ -70,7 +69,9 @@ private:
     void FinishToolTurn();
     bool IsClosing() const;
 
-    ToolInvocationResult MakeWebFetchToolInvocationResult(const WebFetchResult& r);
+    // Async tools are only started by the agent loop.  A completion it
+    // does not claim has no turn to join: note it and reset the UI.
+    void DropUnclaimedResult(const std::string& toolName);
 
     ChatDisplay*                  m_chatDisplay;
     std::unique_ptr<ChatHistory>& m_chatHistory;

@@ -55,6 +55,9 @@ bool NormalizeAllowedPythonPackage(const std::string& requested,
     if (p == "pil")  p = "pillow";
     if (p == "pptx") p = "python-pptx";
     if (p == "bs4")  p = "beautifulsoup4";
+    if (p == "yaml") p = "pyyaml";
+    if (p == "cv2")  p = "opencv-python";
+    if (p == "sklearn") p = "scikit-learn";
 
     if (p.empty()) {
         errorOut = "python_install_package requires one package name.";

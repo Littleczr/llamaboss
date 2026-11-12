@@ -54,6 +54,19 @@ constexpr IconDef kIcons[] = {
   </g>
 </svg>
 )LB_SVG" },
+
+    // ── Eject: project strip "unload model" button ─────────────────
+    // Drawn small inside the 24x24 box so it sits in the strip's
+    // shorter row without a size parameter on ApplyButton.
+    { Id::Eject, R"LB_SVG(<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none">
+  <title>LlamaBoss eject model</title>
+  <desc>An upward triangle above a short bar, the classic eject symbol.</desc>
+  <g stroke="#D0D5DC" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M12 5.5 L18.5 13 L5.5 13 Z"/>
+    <path d="M5.5 17.5 H18.5"/>
+  </g>
+</svg>
+)LB_SVG" },
 };
 
 static_assert(sizeof(kIcons) / sizeof(kIcons[0]) ==

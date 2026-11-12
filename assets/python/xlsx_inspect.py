@@ -59,6 +59,62 @@ def cell_to_jsonable(value):
     return str(value)
 
 
+UNCALCULATED = '<uncalculated formula: {}>'
+
+
+def is_formula(v):
+    if v is None:
+        return False
+    if isinstance(v, str):
+        return v.startswith('=')
+    # ArrayFormula / DataTableFormula objects from openpyxl
+    return type(v).__name__.endswith('Formula')
+
+
+def formula_text(v):
+    if isinstance(v, str):
+        return v
+    return str(getattr(v, 'text', None) or v)
+
+
+def open_formula_view(load_workbook, target, warnings):
+    """Second read-only view with data_only=False so formula cells can be told
+    apart from genuinely empty cells.  data_only=True alone reports a formula
+    with no cached result (a file never recalculated by Excel) as blank."""
+    try:
+        return load_workbook(filename=str(target), read_only=True, data_only=False)
+    except Exception as ex:
+        warnings.append('Could not read formula metadata; formulas without cached values '
+                        'may appear blank: ' + str(ex))
+        return None
+
+
+def workbook_has_formulas(target):
+    """Cheap pre-scan of the worksheet XML for formula elements (<f> or a
+    namespaced <x:f>), so formula-free files skip the second read pass.
+    Any doubt -> True (do the full check)."""
+    import re as _re
+    import zipfile as _zf
+    pat = _re.compile(rb'<(?:[A-Za-z_][\w.-]*:)?f[\s>/]')
+    try:
+        with _zf.ZipFile(str(target)) as z:
+            for name in z.namelist():
+                if not (name.startswith('xl/worksheets/') and name.endswith('.xml')):
+                    continue
+                tail = b''
+                with z.open(name) as fh:
+                    while True:
+                        chunk = fh.read(1 << 20)
+                        if not chunk:
+                            break
+                        if pat.search(tail + chunk):
+                            return True
+                        tail = chunk[-32:]
+        return False
+    except Exception:
+        return True
+
+
 def main():
     if len(sys.argv) != 2:
         emit({'ok': False, 'helper': 'xlsx_inspect', 'error': 'xlsx_inspect expects exactly one file path argument'}, 2)
@@ -100,6 +156,7 @@ def main():
         wb = load_workbook(filename=str(target), read_only=True, data_only=True)
     except Exception as ex:
         emit({'ok': False, 'helper': 'xlsx_inspect', 'error': 'Could not open workbook: ' + str(ex), 'path': str(target)}, 6)
+    wbf = open_formula_view(load_workbook, target, warnings) if workbook_has_formulas(target) else None
 
     max_rows_to_scan_per_sheet = 100000
     max_sample_data_rows = 5
@@ -114,13 +171,32 @@ def main():
             continue
 
         rows_iter = ws.iter_rows(values_only=True)
+        f_iter = None
+        if wbf is not None:
+            try:
+                f_iter = wbf[sheet_name].iter_rows(values_only=True)
+            except Exception:
+                f_iter = None
         rows = []
         row_count = 0
+        formula_cells = 0
+        uncalculated_cells = 0
         try:
             for row in rows_iter:
                 row_count += 1
+                frow = next(f_iter, None) if f_iter is not None else None
+                row = list(row)
+                if frow is not None:
+                    for i, fv in enumerate(frow):
+                        if is_formula(fv):
+                            formula_cells += 1
+                            if i < len(row) and row[i] is None:
+                                uncalculated_cells += 1
+                                row[i] = UNCALCULATED.format(formula_text(fv))
+                            elif i >= len(row):
+                                uncalculated_cells += 1
                 if len(rows) < (max_sample_data_rows + 1):
-                    rows.append(list(row))
+                    rows.append(row)
                 if row_count >= max_rows_to_scan_per_sheet:
                     warnings.append('Sheet "' + sheet_name + '": stopped counting at 100000 rows.')
                     break
@@ -138,6 +214,12 @@ def main():
 
         column_count = max((len(r) for r in rows), default=0)
 
+        if uncalculated_cells:
+            warnings.append(
+                f'Sheet "{sheet_name}": {uncalculated_cells} formula cell(s) have no cached value '
+                '(the file was not recalculated/saved by Excel). Their values are UNKNOWN, not blank; '
+                'do not total or report them as empty.')
+
         sheets_out.append({
             'name': sheet_name,
             'rows_scanned': row_count,
@@ -145,12 +227,16 @@ def main():
             'column_count_sample': column_count,
             'columns': [cell_to_jsonable(h) for h in header],
             'sample_rows': sample_rows,
+            'formula_cells': formula_cells,
+            'uncalculated_formula_cells': uncalculated_cells,
         })
 
-    try:
-        wb.close()
-    except Exception:
-        pass
+    for book in (wb, wbf):
+        try:
+            if book is not None:
+                book.close()
+        except Exception:
+            pass
 
     emit({
         'ok': True,

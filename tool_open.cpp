@@ -1265,6 +1265,31 @@ OpenResult OpenFile(const std::string&                  inputPath,
         return r;
     }
 
+    // HTML pages launch in the default web browser.  .html/.htm stay in
+    // the text-like family (language tag, edit/write rules), but "open
+    // the game" means show the page, not paste its source into the chat:
+    // reading it inline made models tell the user it was "open in your
+    // browser" when nothing had launched.  The page runs in the browser's
+    // sandbox; the model can still read the source with read.
+    {
+        const std::string ext = LowerExt(resolved);
+        if (ext == "html" || ext == "htm") {
+            std::string shellErr = ShellOpenFile(resolved);
+            if (!shellErr.empty()) {
+                r.chips.push_back("failed");
+                r.errorBody = "Could not launch \"" + resolved + "\": " + shellErr;
+                r.chips.push_back(elapsedChip());
+                return r;
+            }
+            r.chips.push_back("launched");
+            r.body = "Opened " + resolved + " in the default web browser. "
+                     "Its source was not read into this chat; use read to "
+                     "see it.\n";
+            r.chips.push_back(elapsedChip());
+            return r;
+        }
+    }
+
     if (risk == FileRisk::TextLike) {
         // Inline read.  Reuse ReadFile so the size cap, binary
         // detection, language hint, and chip composition all match

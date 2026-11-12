@@ -59,7 +59,10 @@ inline bool StartsWith(const std::string& s, const char* prefix)
 
 // The last sentence of |text| (trailing whitespace and closing punctuation
 // removed), lowercased.  Sentences end at ". ", "! ", "? " or a newline.
-inline std::string LastSentenceLower(const std::string& text, bool* endsWithColon)
+// With |splitClauses| (the default) it returns only the last clause after a
+// dash or "; "; without it, the whole last sentence.
+inline std::string LastSentenceLower(const std::string& text, bool* endsWithColon,
+                                     bool splitClauses = true)
 {
     size_t end = text.find_last_not_of(" \t\r\n");
     if (end == std::string::npos) { if (endsWithColon) *endsWithColon = false; return {}; }
@@ -80,8 +83,11 @@ inline std::string LastSentenceLower(const std::string& text, bool* endsWithColo
     for (size_t i = 0; i + 1 < s.size(); ++i) {
         const char c = s[i];
         if (c == '\n') start = i + 1;
-        else if ((c == '.' || c == '!' || c == '?' || c == ';') &&
+        else if ((c == '.' || c == '!' || c == '?') &&
                  (s[i + 1] == ' ' || s[i + 1] == '\t'))
+            start = i + 2;
+        else if (!splitClauses) continue;
+        else if (c == ';' && (s[i + 1] == ' ' || s[i + 1] == '\t'))
             start = i + 2;
         else if (c == ' ' && s[i + 1] == '-' && i + 3 < s.size() &&
                  s[i + 2] == '-' && s[i + 3] == ' ')
@@ -140,7 +146,12 @@ inline bool HasCallInsideLeakedReasoning(const std::string& text)
 
 inline bool LooksLikeAnnouncedNextStep(const std::string& rawReply)
 {
-    const std::string prose = VisibleText(rawReply);
+    // Curly apostrophes ("I\u2019m", "let\u2019s", "I\u2019ll now") match the
+    // straight-quote cues below.
+    std::string prose = VisibleText(rawReply);
+    for (size_t at = prose.find("\xE2\x80\x99"); at != std::string::npos;
+         at = prose.find("\xE2\x80\x99", at + 1))
+        prose.replace(at, 3, "'");
     const size_t first = prose.find_first_not_of(" \t\r\n");
     if (first == std::string::npos) return false;
     const size_t last = prose.find_last_not_of(" \t\r\n");
@@ -154,20 +165,35 @@ inline bool LooksLikeAnnouncedNextStep(const std::string& rawReply)
     // common case where a colon ends a question to the user.
     if (endsWithColon && s.find('?') == std::string::npos) return true;
 
-    if (StartsWith(s, "step ") && s.size() > 5 &&
-        lb_ascii::IsDigit(static_cast<unsigned char>(s[5])))
-        return true;
-    if (StartsWith(s, "let me ") && !StartsWith(s, "let me know"))
-        return true;
-    static const char* const kCues[] = {
-        "now ", "now,", "next ", "next,", "i'll now", "i will now",
-        "moving on", "proceeding", "continuing",
-        "let's ", "retrying", "trying again", "i'll retry", "i will retry",
-        "will retry",
+    auto startsWithCue = [](const std::string& t) {
+        if (StartsWith(t, "step ") && t.size() > 5 &&
+            lb_ascii::IsDigit(static_cast<unsigned char>(t[5])))
+            return true;
+        if (StartsWith(t, "let me ") && !StartsWith(t, "let me know"))
+            return true;
+        static const char* const kCues[] = {
+            "now ", "now,", "next ", "next,", "i'll now", "i will now",
+            "moving on", "proceeding", "continuing",
+            "let's ", "retrying", "trying again", "i'll retry", "i will retry",
+            "will retry",
+            // Present-progressive promises (Strata IQ3_S, 2026-11-10): "I'm
+            // writing an original vertical-scrolling WWII shooter ...: formations,
+            // kamikaze dives, ..." ended the turn with no write call.
+            "i'm writing", "i'm building", "i'm creating", "i'm making",
+            "i'm generating", "i'm putting together", "i'm going to ",
+            "i am writing", "i am building", "i am creating", "i am going to ",
+        };
+        for (const char* cue : kCues)
+            if (StartsWith(t, cue)) return true;
+        return false;
     };
-    for (const char* cue : kCues)
-        if (StartsWith(s, cue)) return true;
-    return false;
+    if (startsWithCue(s)) return true;
+
+    // The cue can also open the sentence, before a dash that the clause
+    // split cuts at: "Now writing the game \u2014 a vertical scroller with
+    // ..." (Strata IQ3_S, 2026-11-10) kept only the text after the dash.
+    const std::string whole = LastSentenceLower(prose, nullptr, /*splitClauses*/ false);
+    return whole != s && startsWithCue(whole);
 }
 
 } // namespace lb_announced_step

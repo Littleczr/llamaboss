@@ -7,6 +7,7 @@
 #include "ascii_animation.h"
 #include "theme.h"
 #include "path_safety.h"
+#include "tool_open.h"      // ClassifyForOpen: the shared "never launch" list
 #include <wx/caret.h>
 #include <wx/file.h>
 #include <wx/msgdlg.h>
@@ -259,6 +260,75 @@ bool IsMarkdownDocumentFile(const PresentedFile& file)
 
     const std::string ext = GetFileExtensionLower(file);
     return ext == "md" || ext == "markdown";
+}
+
+// ── File chip [Open] policy ──────────────────────────────────────
+// [Open] hands the file to the Windows shell, which runs whatever the
+// extension is registered for.  Chips are created for ANY file a command
+// or script produced, so the decision uses the same kill list as the
+// open tool (tool_open.cpp RiskyExtensions) instead of a private list
+// that only knew about source-code extensions.
+
+// True when `nameOrPath` must never be launched from a chip.
+bool IsShellOpenBlockedName(const std::string& nameOrPath)
+{
+    // Windows ignores trailing dots and spaces, so "setup.exe." on a
+    // chip is setup.exe on disk.  Classify the name the shell will use.
+    std::string s = nameOrPath;
+    while (!s.empty() && (s.back() == '.' || s.back() == ' ')) s.pop_back();
+    if (s.empty()) return true;
+
+    const size_t slash = s.find_last_of("/\\");
+    const std::string leaf = (slash == std::string::npos) ? s : s.substr(slash + 1);
+    if (leaf.empty()) return true;
+
+    // "report.txt:payload.exe" names an alternate data stream.
+    if (leaf.find(':') != std::string::npos) return true;
+
+    if (ClassifyForOpen(s) == FileRisk::Risky) return true;
+
+    // Legacy Office formats can carry macros.  The open tool only
+    // launches the macro-free formats (docx/xlsx/pptx); match it.
+    const size_t dot = leaf.find_last_of('.');
+    if (dot != std::string::npos) {
+        const std::string ext = LbLowerAscii(leaf.substr(dot + 1));
+        static const char* const kLegacyOffice[] = {
+            "doc", "dot", "xls", "xlt", "xla", "xlsb",
+            "ppt", "pot", "pps", "ppa", "ppsm", "sldm",
+        };
+        for (const char* blocked : kLegacyOffice)
+            if (ext == blocked) return true;
+    }
+    return false;
+}
+
+// Whether a chip may offer [Open].  The file that would launch is
+// diskPath, so that is what gets classified; the display name is checked
+// as well so a chip can never show one name and open another type.
+bool ChipOpenAllowed(const PresentedFile& file)
+{
+    if (file.diskPath.empty()) return false;
+    if (IsShellOpenBlockedName(file.diskPath)) return false;
+    if (IsShellOpenBlockedName(GetBestFileName(file))) return false;
+
+    // Same question as IsLikelyCodeFile, asked of the name on disk.
+    PresentedFile onDisk;
+    {
+        const size_t slash = file.diskPath.find_last_of("/\\");
+        onDisk.displayName = (slash == std::string::npos)
+            ? file.diskPath : file.diskPath.substr(slash + 1);
+    }
+
+    // Generated Markdown reports are document artifacts, not executable
+    // content: they may open in the user's Markdown/text viewer.
+    if (IsMarkdownDocumentFile(onDisk)) return true;
+
+    // Code/script files stay hidden from the direct [Open] action.  A
+    // "markdown" language tag does not rescue a file whose real
+    // extension is code (report.py tagged as markdown).
+    if (IsLikelyCodeFile(onDisk)) return false;
+    if (IsLikelyCodeFile(file) && !IsMarkdownDocumentFile(file)) return false;
+    return true;
 }
 
 std::string HumanFileSize(std::size_t bytes)
@@ -880,11 +950,10 @@ void ChatDisplay::PresentFile(const PresentedFile& file)
     const std::string title         = GetBestFileName(local);
     const std::string meta          = DescribePresentedFileMeta(local);
     const bool canSaveAs            = !local.inlineContent.empty() || !local.diskPath.empty();
-    // Generated Markdown reports are document artifacts, not executable content.
-    // Keep code/script files hidden from the direct [Open] action, but allow
-    // .md report artifacts to open in the user's default Markdown/text viewer.
-    const bool canOpen              = !local.diskPath.empty() &&
-                                      (!IsLikelyCodeFile(local) || IsMarkdownDocumentFile(local));
+    // Executable/scriptable types, code files and legacy Office formats get
+    // no direct [Open]; .md reports and passive documents do.  The rule is
+    // ChipOpenAllowed above (shared kill list with the open tool).
+    const bool canOpen              = ChipOpenAllowed(local);
     const bool canOpenFolder        = !local.diskPath.empty();
 
     std::vector<std::pair<std::string, FileAction>> actions;
@@ -1023,6 +1092,15 @@ void ChatDisplay::HandleFileChipClick(size_t chipIdx)
         break;
     }
     case FileAction::Open:
+        // Checked again at click time: the chip was drawn earlier, and
+        // this is the last point before the shell runs the file.
+        if (!ChipOpenAllowed(file)) {
+            wxMessageBox("LlamaBoss doesn't open this type of file directly. "
+                         "Use [Open Folder] and open it from File Explorer "
+                         "if you trust it.",
+                         "Open File", wxOK | wxICON_INFORMATION, m_displayCtrl);
+            break;
+        }
         if (!file.diskPath.empty()) {
             if (!wxLaunchDefaultApplication(wxString::FromUTF8(file.diskPath))) {
                 wxMessageBox("Unable to open the file with the default application.",

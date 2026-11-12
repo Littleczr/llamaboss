@@ -257,4 +257,25 @@ inline std::size_t BudgetedBodyBytes(const std::string& body, double bytesPerTok
     return text + (std::size_t)((double)s.count * perImage);
 }
 
+// ── Elide in chunks, not one item per request ──────────────────────
+// The request builder used to elide oldest-first only until the body was
+// back under the budget.  The next request is a few KB bigger, crosses
+// the budget again, and elides ONE more item -- which rewrites history at
+// that item and drops the provider's prompt cache to the system prefix.
+// In the 2026-10-30 ClipJoiner chat that happened on 7 of the last 10
+// requests (#223-#232, "+1 args", "+2 args", ... "+6 args"), each a
+// ~157k-token cache miss: about 1.0M uncached tokens.
+//
+// Once elision is needed at all, the builder now elides down to a lower
+// target (kElisionLowWater of the budget).  The cut moves once, then stays
+// put for the many requests it takes the chat to grow back to the budget.
+// Elision is deterministic oldest-first, so later requests reproduce the
+// same elided prefix byte-for-byte and keep hitting the cache.
+constexpr double kElisionLowWater = 0.85;
+
+inline std::size_t ElisionTargetBytes(std::size_t budgetBytes)
+{
+    return (std::size_t)((double)budgetBytes * kElisionLowWater);
+}
+
 } // namespace lb_elision

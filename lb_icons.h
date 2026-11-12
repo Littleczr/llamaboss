@@ -29,6 +29,7 @@ enum class Id {
     Settings,   // toolbar cogwheel      (assets/icons/LlamaBoss_Cogwheel.svg)
     Attach,     // composer paperclip    (assets/icons/LlamaBoss_Paperclip.svg)
     Agent,      // composer agent robot  (assets/icons/LlamaBoss_Agent.svg)
+    Eject,      // strip eject (unload model); no assets/ master, edit lb_icons.cpp
     kCount      // keep last
 };
 

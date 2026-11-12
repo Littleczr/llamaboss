@@ -12,7 +12,8 @@
 #include "wait_executor.h"   // WaitExecutor, WaitResult
 #include "python_runner.h"
 #include "python_session.h"
-#include "python_arg_policy.h"
+#include "python_package_recovery.h"  // shared missing-package card + 403 hint
+#include "artifact_presentation.h"    // shared "Create ..." card titles
 #include "path_safety.h"
 #include "var_store.h"
 
@@ -306,6 +307,89 @@ bool AgentNativeArgsJsonIsValidObject(const std::string& argsJson)
     }
 }
 
+// {"arguments": X} where X is an object or a JSON string of an object,
+// for a tool whose schema has no "arguments" parameter.  On success
+// `out` is X as a JSON object string.  One level only.
+bool AgentUnwrapArgumentsEnvelope(const std::string& toolName,
+                                  const std::string& argsJson,
+                                  std::string&       out)
+{
+    out.clear();
+    if (argsJson.find("\"arguments\"") == std::string::npos) return false;
+    try {
+        Poco::JSON::Parser ap;
+        Poco::JSON::Object::Ptr obj =
+            ap.parse(argsJson).extract<Poco::JSON::Object::Ptr>();
+        if (!obj || obj->size() != 1 || !obj->has("arguments")) return false;
+
+        const ToolSpec* spec = GetGlobalRouter().Find(toolName);
+        if (!spec || spec->parameters_json_schema.empty()) return false;
+        Poco::JSON::Parser sp;
+        Poco::JSON::Object::Ptr schema =
+            sp.parse(spec->parameters_json_schema).extract<Poco::JSON::Object::Ptr>();
+        Poco::JSON::Object::Ptr props = schema ? schema->getObject("properties") : nullptr;
+        if (!props || props->has("arguments")) return false;
+
+        const Poco::Dynamic::Var inner = obj->get("arguments");
+        Poco::JSON::Object::Ptr innerObj;
+        if (inner.type() == typeid(Poco::JSON::Object::Ptr)) {
+            innerObj = inner.extract<Poco::JSON::Object::Ptr>();
+        } else if (inner.isString()) {
+            Poco::JSON::Parser ip;
+            innerObj = ip.parse(inner.extract<std::string>())
+                           .extract<Poco::JSON::Object::Ptr>();
+        }
+        if (!innerObj || innerObj->size() == 0) return false;
+
+        // At least one inner key must be a real parameter of this tool,
+        // otherwise unwrapping only trades one bad shape for another.
+        std::vector<std::string> names;
+        innerObj->getNames(names);
+        bool anyKnown = false;
+        for (const std::string& n : names)
+            if (props->has(n)) { anyKnown = true; break; }
+        if (!anyKnown) return false;
+
+        std::ostringstream oss;
+        Poco::JSON::Stringifier::stringify(innerObj, oss);
+        out = oss.str();
+        return !out.empty();
+    } catch (...) {
+        out.clear();
+        return false;
+    }
+}
+
+// Whether the Vars\ spool file named by a copied elision marker exists in
+// the current conversation workspace.  Only plain Vars\elided_*.txt names
+// are looked up; anything else is Unknown.
+lb_toolcall_elision::SpoolState AgentSpoolStateForMarker(const std::string& argsJson,
+                                                         const std::string& cwd)
+{
+    using lb_toolcall_elision::SpoolState;
+    const std::string rel = lb_toolcall_elision::SpoolPathFromMarker(argsJson);
+    if (rel.empty()) return SpoolState::Unknown;
+    const std::string prefix = "Vars\\elided_";
+    if (rel.compare(0, prefix.size(), prefix) != 0 ||
+        rel.find("..") != std::string::npos ||
+        rel.find('/') != std::string::npos ||
+        rel.find('\\', prefix.size()) != std::string::npos ||
+        rel.size() < 4 || rel.compare(rel.size() - 4, 4, ".txt") != 0)
+        return SpoolState::Unknown;
+
+    if (cwd.empty()) return SpoolState::Unknown;
+    try {
+        std::error_code ec;
+        const std::filesystem::path abs =
+            std::filesystem::path(path_safety::Utf8ToWide(cwd)) /
+            path_safety::Utf8ToWide(rel);
+        return std::filesystem::is_regular_file(abs, ec) && !ec
+            ? SpoolState::Exists : SpoolState::Missing;
+    } catch (...) {
+        return SpoolState::Unknown;
+    }
+}
+
 std::string AgentTrimAsciiWhitespace(const std::string& value)
 {
     const size_t first = value.find_first_not_of(" \t\r\n");
@@ -472,234 +556,6 @@ bool AgentHasUnsafeNativeArgs(const ToolInvocation& inv)
                0,
                std::char_traits<char>::length(kInvalidNativeArgsJsonPrefix),
                kInvalidNativeArgsJsonPrefix) == 0;
-}
-
-std::string AgentPresentedFileExtLower(const PresentedFile& f)
-{
-    std::string name = !f.displayName.empty() ? f.displayName : f.diskPath;
-    std::replace(name.begin(), name.end(), '\\', '/');
-    size_t slash = name.find_last_of('/');
-    if (slash != std::string::npos) name = name.substr(slash + 1);
-
-    size_t dot = name.find_last_of('.');
-    if (dot == std::string::npos || dot + 1 >= name.size()) return std::string();
-    return LbLowerAscii(name.substr(dot + 1));
-}
-
-struct AgentArtifactPresentation {
-    std::string iconUtf8;
-    std::string toolName;
-};
-
-AgentArtifactPresentation BuildAgentArtifactPresentation(const std::vector<PresentedFile>& files)
-{
-    AgentArtifactPresentation p;
-    if (files.empty()) return p;
-
-    bool hasDocx = false;
-    bool hasSheet = false;
-    bool hasPdf = false;
-    bool hasMarkdown = false;
-    bool hasText = false;
-    bool hasImage = false;
-    bool hasOther = false;
-
-    for (const auto& f : files) {
-        const std::string ext = AgentPresentedFileExtLower(f);
-        const std::string lang = LbLowerAscii(f.language);
-
-        if (ext == "docx") {
-            hasDocx = true;
-        } else if (ext == "xlsx" || ext == "csv") {
-            hasSheet = true;
-        } else if (ext == "pdf") {
-            hasPdf = true;
-        } else if (ext == "md" || ext == "markdown" || lang == "markdown" || lang == "md") {
-            hasMarkdown = true;
-        } else if (ext == "txt" || lang == "text") {
-            hasText = true;
-        } else if (ext == "png" || ext == "jpg" || ext == "jpeg" || ext == "webp") {
-            hasImage = true;
-        } else {
-            hasOther = true;
-        }
-    }
-
-    const int kinds = (hasDocx ? 1 : 0) + (hasSheet ? 1 : 0) +
-                      (hasPdf ? 1 : 0) + (hasMarkdown ? 1 : 0) +
-                      (hasText ? 1 : 0) + (hasImage ? 1 : 0) +
-                      (hasOther ? 1 : 0);
-
-    if (files.size() == 1 && kinds == 1) {
-        if (hasDocx)     return { "\xF0\x9F\x93\x84", "Create Word Document" };      // 📄
-        if (hasSheet)    return { "\xF0\x9F\x93\x8A", "Create Spreadsheet" };        // 📊
-        if (hasPdf)      return { "\xF0\x9F\x93\x84", "Create PDF" };                 // 📄
-        if (hasMarkdown) return { "\xF0\x9F\x93\x9D", "Create Markdown Document" };  // 📝
-        if (hasText)     return { "\xF0\x9F\x93\x84", "Create Text Document" };       // 📄
-        if (hasImage)    return { "\xF0\x9F\x96\xBC", "Create Image" };               // 🖼
-        return { "\xF0\x9F\x93\x8E", "Create File" };                                 // 📎
-    }
-
-    if (hasDocx && kinds == 1)     return { "\xF0\x9F\x93\x84", "Create Word Documents" };
-    if (hasSheet && kinds == 1)    return { "\xF0\x9F\x93\x8A", "Create Spreadsheets" };
-    if (hasPdf && kinds == 1)      return { "\xF0\x9F\x93\x84", "Create PDFs" };
-    if (hasMarkdown && kinds == 1) return { "\xF0\x9F\x93\x9D", "Create Markdown Documents" };
-
-    return { "\xF0\x9F\x93\xA6", "Create Files" };                                    // 📦
-}
-
-void ApplyAgentArtifactPresentation(ToolInvocationResult& r)
-{
-    if (r.presentedFiles.empty()) return;
-    if (!r.errorBody.empty()) return;
-
-    AgentArtifactPresentation p = BuildAgentArtifactPresentation(r.presentedFiles);
-    if (p.toolName.empty()) return;
-
-    r.iconUtf8 = p.iconUtf8;
-    r.toolName = p.toolName;
-}
-
-
-std::string AgentTrimPackageToken(std::string s)
-{
-    size_t a = s.find_first_not_of(" \t\r\n\"'`.,:;()[]{}");
-    if (a == std::string::npos) return std::string();
-    size_t b = s.find_last_not_of(" \t\r\n\"'`.,:;()[]{}");
-    return s.substr(a, b - a + 1);
-}
-
-std::string AgentNormalizePackageTokenForDisplay(const std::string& raw)
-{
-    std::string p = LbLowerAscii(AgentTrimPackageToken(raw));
-    std::replace(p.begin(), p.end(), '_', '-');
-    return p;
-}
-
-bool AgentExtractAfterToken(const std::string& text,
-                         const std::string& token,
-                         std::string& out)
-{
-    size_t pos = text.find(token);
-    if (pos == std::string::npos) return false;
-    pos += token.size();
-
-    while (pos < text.size() &&
-           (text[pos] == ' ' || text[pos] == '\t' || text[pos] == '\r' ||
-            text[pos] == '\n' || text[pos] == '\'' || text[pos] == '"' ||
-            text[pos] == '`')) {
-        ++pos;
-    }
-
-    size_t end = pos;
-    while (end < text.size()) {
-        const char c = text[end];
-        const bool ok = (c >= 'A' && c <= 'Z') ||
-                        (c >= 'a' && c <= 'z') ||
-                        (c >= '0' && c <= '9') ||
-                        c == '_' || c == '-' || c == '.';
-        if (!ok) break;
-        ++end;
-    }
-
-    if (end <= pos) return false;
-    out = text.substr(pos, end - pos);
-    return !out.empty();
-}
-
-bool AgentFindMissingPythonPackage(const std::string& stdoutText,
-                                const std::string& stderrText,
-                                std::string&       importNameOut,
-                                std::string&       packageNameOut,
-                                bool&              installableOut)
-{
-    importNameOut.clear();
-    packageNameOut.clear();
-    installableOut = false;
-
-    const std::string text = stderrText + "\n" + stdoutText;
-    const std::string lower = LbLowerAscii(text);
-
-    std::string candidate;
-    if (!AgentExtractAfterToken(text, "No module named", candidate) &&
-        !AgentExtractAfterToken(text, "no module named", candidate)) {
-        if (!AgentExtractAfterToken(lower, "pip install --user --disable-pip-version-check", candidate) &&
-            !AgentExtractAfterToken(lower, "pip install --user", candidate)) {
-            if (lower.find("openpyxl python package is required") != std::string::npos) {
-                candidate = "openpyxl";
-            } else if (lower.find("install pymupdf") != std::string::npos) {
-                candidate = "pymupdf";
-            } else if (lower.find("missing pdf form dependency") != std::string::npos ||
-                       lower.find("missing pdf text extraction dependency") != std::string::npos ||
-                       lower.find("install pypdf") != std::string::npos) {
-                candidate = "pypdf";
-            }
-        }
-    }
-
-    candidate = AgentTrimPackageToken(candidate);
-    if (candidate.empty()) return false;
-
-    importNameOut = candidate;
-
-    std::string normalizedPackage;
-    std::string normalizeError;
-    installableOut = python_arg_policy::NormalizeAllowedPythonPackage(
-        candidate, normalizedPackage, normalizeError);
-
-    // For installable packages, use the exact shared normalized name that
-    // python_install_package will accept.  For unsupported tokens, keep a
-    // simple lowercase display value so the recovery message remains useful
-    // without duplicating the install policy.
-    packageNameOut = installableOut
-        ? normalizedPackage
-        : AgentNormalizePackageTokenForDisplay(candidate);
-    return true;
-}
-
-void ApplyAgentMissingPythonPackageRecovery(ToolInvocationResult& r,
-                                       const PythonRunResult& py)
-{
-    if (py.exitCode == 0 || py.cancelled || py.timedOut) return;
-
-    std::string importName;
-    std::string packageName;
-    bool installable = false;
-    if (!AgentFindMissingPythonPackage(py.stdoutText,
-                                    py.stderrText,
-                                    importName,
-                                    packageName,
-                                    installable)) {
-        return;
-    }
-
-    r.iconUtf8 = "\xF0\x9F\x93\xA6"; // 📦
-    r.toolName = installable ? std::string("Missing Python Package")
-                             : std::string("Unsupported Python Package");
-
-    std::ostringstream body;
-    if (installable) {
-        body << "Python needs the package `" << packageName
-             << "` before this step can continue.\n\n"
-             << "Suggested next step for LlamaBoss: use `python_install_package "
-             << packageName << "`, then retry the failed step once.\n\n"
-             << "No package was installed yet. The user will see an approval "
-                "card with the exact package name before pip runs.";
-    } else {
-        body << "Python tried to import `" << importName
-             << "`, but the inferred package name `" << packageName
-             << "` is not a simple PyPI name LlamaBoss can install through "
-                "python_install_package.\n\n"
-             << "The script may need to be rewritten using the standard "
-                "library, or the user can install the dependency manually.";
-    }
-
-    if (!r.body.empty()) {
-        body << "\n\nOriginal stdout:\n" << r.body;
-    }
-
-    r.body = body.str();
-    r.bodyLang = "markdown";
 }
 
 bool TryReadSmallTextFile(const std::string& path,
@@ -1731,6 +1587,18 @@ std::string AgentController::BuildRequestBody()
     const ToolProtocol requestProto = m_cb.getActiveProtocol
                                         ? m_cb.getActiveProtocol()
                                         : ToolProtocol::Unknown;
+    // A protocol flip inside one agent loop changes the system prompt and
+    // drops/adds the whole tool catalog (full cache miss, and a native
+    // model left without tools writes calls as text).  It should never
+    // happen now that remote lanes resolve their own protocol; log it so
+    // a recurrence is visible in the log rather than only in the export.
+    if (m_requestProtocol != ToolProtocol::Unknown &&
+        requestProto != m_requestProtocol) {
+        if (auto* logger = m_appState->GetLogger())
+            logger->warning(std::string("Agent request protocol changed mid-loop: ") +
+                            ToolProtocolName(m_requestProtocol) + " -> " +
+                            ToolProtocolName(requestProto));
+    }
     m_requestProtocol = requestProto;
 
     std::string sysPrompt = m_cb.buildSystemPrompt
@@ -2650,9 +2518,47 @@ bool AgentController::HandleAssistantComplete(const std::string& fullResponse,
                     return IsNativeBatchSafeTool(inv.name);
                 });
 
+            // Mixed batch: when the reply starts with two or more
+            // batch-safe reads followed by a call that is not batch-safe
+            // (e.g. read, read, powershell), run the read-only prefix as a
+            // batch and drop the rest with a notice, instead of running
+            // only the first call.  The dropped call is exactly what the
+            // first-call-only rule would have dropped too; the reads it
+            // keeps are independent by construction.  (2026-10-30: two
+            // such notices left gpt-6-sol issuing one call per request for
+            // the remaining ~210 requests of the chat.)
+            std::string mixedBatchNotice;
+            if (invocations.size() > 1 && !hasUnsafeNativeArgs &&
+                !allCallsBatchSafe &&
+                !IsNativeBatchSafeWriteSet(invocations)) {
+                size_t safePrefix = 0;
+                while (safePrefix < invocations.size() &&
+                       IsNativeBatchSafeTool(invocations[safePrefix].name))
+                    ++safePrefix;
+                if (safePrefix >= 2) {
+                    std::string droppedNames;
+                    for (size_t k = safePrefix; k < invocations.size(); ++k) {
+                        if (!droppedNames.empty()) droppedNames += ", ";
+                        droppedNames += invocations[k].name;
+                    }
+                    const size_t dropped = invocations.size() - safePrefix;
+                    invocations.resize(safePrefix);
+                    mixedBatchNotice =
+                        "\n\n[notice] LlamaBoss ran the first " +
+                        std::to_string(safePrefix) +
+                        " read-only calls of your reply together. The other " +
+                        std::to_string(dropped) + " call(s) (" + droppedNames +
+                        ") are not batch-safe and were not run; re-issue them "
+                        "after reading these results. Independent read-only "
+                        "calls (read, read_range, ls, grep, hash, zip_inspect, "
+                        "...) may still be batched.";
+                }
+            }
+            const bool runAsBatch = !mixedBatchNotice.empty();
+
             bool batchMode = invocations.size() > 1 &&
                              !hasUnsafeNativeArgs &&
-                             (allCallsBatchSafe ||
+                             (allCallsBatchSafe || runAsBatch ||
                               IsNativeBatchSafeWriteSet(invocations));
             std::string sidecarJson;
             if (batchMode) {
@@ -2671,6 +2577,9 @@ bool AgentController::HandleAssistantComplete(const std::string& fullResponse,
                                            invocations.end());
                 if (!overflowNotice.empty()) {
                     m_pendingSoftHint += overflowNotice;
+                }
+                if (!mixedBatchNotice.empty()) {
+                    m_pendingSoftHint += mixedBatchNotice;
                 }
 
                 bool cont = DispatchAndContinue(invocations.front());
@@ -2758,7 +2667,53 @@ bool AgentController::HandleAssistantComplete(const std::string& fullResponse,
     // XML parser would synthesize a spurious malformed-invocation
     // error.  Native function-call is authoritative when active;
     // empty == final answer, end loop.
+    // Announced-step recovery: mid-task (at least one tool step this
+    // turn), the reply only promises the next step ("Now step 9:", "Let me
+    // write it.") with no call.  Ending here leaves the task half done, so
+    // give the model one more request with a trailing control note.
+    // Bounded per turn and never twice in a row; the prose stays in
+    // history and on screen exactly as streamed.
+    // A complete call written inside leaked reasoning (before a stray
+    // </think>) is never executed -- correctly -- but the model then
+    // reports it as done.  Nudge it to re-issue the call properly.
+    // Checked on any reply, including a turn's first.
+    //
+    // Shared by BOTH no-call exits.  It used to live only on the XML path,
+    // so on native tool calling (Strata, llama-server --jinja, OpenAI) a
+    // reply like "Let me write it." with no tool_calls ended the turn at
+    // the native early-exit below and the user had to type "go ahead".
+    auto tryAnnouncedStepRecovery = [&](const std::string& prose) -> bool {
+        const bool callInLeakedReasoning =
+            lb_announced_step::HasCallInsideLeakedReasoning(fullResponse);
+        const bool midTask = m_iterationsUsed > 0 || m_toolAttemptsThisTurn > 0;
+        if (replyFollowsAnnouncedRecovery ||
+            m_announcedStepRecoveries >= kMaxAnnouncedStepRecoveries ||
+            !(callInLeakedReasoning ||
+              (midTask && lb_announced_step::LooksLikeAnnouncedNextStep(prose)))) {
+            return false;
+        }
+        ++m_announcedStepRecoveries;
+        m_lastRequestWasAnnouncedRecovery = true;
+        m_nextRequestTrailingNote = callInLeakedReasoning
+            ? "[LlamaBoss loop note, not from the user] Your previous reply "
+              "wrote a tool call inside your reasoning (before </think>), so "
+              "it did NOT run and no tool result exists for it. Do not report "
+              "it as done. If you still need it, emit the tool call now, "
+              "outside your reasoning."
+            : "[LlamaBoss loop note, not from the user] Your previous reply "
+              "described a next step but contained no tool call, so nothing "
+              "ran. If every requested step is complete, give the final "
+              "answer now. Otherwise call the tool for that step now.";
+        ContinueLoop();
+        return true;
+    };
+
     if (nativeActive && toolCallsJson.empty()) {
+        // Native reply with no structured tool_calls.  VisibleText() inside
+        // the detector strips <think> blocks, so the raw reply is the prose.
+        if (tryAnnouncedStepRecovery(fullResponse))
+            return true;
+
         // Diagnostic only: a native turn whose text still carries an XML
         // tool-call block usually means a protocol mismatch between the
         // request and this parse.  Behaviour is unchanged (end loop), but
@@ -2814,38 +2769,9 @@ bool AgentController::HandleAssistantComplete(const std::string& fullResponse,
     // MyFrame already rendered the streamed prose; we just exit
     // the loop and let normal completion flow through.
     if (!parsed.hasInvocation) {
-        // Announced-step recovery: mid-task (at least one tool step this
-        // turn), the reply only promises the next step ("Now step 9:")
-        // with no call.  Ending here leaves the task half done, so give
-        // the model one more request with a trailing control note.
-        // Bounded per turn and never twice in a row; the prose stays in
-        // history and on screen exactly as streamed.
-        // A complete call written inside leaked reasoning (before a stray
-        // </think>) is never executed -- correctly -- but the model then
-        // reports it as done.  Nudge it to re-issue the call properly.
-        // Checked first and on any reply, including a turn's first.
-        const bool callInLeakedReasoning =
-            lb_announced_step::HasCallInsideLeakedReasoning(fullResponse);
-        const bool midTask = m_iterationsUsed > 0 || m_toolAttemptsThisTurn > 0;
-        if (!replyFollowsAnnouncedRecovery &&
-            m_announcedStepRecoveries < kMaxAnnouncedStepRecoveries &&
-            (callInLeakedReasoning ||
-             (midTask && lb_announced_step::LooksLikeAnnouncedNextStep(parsed.prose)))) {
-            ++m_announcedStepRecoveries;
-            m_lastRequestWasAnnouncedRecovery = true;
-            m_nextRequestTrailingNote = callInLeakedReasoning
-                ? "[LlamaBoss loop note, not from the user] Your previous reply "
-                  "wrote a tool call inside your reasoning (before </think>), so "
-                  "it did NOT run and no tool result exists for it. Do not report "
-                  "it as done. If you still need it, emit the tool call now, "
-                  "outside your reasoning."
-                : "[LlamaBoss loop note, not from the user] Your previous reply "
-                  "described a next step but contained no tool call, so nothing "
-                  "ran. If every requested step is complete, give the final "
-                  "answer now. Otherwise call the tool for that step now.";
-            ContinueLoop();
+        // Announced-step recovery (see tryAnnouncedStepRecovery above).
+        if (tryAnnouncedStepRecovery(parsed.prose))
             return true;
-        }
 
         // Normal end of loop — no user message needed.
         EndLoop(AgentEndReason::Normal, "");
@@ -2948,6 +2874,25 @@ std::vector<ToolInvocation> AgentController::ParseStructuredToolCalls(
             continue;
         }
 
+        // Envelope unwrap: {"arguments":{"args":"..."}} or
+        // {"arguments":"{\"args\":...}"} -- the model nested the real
+        // parameters one level down.  Only when "arguments" is the sole key
+        // and the tool has no parameter of that name, so nothing valid is
+        // reinterpreted.  The stored tool_calls sidecar keeps the model's
+        // original text (the Responses replay compares against it); only
+        // the projection for validation, approval and dispatch changes.
+        {
+            std::string unwrapped;
+            if (AgentUnwrapArgumentsEnvelope(inv.name, argsRaw, unwrapped)) {
+                argsRaw = unwrapped;
+                m_pendingSoftHint +=
+                    "\n\n[notice] Your " + inv.name + " call nested its "
+                    "parameters inside an \"arguments\" key. LlamaBoss "
+                    "unwrapped it this time; pass the parameters at the top "
+                    "level of the arguments object.";
+            }
+        }
+
         if (inv.name == tool_names::kPowerShell) {
             std::string timeoutError;
             if (!AgentReadNativePowerShellTimeout(
@@ -2979,8 +2924,17 @@ std::vector<ToolInvocation> AgentController::ParseStructuredToolCalls(
         if (lb_toolcall_elision::ContainsArgElisionMarker(argsRaw)) {
             inv.args.clear();
             inv.valid = false;
+            // Does the spool file the marker names actually exist?  Models
+            // also INVENT the marker on brand-new calls (seen with
+            // Qwen3.8-Flash-Next writing _harn3.txt), with a made-up hash;
+            // pointing them at a file that was never written cost a failed
+            // read and another rejected call.
             inv.invalidReason =
-                lb_toolcall_elision::CopiedElisionRejection(argsRaw);
+                lb_toolcall_elision::CopiedElisionRejection(
+                    argsRaw, AgentSpoolStateForMarker(
+                        argsRaw, m_cb.buildToolContext
+                                     ? m_cb.buildToolContext().cwd
+                                     : std::string()));
             out.push_back(std::move(inv));
             continue;
         }
@@ -3843,9 +3797,10 @@ bool AgentController::HandlePythonComplete(const PythonRunResult& pythonResult)
     r.bodyLang      = (isRun || isInstall) ? std::string() : std::string("json");
     r.presentedFiles = pythonResult.presentedFiles;
     if (isRun && pythonResult.exitCode == 0 && !pythonResult.cancelled && !pythonResult.timedOut) {
-        ApplyAgentArtifactPresentation(r);
+        ApplyArtifactPresentation(r);
     }
-    ApplyAgentMissingPythonPackageRecovery(r, pythonResult);
+    ApplyMissingPythonPackageRecovery(r, pythonResult);
+    ApplyPythonHttpBlockedHint(r, pythonResult);
 
     if (m_cancelled || pythonResult.cancelled) {
         return FinishAsyncToolResult(inv, r, true);
@@ -4004,8 +3959,11 @@ bool AgentController::HandleAssistantError(const std::string& errorText)
                                   errorText == "Failed to start chat request";
     if (!m_cancelled && !frameOwnsMessage) {
         std::vector<std::string> chips = { "stopped", "model request failed" };
-        std::string msg = "The model request failed: " +
-            lb_transient_error::ShortForm(errorText, 300) + ".";
+        // Errors often end in a period already; don't print "..".
+        std::string reason = lb_transient_error::ShortForm(errorText, 300);
+        while (!reason.empty() && (reason.back() == '.' || reason.back() == ' '))
+            reason.pop_back();
+        std::string msg = "The model request failed: " + reason + ".";
         if (m_transientRetries > 0)
             msg += " Automatic retries used: " +
                    std::to_string(m_transientRetries) + ".";

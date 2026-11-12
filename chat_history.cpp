@@ -1130,6 +1130,8 @@ void ChatHistory::SetLastMessageToolImages(
 void ChatHistory::Clear()
 {
     m_messages.clear();
+    m_stickyArgsElided = 0;
+    m_stickyResultsElided = 0;
     m_streamBuffer.clear();
     m_streamBufferDirty = 0;
     m_filePath.clear();
@@ -2023,7 +2025,27 @@ std::string ChatHistory::BuildChatRequestJson(const std::string& model, bool str
         const size_t budgetedBodySize =
             lb_elision::BudgetedBodyBytes(body, elisionBpt);
 
-        if (budgetedBodySize > budget) {
+        // Sticky, chunked elision (elision_budget.h, ElisionTargetBytes).
+        // The oldest m_stickyArgsElided calls / m_stickyResultsElided
+        // results elided by an earlier request stay elided while the body
+        // is above the low-water target, so the elided prefix is the same
+        // bytes on every request and the provider cache keeps hitting.
+        // Only when the body crosses the budget again does the cut move,
+        // and then it moves down to the target in one step.
+        const size_t target = lb_elision::ElisionTargetBytes(budget);
+        if (budgetedBodySize <= target) {
+            // Plenty of room (window grew, history shrank): un-elide.
+            m_stickyArgsElided = 0;
+            m_stickyResultsElided = 0;
+        }
+        const bool overBudget = budgetedBodySize > budget;
+        const bool keepSticky = m_stickyArgsElided > 0 || m_stickyResultsElided > 0;
+
+        if (overBudget || keepSticky) {
+            // When under budget, only the sticky prefix is re-applied;
+            // when over, elide on down to the low-water target.
+            const size_t stopAt = overBudget ? target : (size_t)-1;
+
             // Count tool results so we know which ones to preserve.
             size_t totalToolResults = 0;
             for (const auto& w : wire) if (w.isToolResult) ++totalToolResults;
@@ -2102,7 +2124,8 @@ std::string ChatHistory::BuildChatRequestJson(const std::string& model, bool str
                         if (!rel.empty()) m_elisionSpoolCache.emplace(key, rel);
                         return rel;
                     };
-                for (size_t i = 0; i < preservedStart && estimatedBodySize > budget; ++i) {
+                int argTurnsSeen = 0;
+                for (size_t i = 0; i < preservedStart; ++i) {
                     WireMsg& w = wire[i];
                     if (w.role != "assistant" || !w.toolCalls) continue;
 
@@ -2111,6 +2134,12 @@ std::string ChatHistory::BuildChatRequestJson(const std::string& model, bool str
                            !wire[j].toolCallId.empty()) ++j;
                     if (j == i + 1) continue;            // no replies: not completed
                     if (j > preservedStart) continue;    // replies reach preserved results
+
+                    // Eligible turn.  The sticky prefix is always cut;
+                    // beyond it, only while still above the stop point.
+                    const bool sticky = argTurnsSeen < m_stickyArgsElided;
+                    if (!sticky && !(estimatedBodySize > stopAt)) break;
+                    ++argTurnsSeen;
 
                     Poco::JSON::Array::Ptr shorter =
                         lb_toolcall_elision::ShortenToolCallsArray(
@@ -2133,15 +2162,18 @@ std::string ChatHistory::BuildChatRequestJson(const std::string& model, bool str
                     ++m_lastBuildArgsElidedCount;
                     wireDirty = true;
                 }
+                m_stickyArgsElided = argTurnsSeen;
             }
 
             // ── Step 2b: elide old tool-result bodies ────────────
             size_t toolResultsSeen   = 0;
 
-            for (size_t i = 0; i < wire.size() && estimatedBodySize > budget; ++i) {
+            for (size_t i = 0; i < wire.size(); ++i) {
                 if (!wire[i].isToolResult) continue;
+                if (toolResultsSeen >= maxCandidates) break;
+                const bool sticky = (int)toolResultsSeen < m_stickyResultsElided;
+                if (!sticky && !(estimatedBodySize > stopAt)) break;
                 ++toolResultsSeen;
-                if (toolResultsSeen > maxCandidates) break;
 
                 const size_t oldSize = wire[i].content.size();
                 // Spool first so the marker can name the file.  A result
@@ -2167,9 +2199,8 @@ std::string ChatHistory::BuildChatRequestJson(const std::string& model, bool str
                     ++m_lastBuildElidedCount;   // context meter: real drop
                 }
                 wireDirty = true;
-
-                if (estimatedBodySize <= budget) break;
             }
+            m_stickyResultsElided = (int)toolResultsSeen;
         }
     }
 
@@ -3098,6 +3129,8 @@ bool ChatHistory::LoadFromFile(const std::string& filePath, std::vector<std::str
         m_archived       = newArchived;
         m_modelSelection = std::move(newModelSelection);
         m_messages       = std::move(newMessages);
+        m_stickyArgsElided    = 0;   // new transcript: no elision prefix yet
+        m_stickyResultsElided = 0;
 
         // Repair legacy titles in memory as soon as the conversation opens
         // so the window title is useful immediately.  The next normal save
@@ -3388,9 +3421,31 @@ std::string TitleFromAttachments(const Poco::JSON::Object::Ptr& msg)
 
 } // namespace
 
+// The ZIP attachment block (AttachmentManager::BakeZipFilesIntoMessage) is
+// harness text in front of the user's words: "[Attached ZIP archive: x]
+// Safe zip_inspect tool argument: ..." ending in a blank line.  It made
+// titles like "[Attached ZIP archive: ClipJoiner_v0.1.zip] Safe
+// zip_inspect ...".  Skip every leading ZIP block so the title comes from
+// what the user typed.  (Other attachment kinds can carry file text with
+// blank lines inside, so only the ZIP block, which never does, is cut.)
+static std::string StripBakedZipBlocks(std::string content)
+{
+    static const std::string kZipHeader = "[Attached ZIP archive: ";
+    for (;;) {
+        size_t lead = 0;
+        while (lead < content.size() &&
+               lb_ascii::IsSpace(static_cast<unsigned char>(content[lead]))) ++lead;
+        if (content.compare(lead, kZipHeader.size(), kZipHeader) != 0) break;
+        const size_t blank = content.find("\n\n", lead);
+        if (blank == std::string::npos) return std::string();   // block only
+        content.erase(0, blank + 2);
+    }
+    return content;
+}
+
 std::string ChatHistory::TitleFromUserText(const std::string& text)
 {
-    std::string content = StripSessionContextHeader(text);
+    std::string content = StripBakedZipBlocks(StripSessionContextHeader(text));
     content = TitleStripGreeting(TitleStripOuterQuotes(
         TitleCollapseWhitespace(std::move(content))));
     if (content.empty()) return std::string();

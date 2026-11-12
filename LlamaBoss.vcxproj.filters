@@ -453,6 +453,9 @@
     <ClInclude Include="command_policy.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="secret_access_guard.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="agent_controller.h">
       <Filter>Header Files</Filter>
     </ClInclude>

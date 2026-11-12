@@ -1939,11 +1939,18 @@ using lb_win::CancelThreadSynchronousIo;   // lb_win_process.h
 void ReaderLoop(HANDLE readEnd,
                 std::string& dest,
                 std::mutex& destMutex,
-                std::atomic<bool>& truncatedFlag)
+                std::atomic<bool>& truncatedFlag,
+                std::atomic<bool>& stopFlag,
+                std::atomic<bool>& doneFlag)
 {
     constexpr DWORD kChunk = 4096;
     char buf[kChunk];
     for (;;) {
+        // Checked before every read so a forced stop that lands between
+        // two reads cannot be missed (CancelThreadSynchronousIo only
+        // affects a read that is already in flight).
+        if (stopFlag.load()) break;
+
         DWORD got = 0;
         BOOL ok = ReadFile(readEnd, buf, kChunk, &got, nullptr);
         if (!ok || got == 0) break;
@@ -1958,6 +1965,7 @@ void ReaderLoop(HANDLE readEnd,
             truncatedFlag.store(true);
         }
     }
+    doneFlag.store(true);
 }
 
 using lb_win::QuoteArg;   // lb_win_process.h
@@ -2258,8 +2266,35 @@ private:
                 ? std::string("python_run_script")
                 : std::string("python_run_script ") + displayName;
             if (!pythonRunScriptArgvForHint.empty()) {
-                result.commandEcho += "  ·  " + std::to_string(pythonRunScriptArgvForHint.size()) +
-                    (pythonRunScriptArgvForHint.size() == 1 ? " arg" : " args");
+                // Show the arguments themselves, not just their count: a
+                // card reading "chromeBrowsing.py · 3 args" told neither
+                // the user nor a later export what the call did.  Long
+                // values are shortened; newlines show as a return mark.
+                constexpr size_t kEchoArgBytes  = 80;
+                constexpr size_t kEchoArgsBytes = 240;
+                std::string shown;
+                for (const std::string& a : pythonRunScriptArgvForHint) {
+                    std::string v;
+                    for (char c : a) {
+                        if (c == '\r') continue;
+                        if (c == '\n') v += "\xE2\x8F\x8E";   // ⏎
+                        else v.push_back(c);
+                    }
+                    if (v.size() > kEchoArgBytes)
+                        v = LbUtf8SafeTruncate(v, kEchoArgBytes) + "\xE2\x80\xA6";
+                    const bool quote = v.empty() ||
+                        v.find_first_of(" \t\"") != std::string::npos;
+                    if (quote) {
+                        std::string q = "\"";
+                        for (char c : v) { if (c == '"') q += "\\\""; else q.push_back(c); }
+                        v = q + "\"";
+                    }
+                    if (!shown.empty()) shown.push_back(' ');
+                    shown += v;
+                }
+                if (shown.size() > kEchoArgsBytes)
+                    shown = LbUtf8SafeTruncate(shown, kEchoArgsBytes) + "\xE2\x80\xA6";
+                result.commandEcho += " " + shown;
             }
             beforeFiles = SnapshotPythonRunArtifactFiles(m_cwd, m_activeProjectRoot);
         } else {
@@ -2575,16 +2610,23 @@ private:
 
         std::mutex outMu, errMu;
         std::atomic<bool> truncated(false);
+        std::atomic<bool> stopReaders(false);
+        std::atomic<bool> stdoutReaderDone(false);
+        std::atomic<bool> stderrReaderDone(false);
         std::thread outThread(ReaderLoop,
             outR.h,
             std::ref(result.stdoutText),
             std::ref(outMu),
-            std::ref(truncated));
+            std::ref(truncated),
+            std::ref(stopReaders),
+            std::ref(stdoutReaderDone));
         std::thread errThread(ReaderLoop,
             errR.h,
             std::ref(result.stderrText),
             std::ref(errMu),
-            std::ref(truncated));
+            std::ref(truncated),
+            std::ref(stopReaders),
+            std::ref(stderrReaderDone));
 
         constexpr DWORD kTickMs = 100;
         double deadline = NowSec() + (m_timeoutMs / 1000.0);
@@ -2607,26 +2649,66 @@ private:
             }
         }
 
+        // Always close the job before joining the pipe readers (same
+        // contract as cmd_executor.cpp).  On timeout or cancellation this
+        // kills the whole process tree as before.  On a NORMAL exit it also
+        // ends any descendant the script left running: such a child owns an
+        // inherited copy of the stdout/stderr writer, so the readers would
+        // never see EOF and the unbounded joins below used to keep the
+        // Python tool busy past its deadline (Stop no longer reached it).
+        // This only moves the kill EARLIER: the job's HandleGuard destructor
+        // already killed every leftover descendant when RunOne returned --
+        // it just ran after the joins, which is what let them hang.
+        CloseHandle(job.release());
+
         if (killIt) {
-            // Closing the job handle triggers KILL_ON_JOB_CLOSE across
-            // the whole process tree.
-            CloseHandle(job.release());
-            // Give the OS a beat to deliver the kill so the readers see
-            // EOF and unblock on their own.
-            DWORD killed = WaitForSingleObject(proc.h, 2000);
-            if (killed == WAIT_TIMEOUT) {
-                // A stubborn process or a leaked writer is still holding a
-                // pipe open.  Cancel the in-flight ReadFile calls so the
-                // joins below cannot park this detached worker forever.
-                if (outThread.joinable())
+            // Give Windows a moment to deliver the job termination.  Reader
+            // completion is checked separately below because the direct
+            // process can be gone while a leaked writer still holds a pipe.
+            WaitForSingleObject(proc.h, 2000);
+        }
+
+        // Bounded drain: let buffered output arrive, but never wait on the
+        // pipes indefinitely.
+        constexpr DWORD kReaderDrainGraceMs = 2000;
+        const ULONGLONG drainDeadline = GetTickCount64() + kReaderDrainGraceMs;
+        while ((!stdoutReaderDone.load() || !stderrReaderDone.load()) &&
+               GetTickCount64() < drainDeadline) {
+            Sleep(10);
+        }
+
+        const bool forcedReaderStop =
+            !stdoutReaderDone.load() || !stderrReaderDone.load();
+        if (forcedReaderStop) {
+            // Ask each blocked synchronous ReadFile to return.  Repeat for a
+            // bounded window: a single cancel can land between two reads and
+            // be missed; stopReaders makes the loop exit before re-reading.
+            stopReaders.store(true);
+            constexpr DWORD kReaderCancelWindowMs = 2000;
+            const ULONGLONG cancelDeadline =
+                GetTickCount64() + kReaderCancelWindowMs;
+            while ((!stdoutReaderDone.load() || !stderrReaderDone.load()) &&
+                   GetTickCount64() < cancelDeadline) {
+                if (outThread.joinable() && !stdoutReaderDone.load())
                     CancelThreadSynchronousIo(outThread.native_handle());
-                if (errThread.joinable())
+                if (errThread.joinable() && !stderrReaderDone.load())
                     CancelThreadSynchronousIo(errThread.native_handle());
+                Sleep(25);
             }
         }
 
         if (outThread.joinable()) outThread.join();
         if (errThread.joinable()) errThread.join();
+
+        if (forcedReaderStop) {
+            std::lock_guard<std::mutex> lk(errMu);
+            if (!result.stderrText.empty() && result.stderrText.back() != '\n')
+                result.stderrText += "\r\n";
+            result.stderrText +=
+                "[a leftover process still held the output pipes after the script "
+                "ended; output collection was stopped. Scripts must not leave "
+                "background processes running.]\r\n";
+        }
 
         // Guard the chat/model request boundary.  Helpers are supposed to
         // return UTF-8, but Windows subprocess output is not trustworthy

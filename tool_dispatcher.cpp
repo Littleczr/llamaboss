@@ -11,6 +11,7 @@
 #include "tool_router.h"
 #include "ui_event_post.h"
 #include "background_work.h"   // lb::BeginBackgroundWork (drained in MyApp::OnExit)
+#include "secret_access_guard.h"
 
 #include <cassert>
 #include <exception>
@@ -196,6 +197,21 @@ DispatchOutcome DispatchInvocation(const ToolInvocation& inv,
         // unknown names via IsKnownToolName.  Belt-and-braces fallback
         // for any path that bypasses the parser.
         return MakeInvalidOutcome(inv, "Unknown tool: " + inv.name);
+    }
+
+    // Hard block on reading stored credentials from any tool that runs
+    // code or writes a script.  Checked here so every caller (agent loop,
+    // slash commands, background worker) gets it, and before dispatch so
+    // a remembered chat-wide approval cannot let it through.
+    if (ToolArgsMayReadSecrets(inv.name)) {
+        const std::string secret = DetectSecretStoreAccess(inv.args);
+        if (!secret.empty()) {
+            DispatchOutcome blocked = MakeInvalidOutcome(
+                inv, "Blocked: this call " + secret + ". " +
+                     SecretStoreRejectionAdvice());
+            blocked.result.chips = { "blocked" };
+            return blocked;
+        }
     }
 
     DispatchDeps deps;

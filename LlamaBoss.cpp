@@ -90,7 +90,7 @@
 #include "chat_folders.h"
 
 // ─── Application version ─────────────────────────────────────
-static const char* LLAMABOSS_VERSION = "0.1.27";
+static const char* LLAMABOSS_VERSION = "0.1.29";
 
 // Native menu command ids. Keep above wxID_HIGHEST to avoid collisions
 // with stock wxWidgets commands.
@@ -229,6 +229,28 @@ std::string LbTraceTimestampForFilename()
 // LbBackgroundThreadKeeper moved to lb_background_threads.h (used by
 // the About dialog's update check / installer download).
 
+// Completion tokens that will come back on the NEXT request.  Reasoning
+// is stripped from history before it goes on the wire, so counting it
+// made the meter jump by the whole think block (98k shown, next prompt
+// 68k, on a Qwen3.8-Flash turn with 31k completion tokens).  Use the
+// server's reasoning_tokens when it reports them; otherwise scale the
+// completion count by the share of the reply bytes that survive: the
+// visible text plus the native tool-call arguments.
+long long LbCarriedCompletionTokens(long long completionTokens,
+                                    long long reasoningTokens,
+                                    const std::string& fullResponse,
+                                    size_t toolCallsBytes)
+{
+    if (completionTokens <= 0) return 0;
+    if (reasoningTokens > 0)
+        return completionTokens > reasoningTokens ? completionTokens - reasoningTokens : 0;
+    const size_t visible = answer_receipts::StripThinkBlocks(fullResponse).size();
+    const size_t total   = fullResponse.size() + toolCallsBytes;
+    const size_t kept    = visible + toolCallsBytes;
+    if (total == 0 || kept >= total) return completionTokens;
+    return (long long)((double)completionTokens * (double)kept / (double)total + 0.5);
+}
+
 const wxColour& LbInteractiveAccentForTheme(const ThemeData& theme)
 {
     // Single rule lives in theme.h so the toolbar, the settings cogwheel
@@ -259,11 +281,6 @@ private:
 enum class ChatState {
     Idle,
     Streaming,
-    RunningCmd,
-    RunningGrep,
-    RunningPython,
-    RunningWebFetch,
-    RunningToolWorker,
     AwaitingApproval,
 };
 
@@ -622,6 +639,7 @@ private:
         stripCallbacks.onSkillMenuRequested = [this](wxWindow* anchor) {
             ShowSkillPopupMenu(anchor);
         };
+        stripCallbacks.onEjectRequested = [this]() { OnStripEject(); };
         m_projectStrip = std::make_unique<ProjectStatusStrip>(
             this, m_appState->GetTheme(), stripCallbacks);
         mainSizer->Add(m_projectStrip->GetPanel(), 0, wxEXPAND);
@@ -1108,7 +1126,7 @@ private:
                 ++m_generationId;
                 return m_generationId;
             },
-            /*getActiveProtocol*/ [this]() { return _activeProtocol; },
+            /*getActiveProtocol*/ [this]() { return ResolveRequestProtocol(); },
             /*resolveWireModel*/ [this]() {
                 // Same per-conversation value the main send path uses
                 // (see the `model` local in the send handler).  Holds
@@ -1887,18 +1905,6 @@ private:
     }
 
 
-    // Slash-command approval state.  Agent approvals live inside
-    // AgentController because native tool_call_id threading must
-    // remain with the loop.  Slash approvals live here because MyFrame
-    // owns slash rendering, persistence, and async state.
-    struct PendingSlashApproval {
-        ToolInvocation invocation;
-        ToolContext    context;
-        std::string    writeRootGrant;
-        bool           active = false;
-    };
-    PendingSlashApproval m_pendingSlashApproval;
-
     ToolCallStreamDetector m_agentToolStreamDetector;
     size_t m_agentToolVisibleProseLen = 0;
 
@@ -2528,9 +2534,8 @@ private:
 
     void SetStreamingState(bool streaming)
     {
-        // Most callers set a more specific busy state before toggling the UI
-        // (RunningPython, RunningCmd, RunningGrep, RunningWebFetch, or
-        // Streaming).  This backstop prevents any future UI-only true toggle
+        // Callers normally set Streaming before toggling the UI.  This
+        // backstop prevents any future UI-only true toggle
         // from accidentally leaving the frame logically Idle while work is
         // still in flight.
         if (streaming && m_chatState == ChatState::Idle) {
@@ -2713,41 +2718,6 @@ private:
         // Reuse normal persistence; an empty chat remains unsaved until it
         // has content, and then carries its selected mode with its snapshot.
         if (m_convController) m_convController->AutoSaveConversation();
-    }
-
-    static bool IsPythonAsyncToolName(const std::string& toolName)
-    {
-        if (toolName == tool_names::kGrep ||
-            toolName == tool_names::kPowerShell ||
-            toolName == tool_names::kWebFetchUrl) {
-            return false;
-        }
-
-        const ToolSpec* spec = GetGlobalRouter().Find(toolName);
-        return spec && spec->safety.isAsync;
-    }
-
-    static ChatState ChatStateForAsyncToolName(const std::string& toolName)
-    {
-        if (toolName == tool_names::kGrep) {
-            return ChatState::RunningGrep;
-        }
-        if (toolName == tool_names::kPowerShell) {
-            return ChatState::RunningCmd;
-        }
-        if (toolName == tool_names::kWebFetchUrl) {
-            return ChatState::RunningWebFetch;
-        }
-        if (IsPythonAsyncToolName(toolName)) {
-            return ChatState::RunningPython;
-        }
-
-        // Defensive fallback: DispatchInvocation already verified that this
-        // tool is registered as async.  Even if a future async tool is not
-        // added to the explicit mapping above, never leave the frame Idle
-        // while its worker is in flight.
-        assert(false && "Async tool has no ChatState mapping.");
-        return ChatState::RunningCmd;
     }
 
     // ═════════════════════════════════════════════════════════════
@@ -3176,9 +3146,11 @@ private:
         if (payload) {
             if (payload->PromptTokens() >= 0) {
                 m_ctxAnchorPromptTokens = payload->PromptTokens();
-                m_ctxAnchorCompletionTokens =
-                    payload->CompletionTokens() > 0
-                        ? payload->CompletionTokens() : 0;
+                m_ctxAnchorCompletionTokens = LbCarriedCompletionTokens(
+                    payload->CompletionTokens(),
+                    payload->Stats().reasoningTokens,
+                    fullResponse,
+                    payload->ToolCallsJson().size());
                 m_ctxAnchorExact = true;
                 m_ctxAnchorRevision =
                     m_chatHistory ? m_chatHistory->GetRevision() : 0;
@@ -3560,252 +3532,67 @@ private:
             m_pySessionManager->ReapIdle();
     }
 
-    // ─── Unified slash-command dispatch ──────────────────────────
+    // ─── Typed tool commands ─────────────────────────────────────
     //
-    // Typed tool commands (/reminder_create, /reminder_list and
-    // /reminder_cancel; see kToolSlashTable in lb_input_parsers.cpp)
-    // flow through HandleSlashCommand below.  The method builds a
-    // ToolInvocation, calls DispatchInvocation, and either renders the
-    // sync result or sets the chat-state so the matching
-    // OnGrepComplete / OnCmdComplete picks up the async continuation.
+    // /reminder_create, /reminder_list and /reminder_cancel (see
+    // kToolSlashTable in lb_input_parsers.cpp) run through the same
+    // DispatchInvocation the agent uses and render via
+    // RenderAndPersistSlashResult.  All three are synchronous and never
+    // need an approval card, so typed commands have no async, worker, or
+    // approval state of their own.  A tool added to kToolSlashTable that
+    // lacks those properties is refused here (fail closed) rather than
+    // run without its approval card; it trips an assert in debug builds.
     //
-    // /cd is NOT a tool — it mutates per-conversation state and keeps
-    // a dedicated handler.  Dispatch, validation, rendering, and
-    // history for everything else are identical to the agent path.
-    //
-    // toolCallId is always empty for slash invocations: there is no
-    // model-emitted call to thread.  AddUserMessage (rather than
-    // AddToolResultMessage) is therefore the correct persistence
-    // call for the result — see RenderAndPersistSlashResult.
-    void DisplaySlashPendingIndicator(const std::string& toolName,
-                                      const std::string& args)
-    {
-        const ToolSpec* spec = GetGlobalRouter().Find(toolName);
-        if (!spec || (!spec->safety.isAsync && !spec->safety.dispatchOnWorker)) return;
-
-        // Grep benefits from the richer historical indicator because the
-        // resolved target path is not obvious from the raw slash text.
-        if (toolName == tool_names::kGrep && !args.empty()) {
-            // Re-extract pattern + path purely for the indicator.
-            // The dispatcher re-extracts identically inside DoGrep.
-            std::string s = args;
-            size_t a = s.find_first_not_of(" \t\r\n");
-            if (a == std::string::npos)      s.clear();
-            else if (a > 0)                  s.erase(0, a);
-
-            size_t sep = s.find_first_of(" \t");
-            std::string pat = (sep == std::string::npos) ? s
-                                                          : s.substr(0, sep);
-            std::string rawPath = (sep == std::string::npos)
-                ? std::string()
-                : s.substr(sep + 1);
-            {
-                size_t pa = rawPath.find_first_not_of(" \t\r\n");
-                size_t pb = rawPath.find_last_not_of(" \t\r\n");
-                if (pa == std::string::npos) rawPath.clear();
-                else                          rawPath = rawPath.substr(pa, pb - pa + 1);
-            }
-
-            std::string ctxCwd  = ResolveCurrentCwd();
-            std::string target  = rawPath.empty() ? ctxCwd : rawPath;
-            std::string resolved = ResolveToolPath(target, ctxCwd);
-            if (!resolved.empty() && !pat.empty()) {
-                m_chatDisplay->DisplaySystemMessage(
-                    spec->iconUtf8 + " Grep: '" + pat + "' in " + resolved);
-            }
-            return;
-        }
-
-        // Keep the command echo for PowerShell; it is the one async slash
-        // indicator where the raw args are the useful status text.
-        if (toolName == tool_names::kPowerShell && !args.empty()) {
-            m_chatDisplay->DisplaySystemMessage(
-                spec->iconUtf8 + " PowerShell: " + args);
-            return;
-        }
-
-        const std::string icon = spec->iconUtf8.empty()
-            ? std::string("\xE2\x9A\xA0")
-            : spec->iconUtf8;
-        const std::string label = spec->displayName.empty()
-            ? toolName
-            : spec->displayName;
-
-        m_chatDisplay->DisplaySystemMessage(icon + " " + label);
-    }
-
-    void DispatchSlashInvocation(const ToolInvocation& inv,
-                                 const ToolContext&    ctx)
-    {
-        // Only announce work once approval (when required) has been granted
-        // and dispatch is actually about to begin.  Emitting this at the top
-        // of HandleSlashCommand made approval-gated async/worker tools look as
-        // though they were already running while the user was still deciding.
-        if (inv.valid)
-            DisplaySlashPendingIndicator(inv.name, inv.args);
-
-        if (inv.valid && ShouldDispatchToolOnWorker(inv.name)) {
-            if (m_toolWorker && m_toolWorker->Start(inv, ctx)) {
-                m_chatState = ChatState::RunningToolWorker;
-                SetStreamingState(true);
-                return;
-            }
-
-            ToolInvocationResult r;
-            r.toolTag       = inv.name;
-            r.invocationRaw = inv.rawBlock;
-            r.iconUtf8      = tool_approval::ToolIcon(inv.name);
-            r.toolName      = tool_approval::ToolDisplayName(inv.name);
-            r.commandEcho   = inv.args.empty() ? inv.name : inv.args;
-            r.chips         = { "error" };
-            r.errorBody     =
-                "The background tool worker is already busy or could not start.";
-            m_toolResultController->RenderAndPersistSlashResult(r);
-            if (!m_chatHistory->IsEmpty())
-                m_convController->AutoSaveConversation();
-            return;
-        }
-
-        DispatchOutcome out = DispatchInvocation(
-            inv, ctx, m_grepExecutor.get(), m_cmdExecutor.get(),
-            m_pythonRunner.get(), m_webFetchExecutor.get(),
-            m_pySessionManager.get());
-
-        switch (out.status) {
-        case DispatchStatus::Completed:
-        case DispatchStatus::Invalid:
-            m_toolResultController->RenderAndPersistSlashResult(out.result);
-            if (!m_chatHistory->IsEmpty())
-                m_convController->AutoSaveConversation();
-            return;
-
-        case DispatchStatus::Async:
-            // The dispatcher already started the specialized worker.
-            m_chatState = ChatStateForAsyncToolName(inv.name);
-            SetStreamingState(true);
-            return;
-        }
-    }
-
-    void GateOrDispatchSlashInvocation(const ToolInvocation& inv,
-                                       const ToolContext&    ctx)
-    {
-        // Location authorization is independent of general tool trust. Even
-        // a chat that previously selected Allow Always must explicitly grant
-        // each out-of-root folder before a native mutation can run there.
-        const bool alreadyApproved =
-            m_chatHistory && m_chatHistory->IsToolChatApproved(inv.name);
-
-        tool_approval::ApprovalDecision approval;
-        const bool needsWriteRoot =
-            tool_approval::RequiresWriteRootGrant(inv, ctx, approval);
-        const bool needsActionApproval =
-            !needsWriteRoot &&
-            !alreadyApproved &&
-            tool_approval::RequiresApproval(inv, ctx, approval);
-
-        if (needsWriteRoot || needsActionApproval) {
-            if (HasPendingApproval()) {
-                m_chatDisplay->DisplaySystemMessage(
-                    "Approval is already pending. Use the buttons above to respond.");
-                return;
-            }
-            m_pendingSlashApproval.invocation = inv;
-            m_pendingSlashApproval.context    = ctx;
-            m_pendingSlashApproval.writeRootGrant = needsWriteRoot
-                ? approval.writeRoot
-                : std::string();
-            m_pendingSlashApproval.active = true;
-
-            ToolBlock card = approval.block;
-            card.requiresApproval = true;
-            m_chatDisplay->DisplayToolBlock(card, false);
-            SetApprovalState(true);
-            return;
-        }
-
-        DispatchSlashInvocation(inv, ctx);
-    }
-
+    // /cd is NOT a tool -- it mutates per-conversation state and keeps a
+    // dedicated handler.  toolCallId stays empty: there is no
+    // model-emitted call to thread, so the result is persisted as a user
+    // message (see RenderAndPersistSlashResult).
     void HandleSlashCommand(const std::string& toolName,
                             const std::string& args)
     {
-        // Build the protocol-neutral invocation.  Validation runs
-        // here so DispatchInvocation can fold a shape-level rejection
-        // into the same Invalid-outcome path the parser uses for
-        // malformed agent <tool_call> blocks.
         ToolInvocation inv;
-        inv.name     = toolName;
-        inv.args     = args;
-        inv.rawBlock.clear();    // no <tool_call> source for slash
-        inv.toolCallId.clear();  // no native id threading for slash
+        inv.name = toolName;
+        inv.args = args;
 
         std::string reason;
         inv.valid         = ValidateToolArgs(toolName, args, reason);
         inv.invalidReason = reason;
 
-        GateOrDispatchSlashInvocation(inv, BuildToolContext());
-    }
+        const ToolContext ctx = BuildToolContext();
 
-
-    bool HasPendingApproval() const
-    {
-        return m_pendingSlashApproval.active ||
-               (m_agentController && m_agentController->IsAwaitingApproval());
-    }
-
-    void ExecuteApprovedSlashTool(bool rememberForChat = false)
-    {
-        if (!m_pendingSlashApproval.active) return;
-
-        ToolInvocation inv = m_pendingSlashApproval.invocation;
-        ToolContext    ctx = m_pendingSlashApproval.context;
-        std::string    writeRootGrant =
-            m_pendingSlashApproval.writeRootGrant;
-        m_pendingSlashApproval = PendingSlashApproval{};
-        SetApprovalState(false);
-
-        if (!writeRootGrant.empty()) {
-            if (!m_chatHistory ||
-                !m_chatHistory->GrantWriteRootForChat(writeRootGrant)) {
-                ToolInvocationResult r = tool_approval::DeniedResult(
-                    inv,
-                    "Folder access could not be granted. Tool was not executed.");
-                m_toolResultController->RenderAndPersistSlashResult(r);
-                return;
-            }
-
-            // Rebuild so the new root is present, then re-run the ordinary
-            // action gate. A delete therefore still gets its delete card.
-            GateOrDispatchSlashInvocation(inv, BuildToolContext());
+        const ToolSpec* spec = GetGlobalRouter().Find(toolName);
+        tool_approval::ApprovalDecision approval;
+        const bool typeable =
+            spec && !spec->safety.isAsync && !spec->safety.dispatchOnWorker &&
+            !(inv.valid &&
+              (tool_approval::RequiresWriteRootGrant(inv, ctx, approval) ||
+               tool_approval::RequiresApproval(inv, ctx, approval)));
+        if (!typeable) {
+            assert(false && "kToolSlashTable entry needs async/worker/approval support");
+            ToolInvocationResult r;
+            r.toolTag     = toolName;
+            r.iconUtf8    = tool_approval::ToolIcon(toolName);
+            r.toolName    = tool_approval::ToolDisplayName(toolName);
+            r.commandEcho = args.empty() ? toolName : args;
+            r.chips       = { "blocked" };
+            r.errorBody   = "This tool can't be run as a typed command. "
+                            "Ask the model to run it instead.";
+            m_toolResultController->RenderAndPersistSlashResult(r);
             return;
         }
 
-        // Mark BEFORE dispatch so the per-chat approval state is
-        // already in place if the model immediately requests another
-        // approval-required tool.  "Approve always" now means
-        // one-approval mode for this conversation, not just this
-        // individual tool name.
-        if (rememberForChat && m_chatHistory) {
-            m_chatHistory->RememberAllToolApprovalsForChat();
-        }
-
-        DispatchSlashInvocation(inv, ctx);
-    }
-
-    void DenyPendingSlashTool(const std::string& message =
-        "Denied by user. Tool was not executed.")
-    {
-        if (!m_pendingSlashApproval.active) return;
-
-        ToolInvocation inv = m_pendingSlashApproval.invocation;
-        m_pendingSlashApproval = PendingSlashApproval{};
-        SetApprovalState(false);
-
-        ToolInvocationResult r = tool_approval::DeniedResult(inv, message);
-        m_toolResultController->RenderAndPersistSlashResult(r);
+        const DispatchOutcome out = DispatchInvocation(
+            inv, ctx, m_grepExecutor.get(), m_cmdExecutor.get(),
+            m_pythonRunner.get(), m_webFetchExecutor.get(),
+            m_pySessionManager.get());
+        m_toolResultController->RenderAndPersistSlashResult(out.result);
         if (!m_chatHistory->IsEmpty())
             m_convController->AutoSaveConversation();
+    }
+
+    bool HasPendingApproval() const
+    {
+        return m_agentController && m_agentController->IsAwaitingApproval();
     }
 
     void HandleApprovalCommand(bool approve, bool rememberForChat = false)
@@ -3819,16 +3606,14 @@ private:
 
         // Session trust: chat-wide approval survives switching away and
         // back within this run of LlamaBoss.  Record the path here — the
-        // single choke point both the slash and agent paths route
-        // through for clicks AND typed commands — and let
+        // single choke point approvals route through for clicks AND
+        // typed approve/deny words — and let
         // LoadConversationFromPath re-arm the ChatHistory flag on
         // reload.  Unsaved chats have an empty path and are ignored;
         // AutoSaveConversation syncs them once a path exists.
         const bool resolvingWriteRoot =
-            (m_pendingSlashApproval.active &&
-             !m_pendingSlashApproval.writeRootGrant.empty()) ||
-            (m_agentController &&
-             m_agentController->IsAwaitingWriteRootGrant());
+            m_agentController &&
+            m_agentController->IsAwaitingWriteRootGrant();
 
         if (approve && rememberForChat && !resolvingWriteRoot &&
             m_chatHistory) {
@@ -3836,19 +3621,13 @@ private:
                 .RememberSessionTrust(m_chatHistory->GetFilePath());
         }
 
-        if (m_pendingSlashApproval.active) {
-            if (approve) ExecuteApprovedSlashTool(rememberForChat);
-            else         DenyPendingSlashTool();
-            return;
-        }
-
         if (m_agentController && m_agentController->IsAwaitingApproval()) {
             SetApprovalState(false);
             if (approve) {
                 bool ok = m_agentController->ApprovePendingTool(rememberForChat);
                 if (ok && m_agentController->IsAwaitingAsyncResult()) {
-                    // Agent-owned async tools are part of the active turn just
-                    // like slash async tools.  Set the logical busy state before
+                    // Agent-owned async tools are part of the active turn.
+                    // Set the logical busy state before
                     // toggling widgets so IsBusy() blocks sidebar loads,
                     // Ctrl+N/Ctrl+O/Ctrl+S, and model switches until the
                     // completion event returns through AgentController.
@@ -3955,8 +3734,33 @@ private:
     // need the full grammar tutorial below.
     //
     // BuildAgentSystemPrompt() is the dispatcher; it picks based
-    // on _activeProtocol.  Both branches share workspace context
+    // on ResolveRequestProtocol().  Both branches share workspace context
     // and per-tool behaviour notes via small helper composers.
+
+    // Tool protocol for the NEXT request of this conversation.
+    //
+    // _activeProtocol caches the protocol of the app-global target (the
+    // loaded local model, or the last remote target installed globally).
+    // A remote conversation resolves its own endpoint per send and is not
+    // necessarily that global target, and OnServiceStateChanged resets
+    // the cache to Unknown whenever the frame's conversation is not the
+    // active target -- e.g. another window loading a local model.  Reading
+    // the cache for a remote chat then built an XML-prompt request with
+    // no tool catalog mid-turn (2026-10-30, requests #124-#125 of the
+    // ClipJoiner chat: native model, no tools, text-encoded tool call).
+    // Remote lanes therefore take the protocol from their own endpoint.
+    ToolProtocol ResolveRequestProtocol()
+    {
+        if (m_modelSwitcher && !m_modelSwitcher->SessionUsesLocalServer()) {
+            const InferenceTarget t = m_modelSwitcher->ResolveTargetForConversation();
+            if (t.resolutionError.empty() && t.protocol != ToolProtocol::Unknown)
+                return t.protocol;
+            // Unresolvable remote target: the send fails at the transport
+            // anyway; keep the request shape native like every remote lane.
+            return ToolProtocol::Native;
+        }
+        return _activeProtocol;
+    }
 
     // sideEffectFree: build the prompt without giving an empty, unsaved
     // chat an identity.  ResolveCurrentCwd() assigns a conversation path
@@ -3978,7 +3782,7 @@ private:
         input.pendingSkillAuthoringContextBlock = m_skillDraftController->BuildPendingSkillAuthoringContextBlock();
         input.toolSafetySummaryText = BuildToolSafetySummaryText(GetGlobalRouter());
 
-        if (_activeProtocol == ToolProtocol::Native) {
+        if (ResolveRequestProtocol() == ToolProtocol::Native) {
             return ::BuildAgentSystemPromptNative(input);
         }
         return ::BuildAgentSystemPromptXml(input);
@@ -5078,11 +4882,6 @@ private:
         // Stop while an approval card is pending means cancel the
         // pending tool, not a nonexistent chat stream.
         if (m_chatState == ChatState::AwaitingApproval) {
-            if (m_pendingSlashApproval.active) {
-                DenyPendingSlashTool(
-                    "Cancelled by user before approval. Tool was not executed.");
-                return;
-            }
             if (m_agentController->IsActive() &&
                 m_agentController->IsAwaitingApproval()) {
                 m_agentController->CancelPendingApproval();
@@ -5152,37 +4951,6 @@ private:
         }
 
         if (IsBusy()) {
-            // /cmd runs get cancelled through the executor; the worker
-            // posts wxEVT_CMD_COMPLETE with cancelled=true which drives
-            // the UI reset in OnCmdComplete.
-            if (m_chatState == ChatState::RunningCmd) {
-                m_cmdExecutor->Cancel();
-                return;
-            }
-            // /grep is the same pattern: worker polls the cancel flag,
-            // finishes up with cancelled=true, and posts COMPLETE.
-            if (m_chatState == ChatState::RunningGrep) {
-                m_grepExecutor->Cancel();
-                return;
-            }
-            if (m_chatState == ChatState::RunningPython) {
-                // RunningPython covers both Python backends; Cancel()
-                // on the idle one is a harmless flag set.  A cancelled
-                // /py exec kills its session (state lost, said
-                // explicitly in the result card).
-                m_pythonRunner->Cancel();
-                if (m_pySessionManager) m_pySessionManager->Cancel();
-                return;
-            }
-            if (m_chatState == ChatState::RunningWebFetch) {
-                m_webFetchExecutor->Cancel();
-                return;
-            }
-            if (m_chatState == ChatState::RunningToolWorker) {
-                m_toolWorker->Cancel();
-                return;
-            }
-
             // Policy alignment with OnClose/OnAssistantError: commit the
             // last batched delta (up to ~16 ms of streamed text) instead
             // of dropping it, so Stop preserves exactly what was
@@ -5756,6 +5524,34 @@ private:
         if (change != ModelServiceChange::Sync) {
             InvalidateContextAnchor();
             RefreshContextMeter();
+        }
+
+        UpdateStripEjectIcon();
+    }
+
+    // ── Strip eject icon ─────────────────────────────────────────
+    // Visible only while a local llama-server has a model ready (not
+    // while loading, not on a remote target).  Every frame gets the
+    // service broadcast, so all windows' icons stay in sync.
+    void UpdateStripEjectIcon()
+    {
+        if (!m_projectStrip || !m_modelService) return;
+        m_projectStrip->SetEjectVisible(
+            m_modelService->IsServerReady() &&
+            !m_modelService->Server().GetLoadedModel().empty());
+    }
+
+    // One click, no confirm: undoing an eject only costs a reload on the
+    // next Send.  Refusals (streaming / loading) go to the chat as notices.
+    void OnStripEject()
+    {
+        if (!m_modelSwitcher || !m_chatDisplay) return;
+        std::string why;
+        if (m_modelSwitcher->TryEjectLocalModel(why)) {
+            m_chatDisplay->DisplaySystemNotice(
+                "Model unloaded. It reloads when you send your next message.");
+        } else {
+            m_chatDisplay->DisplaySystemNotice(why);
         }
     }
 
@@ -7395,7 +7191,7 @@ private:
             // same on subsequent iterations (see
             // AgentController::BuildRequestBody); this is the first
             // turn before the controller takes over the loop.
-            firstTurnProto = _activeProtocol;
+            firstTurnProto = ResolveRequestProtocol();
             std::string tools;
             const bool native = (firstTurnProto == ToolProtocol::Native);
             if (native) {
@@ -7674,12 +7470,11 @@ private:
                 }
             }
 
-            const std::string deferred = m_modelSwitcher->TakePendingDeferredModel();
-            if (!deferred.empty() &&
-                wxFileExists(wxString::FromUTF8(deferred)))
-            {
+            // Load modelPath and queue this prompt to fire from
+            // OnServerReady.  Shared by the deferred and ejected paths.
+            auto queueLocalLoad = [this](const std::string& modelPath) {
                 m_pendingSend.active    = true;
-                m_pendingSend.modelPath = deferred;
+                m_pendingSend.modelPath = modelPath;
                 SetPendingSendUi(true);   // text stays in the composer
 
                 // A fresh model invalidates the previous tool protocol; reset
@@ -7689,11 +7484,18 @@ private:
 
                 _statusDot->SetConnected(false);
                 m_chatDisplay->DisplaySystemMessage(
-                    "Loading " + ServerManager::ModelDisplayName(deferred) +
+                    "Loading " + ServerManager::ModelDisplayName(modelPath) +
                     "\xE2\x80\xA6 your message will send when it's ready.");
 
                 m_modelService->RequestLocalModel(
-                    deferred, m_appState->MakeServerConfig());
+                    modelPath, m_appState->MakeServerConfig());
+            };
+
+            const std::string deferred = m_modelSwitcher->TakePendingDeferredModel();
+            if (!deferred.empty() &&
+                wxFileExists(wxString::FromUTF8(deferred)))
+            {
+                queueLocalLoad(deferred);
                 return;
             }
             if (!deferred.empty()) {
@@ -7721,6 +7523,27 @@ private:
                         "\xE2\x80\xA6 your message will send when it's ready.");
                     return;
                 }
+            }
+
+            // Nothing loaded and nothing loading: the model was ejected
+            // (Manage Models > Eject).  Frames with a pinned local model
+            // already parked it as deferred above; this covers windows
+            // with no pin (e.g. opened after the eject) by reloading the
+            // conversation's / app's local model.
+            if (m_modelService->GetActiveSelectionKey().empty() &&
+                m_modelService->GetLastChange() == ModelServiceChange::Stopped &&
+                m_modelSwitcher->SessionUsesLocalServer()) {
+                const std::string reload =
+                    m_modelSwitcher->GetConversationModelForSave();
+                if (!reload.empty() &&
+                    wxFileExists(wxString::FromUTF8(reload))) {
+                    queueLocalLoad(reload);
+                    return;
+                }
+                m_chatDisplay->DisplaySystemMessage(
+                    "No model is loaded. Choose a model from the model pill, "
+                    "then send again.");
+                return;
             }
             m_chatDisplay->DisplaySystemMessage(
                 "Server is still loading the model. Please wait...");

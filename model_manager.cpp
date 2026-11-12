@@ -2,8 +2,8 @@
 //
 // Filesystem-based model manager for LlamaBoss.
 // Lists .gguf files from %LOCALAPPDATA%\LlamaBoss\models\
-// Supports delete (removes the file), opening the folder, and
-// downloading a model from a pasted link.
+// Supports delete (removes the file), opening the folder, ejecting
+// the running local model, and downloading a model from a pasted link.
 
 #include "model_manager.h"
 #include "server_manager.h"
@@ -90,7 +90,11 @@ enum {
     ID_MM_REFRESH    = wxID_HIGHEST + 202,
     ID_MM_OPENFOLDER = wxID_HIGHEST + 204,
     ID_MM_URL_BUTTON = wxID_HIGHEST + 206,
+    ID_MM_EJECT      = wxID_HIGHEST + 208,
 };
+
+// Shown after the model name of the row llama-server has loaded.
+static const char* const kLoadedMarker = "   \xE2\x97\x8F loaded";
 
 // Posted by the link pre-check worker.  Int = probe generation,
 // payload = ModelUrlProbe.
@@ -101,6 +105,7 @@ static constexpr long long kDiskHeadroomBytes = 1LL << 30;   // 1 GB
 
 wxBEGIN_EVENT_TABLE(ModelManagerDialog, wxDialog)
     EVT_BUTTON(ID_MM_REFRESH,    ModelManagerDialog::OnRefreshClicked)
+    EVT_BUTTON(ID_MM_EJECT,      ModelManagerDialog::OnEjectClicked)
     EVT_BUTTON(ID_MM_OPENFOLDER, ModelManagerDialog::OnOpenFolderClicked)
     EVT_BUTTON(wxID_CLOSE,       ModelManagerDialog::OnClose)
 wxEND_EVENT_TABLE()
@@ -108,12 +113,14 @@ wxEND_EVENT_TABLE()
 ModelManagerDialog::ModelManagerDialog(wxWindow* parent,
                                        const ThemeData* theme,
                                        std::string loadedModelPath,
-                                       std::string configuredModelPath)
+                                       std::string configuredModelPath,
+                                       std::function<bool(std::string&)> onEject)
     : wxDialog(parent, wxID_ANY, "Manage Models", wxDefaultPosition, wxSize(660, 580),
                wxDEFAULT_DIALOG_STYLE | wxRESIZE_BORDER)
     , m_theme(theme)
     , m_loadedModelPath(std::move(loadedModelPath))
     , m_configuredModelPath(std::move(configuredModelPath))
+    , m_onEject(std::move(onEject))
 {
     // Bump dialog default font to match the rest of the dialog family.
     wxFont f = GetFont();
@@ -188,6 +195,11 @@ void ModelManagerDialog::CreateControls()
     //  letting a red button visually dominate the dialog.
     auto* actionSizer = new wxBoxSizer(wxHORIZONTAL);
     m_refreshButton = MakeAccentButton(body, ID_MM_REFRESH, "Refresh", t);
+    // Eject unloads the running local model (frees VRAM).  It is a
+    // runtime action, not a file action, so it sits beside Refresh
+    // rather than on the list with Delete.
+    if (m_onEject)
+        m_ejectButton = MakeAccentButton(body, ID_MM_EJECT, "Eject", t);
     auto* openBtn   = MakeAccentButton(body, ID_MM_OPENFOLDER, "Open folder", t);
 
     auto* deleteHint = new wxStaticText(body, wxID_ANY,
@@ -200,7 +212,10 @@ void ModelManagerDialog::CreateControls()
         deleteHint->SetForegroundColour(t.textMuted);
     }
 
-    actionSizer->Add(m_refreshButton, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 14);
+    actionSizer->Add(m_refreshButton, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT,
+                     m_ejectButton ? 8 : 14);
+    if (m_ejectButton)
+        actionSizer->Add(m_ejectButton, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 14);
     actionSizer->Add(deleteHint,      0, wxALIGN_CENTER_VERTICAL);
     actionSizer->AddStretchSpacer();
     actionSizer->Add(openBtn,         0, wxALIGN_CENTER_VERTICAL);
@@ -297,6 +312,8 @@ void ModelManagerDialog::CreateControls()
         closeBtn->SetForegroundColour(t.textMuted);
         m_urlButton->SetBackgroundColour(t.accentButton);
         m_urlButton->SetForegroundColour(t.accentButtonText);
+        // m_ejectButton is painted by UpdateEjectButton (enabled/disabled
+        // colours), called from RefreshModelList after CreateControls.
 
         // Status + header + hints should remain muted (the recursive
         // helper painted them with textPrimary).
@@ -344,6 +361,9 @@ void ModelManagerDialog::RefreshModelList()
         std::string sizeStr = (fileSize != wxInvalidSize)
                               ? FormatSize(fileSize) : "?";
 
+        if (IsLoadedModelPath(path))
+            displayName += kLoadedMarker;
+
         long idx = m_modelList->InsertItem(row, wxString::FromUTF8(displayName));
         m_modelList->SetItem(idx, 1, wxString::FromUTF8(sizeStr));
 
@@ -351,7 +371,14 @@ void ModelManagerDialog::RefreshModelList()
         row++;
     }
 
-    m_statusText->SetLabel(wxString::Format("%ld model(s) found", row));
+    wxString status = wxString::Format("%ld model(s) found", row);
+    if (!m_loadedModelPath.empty()) {
+        status += wxString::FromUTF8(" \xC2\xB7 ");
+        status += wxString::FromUTF8(ServerManager::ModelDisplayName(m_loadedModelPath));
+        status += " is loaded in VRAM";
+    }
+    m_statusText->SetLabel(status);
+    UpdateEjectButton();
     m_tipRow = -2;
     m_modelList->UnsetToolTip();
     FitNameColumn();
@@ -488,13 +515,14 @@ void ModelManagerDialog::OnDeleteClicked(wxCommandEvent&)
     if (sel >= static_cast<long>(m_modelPaths.size())) return;
 
     const std::string modelPath = m_modelPaths[static_cast<size_t>(sel)];
-    const wxString displayName = m_modelList->GetItemText(sel);
     const wxString modelPathWx = wxString::FromUTF8(modelPath);
+    // From the path, not the row text: the loaded row carries a marker.
+    const wxString displayName = wxFileName(modelPathWx).GetName();
 
     if (IsLoadedModelPath(modelPath)) {
         wxMessageBox(
             "This model is currently loaded by llama-server.\n\n"
-            "Switch to another model before deleting it.",
+            "Eject it or switch to another model before deleting it.",
             "Model In Use", wxOK | wxICON_INFORMATION, this);
         wxString status = "Cannot delete loaded model: ";
         status += displayName;
@@ -530,6 +558,43 @@ void ModelManagerDialog::OnDeleteClicked(wxCommandEvent&)
         status += " - file may be in use by llama-server";
         m_statusText->SetLabel(status);
     }
+}
+
+// ── Eject ────────────────────────────────────────────────────────
+// Stops llama-server so its VRAM is free for other apps (ComfyUI etc.).
+// The callback (ModelSwitcher) refuses while a response is streaming or
+// the model is loading; nothing reloads until the next message is sent.
+
+void ModelManagerDialog::UpdateEjectButton()
+{
+    if (!m_ejectButton) return;
+    const ThemeData fallback = ThemeManager::GetDarkTheme();
+    const ThemeData& t = m_theme ? *m_theme : fallback;
+
+    const bool canEject = !m_loadedModelPath.empty();
+    m_ejectButton->Enable(canEject);
+    m_ejectButton->SetBackgroundColour(canEject ? t.accentButton : t.bgInputField);
+    m_ejectButton->SetForegroundColour(canEject ? t.accentButtonText : t.textMuted);
+    m_ejectButton->SetToolTip(canEject
+        ? "Unload the model from VRAM. It reloads on your next message."
+        : "No local model is loaded.");
+    m_ejectButton->Refresh();
+}
+
+void ModelManagerDialog::OnEjectClicked(wxCommandEvent&)
+{
+    if (!m_onEject || m_loadedModelPath.empty()) return;
+
+    std::string why;
+    if (!m_onEject(why)) {
+        m_statusText->SetLabel(wxString::FromUTF8(why));
+        return;
+    }
+
+    m_loadedModelPath.clear();
+    RefreshModelList();   // drops the loaded marker, repaints Eject
+    m_statusText->SetLabel(
+        "Model unloaded. VRAM freed. It reloads on your next message.");
 }
 
 void ModelManagerDialog::OnRefreshClicked(wxCommandEvent&)

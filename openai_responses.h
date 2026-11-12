@@ -424,6 +424,42 @@ inline std::string BuildChatRequest(const std::string& chatJson, bool chatgptPla
     return Stringify(request);
 }
 
+// A Responses `error` stream event.  The public API sends
+//   {"type":"error","code":..,"message":..,"param":..}
+// but other routes (the ChatGPT plan backend among them) nest it as
+//   {"type":"error","error":{"type":..,"code":..,"message":..}}
+// or put a plain string in "error".  Read every shape, and when none
+// carries a message, show the raw event (bounded) instead of a generic
+// label, so the real reason is never thrown away.
+inline std::string DescribeErrorEvent(const Object::Ptr& event)
+{
+    auto text = [](const Object::Ptr& o, const char* key) -> std::string {
+        if (!o || !o->has(key) || o->isNull(key)) return {};
+        try {
+            const auto v = o->get(key);
+            if (v.isString() || v.isNumeric()) return v.convert<std::string>();
+        } catch (...) {}
+        return {};
+    };
+    const Object::Ptr nested = event ? event->getObject("error") : Object::Ptr();
+    std::string message = text(event, "message");
+    if (message.empty()) message = text(nested, "message");
+    if (message.empty()) message = text(event, "error");      // "error":"..."
+    std::string code = text(event, "code");
+    if (code.empty()) code = text(nested, "code");
+    if (code.empty()) code = text(nested, "type");
+    if (!code.empty()) {
+        // Plan codes (usage limit, eligibility, ...) get the plain wording.
+        const std::string plain = lb_chatgpt::DescribePlanErrorCode(code);
+        if (!plain.empty()) return plain + " [" + code + "]";
+    }
+    if (!message.empty()) return code.empty() ? message : message + " [" + code + "]";
+    std::string raw;
+    try { raw = event ? Stringify(event) : std::string(); } catch (...) {}
+    if (raw.size() > 400) raw = raw.substr(0, 400) + "...";
+    return "Responses stream error with no message; raw event: " + raw;
+}
+
 struct StreamUpdate {
     std::string text;
     std::string summary;
@@ -456,8 +492,7 @@ public:
         if (m_terminal) throw std::runtime_error("Responses event arrived after completion.");
         const std::string type = RequiredString(event, "type");
         if (type == "error") {
-            update.error = event->optValue<std::string>("message", "Responses stream error.");
-            if (update.error.empty()) update.error = "Responses stream error.";
+            update.error = DescribeErrorEvent(event);
             m_terminal = true;
             return update;
         }

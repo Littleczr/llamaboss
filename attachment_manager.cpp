@@ -781,8 +781,8 @@ std::string AttachmentManager::BakeDocxFilesIntoMessage(const std::string& userT
                      "and does not require approval.\n";
         } else {
             baked += "Document text is not embedded in this non-agent request. If the user "
-                     "needs the contents, tell them to enable Agent mode or run: "
-                     "/docx_extract_text " + item.data + "\n";
+                     "needs the contents, tell them to turn on Agent mode so you can "
+                     "read it.\n";
         }
 
         baked += "\n";
@@ -861,8 +861,8 @@ std::string AttachmentManager::BakeZipFilesIntoMessage(const std::string& userTe
                      "filenames alone.\n";
         } else {
             baked += "Archive contents are not embedded in this non-agent request. If the user "
-                     "needs them, tell them to enable Agent mode or run: "
-                     "/zip_inspect " + item.data + "\n";
+                     "needs them, tell them to turn on Agent mode so you can "
+                     "inspect it.\n";
         }
 
         baked += "\n";

@@ -2,6 +2,7 @@
 
 #include "connections_dialog.h"
 #include "secrets_store.h"
+#include "endpoint_store.h"
 #include "theme.h"
 #include "widgets.h"   // ApplyDialogThemeRecursive, ApplyDarkTitleBar
 
@@ -243,9 +244,15 @@ public:
         m_valueLabel->SetMinSize(wxSize(140, -1));
         valueRow->Add(m_valueLabel, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 8);
 
-        m_valueField = new wxTextCtrl(this, wxID_ANY, seedValue,
+        // Env var names stay readable; a pasted key is masked, so it
+        // never shows on screen or in a screenshot.  wxTE_PASSWORD can't
+        // be toggled on a live control, so each mode has its own field.
+        m_valueField = new wxTextCtrl(this, wxID_ANY, seedIsEnvRef ? seedValue : wxString(),
                                       wxDefaultPosition, wxSize(280, -1));
+        m_secretField = new wxTextCtrl(this, wxID_ANY, seedIsEnvRef ? wxString() : seedValue,
+                                       wxDefaultPosition, wxSize(280, -1), wxTE_PASSWORD);
         valueRow->Add(m_valueField, 1, wxALIGN_CENTER_VERTICAL);
+        valueRow->Add(m_secretField, 1, wxALIGN_CENTER_VERTICAL);
         root->Add(valueRow, 0, wxEXPAND | wxLEFT | wxRIGHT, 12);
 
         m_valueHint = new wxStaticText(this, wxID_ANY, wxEmptyString);
@@ -325,7 +332,7 @@ public:
 
     wxString GetProvider() const { return m_providerField->GetValue().Trim().Trim(false); }
     wxString GetKey()      const { return m_keyField->GetValue().Trim().Trim(false); }
-    wxString GetValue()    const { return m_valueField->GetValue().Trim().Trim(false); }
+    wxString GetValue()    const { return ActiveValueField()->GetValue().Trim().Trim(false); }
     bool     IsEnvRef()    const { return m_envRefRadio->GetValue(); }
 
 private:
@@ -334,8 +341,15 @@ private:
         UpdateValueLabel();
     }
 
+    wxTextCtrl* ActiveValueField() const
+    {
+        return m_envRefRadio->GetValue() ? m_valueField : m_secretField;
+    }
+
     void UpdateValueLabel()
     {
+        m_valueField->Show(m_envRefRadio->GetValue());
+        m_secretField->Show(!m_envRefRadio->GetValue());
         if (m_envRefRadio->GetValue()) {
             m_valueLabel->SetLabel("Env var name:");
             m_valueHint->SetLabel(
@@ -399,7 +413,7 @@ private:
                     ? wxString("Environment variable name is required.")
                     : wxString("API key value is required."),
                 "Missing field", wxOK | wxICON_INFORMATION, this);
-            m_valueField->SetFocus();
+            ActiveValueField()->SetFocus();
             return;
         }
 
@@ -412,7 +426,8 @@ private:
     wxRadioButton* m_envRefRadio   = nullptr;
     wxStaticText*  m_valueLabel    = nullptr;
     wxStaticText*  m_valueHint     = nullptr;
-    wxTextCtrl*    m_valueField    = nullptr;
+    wxTextCtrl*    m_valueField    = nullptr;   // env var name (plain)
+    wxTextCtrl*    m_secretField   = nullptr;   // pasted key (masked)
     bool           m_allowEmptyDirectValue = false;
 };
 
@@ -432,12 +447,14 @@ wxEND_EVENT_TABLE()
 
 ConnectionsDialog::ConnectionsDialog(wxWindow* parent,
                                      SecretsStore* store,
-                                     const ThemeData& theme)
-    : wxDialog(parent, wxID_ANY, "Connections",
+                                     const ThemeData& theme,
+                                     const EndpointStore* endpoints)
+    : wxDialog(parent, wxID_ANY, "Service keys",
                wxDefaultPosition, wxSize(580, 420),
                wxDEFAULT_DIALOG_STYLE | wxRESIZE_BORDER)
     , m_store(store)
     , m_theme(&theme)
+    , m_endpoints(endpoints)
 {
     // Bump the dialog default font to match settings.cpp (11pt body).
     wxFont base = GetFont();
@@ -695,6 +712,16 @@ void ConnectionsDialog::OnEdit(wxCommandEvent&)
     const bool identityChanged =
         (originalProvider != provider || originalKey != key);
 
+    if (identityChanged) {
+        const wxString users = ProvidersUsingKey(originalP, originalK);
+        if (!users.IsEmpty() && wxMessageBox(
+                wxString::Format("%s.%s is the API key for %s. Renaming it means %s "
+                                 "can't find its key until you edit it under AI providers.\n\nRename anyway?",
+                                 originalProvider, originalKey, users, users),
+                "Key in use", wxYES_NO | wxNO_DEFAULT | wxICON_WARNING, this) != wxYES)
+            return;
+    }
+
     if (identityChanged && m_store->HasSecret(p, k)) {
         int ans = wxMessageBox(
             wxString::Format(
@@ -735,9 +762,14 @@ void ConnectionsDialog::OnDelete(wxCommandEvent&)
     wxString provider = m_list->GetItemText(sel, 0);
     wxString key      = m_list->GetItemText(sel, 1);
 
-    int ans = wxMessageBox(
-        wxString::Format("Delete %s.%s?", provider, key),
-        "Confirm", wxYES_NO | wxICON_WARNING, this);
+    wxString question = wxString::Format("Delete %s.%s?", provider, key);
+    const wxString users = ProvidersUsingKey(std::string(provider.ToUTF8().data()),
+                                             std::string(key.ToUTF8().data()));
+    if (!users.IsEmpty())
+        question += wxString::Format("\n\nThis is the API key for %s. Its models stop working "
+                                     "until you add a key again.", users);
+    int ans = wxMessageBox(question, "Confirm",
+                           wxYES_NO | (users.IsEmpty() ? 0 : wxNO_DEFAULT) | wxICON_WARNING, this);
     if (ans != wxYES) return;
 
     m_store->RemoveSecret(
@@ -746,6 +778,21 @@ void ConnectionsDialog::OnDelete(wxCommandEvent&)
 
     RebuildList();
     UpdateButtonState();
+}
+
+wxString ConnectionsDialog::ProvidersUsingKey(const std::string& provider,
+                                             const std::string& key) const
+{
+    wxString names;
+    if (!m_endpoints) return names;
+    for (const auto& ep : m_endpoints->Endpoints()) {
+        if (ep.authScheme == EndpointStore::AuthScheme::None ||
+            ep.authScheme == EndpointStore::AuthScheme::ChatGpt) continue;
+        if (ep.secretProvider != provider || ep.secretKey != key) continue;
+        if (!names.IsEmpty()) names += ", ";
+        names += wxString::FromUTF8(ep.displayName.empty() ? ep.id : ep.displayName);
+    }
+    return names;
 }
 
 void ConnectionsDialog::OnClose(wxCommandEvent&)

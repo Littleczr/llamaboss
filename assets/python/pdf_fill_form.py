@@ -247,6 +247,12 @@ def normalize_checkbox_value(v, on_states):
     s = str(v).strip()
     if s == '':
         return 'Off'
+    # An exact match on one of THIS field's on-states wins over the generic
+    # aliases below.  Some real forms use on-state names like "No", "0" or
+    # "false" (e.g. the "No" box of a Yes/No pair); passing the name that
+    # pdf_inspect_form reported must select it, not uncheck it.
+    if s in on_states:
+        return s
     sl = s.lower()
     if sl in ('off', 'false', 'no', '0', 'unchecked', 'no_'):
         return 'Off'

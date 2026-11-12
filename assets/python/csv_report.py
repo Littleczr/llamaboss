@@ -1,5 +1,6 @@
 
 import csv
+import io
 import json
 import re
 import sys
@@ -117,7 +118,8 @@ def main():
     rows = []
     max_rows_to_scan = 100000
     try:
-        reader = csv.reader(text.splitlines(), delimiter=delimiter)
+        # newline='' preserves newlines inside quoted fields.
+        reader = csv.reader(io.StringIO(text, newline=''), delimiter=delimiter)
         for row in reader:
             rows.append(row)
             if len(rows) >= max_rows_to_scan:

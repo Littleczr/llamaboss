@@ -104,13 +104,20 @@ inline bool EnsureParentDirectory(const wxString& path)
     return wxFileName::Mkdir(dir, wxS_DIR_DEFAULT, wxPATH_MKDIR_FULL);
 }
 
-inline std::string ReadWholeFile(const wxString& path)
+// Returns false when the file could not be read (locked, permissions,
+// I/O error) -- distinct from an empty file.  A failed read must never
+// load as "no reminders": the next create/cancel would save that empty
+// list over the real file.
+inline bool ReadWholeFile(const wxString& path, std::string& out)
 {
+    out.clear();
     std::ifstream f(path.fn_str(), std::ios::in | std::ios::binary);
-    if (!f) return {};
+    if (!f) return false;
     std::ostringstream ss;
     ss << f.rdbuf();
-    return ss.str();
+    if (f.bad()) return false;
+    out = ss.str();
+    return true;
 }
 
 inline bool WriteWholeFileAtomic(const wxString& path, const std::string& body)
@@ -562,7 +569,17 @@ private:
         const wxString path = detail::StoragePathWx();
         if (!wxFileExists(path)) return true;
 
-        const std::string body = detail::ReadWholeFile(path);
+        std::string body;
+        if (!detail::ReadWholeFile(path, body)) {
+            // Usually transient (antivirus scan, another window mid-save).
+            // Leave m_loaded false so the next call retries instead of
+            // latching the error for the whole session; SaveLocked is never
+            // reached while this fails, so the file stays untouched.
+            m_loaded = false;
+            m_loadError = "Could not read REMINDERS.json (another program may "
+                          "have it open). Try again in a moment.";
+            return false;
+        }
         if (body.empty()) return true;
 
         try {

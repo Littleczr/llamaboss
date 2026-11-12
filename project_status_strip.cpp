@@ -1,6 +1,8 @@
 // project_status_strip.cpp
 #include "project_status_strip.h"
 #include "theme.h"
+#include "lb_icons.h"
+#include "lb_hover_tile.h"
 
 #include <wx/sizer.h>
 
@@ -89,6 +91,9 @@ ProjectStatusStrip::ProjectStatusStrip(wxWindow* parent,
     m_panel->SetBackgroundColour(m_bgColor);
 
     BuildContent();
+    if (m_ejectButton)
+        LbIcons::ApplyFlatButton(m_ejectButton, LbIcons::Id::Eject,
+                                 theme, m_bgColor);
     RelayoutCurrentState();
 }
 
@@ -147,6 +152,24 @@ void ProjectStatusStrip::BuildContent()
                   wxALIGN_CENTER_VERTICAL | wxLEFT, kStateActionGap);
 
     rowSizer->AddStretchSpacer(1);
+
+    // ── Eject icon (right end) ───────────────────────────────────
+    // Same flat SVG idiom as the toolbar cogwheel: muted glyph, accent
+    // on hover, no tile.  Hidden until the frame reports a loaded local
+    // model.  Keeps a text label for accessibility (wxBU_NOTEXT).
+    m_ejectButton = new wxButton(m_row, wxID_ANY, "Eject model",
+        wxDefaultPosition, m_row->FromDIP(wxSize(40, 26)),
+        wxBORDER_NONE | wxBU_NOTEXT);
+    m_ejectButton->SetName("Eject model");
+    m_ejectButton->SetToolTip("Eject model (free VRAM)");
+    m_ejectButton->SetCursor(wxCURSOR_HAND);
+    m_ejectButton->Hide();
+    rowSizer->Add(m_ejectButton, 0, wxALIGN_CENTER_VERTICAL);
+    m_ejectButton->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) {
+        if (m_callbacks.onEjectRequested) m_callbacks.onEjectRequested();
+    });
+    LbHoverTile::BindGlyph(m_ejectButton);
+
     rowSizer->AddSpacer(kEdgePad);  // symmetric right edge padding
 
     m_row->SetSizer(rowSizer);
@@ -301,6 +324,14 @@ void ProjectStatusStrip::Refresh(const State& state)
     RelayoutCurrentState();
 }
 
+void ProjectStatusStrip::SetEjectVisible(bool visible)
+{
+    if (!m_ejectButton || m_ejectButton->IsShown() == visible) return;
+    m_ejectButton->Show(visible);
+    if (m_row) m_row->Layout();
+    if (m_panel) m_panel->Refresh();
+}
+
 void ProjectStatusStrip::ApplyTheme(const ThemeData& theme)
 {
     m_bgColor     = theme.bgToolbar;
@@ -315,6 +346,9 @@ void ProjectStatusStrip::ApplyTheme(const ThemeData& theme)
     if (m_actionLabel)      m_actionLabel->SetForegroundColour(m_mutedColor);
     if (m_skillActionLabel) m_skillActionLabel->SetForegroundColour(m_mutedColor);
     if (m_separator)       m_separator->SetBackgroundColour(m_borderColor);
+    if (m_ejectButton)
+        LbIcons::ApplyFlatButton(m_ejectButton, LbIcons::Id::Eject,
+                                 theme, m_bgColor);
 
     if (m_panel) m_panel->Refresh();
 }

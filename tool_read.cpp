@@ -119,9 +119,62 @@ void DropIncompleteUtf8Tail(std::string& s)
         s.resize(j - 1);
 }
 
-// Any NUL byte in the sniff window ⇒ binary.  This misses UTF-16
-// text (which has NULs by design) but that's rare on Windows dev
-// workflows; the agent can always /cmd Get-Content as a fallback.
+// UTF-16 text with a byte-order mark (MSBuild .tlog files, PowerShell
+// `Out-File` output, many Windows logs) is converted to UTF-8 before the
+// binary check, so it reads as text instead of a hex dump.  Returns true
+// and rewrites `content` when a UTF-16 BOM was found.  Unpaired
+// surrogates become U+FFFD; an odd trailing byte (cut by a byte cap) is
+// dropped.  Files without a BOM are untouched.
+bool TranscodeUtf16BomToUtf8(std::string& content)
+{
+    if (content.size() < 2) return false;
+    const unsigned char b0 = (unsigned char)content[0];
+    const unsigned char b1 = (unsigned char)content[1];
+    const bool le = (b0 == 0xFF && b1 == 0xFE);
+    const bool be = (b0 == 0xFE && b1 == 0xFF);
+    if (!le && !be) return false;
+
+    auto unit = [&](size_t i) -> unsigned {
+        const unsigned char a = (unsigned char)content[i];
+        const unsigned char b = (unsigned char)content[i + 1];
+        return le ? (unsigned)(a | (b << 8)) : (unsigned)((a << 8) | b);
+    };
+    auto put = [](std::string& o, unsigned cp) {
+        if (cp < 0x80) o.push_back((char)cp);
+        else if (cp < 0x800) { o.push_back((char)(0xC0 | (cp >> 6)));
+                               o.push_back((char)(0x80 | (cp & 0x3F))); }
+        else if (cp < 0x10000) { o.push_back((char)(0xE0 | (cp >> 12)));
+                                 o.push_back((char)(0x80 | ((cp >> 6) & 0x3F)));
+                                 o.push_back((char)(0x80 | (cp & 0x3F))); }
+        else { o.push_back((char)(0xF0 | (cp >> 18)));
+               o.push_back((char)(0x80 | ((cp >> 12) & 0x3F)));
+               o.push_back((char)(0x80 | ((cp >> 6) & 0x3F)));
+               o.push_back((char)(0x80 | (cp & 0x3F))); }
+    };
+
+    std::string out;
+    out.reserve(content.size() / 2 + 16);
+    const size_t n = content.size() & ~(size_t)1;
+    for (size_t i = 2; i < n; i += 2) {
+        unsigned u = unit(i);
+        if (u >= 0xD800 && u <= 0xDBFF && i + 3 < n) {
+            const unsigned lo = unit(i + 2);
+            if (lo >= 0xDC00 && lo <= 0xDFFF) {
+                put(out, 0x10000 + ((u - 0xD800) << 10) + (lo - 0xDC00));
+                i += 2;
+                continue;
+            }
+        }
+        if (u >= 0xD800 && u <= 0xDFFF) u = 0xFFFD;
+        put(out, u);
+    }
+    content.swap(out);
+    return true;
+}
+
+// Any NUL byte in the sniff window ⇒ binary.  UTF-16 files that carry a
+// BOM are transcoded first (TranscodeUtf16BomToUtf8), so this only sees
+// BOM-less UTF-16, which stays a hex preview.
 bool IsBinary(const char* data, size_t n)
 {
     size_t check = std::min(n, kBinarySniffBytes);
@@ -357,6 +410,7 @@ ReadResult ReadFile(const std::string& inputPath, const ToolContext& ctx)
             content.resize((size_t)f.gcount());
         }
     }
+    const bool fromUtf16 = TranscodeUtf16BomToUtf8(content);
     if (truncated) DropIncompleteUtf8Tail(content);
 
     // Count the visible file lines BEFORE appending our synthetic
@@ -394,6 +448,7 @@ ReadResult ReadFile(const std::string& inputPath, const ToolContext& ctx)
     r.chips.push_back(std::to_string(shownLineCount) +
                       (truncated ? " shown lines" : " lines"));
     if (truncated) r.chips.push_back("truncated");
+    if (fromUtf16) r.chips.push_back("UTF-16 shown as UTF-8");
     // A UTF-8 BOM is file metadata, not text: shown inline it became an
     // invisible character glued to line 1 that a model could copy into
     // an edit's OLD block.  Strip it from the view and say so.
@@ -507,6 +562,7 @@ ReadResult ReadFileHead(const std::string& inputPath,
             content.resize((size_t)f.gcount());
         }
     }
+    const bool headFromUtf16 = TranscodeUtf16BomToUtf8(content);
     if (toRead < totalBytes) DropIncompleteUtf8Tail(content);
 
     if (IsBinary(content.data(), content.size())) {
@@ -576,6 +632,7 @@ ReadResult ReadFileHead(const std::string& inputPath,
     if (truncatedByLines) r.chips.push_back("truncated");
     if (clampedAnyLine) r.chips.push_back("long lines clamped");
     if (headBomStripped) r.chips.push_back("UTF-8 BOM");
+    if (headFromUtf16) r.chips.push_back("UTF-16 shown as UTF-8");
     r.body = std::move(out);
     r.bodyLang = InferBodyLang(resolved);
     r.chips.push_back(LbElapsedChip(t0));
@@ -689,6 +746,7 @@ ReadResult ReadFileRange(const std::string& inputPath,
         if (f.gcount() < (std::streamsize)totalBytes)
             content.resize((size_t)f.gcount());
     }
+    TranscodeUtf16BomToUtf8(content);
 
     if (IsBinary(content.data(), std::min(content.size(), (size_t)4096))) {
         r.chips.push_back(LbToolHumanBytes(totalBytes));
@@ -962,6 +1020,7 @@ ReadResult ReadFileRanges(const std::string& inputPath,
         if (f.gcount() < (std::streamsize)totalBytes)
             content.resize((size_t)f.gcount());
     }
+    TranscodeUtf16BomToUtf8(content);
 
     if (IsBinary(content.data(), std::min(content.size(), (size_t)4096))) {
         r.chips.push_back(LbToolHumanBytes(totalBytes));
