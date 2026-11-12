@@ -189,7 +189,7 @@ When the login keychain has an "Apple Development" (or, failing that, a self-sig
 | 5 | Remote endpoint streams; stop works | **Verified** streaming with OpenRouter GPT 6 Luna (2026-10-11 onward). Stop during a remote stream verified (2026-10-13) |
 | 6 | Shell and Python tools | **Done**: zsh shell tool (2026-10-11), Python helpers and scripts (2026-10-11), `py` session (2026-10-12), web fetch (2026-10-12), bundled Python runtime (2026-10-13) |
 | 7 | File-tool boundaries, protected credentials, packaged app | Credentials in the Keychain **verified**; packaged, notarized app **done** (2026-10-12). File-tool boundary cases (symlinks, case-sensitive volumes) implemented, not systematically tested |
-| 8 | Public Mac release | **Done 2026-10-12**: Beta 0.1.23 on R2 and llamaboss.com. 0.1.24 with the bundled Python notarized and published 2026-10-13 (R2 + site 0.2.9). 0.1.25 notarized and published 2026-10-15 (R2 + site 0.2.11). 0.1.29 DMG notarized and on R2 2026-11-12 (site/notes held for PATCH_NOTES) |
+| 8 | Public Mac release | **Done 2026-10-12**: Beta 0.1.23 on R2 and llamaboss.com. 0.1.24 with the bundled Python notarized and published 2026-10-13 (R2 + site 0.2.9). 0.1.25 notarized and published 2026-10-15 (R2 + site 0.2.11). 0.1.29 notarized and published 2026-11-12 (R2 + site 0.2.14, Mac-only; Windows still 0.1.27) |
 
 ## Implemented for macOS (compiles; runtime verification pending unless noted)
 
@@ -889,7 +889,7 @@ checkout of 8814026; the 9e8b3d3 packages are refused there. Those are kept in
   `Websites/LlamaBoss_Website_v0_2_12_mac_v0_1_27_20261030_085554.zip`, LATEST.json updated
   (no `treehash`: the PC's recipe isn't documented; asked in NEXT_RELEASE).
 
-## Merge of `main` eff06e3 (0.1.29) and Mac 0.1.29 DMG — 2026-11-12
+## Merge of `main` eff06e3 (0.1.29) and Mac 0.1.29 release — 2026-11-12
 
 - **Merge** `17d98b3`. Conflicts: `endpoints_dialog.cpp` (main adopted the llama-server
   `"data"` fallback; took main's, the Mac-only copy from c08465a is gone), `LlamaBoss.cpp` and
@@ -914,22 +914,30 @@ checkout of 8814026; the 9e8b3d3 packages are refused there. Those are kept in
   id aacca474-1a34-47ce-8a1e-5dc07fe1daad), stapled, Gatekeeper "Notarized Developer ID".
   R2 `LlamaBoss_Beta_v0.1.29_macOS.dmg`, public URL re-downloaded and hash-matched. Copied
   to the share `Releases/Mac/`. Log: `dist/package-0.1.29.log`.
-- **Held by the user**: Mac release notes and website docs/version.json wait for the 0.1.29
-  `PATCH_NOTES.md` on main (main eff06e3 still has the 0.1.27 notes). Live site is still
-  0.2.12 (Windows + Mac 0.1.27); site 0.2.13 is still awaiting approval.
+- **Notes + site** (after the user pushed PATCH_NOTES 0.1.29, main 21d24cc, merged as a
+  docs-only merge; DMG unchanged because PATCH_NOTES isn't bundled): Mac release notes
+  `Releases/notes/0.1.29-mac.md` on the share (PATCH_NOTES adjusted for the Mac: Keychain
+  coverage is shell-only, Eject frees memory). Eject verified on the Mac (server stops,
+  "Model unloaded" message).
+- **Site 0.2.14** = LATEST `v0_2_12_mac_v0_1_27` package (live checked identical) +
+  `LlamaBoss_Website_work/edit_0214_docs.py`: "New in 0.1.29" on Start here, Start here/FAQ
+  "0.1.29 for Mac and 0.1.27 for Windows. Updated November 12, 2026", provider scan ports note,
+  Mac 0.1.29 links, `mac_*` in version.json (Windows fields unchanged: Windows 0.1.29 isn't
+  published), site-build.json, sitemap lastmod. Preview `mac-0-1-29.llamaboss.pages.dev`, then
+  production; live re-checked identical. Package
+  `Websites/LlamaBoss_Website_v0_2_14_mac_v0_1_29_20261112_054534.zip`, LATEST.json updated.
+  Unpublished 0.2.13 rewrite must carry these changes over (noted in its HANDOFF.md).
 
 ## Next task
 
-0. **Mac 0.1.29 notes + site**: after the user pushes the 0.1.29 PATCH_NOTES.md to main, pull
-   main and write the Mac release notes from it; then the website docs/version.json per
-   the LATEST.json rule.
+0. **Windows 0.1.29 on the site**: when the PC publishes it, start from LATEST (site 0.2.14).
 1. **Needs the user:** fresh-account test with `/Users/Shared/LlamaBoss-FreshTest` (checklist
    inside): create a standard user account and log in to it.
 2. **Needs the user:** rotate the Cloudflare Pages API token (it was printed into a session
    transcript on 2026-10-13; not sent anywhere else) and update the credentials file on the share.
-3. Site deploys from either side start from `Websites/LATEST.json`. As of 2026-10-30 it names
-   `LlamaBoss_Website_v0_2_12_mac_v0_1_27_20261030_085554.zip` (site 0.2.12, Windows 0.1.27,
-   Mac 0.1.27; live checked identical).
+3. Site deploys from either side start from `Websites/LATEST.json`. As of 2026-11-12 it names
+   `LlamaBoss_Website_v0_2_14_mac_v0_1_29_20261112_054534.zip` (site 0.2.14, Windows 0.1.27,
+   Mac 0.1.29; live checked identical).
 4. PC findings for 0.1.26: `## Known issues` in the share's `NEXT_RELEASE.md`.
 5. File-tool boundary cases on the Mac (symlinks, case-sensitive volume), milestone 7.
 6. The `Tests/` suite now also runs on the Mac (`macos/run_native_tests.zsh`); see the
