@@ -2,7 +2,7 @@
 
 ## Safety
 
-- Tools can no longer read stored credentials. `git credential fill`, `gh auth token`, Windows Credential Manager, keyring, DPAPI, `.git-credentials`, gh `hosts.yml`, LlamaBoss `secrets.json` and browser password files are refused in PowerShell, Python and script-writing tools, even when tools are approved for the chat. On the Mac this also covers Keychain password reads.
+- Tools can no longer read stored credentials. `git credential fill`, `gh auth token`, Windows Credential Manager, keyring, DPAPI, `.git-credentials`, gh `hosts.yml`, LlamaBoss `secrets.json` and browser password files are refused in PowerShell, Python and script-writing tools, even when tools are approved for the chat. On the Mac, the shell tool also refuses Keychain password reads.
 - The [Open] button on file chips now respects the same blocked list as the `open` tool.
 - `.html` files opened by a model now open in your default browser instead of being read inline.
 
@@ -11,6 +11,7 @@
 - Add AI provider now lists models from a running llama-server (the list used to come up empty).
 - The local server scan checks ports 8080–8090 and labels what it finds "local server".
 - Provider window polish: clearer model counts, no stale unticked model rows, and Edit/Delete now work after you add service keys.
+- LlamaBoss warns before you rename or delete a key that a provider uses.
 - New Eject button in Manage Models (right-click the model pill) and an eject icon on the Project/Skills strip, to free VRAM when you need the GPU for something else. A model can't be ejected while it's working.
 
 ## Agent and tools
@@ -40,6 +41,7 @@
 
 - Saved provider settings and API keys are written safely: a failed save no longer leaves a half-written file.
 - A reminders file that can't be read no longer causes problems.
+- notes_append adds to a notes file instead of overwriting it.
 
 # LlamaBoss 0.1.27 - Patch Notes
 
