@@ -189,7 +189,7 @@ When the login keychain has an "Apple Development" (or, failing that, a self-sig
 | 5 | Remote endpoint streams; stop works | **Verified** streaming with OpenRouter GPT 6 Luna (2026-10-11 onward). Stop during a remote stream verified (2026-10-13) |
 | 6 | Shell and Python tools | **Done**: zsh shell tool (2026-10-11), Python helpers and scripts (2026-10-11), `py` session (2026-10-12), web fetch (2026-10-12), bundled Python runtime (2026-10-13) |
 | 7 | File-tool boundaries, protected credentials, packaged app | Credentials in the Keychain **verified**; packaged, notarized app **done** (2026-10-12). File-tool boundary cases (symlinks, case-sensitive volumes) implemented, not systematically tested |
-| 8 | Public Mac release | **Done 2026-10-12**: Beta 0.1.23 on R2 and llamaboss.com. 0.1.24 with the bundled Python notarized and published 2026-10-13 (R2 + site 0.2.9). 0.1.25 notarized and published 2026-10-15 (R2 + site 0.2.11) |
+| 8 | Public Mac release | **Done 2026-10-12**: Beta 0.1.23 on R2 and llamaboss.com. 0.1.24 with the bundled Python notarized and published 2026-10-13 (R2 + site 0.2.9). 0.1.25 notarized and published 2026-10-15 (R2 + site 0.2.11). 0.1.29 DMG notarized and on R2 2026-11-12 (site/notes held for PATCH_NOTES) |
 
 ## Implemented for macOS (compiles; runtime verification pending unless noted)
 
@@ -889,8 +889,40 @@ checkout of 8814026; the 9e8b3d3 packages are refused there. Those are kept in
   `Websites/LlamaBoss_Website_v0_2_12_mac_v0_1_27_20261030_085554.zip`, LATEST.json updated
   (no `treehash`: the PC's recipe isn't documented; asked in NEXT_RELEASE).
 
+## Merge of `main` eff06e3 (0.1.29) and Mac 0.1.29 DMG — 2026-11-12
+
+- **Merge** `17d98b3`. Conflicts: `endpoints_dialog.cpp` (main adopted the llama-server
+  `"data"` fallback; took main's, the Mac-only copy from c08465a is gone), `LlamaBoss.cpp` and
+  `tool_result_controller.cpp` (main removed the slash async/approval paths; took main's),
+  `agent_prompt_builder.cpp` (HTML-opens-in-browser text mirrored in the Mac line),
+  `connections_dialog.cpp` (key-in-use wording + Mac alert buttons Delete/Rename),
+  `tool_notes.cpp` (Mac AtomicWriteFile honors main's new replaceExisting/errOut via
+  RENAME_EXCL/errno; DWORD/ERROR_* aliases). Windows view of every touched file: the same
+  long-standing helper differences as before, nothing new.
+- **Mac build fixes**: `tool_write.cpp` POSIX branch (`mutation` is now a unique_ptr);
+  `command_policy_zsh.cpp` runs main's `DetectSecretStoreAccess` before anything else, plus
+  `DetectMacKeychainAccess` (`security find-*-password` with -w/-g, `dump-keychain`, `export`).
+  10 new cases in `command_policy_zsh_tests` (7 reject, 3 approval). The shared guard has no
+  Keychain patterns, so py/python code is not covered on the Mac: logged in NEXT_RELEASE.
+- **Native tests**: unchanged baseline (command_policy PowerShell 13 N/A; Tests/ 104/112 =
+  7 `Vars\` separator cases + stale R0_S3); zsh policy 0 failures (73 checks);
+  new `secret_access_guard_tests` ALL PASSED (failed 1 before the zsh wiring).
+- **Verified in the app**: Add AI provider lists a separate llama-server (8081, Gemma 3 1B,
+  both `models` and `data` in /v1/models) with its model and "Read from the server: 4K".
+- **DMG**: `dist/LlamaBoss-0.1.29-macOS.dmg`, 56,289,776 bytes, SHA-256
+  `4c338d734de1abb6a7f312fb70e71fdd582eda93b28eaf63f1d26e3bd1320dab`, notarized (Accepted,
+  id aacca474-1a34-47ce-8a1e-5dc07fe1daad), stapled, Gatekeeper "Notarized Developer ID".
+  R2 `LlamaBoss_Beta_v0.1.29_macOS.dmg`, public URL re-downloaded and hash-matched. Copied
+  to the share `Releases/Mac/`. Log: `dist/package-0.1.29.log`.
+- **Held by the user**: Mac release notes and website docs/version.json wait for the 0.1.29
+  `PATCH_NOTES.md` on main (main eff06e3 still has the 0.1.27 notes). Live site is still
+  0.2.12 (Windows + Mac 0.1.27); site 0.2.13 is still awaiting approval.
+
 ## Next task
 
+0. **Mac 0.1.29 notes + site**: after the user pushes the 0.1.29 PATCH_NOTES.md to main, pull
+   main and write the Mac release notes from it; then the website docs/version.json per
+   the LATEST.json rule.
 1. **Needs the user:** fresh-account test with `/Users/Shared/LlamaBoss-FreshTest` (checklist
    inside): create a standard user account and log in to it.
 2. **Needs the user:** rotate the Cloudflare Pages API token (it was printed into a session
