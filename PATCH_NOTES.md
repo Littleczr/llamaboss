@@ -1,3 +1,46 @@
+# LlamaBoss 0.1.29 - Patch Notes
+
+## Safety
+
+- Tools can no longer read stored credentials. `git credential fill`, `gh auth token`, Windows Credential Manager, keyring, DPAPI, `.git-credentials`, gh `hosts.yml`, LlamaBoss `secrets.json` and browser password files are refused in PowerShell, Python and script-writing tools, even when tools are approved for the chat. On the Mac this also covers Keychain password reads.
+- The [Open] button on file chips now respects the same blocked list as the `open` tool.
+- `.html` files opened by a model now open in your default browser instead of being read inline.
+
+## Models and providers
+
+- Add AI provider now lists models from a running llama-server (the list used to come up empty).
+- The local server scan checks ports 8080–8090 and labels what it finds "local server".
+- Provider window polish: clearer model counts, no stale unticked model rows, and Edit/Delete now work after you add service keys.
+- New Eject button in Manage Models (right-click the model pill) and an eject icon on the Project/Skills strip, to free VRAM when you need the GPU for something else. A model can't be ejected while it's working.
+
+## Agent and tools
+
+- Remote chats always send the native tool catalog. Before, loading a model in another window could make the next request go out without tools.
+- Long chats keep their prompt cache. Once a chat needs trimming, it trims once to 85% and reuses that cut instead of trimming one item per request.
+- When a reply starts with two or more read-only calls, they now run together instead of only the first.
+- Models that announce a step ("I'm writing the file now…") and then stop are nudged to actually do it.
+- Better recovery from malformed tool calls: invented "[elided]" markers are rejected, and arguments wrapped in an extra `"arguments"` layer are unwrapped.
+- `write` creates missing parent folders.
+- `read`, `read_head` and `read_range` decode UTF-16 files that start with a BOM instead of showing a hex dump.
+- A tool result that arrives after its agent turn has ended is no longer added to the chat as a stray message.
+- When a Python script fails on a missing package like `yaml.constructor`, LlamaBoss now suggests the right package to install (`pyyaml`).
+- Python scripts blocked with HTTP 403 get a hint to use `web_fetch_url`.
+- python_run_script cards show the script's arguments.
+
+## Documents
+
+- Many Excel and PDF fixes from a pre-release review: workbook creation, xlsx inspect/report, CSV to Excel, PDF text extraction and PDF form filling.
+
+## Interface
+
+- The context meter no longer counts reasoning tokens.
+- Chat titles skip the "[Attached ZIP archive …]" block.
+
+## Reliability
+
+- Saved provider settings and API keys are written safely: a failed save no longer leaves a half-written file.
+- A reminders file that can't be read no longer causes problems.
+
 # LlamaBoss 0.1.27 - Patch Notes
 
 ## Highlights
